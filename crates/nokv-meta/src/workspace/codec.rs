@@ -1,8 +1,8 @@
 use nokv_types::{
-    ArtifactRevisionId, CommitConsumerKind, CommitId, CommitVersion, HistoryHoldKind,
-    LogicalShardId, NormalizedRelativePath, OperationId, OperationKind, ReferenceEpoch,
-    ReferenceKind, RootId, SnapshotAliasName, SnapshotId, TagName, WorkbenchId,
-    WorkspaceIncarnationId,
+    ArtifactRevisionId, CommitConsumerKind, CommitId, CommitVersion, GenericIndexGenerationId,
+    GenericIndexReferenceKind, HistoryHoldKind, LogicalShardId, NormalizedRelativePath,
+    OperationId, OperationKind, ReferenceEpoch, ReferenceKind, RootId, SnapshotAliasName,
+    SnapshotId, TagName, WorkbenchId, WorkspaceIncarnationId, SHA256_BYTES,
 };
 
 pub const SCHEMA_ID: &str = "nokv_workspace";
@@ -17,16 +17,18 @@ pub const PATH_COMPONENT_DELIMITER: u8 = 0;
 pub const PATH_EXACT_TERMINATOR: u8 = 0x01;
 const SNAPSHOT_ID_CLAIM_DISCRIMINATOR: u8 = 0xff;
 const ARTIFACT_REVISION_CLAIM_DISCRIMINATOR: u8 = 0xff;
+const GENERIC_INDEX_HEADER_DISCRIMINATOR: u8 = 0;
+const GENERIC_INDEX_ROW_DISCRIMINATOR: u8 = 1;
+const GENERIC_INDEX_REFERENCE_DISCRIMINATOR: u8 = 2;
+const GENERIC_INDEX_APPEND_RECEIPT_DISCRIMINATOR: u8 = 3;
 
 const FIXED_ID_BYTES: usize = 16;
 pub(crate) const SYSTEM_SCHEMA_KEY: &[u8] = b"schema";
-const SYSTEM_FORMAT_VERSION: u32 = 9;
-const PREVIOUS_SYSTEM_FORMAT_VERSION: u32 = 8;
+const SYSTEM_FORMAT_VERSION: u32 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SchemaMarkerVersion {
     Current,
-    Format8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,6 +331,10 @@ pub fn restore_history_hold_key(root: RootId, operation: OperationId) -> Vec<u8>
     operation_history_hold_key(root, HistoryHoldKind::Restore, operation)
 }
 
+pub fn register_generic_index_history_hold_key(root: RootId, operation: OperationId) -> Vec<u8> {
+    operation_history_hold_key(root, HistoryHoldKind::RegisterGenericIndex, operation)
+}
+
 fn operation_history_hold_key(
     root: RootId,
     kind: HistoryHoldKind,
@@ -470,6 +476,16 @@ pub fn lease_commit_consumer_key(
     key
 }
 
+pub fn snapshot_commit_consumer_key(
+    root: RootId,
+    commit: CommitId,
+    snapshot: SnapshotId,
+) -> Vec<u8> {
+    let mut key = commit_consumer_prefix(root, commit, CommitConsumerKind::Snapshot);
+    key.extend_from_slice(&snapshot.get().to_be_bytes());
+    key
+}
+
 pub fn child_commit_consumer_key(root: RootId, parent: CommitId, child: CommitId) -> Vec<u8> {
     let mut key = commit_consumer_prefix(root, parent, CommitConsumerKind::ChildCommit);
     key.extend_from_slice(child.as_bytes());
@@ -539,6 +555,210 @@ pub fn restore_member_prefix(root: RootId, operation: OperationId) -> Vec<u8> {
     key.extend_from_slice(root.as_bytes());
     key.extend_from_slice(operation.as_bytes());
     key
+}
+
+/// Exact current Generic index pointer for one workspace-relative scope.
+///
+/// `None` denotes the workspace root. The exact terminator keeps that key
+/// distinct from every non-root registration path.
+pub fn generic_index_current_key(
+    root: RootId,
+    workspace: WorkspaceIncarnationId,
+    index_path: Option<&NormalizedRelativePath>,
+) -> Vec<u8> {
+    let mut key = generic_index_current_prefix(root, workspace);
+    if let Some(index_path) = index_path {
+        push_ordered_path_components(&mut key, index_path);
+    }
+    key.push(PATH_EXACT_TERMINATOR);
+    key
+}
+
+pub fn generic_index_current_prefix(root: RootId, workspace: WorkspaceIncarnationId) -> Vec<u8> {
+    [root.as_bytes().as_slice(), workspace.as_bytes()].concat()
+}
+
+/// Decode an exact current Generic index key.
+///
+/// The outer option rejects a malformed or differently-scoped key; the inner
+/// option is `None` only for the workspace-root registration.
+pub fn decode_generic_index_current_key(
+    root: RootId,
+    workspace: WorkspaceIncarnationId,
+    key: &[u8],
+) -> Option<Option<NormalizedRelativePath>> {
+    decode_optional_path_key(&generic_index_current_prefix(root, workspace), key)
+}
+
+fn generic_index_generation_record_prefix(
+    root: RootId,
+    record_discriminator: u8,
+    generation: GenericIndexGenerationId,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(FIXED_ID_BYTES * 2 + 1);
+    key.extend_from_slice(root.as_bytes());
+    key.push(record_discriminator);
+    key.extend_from_slice(generation.as_bytes());
+    key
+}
+
+/// Root-scoped prefix for generation headers only. It excludes materialized
+/// rows, strong-owner references, and append receipts.
+pub fn generic_index_generation_prefix(root: RootId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(FIXED_ID_BYTES + 1);
+    key.extend_from_slice(root.as_bytes());
+    key.push(GENERIC_INDEX_HEADER_DISCRIMINATOR);
+    key
+}
+
+pub fn generic_index_generation_key(root: RootId, generation: GenericIndexGenerationId) -> Vec<u8> {
+    let mut key = generic_index_generation_prefix(root);
+    key.extend_from_slice(generation.as_bytes());
+    key
+}
+
+pub fn decode_generic_index_generation_key(
+    root: RootId,
+    key: &[u8],
+) -> Option<GenericIndexGenerationId> {
+    let prefix = generic_index_generation_prefix(root);
+    if key.len() != prefix.len() + FIXED_ID_BYTES || !key.starts_with(&prefix) {
+        return None;
+    }
+    Some(GenericIndexGenerationId::from_bytes(
+        key[prefix.len()..].try_into().ok()?,
+    ))
+}
+
+pub fn generic_index_row_prefix(root: RootId, generation: GenericIndexGenerationId) -> Vec<u8> {
+    generic_index_generation_record_prefix(root, GENERIC_INDEX_ROW_DISCRIMINATOR, generation)
+}
+
+pub fn generic_index_row_key(
+    root: RootId,
+    generation: GenericIndexGenerationId,
+    sequence: u64,
+) -> Vec<u8> {
+    let mut key = generic_index_row_prefix(root, generation);
+    key.extend_from_slice(&sequence.to_be_bytes());
+    key
+}
+
+pub fn decode_generic_index_row_key(
+    root: RootId,
+    generation: GenericIndexGenerationId,
+    key: &[u8],
+) -> Option<u64> {
+    decode_generation_u64_suffix(generic_index_row_prefix(root, generation), key)
+}
+
+pub fn generic_index_generation_ref_prefix(
+    root: RootId,
+    generation: GenericIndexGenerationId,
+) -> Vec<u8> {
+    generic_index_generation_record_prefix(root, GENERIC_INDEX_REFERENCE_DISCRIMINATOR, generation)
+}
+
+pub fn generic_index_generation_ref_key(
+    root: RootId,
+    generation: GenericIndexGenerationId,
+    kind: GenericIndexReferenceKind,
+    owner_digest: [u8; SHA256_BYTES],
+) -> Vec<u8> {
+    let mut key = generic_index_generation_ref_prefix(root, generation);
+    key.push(kind.into());
+    key.extend_from_slice(&owner_digest);
+    key
+}
+
+pub fn decode_generic_index_generation_ref_key(
+    root: RootId,
+    generation: GenericIndexGenerationId,
+    key: &[u8],
+) -> Option<(GenericIndexReferenceKind, [u8; SHA256_BYTES])> {
+    let prefix = generic_index_generation_ref_prefix(root, generation);
+    if key.len() != prefix.len() + 1 + SHA256_BYTES || !key.starts_with(&prefix) {
+        return None;
+    }
+    let kind = GenericIndexReferenceKind::try_from(key[prefix.len()]).ok()?;
+    let owner_digest = key[prefix.len() + 1..].try_into().ok()?;
+    Some((kind, owner_digest))
+}
+
+pub fn generic_index_append_receipt_prefix(
+    root: RootId,
+    generation: GenericIndexGenerationId,
+) -> Vec<u8> {
+    generic_index_generation_record_prefix(
+        root,
+        GENERIC_INDEX_APPEND_RECEIPT_DISCRIMINATOR,
+        generation,
+    )
+}
+
+pub fn generic_index_append_receipt_key(
+    root: RootId,
+    generation: GenericIndexGenerationId,
+    first_sequence: u64,
+) -> Vec<u8> {
+    let mut key = generic_index_append_receipt_prefix(root, generation);
+    key.extend_from_slice(&first_sequence.to_be_bytes());
+    key
+}
+
+pub fn decode_generic_index_append_receipt_key(
+    root: RootId,
+    generation: GenericIndexGenerationId,
+    key: &[u8],
+) -> Option<u64> {
+    decode_generation_u64_suffix(generic_index_append_receipt_prefix(root, generation), key)
+}
+
+fn decode_generation_u64_suffix(prefix: Vec<u8>, key: &[u8]) -> Option<u64> {
+    if key.len() != prefix.len() + 8 || !key.starts_with(&prefix) {
+        return None;
+    }
+    Some(u64::from_be_bytes(key[prefix.len()..].try_into().ok()?))
+}
+
+pub fn commit_generic_index_member_prefix(root: RootId, commit: CommitId) -> Vec<u8> {
+    commit_key(root, commit)
+}
+
+pub fn commit_generic_index_member_key(
+    root: RootId,
+    commit: CommitId,
+    index_path: Option<&NormalizedRelativePath>,
+) -> Vec<u8> {
+    let mut key = commit_generic_index_member_prefix(root, commit);
+    if let Some(index_path) = index_path {
+        push_ordered_path_components(&mut key, index_path);
+    }
+    key.push(PATH_EXACT_TERMINATOR);
+    key
+}
+
+pub fn decode_commit_generic_index_member_key(
+    root: RootId,
+    commit: CommitId,
+    key: &[u8],
+) -> Option<Option<NormalizedRelativePath>> {
+    decode_optional_path_key(&commit_generic_index_member_prefix(root, commit), key)
+}
+
+fn decode_optional_path_key(prefix: &[u8], key: &[u8]) -> Option<Option<NormalizedRelativePath>> {
+    if key.len() < prefix.len() + 1
+        || !key.starts_with(prefix)
+        || key.last() != Some(&PATH_EXACT_TERMINATOR)
+    {
+        return None;
+    }
+    let encoded = &key[prefix.len()..key.len() - 1];
+    if encoded.is_empty() {
+        Some(None)
+    } else {
+        decode_path_components(encoded).map(Some)
+    }
 }
 
 pub fn gc_candidate_key(
@@ -620,8 +840,6 @@ pub(crate) fn classify_schema_marker_for_open(
 ) -> Result<SchemaMarkerVersion, SchemaMarkerError> {
     if value == encode_schema_marker() {
         Ok(SchemaMarkerVersion::Current)
-    } else if value == encode_schema_marker_version(PREVIOUS_SYSTEM_FORMAT_VERSION) {
-        Ok(SchemaMarkerVersion::Format8)
     } else {
         Err(SchemaMarkerError)
     }
@@ -945,6 +1163,11 @@ mod tests {
         assert_eq!(&build_hold[17..], operation.as_bytes());
         let restore_hold = restore_history_hold_key(root, operation);
         assert_eq!(restore_hold[16], u8::from(HistoryHoldKind::Restore));
+        let generic_index_hold = register_generic_index_history_hold_key(root, operation);
+        assert_eq!(
+            generic_index_hold[16],
+            u8::from(HistoryHoldKind::RegisterGenericIndex)
+        );
     }
 
     #[test]
@@ -960,21 +1183,132 @@ mod tests {
         let tag_owner = tag_commit_consumer_key(root, parent, workspace, &tag);
         let lease = lease_commit_consumer_key(root, parent, operation);
         let child_owner = child_commit_consumer_key(root, parent, child);
+        let snapshot_owner = snapshot_commit_consumer_key(root, parent, SnapshotId::new(9));
         assert_eq!(head[48], u8::from(CommitConsumerKind::WorkbenchHead));
         assert_eq!(tag_owner[48], u8::from(CommitConsumerKind::Tag));
         assert_eq!(lease[48], u8::from(CommitConsumerKind::Lease));
         assert_eq!(child_owner[48], u8::from(CommitConsumerKind::ChildCommit));
+        assert_eq!(snapshot_owner[48], u8::from(CommitConsumerKind::Snapshot));
         assert_eq!(&head[49..], workspace.as_bytes());
         assert_eq!(&lease[49..], operation.as_bytes());
         assert_eq!(&child_owner[49..], child.as_bytes());
+        assert_eq!(&snapshot_owner[49..], &9_u64.to_be_bytes());
         assert_eq!(&tag_owner[49..65], workspace.as_bytes());
         assert_eq!(&tag_owner[65..67], &4_u16.to_be_bytes());
         assert_eq!(&tag_owner[67..], b"prod");
     }
 
     #[test]
+    fn generic_index_keys_freeze_root_scope_and_record_shapes() {
+        let root = root(0x11);
+        let workspace = workspace(0x22);
+        let generation = GenericIndexGenerationId::from_bytes([0x33; FIXED_ID_BYTES]);
+        let commit = CommitId::from_bytes([0x44; SHA256_BYTES]);
+        let scope = path("outputs/runs");
+
+        let current = generic_index_current_key(root, workspace, Some(&scope));
+        assert_eq!(
+            decode_generic_index_current_key(root, workspace, &current),
+            Some(Some(scope.clone()))
+        );
+        let root_current = generic_index_current_key(root, workspace, None);
+        assert_eq!(
+            decode_generic_index_current_key(root, workspace, &root_current),
+            Some(None)
+        );
+        let mut malformed_current = current.clone();
+        malformed_current.push(PATH_EXACT_TERMINATOR);
+        assert_eq!(
+            decode_generic_index_current_key(root, workspace, &malformed_current),
+            None
+        );
+        assert_eq!(
+            decode_generic_index_current_key(
+                RootId::from_bytes([0x99; FIXED_ID_BYTES]),
+                workspace,
+                &current,
+            ),
+            None
+        );
+        assert_eq!(
+            generic_index_current_prefix(root, workspace),
+            [root.as_bytes().as_slice(), workspace.as_bytes()].concat()
+        );
+
+        let header = generic_index_generation_key(root, generation);
+        assert_eq!(header[16], GENERIC_INDEX_HEADER_DISCRIMINATOR);
+        assert_eq!(
+            decode_generic_index_generation_key(root, &header),
+            Some(generation)
+        );
+        assert!(header.starts_with(&generic_index_generation_prefix(root)));
+        let mut malformed_header = header.clone();
+        malformed_header.push(0);
+        assert_eq!(
+            decode_generic_index_generation_key(root, &malformed_header),
+            None
+        );
+        let row = generic_index_row_key(root, generation, 7);
+        assert_eq!(row[16], GENERIC_INDEX_ROW_DISCRIMINATOR);
+        assert!(row.starts_with(&generic_index_row_prefix(root, generation)));
+        assert_eq!(
+            decode_generic_index_row_key(root, generation, &row),
+            Some(7)
+        );
+        assert_eq!(
+            decode_generic_index_row_key(root, generation, &row[..row.len() - 1]),
+            None
+        );
+        let owner_digest = [0x55; SHA256_BYTES];
+        let reference = generic_index_generation_ref_key(
+            root,
+            generation,
+            GenericIndexReferenceKind::Commit,
+            owner_digest,
+        );
+        assert_eq!(
+            decode_generic_index_generation_ref_key(root, generation, &reference),
+            Some((GenericIndexReferenceKind::Commit, owner_digest))
+        );
+        let mut unknown_reference = reference.clone();
+        unknown_reference[generic_index_generation_ref_prefix(root, generation).len()] = 0xff;
+        assert_eq!(
+            decode_generic_index_generation_ref_key(root, generation, &unknown_reference),
+            None
+        );
+        let receipt = generic_index_append_receipt_key(root, generation, 7);
+        assert_eq!(
+            decode_generic_index_append_receipt_key(root, generation, &receipt),
+            Some(7)
+        );
+        let mut malformed_receipt = receipt.clone();
+        malformed_receipt.push(0);
+        assert_eq!(
+            decode_generic_index_append_receipt_key(root, generation, &malformed_receipt),
+            None
+        );
+
+        let member = commit_generic_index_member_key(root, commit, Some(&scope));
+        assert_eq!(
+            decode_commit_generic_index_member_key(root, commit, &member),
+            Some(Some(scope))
+        );
+        let root_member = commit_generic_index_member_key(root, commit, None);
+        assert_eq!(
+            decode_commit_generic_index_member_key(root, commit, &root_member),
+            Some(None)
+        );
+        let mut malformed_member = member;
+        malformed_member.push(PATH_EXACT_TERMINATOR);
+        assert_eq!(
+            decode_commit_generic_index_member_key(root, commit, &malformed_member),
+            None
+        );
+    }
+
+    #[test]
     fn schema_marker_is_exact_and_versioned() {
-        assert_eq!(SYSTEM_FORMAT_VERSION, 9);
+        assert_eq!(SYSTEM_FORMAT_VERSION, 10);
         let marker = encode_schema_marker();
         assert_eq!(marker[0], VALUE_FORMAT_VERSION);
         assert_eq!(
@@ -987,14 +1321,14 @@ mod tests {
             SchemaMarkerVersion::Current
         );
 
-        let previous_layout = encode_schema_marker_version(PREVIOUS_SYSTEM_FORMAT_VERSION);
+        let previous_layout = encode_schema_marker_version(9);
         assert_eq!(
             validate_schema_marker(&previous_layout),
             Err(SchemaMarkerError)
         );
         assert_eq!(
-            classify_schema_marker_for_open(&previous_layout).unwrap(),
-            SchemaMarkerVersion::Format8
+            classify_schema_marker_for_open(&previous_layout),
+            Err(SchemaMarkerError)
         );
 
         let mut unknown = marker;

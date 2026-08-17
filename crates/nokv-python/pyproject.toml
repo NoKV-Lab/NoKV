@@ -7,12 +7,15 @@ name = "nokv"
 version = "0.1.0"
 description = "NoKV Python SDK for Agent workspaces and immutable artifacts."
 requires-python = ">=3.9"
-dependencies = []
+dependencies = ["fsspec>=2024.0.0"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
     "Topic :: System :: Distributed Computing",
 ]
+
+[project.optional-dependencies]
+torch = ["torch>=2.2"]
 
 [tool.maturin]
 module-name = "nokv._native"

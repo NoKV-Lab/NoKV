@@ -8,12 +8,16 @@
 use std::fmt;
 
 use nokv_types::{
-    ConsumerEpoch, Generation, HistoryHoldState, ReadVersion, SnapshotAliasName, SnapshotId,
-    SnapshotState,
+    CommitId, ConsumerEpoch, Generation, HistoryHoldState, ReadVersion, SnapshotAliasName,
+    SnapshotId, SnapshotState,
 };
 
-/// Only supported value format for snapshot-owned payloads.
-pub const SNAPSHOT_VALUE_FORMAT_VERSION: u8 = 1;
+/// Current value format for snapshot refs. Version 1 remains readable so
+/// legacy leased snapshots can be renewed or retired without inventing commit
+/// provenance.
+pub const SNAPSHOT_VALUE_FORMAT_VERSION: u8 = 2;
+const LEGACY_SNAPSHOT_REF_VALUE_FORMAT_VERSION: u8 = 1;
+const SNAPSHOT_AUXILIARY_VALUE_FORMAT_VERSION: u8 = 1;
 
 /// Maximum canonical annotation projection retained with a snapshot.
 pub const MAX_SNAPSHOT_ANNOTATION_BYTES: usize = 16 * 1024;
@@ -25,6 +29,10 @@ pub const MAX_SNAPSHOT_RETIRE_ANNOTATION_BYTES: usize = 4 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotRefRecord {
     pub read_version: ReadVersion,
+    /// Exact sealed workbench commit retained when this snapshot was minted.
+    /// Legacy v1 rows decode as `None`; callers must never infer it from the
+    /// workspace's current head.
+    pub source_commit_id: Option<CommitId>,
     pub alias: Option<SnapshotAliasName>,
     /// Deadline on the shard's persisted lease clock.
     pub lease_deadline_ms: u64,
@@ -172,6 +180,7 @@ impl SnapshotRefRecord {
         let mut encoded = Vec::new();
         encoded.push(SNAPSHOT_VALUE_FORMAT_VERSION);
         encoded.extend_from_slice(&self.read_version.get().to_be_bytes());
+        put_optional_commit_id(&mut encoded, self.source_commit_id);
         put_optional_alias(&mut encoded, self.alias.as_ref());
         encoded.extend_from_slice(&self.lease_deadline_ms.to_be_bytes());
         encoded.push(self.state.into());
@@ -194,8 +203,22 @@ impl SnapshotRefRecord {
 
     pub fn decode(encoded: &[u8]) -> Result<Self, SnapshotRecordError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_value_version()?;
+        let value_version = decoder.u8("value_format_version")?;
+        if !matches!(
+            value_version,
+            LEGACY_SNAPSHOT_REF_VALUE_FORMAT_VERSION | SNAPSHOT_VALUE_FORMAT_VERSION
+        ) {
+            return Err(SnapshotRecordError::UnsupportedValueVersion {
+                actual: value_version,
+                expected: SNAPSHOT_VALUE_FORMAT_VERSION,
+            });
+        }
         let read_version = decoder.read_version("read_version")?;
+        let source_commit_id = if value_version == SNAPSHOT_VALUE_FORMAT_VERSION {
+            decoder.optional_commit_id("source_commit_id")?
+        } else {
+            None
+        };
         let alias = decoder.optional_alias("alias")?;
         let lease_deadline_ms = decoder.u64("lease_deadline_ms")?;
         let state = decode_durable_enum(decoder.u8("state")?)?;
@@ -207,6 +230,7 @@ impl SnapshotRefRecord {
         decoder.finish()?;
         let record = Self {
             read_version,
+            source_commit_id,
             alias,
             lease_deadline_ms,
             state,
@@ -223,7 +247,7 @@ impl SnapshotRefRecord {
 impl SnapshotAliasRecord {
     pub fn encode(&self) -> Vec<u8> {
         let mut encoded = Vec::with_capacity(1 + 8 + 8 + 1);
-        encoded.push(SNAPSHOT_VALUE_FORMAT_VERSION);
+        encoded.push(SNAPSHOT_AUXILIARY_VALUE_FORMAT_VERSION);
         encoded.extend_from_slice(&self.snapshot_id.get().to_be_bytes());
         encoded.extend_from_slice(&self.alias_generation.get().to_be_bytes());
         encoded.push(self.snapshot_state.into());
@@ -232,7 +256,7 @@ impl SnapshotAliasRecord {
 
     pub fn decode(encoded: &[u8]) -> Result<Self, SnapshotRecordError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_value_version()?;
+        decoder.require_value_version(SNAPSHOT_AUXILIARY_VALUE_FORMAT_VERSION)?;
         let snapshot_id = SnapshotId::new(decoder.u64("snapshot_id")?);
         let alias_generation = decoder.generation("alias_generation")?;
         let snapshot_state = decode_durable_enum(decoder.u8("snapshot_state")?)?;
@@ -248,7 +272,7 @@ impl SnapshotAliasRecord {
 impl HistoryHoldRecord {
     pub fn encode(&self) -> Vec<u8> {
         let mut encoded = Vec::with_capacity(1 + 8 + 1 + 8 + 1);
-        encoded.push(SNAPSHOT_VALUE_FORMAT_VERSION);
+        encoded.push(SNAPSHOT_AUXILIARY_VALUE_FORMAT_VERSION);
         encoded.extend_from_slice(&self.read_version.get().to_be_bytes());
         match self.source_snapshot_id {
             None => encoded.push(0),
@@ -263,7 +287,7 @@ impl HistoryHoldRecord {
 
     pub fn decode(encoded: &[u8]) -> Result<Self, SnapshotRecordError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_value_version()?;
+        decoder.require_value_version(SNAPSHOT_AUXILIARY_VALUE_FORMAT_VERSION)?;
         let read_version = decoder.read_version("read_version")?;
         let source_snapshot_id = match decoder.u8("source_snapshot_id")? {
             0 => None,
@@ -330,6 +354,16 @@ fn put_optional_alias(encoded: &mut Vec<u8>, alias: Option<&SnapshotAliasName>) 
     }
 }
 
+fn put_optional_commit_id(encoded: &mut Vec<u8>, commit_id: Option<CommitId>) {
+    match commit_id {
+        None => encoded.push(0),
+        Some(commit_id) => {
+            encoded.push(1);
+            encoded.extend_from_slice(commit_id.as_bytes());
+        }
+    }
+}
+
 fn put_bounded_bytes(
     encoded: &mut Vec<u8>,
     field: &'static str,
@@ -382,15 +416,23 @@ impl<'a> Decoder<'a> {
         Self { input, offset: 0 }
     }
 
-    fn require_value_version(&mut self) -> Result<(), SnapshotRecordError> {
+    fn require_value_version(&mut self, expected: u8) -> Result<(), SnapshotRecordError> {
         let actual = self.u8("value_format_version")?;
-        if actual == SNAPSHOT_VALUE_FORMAT_VERSION {
+        if actual == expected {
             Ok(())
         } else {
-            Err(SnapshotRecordError::UnsupportedValueVersion {
-                actual,
-                expected: SNAPSHOT_VALUE_FORMAT_VERSION,
-            })
+            Err(SnapshotRecordError::UnsupportedValueVersion { actual, expected })
+        }
+    }
+
+    fn optional_commit_id(
+        &mut self,
+        field: &'static str,
+    ) -> Result<Option<CommitId>, SnapshotRecordError> {
+        match self.u8(field)? {
+            0 => Ok(None),
+            1 => Ok(Some(CommitId::from_bytes(self.fixed(field)?))),
+            value => Err(SnapshotRecordError::InvalidOptionalTag { field, value }),
         }
     }
 
@@ -509,6 +551,7 @@ mod tests {
     fn snapshot_ref_round_trip_and_strict_envelope() {
         let record = SnapshotRefRecord {
             read_version: read_version(9),
+            source_commit_id: Some(nokv_types::CommitId::from_bytes([0x5a; 32])),
             alias: Some(SnapshotAliasName::new("handoff").unwrap()),
             lease_deadline_ms: 12_345,
             state: SnapshotState::Active,
@@ -518,7 +561,21 @@ mod tests {
             retire_annotation: None,
         };
         let encoded = record.encode().unwrap();
+        assert_eq!(encoded[0], SNAPSHOT_VALUE_FORMAT_VERSION);
+        assert_eq!(&encoded[1..9], &9_u64.to_be_bytes());
+        assert_eq!(encoded[9], 1);
+        assert_eq!(&encoded[10..42], &[0x5a; 32]);
         assert_eq!(SnapshotRefRecord::decode(&encoded).unwrap(), record);
+
+        let mut invalid_source_tag = encoded.clone();
+        invalid_source_tag[1 + 8] = 2;
+        assert_eq!(
+            SnapshotRefRecord::decode(&invalid_source_tag),
+            Err(SnapshotRecordError::InvalidOptionalTag {
+                field: "source_commit_id",
+                value: 2,
+            })
+        );
 
         let mut trailing = encoded;
         trailing.push(0);
@@ -538,7 +595,7 @@ mod tests {
         assert_eq!(
             alias.encode(),
             vec![
-                SNAPSHOT_VALUE_FORMAT_VERSION,
+                SNAPSHOT_AUXILIARY_VALUE_FORMAT_VERSION,
                 0x01,
                 0x02,
                 0x03,
@@ -572,6 +629,7 @@ mod tests {
     fn terminal_snapshot_cannot_retain_consumers() {
         let record = SnapshotRefRecord {
             read_version: read_version(1),
+            source_commit_id: Some(nokv_types::CommitId::from_bytes([0x11; 32])),
             alias: None,
             lease_deadline_ms: 2,
             state: SnapshotState::ReapClaimed,
@@ -593,6 +651,7 @@ mod tests {
         let annotation = br#"{"metadata":null,"reason":"done"}"#.to_vec();
         let retired = SnapshotRefRecord {
             read_version: read_version(1),
+            source_commit_id: Some(nokv_types::CommitId::from_bytes([0x22; 32])),
             alias: None,
             lease_deadline_ms: 2,
             state: SnapshotState::Retired,
@@ -614,6 +673,44 @@ mod tests {
             active.encode(),
             Err(SnapshotRecordError::InvalidRetireAnnotation {
                 reason: "only explicitly retired snapshots may retain one",
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_v1_snapshot_ref_decodes_without_guessing_source_commit() {
+        let mut encoded = Vec::new();
+        encoded.push(1);
+        encoded.extend_from_slice(&9_u64.to_be_bytes());
+        encoded.push(0);
+        encoded.extend_from_slice(&12_345_u64.to_be_bytes());
+        encoded.push(u8::from(SnapshotState::Active));
+        encoded.extend_from_slice(&0_u64.to_be_bytes());
+        encoded.extend_from_slice(&0_u64.to_be_bytes());
+        encoded.extend_from_slice(&0_u32.to_be_bytes());
+        encoded.push(0);
+
+        let decoded = SnapshotRefRecord::decode(&encoded).unwrap();
+        assert_eq!(decoded.read_version, read_version(9));
+        assert_eq!(decoded.source_commit_id, None);
+        let mut current = decoded.encode().unwrap();
+        assert_eq!(current[0], 2);
+        current[1 + 8 + 1 + 1 + 8] = 0xff;
+        assert_eq!(
+            SnapshotRefRecord::decode(&current),
+            Err(SnapshotRecordError::UnknownDiscriminant {
+                type_name: "SnapshotState",
+                value: 0xff,
+            })
+        );
+
+        let mut unknown = encoded;
+        unknown[0] = 3;
+        assert_eq!(
+            SnapshotRefRecord::decode(&unknown),
+            Err(SnapshotRecordError::UnsupportedValueVersion {
+                actual: 3,
+                expected: 2,
             })
         );
     }

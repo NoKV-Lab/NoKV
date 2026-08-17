@@ -72,6 +72,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/release/test_homebrew_source_release.py
+          python3 scripts/workbench/pre423_contract_ledger.py
+          python3 scripts/workbench/pre423_contract_ledger_test.py
           python3 scripts/workbench/workbench_contract_test.py
 
       - name: Build archive, manifest, and published Formula

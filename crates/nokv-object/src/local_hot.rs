@@ -10,6 +10,7 @@ use crate::store::{
     strict_range, ArtifactObjectStore, ArtifactStoreCapabilities, ImmutableCreateOutcome,
     ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectKey, ObjectRange,
 };
+use crate::ProviderHandleIdentity;
 
 static TEMP_OBJECT_ID: AtomicU64 = AtomicU64::new(1);
 const INTERNAL_TEMP_DIR: &str = ".nokv-artifact-temp";
@@ -56,6 +57,7 @@ pub struct LocalHotTier {
     max_bytes: u64,
     sync_on_create: bool,
     state: Arc<Mutex<LocalHotTierState>>,
+    handle_identity: ProviderHandleIdentity,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -81,6 +83,7 @@ impl LocalHotTier {
             max_bytes: options.max_bytes,
             sync_on_create: options.sync_on_create,
             state: Arc::new(Mutex::new(state)),
+            handle_identity: ProviderHandleIdentity::new(),
         };
         tier.enforce_capacity()?;
         Ok(tier)
@@ -211,6 +214,10 @@ impl LocalHotTier {
 impl ArtifactObjectStore for LocalHotTier {
     fn capabilities(&self) -> ArtifactStoreCapabilities {
         ArtifactStoreCapabilities::default()
+    }
+
+    fn provider_handle_identity(&self) -> ProviderHandleIdentity {
+        self.handle_identity
     }
 
     fn create_immutable(

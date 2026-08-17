@@ -95,7 +95,7 @@ write tools cannot address them.
 | `workbench_put_file` | `replace=false` is create-only; `replace=true` is replace-only. It is never upsert. | Publish create-only or replace-if-generation. |
 | `workbench_append` | Create when missing, otherwise append after generation CAS; retry write conflicts; return the new size and generation. The returned `digest` identifies the appended delta, not the whole resulting body. | Immutable segment publish plus conditional head advance. |
 | `workbench_edit` | UTF-8 exact-string replacement; require one match unless `replace_all=true`; revalidate after a conflict; a byte-identical result does not publish a new generation. | Read with generation plus replace-if-generation. |
-| `workbench_list` | Non-recursive, cursor-paginated listing at live state or a snapshot id/name. | Delimited path scan at one read version. |
+| `workbench_list` | Non-recursive, cursor-paginated listing at live state or a snapshot id/name. | Delimited path scan at one exact snapshot version or one stable live workspace incarnation/revision. |
 | `workbench_stat` | Compact metadata card without reading the body, at live state or a snapshot. | Exact path read at one version. |
 | `workbench_read` | Structured JSON/YAML/text shaping or base64 byte ranges; `if_none_match` uses generation; snapshot reads remain frozen. | Versioned stat and range read. |
 | `workbench_grep` | Case-insensitive literal matching, at most 16 OR patterns, optional basename glob; not regex. | Candidate enumeration plus body range reads. |
@@ -116,15 +116,19 @@ the Workbench adapter. It must not force corresponding record types into the
 metadata core.
 
 `workbench_list` cursors are opaque, scope-bound continuation tokens. They bind
-the workbench, normalized prefix, live-or-snapshot selector, resolved read
-version, and last returned child. A cursor cannot be reused for another scope,
-and a live cursor fails when the owner has advanced past its read version. When
-the caller did not supply a cursor, the adapter may discard a partially
-collected page and retry the whole bounded scan; it never combines pages from
-different read versions. `workbench_catalog` applies the same whole-result
-retry rule to its internal query-digest/read-version cursor. Neither surface
-turns a naked read version into permission to read unretained history; durable
-historical reads still require a snapshot or another typed `HistoryHold`.
+the RootId, workbench, normalized prefix, live-or-snapshot selector,
+continuation fence, and last returned child. Snapshot continuations remain at
+one exact retained root read version. Live continuations may resolve a newer
+root read version only while the target workspace incarnation and revision are
+unchanged; target drift fails closed. When the caller did not supply a cursor,
+the adapter may discard a partially collected attempt and restart the whole
+bounded scan, but it never combines target workspace revisions. Grep cursors
+additionally bind the exact pattern set, basename glob, and recursion mode, so
+changing query semantics cannot skip earlier candidates. `workbench_catalog`
+applies the same whole-result retry rule to its internal
+query-digest/read-version cursor. Neither surface turns a naked read version
+into permission to read unretained history; durable historical reads still
+require a snapshot or another typed `HistoryHold`.
 
 ## Generations And Conditional Writes
 

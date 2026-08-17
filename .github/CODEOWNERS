@@ -1,12 +1,13 @@
 # Copyright 2024-2026 The NoKV Authors.
 # SPDX-License-Identifier: Apache-2.0
 
-# Every production, test, documentation, and workflow change must notify the
-# repository maintainers. All listed owners have direct write access.
-* @wchwawa @feichai0017
-
-# Keep governance-sensitive paths explicit even though the global rule covers
-# them. The last matching rule is authoritative in GitHub CODEOWNERS parsing.
-/.github/ @wchwawa @feichai0017
+# Ordinary product and documentation changes remain on the zero-review fast
+# path. Only CI trust roots require a code-owner review; the base-owned change
+# governance gate separately requires that reviewer to be a core maintainer
+# other than the exact-head introducer.
+/.github/CODEOWNERS @wchwawa @feichai0017
+/.github/actions/ @wchwawa @feichai0017
+/.github/workflows/ @wchwawa @feichai0017
 /scripts/ci/ @wchwawa @feichai0017
-/docs/development/ @wchwawa @feichai0017
+/scripts/workbench/ @wchwawa @feichai0017
+/scripts/release/test_homebrew_source_release.py @wchwawa @feichai0017

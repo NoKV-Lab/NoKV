@@ -120,12 +120,28 @@ reconciled; object listing is never used as reachability truth.
 
 ## Provider Boundary
 
-AWS S3, RustFS, MinIO, and Ceph RGW use the same provider-neutral interface:
+AWS S3, RustFS, MinIO, and Ceph RGW can use the same provider-neutral
+interface, but a provider brand or static capability flag is not evidence that
+a concrete endpoint satisfies the contract.
 
-- immutable put or multipart completion;
-- ranged get;
-- head/integrity evidence;
-- idempotent delete with explicit ambiguous-outcome handling.
+Before business publication, write-conformance admission performs actual
+writes under reserved, unreferenced system keys and verifies:
+
+- a fresh single-PUT create-if-absent;
+- exact-byte replay and different-byte collision;
+- exact whole-object readback and ranged readback;
+- a concurrent different-byte create race with exactly one stored winner.
+
+The resulting receipt is bound to the exact provider handle and admitted
+single-PUT size profile. A receipt from another handle, a missing receipt, or a
+block larger than the admitted maximum fails before object or metadata
+publication. Admission v1 deliberately does not qualify multipart creation,
+completion, or abort; those paths cannot inherit a single-PUT receipt.
+
+The provider interface also retains idempotent deletion with explicit
+ambiguous-outcome handling. Public provider-admission errors and ambiguous
+create/delete errors do not render endpoint, bucket, or physical object-key
+details.
 
 Provider credentials and endpoints are deployment configuration, not durable
 object identity.

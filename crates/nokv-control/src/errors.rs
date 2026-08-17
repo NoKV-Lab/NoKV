@@ -10,6 +10,9 @@ pub enum ControlError {
     InvalidEndpoint(String),
     RootPlacementNotFound(RootId),
     RootPlacementAlreadyExists(RootId),
+    RootAgentAlreadyBound {
+        root_id: RootId,
+    },
     RootObjectNamespaceAlreadyBound {
         root_id: RootId,
         existing: ObjectNamespaceId,
@@ -63,6 +66,10 @@ pub enum ControlError {
         logical_shard_id: LogicalShardId,
         reason: String,
     },
+    RecoveryUploadConflict {
+        logical_shard_id: LogicalShardId,
+        reason: String,
+    },
     InvalidRecord(String),
     InvalidOptions(String),
     Codec(String),
@@ -80,6 +87,9 @@ impl fmt::Display for ControlError {
             }
             Self::RootPlacementAlreadyExists(root_id) => {
                 write!(formatter, "root placement {root_id:?} already exists")
+            }
+            Self::RootAgentAlreadyBound { root_id, .. } => {
+                write!(formatter, "root {root_id:?} is already bound to another Agent")
             }
             Self::RootObjectNamespaceAlreadyBound { root_id, .. } => write!(
                 formatter,
@@ -172,6 +182,13 @@ impl fmt::Display for ControlError {
             } => write!(
                 formatter,
                 "recovery publication for logical shard {logical_shard_id:?} conflicts with durable state: {reason}"
+            ),
+            Self::RecoveryUploadConflict {
+                logical_shard_id,
+                reason,
+            } => write!(
+                formatter,
+                "recovery upload for logical shard {logical_shard_id:?} conflicts with durable state: {reason}"
             ),
             Self::InvalidRecord(reason) => {
                 write!(formatter, "invalid control record: {reason}")

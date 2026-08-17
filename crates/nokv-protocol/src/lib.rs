@@ -12,6 +12,7 @@
 mod artifact_publish;
 mod codec;
 mod error;
+mod handshake;
 mod request;
 mod response;
 mod types;
@@ -31,35 +32,52 @@ pub use codec::{
     WORKSPACE_CAPABILITY_SCHEMA, WORKSPACE_PREFLIGHT_SCHEMA, WORKSPACE_PROTOCOL_SCHEMA,
 };
 pub use error::{ConflictKind, ErrorCode, ProtocolError, RpcFailure};
+pub use handshake::{
+    decode_handshake_frame, decode_handshake_payload, encode_handshake_frame,
+    encode_handshake_payload, has_handshake_magic, HandshakeError, HandshakeKind,
+    WorkspaceHandshake, HANDSHAKE_FRAME_BYTES, HANDSHAKE_PAYLOAD_BYTES, HANDSHAKE_SCHEMA_BYTES,
+    WORKSPACE_HANDSHAKE_MAGIC,
+};
 pub use request::{
-    AbortArtifactPublishRequest, AggregateFunction, AggregateRequest, AggregateSpec,
-    BeginArtifactPublishRequest, CatalogRequest, ChangePageRequest, CommitRequest,
-    CompleteArtifactPublishRequest, CreateWorkspaceRequest, FinalizeRestoreRequest,
-    FindWorkspacesRequest, GetOperationRequest, GetPathRequest, GetSnapshotRequest,
+    AbortArtifactPublishRequest, AbortGenericIndexRegistrationRequest, AggregateFunction,
+    AggregateRequest, AggregateSpec, AppendGenericIndexRowsRequest, BeginArtifactPublishRequest,
+    BeginGenericIndexRegistrationRequest, BindRestoreDestinationRequest, CatalogPathMatch,
+    CatalogRequest, ChangePageRequest, CommitRequest, CompleteArtifactPublishRequest,
+    CreateWorkspaceRequest, FinalizeGenericIndexRegistrationRequest, FinalizeRestoreRequest,
+    FindWorkspacesRequest, GenericIndexFieldCapability, GenericIndexFieldValues, GenericIndexRow,
+    GetGenericIndexRegistrationRequest, GetOperationRequest, GetPathRequest, GetSnapshotRequest,
     GetWorkspaceRequest, ListPathsRequest, ListSnapshotsRequest,
     MarkArtifactObjectsUploadedRequest, MintSnapshotRequest, ObjectUploadProof,
     PrepareRestoreRequest, QuarantineResolution, QueryOperand, QueryOperator, QueryPredicate,
-    QueryScope, ReconcileQuarantinedArtifactPublishRequest, RemovePathRequest,
-    RenewSnapshotRequest, RestoreManifestDescriptor, RestoreSource, RetireSnapshotRequest,
-    SearchRequest, SortDirection, SortField, StageArtifactManifestRequest,
-    StageArtifactObjectsRequest, WorkspacePreflightRequest, WorkspaceRequest, WorkspaceRpcRequest,
-    MAX_QUERY_PAGE_LIMIT,
+    QueryProfile, QueryScope, ReadRestoreSourceRunManifestRequest,
+    ReconcileQuarantinedArtifactPublishRequest, RemovePathRequest, RenamePathRequest,
+    RenewSnapshotRequest, RestoreManifestDescriptor, RestoreManifestIdentity, RestoreSource,
+    RetireSnapshotRequest, SearchRequest, SortDirection, SortField, StageArtifactManifestRequest,
+    StageArtifactObjectsRequest, WorkspaceContinuationFence, WorkspacePreflightRequest,
+    WorkspaceRequest, WorkspaceRpcRequest, MAX_GENERIC_INDEX_ABORT_ROWS,
+    MAX_GENERIC_INDEX_APPEND_ROWS, MAX_GENERIC_INDEX_FIELDS, MAX_GENERIC_INDEX_ROW_BYTES,
+    MAX_GENERIC_INDEX_ROW_FIELDS, MAX_GENERIC_INDEX_VALUES_PER_FIELD, MAX_QUERY_PAGE_LIMIT,
 };
 pub use response::{
     AggregateGroup, AggregateResult, CatalogField, CatalogResult, ChangeEvent, ChangeKind,
     ChangePage, CommitManifestBinding, CommitPreparation, CommitResult, FacetBucket, FacetResult,
-    FindWorkspacesResult, OperationProgress, OperationResult, OperationState, OperationStatus,
-    PathListEntry, PathPage, PathReadResult, PublishResult, RemovePathResult,
-    RestoreOperationPreparation, RestorePreparation, RestoreResult, SearchHit, SearchResult,
-    SnapshotPage, SnapshotResult, SnapshotStatus, WorkspacePreflightResult, WorkspaceResult,
-    WorkspaceRpcOutcome, WorkspaceRpcResponse, WorkspaceSummary, WorkspaceSummaryWithCommit,
+    FindWorkspacesResult, GenericIndexAbortResult, GenericIndexAppendReceipt,
+    GenericIndexAppendResult, GenericIndexRegistrationPhase, GenericIndexRegistrationStatus,
+    GenericNamespaceArtifact, GenericNamespaceHit, GenericNamespaceKind, OperationProgress,
+    OperationResult, OperationState, OperationStatus, PathListEntry, PathPage, PathReadResult,
+    PublishResult, RemovePathResult, RenamePathResult, RestoreDestinationBinding,
+    RestoreDestinationManifestBindings, RestoreManifestBinding, RestoreOperationPreparation,
+    RestorePreparation, RestoreResult, RestoreSourceCommitBinding, SearchHit, SearchResult,
+    SearchRow, SnapshotPage, SnapshotResult, SnapshotStatus, WorkspacePreflightResult,
+    WorkspaceResult, WorkspaceRpcOutcome, WorkspaceRpcResponse, WorkspaceSummary,
+    WorkspaceSummaryWithCommit,
 };
 pub use types::{
     AppendSegment, ArtifactDescriptor, ArtifactManifestRow, ArtifactRevisionIdentity, ByteRange,
-    CommitIdentity, ContentType, Digest, DigestUri, FieldValue, LogicalShardIdentity,
-    ObjectIdentity, ObjectNamespaceIdentity, OperationIdentity, OperationKind, OperationToken,
-    PageRequest, PathMetadata, PublicationAuthority, PublishCondition, RelativePath,
-    RequestIdentity, RootIdentity, RootRoute, ScalarValue, SnapshotAlias, SnapshotSelector,
-    StagedObject, Tag, WorkbenchName, WorkspaceCapability, WorkspaceIdentity, WorkspacePath,
-    WorkspaceReadView,
+    CommitIdentity, ContentType, Digest, DigestUri, FieldValue, GenericIndexGenerationIdentity,
+    LogicalShardIdentity, ObjectIdentity, ObjectNamespaceIdentity, OperationIdentity,
+    OperationKind, OperationToken, PageRequest, PathMetadata, PublicationAuthority,
+    PublishCondition, RelativePath, RequestIdentity, RootIdentity, RootRoute, ScalarValue,
+    SnapshotAlias, SnapshotSelector, StagedObject, Tag, WorkbenchName, WorkspaceCapability,
+    WorkspaceIdentity, WorkspacePath, WorkspaceReadView,
 };

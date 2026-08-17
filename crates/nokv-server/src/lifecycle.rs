@@ -11,6 +11,7 @@
 //! have all been checked.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,9 +27,10 @@ use nokv_types::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{OwnerLossSignal, RootOwnerRegistry};
+use crate::{OwnerLossSignal, RecoveryPublisher, RecoveryPublisherError, RootOwnerRegistry};
 
 const OWNER_LOSS_POLL_SLICE: Duration = Duration::from_millis(10);
+static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Why an authoritative metadata row requires provider deletion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +113,19 @@ pub trait LifecycleObjectDeleter: Send + Sync {
         &self,
         request: &LifecycleDeleteRequest,
     ) -> Result<LifecycleAbsenceProof, LifecycleDeleteError>;
+}
+
+/// Required recovery barrier for background metadata mutations. A lifecycle
+/// transition is not externally durable until its outbox tail is published to
+/// immutable objects and committed by the control plane.
+pub trait LifecycleDurabilityBarrier: Send + Sync {
+    fn publish_current(&self) -> Result<(), RecoveryPublisherError>;
+}
+
+impl LifecycleDurabilityBarrier for RecoveryPublisher {
+    fn publish_current(&self) -> Result<(), RecoveryPublisherError> {
+        RecoveryPublisher::publish_current(self).map(|_| ())
+    }
 }
 
 /// Server-owned adapter from immutable object-store primitives to the durable
@@ -235,6 +250,10 @@ pub enum LifecycleError {
         detail: String,
     },
     Clock(String),
+    RecoveryPublication {
+        primary: Option<String>,
+        source: RecoveryPublisherError,
+    },
     WorkerLockPoisoned,
 }
 
@@ -253,6 +272,13 @@ impl fmt::Display for LifecycleError {
                 write!(formatter, "lifecycle {action} failed: {detail}")
             }
             Self::Clock(detail) => write!(formatter, "lifecycle clock failed: {detail}"),
+            Self::RecoveryPublication { primary, source } => match primary {
+                Some(primary) => write!(
+                    formatter,
+                    "lifecycle failed before recovery publication: {primary}; recovery publication also failed: {source}"
+                ),
+                None => write!(formatter, "lifecycle recovery publication failed: {source}"),
+            },
             Self::WorkerLockPoisoned => formatter.write_str("lifecycle worker lock is poisoned"),
         }
     }
@@ -262,6 +288,7 @@ impl std::error::Error for LifecycleError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Meta(error) => Some(error),
+            Self::RecoveryPublication { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -294,6 +321,7 @@ pub struct LifecycleRunner {
     route: RootRoute,
     owner_loss: OwnerLossSignal,
     objects: Arc<dyn LifecycleObjectDeleter>,
+    durability: Arc<dyn LifecycleDurabilityBarrier>,
     options: LifecycleRunnerOptions,
     cursors: Mutex<LifecycleCursors>,
 }
@@ -305,6 +333,7 @@ impl LifecycleRunner {
         route: RootRoute,
         owner_loss: OwnerLossSignal,
         objects: Arc<dyn LifecycleObjectDeleter>,
+        durability: Arc<dyn LifecycleDurabilityBarrier>,
         options: LifecycleRunnerOptions,
     ) -> Result<Self, LifecycleError> {
         route
@@ -316,6 +345,7 @@ impl LifecycleRunner {
             route,
             owner_loss,
             objects,
+            durability,
             options: options.validate()?,
             cursors: Mutex::new(LifecycleCursors::default()),
         };
@@ -325,25 +355,69 @@ impl LifecycleRunner {
 
     /// Execute one bounded recovery pass over every lifecycle family.
     pub fn run_once(&self, observed_now_ms: u64) -> Result<LifecycleCycleReport, LifecycleError> {
-        self.require_current_owner()?;
-        let mut cursors = self
-            .cursors
-            .lock()
-            .map_err(|_| LifecycleError::WorkerLockPoisoned)?;
-        let mut report = LifecycleCycleReport::default();
-        self.recover_publications(&mut cursors, observed_now_ms, &mut report)?;
-        self.reap_snapshots(&mut cursors, observed_now_ms, &mut report)?;
-        self.recover_restores(&mut cursors, &mut report)?;
-        self.recover_commit_builds(&mut cursors, &mut report)?;
-        self.retire_commits(&mut cursors, &mut report)?;
-        self.collect_revisions(&mut cursors, &mut report)?;
-        Ok(report)
+        let result = (|| {
+            self.require_current_owner()?;
+            let mut cursors = self
+                .cursors
+                .lock()
+                .map_err(|_| LifecycleError::WorkerLockPoisoned)?;
+            let mut report = LifecycleCycleReport::default();
+            self.recover_publications(&mut cursors, observed_now_ms, &mut report)?;
+            self.reap_snapshots(&mut cursors, observed_now_ms, &mut report)?;
+            self.recover_restores(&mut cursors, &mut report)?;
+            self.recover_commit_builds(&mut cursors, &mut report)?;
+            self.retire_commits(&mut cursors, &mut report)?;
+            self.collect_revisions(&mut cursors, &mut report)?;
+            Ok(report)
+        })();
+        self.finish_with_durability(result)
+    }
+
+    fn publish_current(&self) -> Result<(), LifecycleError> {
+        self.durability
+            .publish_current()
+            .map_err(|source| LifecycleError::RecoveryPublication {
+                primary: None,
+                source,
+            })
+    }
+
+    fn finish_with_durability(
+        &self,
+        result: Result<LifecycleCycleReport, LifecycleError>,
+    ) -> Result<LifecycleCycleReport, LifecycleError> {
+        match (result, self.durability.publish_current()) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(source)) => Err(LifecycleError::RecoveryPublication {
+                primary: None,
+                source,
+            }),
+            (Err(primary), Err(source)) => Err(LifecycleError::RecoveryPublication {
+                primary: Some(primary.to_string()),
+                source,
+            }),
+        }
     }
 
     /// Run continuously until ownership is lost or a non-retryable invariant
     /// failure requires operator attention.
     pub fn run_until_owner_loss(&self) -> Result<(), LifecycleError> {
+        self.run_until_owner_loss_or_shutdown(&NEVER_SHUTDOWN)
+    }
+
+    /// Run until ownership is lost, a terminal invariant fails, or graceful
+    /// process shutdown is requested. A graceful return leaves the route and
+    /// lease intact for the RPC runtime to drain before exact release.
+    pub fn run_until_owner_loss_or_shutdown(
+        &self,
+        shutdown: &AtomicBool,
+    ) -> Result<(), LifecycleError> {
         loop {
+            if shutdown.load(AtomicOrdering::Acquire) {
+                return self
+                    .require_current_owner()
+                    .map_err(|error| self.fail_closed_error(error));
+            }
             let observed_now_ms = match unix_time_ms() {
                 Ok(observed_now_ms) => observed_now_ms,
                 Err(error) => return Err(self.fail_closed_error(error)),
@@ -353,8 +427,10 @@ impl LifecycleRunner {
                 Err(error) if retryable_lifecycle(&error) => {}
                 Err(error) => return Err(self.fail_closed_error(error)),
             }
-            if let Err(error) = self.wait_poll_interval_or_owner_loss() {
-                return Err(self.fail_closed_error(error));
+            match self.wait_poll_interval_or_owner_loss_or_shutdown(shutdown) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => return Err(self.fail_closed_error(error)),
             }
         }
     }
@@ -368,7 +444,10 @@ impl LifecycleRunner {
         }
     }
 
-    fn wait_poll_interval_or_owner_loss(&self) -> Result<(), LifecycleError> {
+    fn wait_poll_interval_or_owner_loss_or_shutdown(
+        &self,
+        shutdown: &AtomicBool,
+    ) -> Result<bool, LifecycleError> {
         let deadline = Instant::now()
             .checked_add(self.options.poll_interval)
             .ok_or_else(|| {
@@ -376,9 +455,12 @@ impl LifecycleRunner {
             })?;
         loop {
             self.require_current_owner()?;
+            if shutdown.load(AtomicOrdering::Acquire) {
+                return Ok(true);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Ok(());
+                return Ok(false);
             }
             thread::sleep(remaining.min(OWNER_LOSS_POLL_SLICE));
         }
@@ -573,6 +655,7 @@ impl LifecycleRunner {
                     (StagedProviderState::Aborted, StagedCleanupState::Deleted)
                 ) {
                     self.require_current_owner()?;
+                    self.publish_current()?;
                     let request = LifecycleDeleteRequest {
                         purpose: LifecycleDeletePurpose::AbortedPublication,
                         object_key: expected.object_key.clone(),
@@ -1272,6 +1355,7 @@ impl LifecycleRunner {
         for entry in batch.entries {
             let absence_digest = if entry.delete_required {
                 self.require_current_owner()?;
+                self.publish_current()?;
                 let request = LifecycleDeleteRequest {
                     purpose: LifecycleDeletePurpose::RevisionGarbageCollection,
                     object_key: entry.row.object_key.clone(),
@@ -1574,6 +1658,12 @@ fn retryable_lifecycle(error: &LifecycleError) -> bool {
     matches!(
         error,
         LifecycleError::Meta(meta::MetaError::ReadStabilityExhausted { .. })
+    ) || matches!(
+        error,
+        LifecycleError::RecoveryPublication {
+            primary: None,
+            source,
+        } if source.retryable()
     )
 }
 
@@ -1587,8 +1677,11 @@ fn snapshot_concurrent(error: &meta::SnapshotError) -> bool {
 }
 
 fn restore_concurrent(error: &meta::RestoreError) -> bool {
-    matches!(error, meta::RestoreError::ConcurrentMutation)
-        || matches!(error, meta::RestoreError::Meta(source) if concurrent_meta(source))
+    matches!(
+        error,
+        meta::RestoreError::ConcurrentMutation
+            | meta::RestoreError::PublicationCleanupPending { .. }
+    ) || matches!(error, meta::RestoreError::Meta(source) if concurrent_meta(source))
 }
 
 fn commit_concurrent(error: &meta::CommitError) -> bool {
@@ -1602,7 +1695,7 @@ fn gc_concurrent(error: &meta::GcError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use nokv_object::{
         ArtifactStoreCapabilities, ImmutableCreateOutcome, ObjectError, ObjectInfo, ObjectRange,
@@ -1625,11 +1718,90 @@ mod tests {
         }
     }
 
+    struct TestDurabilityBarrier {
+        calls: AtomicUsize,
+    }
+
+    impl LifecycleDurabilityBarrier for TestDurabilityBarrier {
+        fn publish_current(&self) -> Result<(), RecoveryPublisherError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn test_durability() -> Arc<dyn LifecycleDurabilityBarrier> {
+        Arc::new(TestDurabilityBarrier {
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    struct FailingDurabilityBarrier;
+
+    impl LifecycleDurabilityBarrier for FailingDurabilityBarrier {
+        fn publish_current(&self) -> Result<(), RecoveryPublisherError> {
+            Err(RecoveryPublisherError::Backlog {
+                remaining_after_lsn: 7,
+            })
+        }
+    }
+
     #[test]
     fn unstable_metadata_reads_are_retryable_lifecycle_work() {
         let error = meta::MetaError::ReadStabilityExhausted { attempts: 4 };
         assert!(concurrent_meta(&error));
         assert!(retryable_lifecycle(&LifecycleError::Meta(error)));
+    }
+
+    #[test]
+    fn lifecycle_cycle_cannot_succeed_before_its_recovery_tail_is_published() {
+        let fixture = fixture();
+        let runner = LifecycleRunner::new(
+            Arc::clone(&fixture.store),
+            Arc::clone(&fixture.registry),
+            fixture.route,
+            OwnerLossSignal::default(),
+            Arc::new(FakeDeleter {
+                ambiguous: false,
+                calls: AtomicUsize::new(0),
+                object_keys: Mutex::new(Vec::new()),
+            }),
+            Arc::new(FailingDurabilityBarrier),
+            LifecycleRunnerOptions {
+                scan_page_size: 8,
+                mutation_batch_size: 8,
+                ..LifecycleRunnerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let error = runner.run_once(100).unwrap_err();
+        assert!(matches!(
+            &error,
+            LifecycleError::RecoveryPublication { primary: None, .. }
+        ));
+        assert!(retryable_lifecycle(&error));
+    }
+
+    #[test]
+    fn restore_cleanup_waits_are_retryable_without_hiding_terminal_corruption() {
+        let operation_id = OperationId::from_bytes([0x71; FIXED_ID_BYTES]);
+        assert!(restore_concurrent(
+            &meta::RestoreError::PublicationCleanupPending {
+                operation_id,
+                phase: PublishPhase::Uploading,
+            }
+        ));
+
+        assert!(!restore_concurrent(&meta::RestoreError::InvalidPhase {
+            expected: "Cleaning",
+            actual: RestorePhase::Quarantined,
+        }));
+        assert!(!restore_concurrent(
+            &meta::RestoreError::OperationIdentityMismatch {
+                expected: operation_id,
+                actual: OperationId::from_bytes([0x72; FIXED_ID_BYTES]),
+            }
+        ));
     }
 
     struct FakeArtifactStore {
@@ -2235,6 +2407,15 @@ mod tests {
             member_cursor: None,
             member_count: 0,
             member_digest: [0; SHA256_BYTES],
+            path_members_complete: false,
+            generic_index_cursor: None,
+            generic_index_count: 0,
+            generic_index_digest: [0; SHA256_BYTES],
+            generic_indexes_complete: false,
+            generic_index_ref_cursor: None,
+            generic_index_ref_count: 0,
+            generic_index_ref_digest: [0; SHA256_BYTES],
+            generic_index_refs_complete: false,
             members_complete: false,
             revision_ref_count: 0,
             revision_cursor: None,
@@ -2245,6 +2426,7 @@ mod tests {
             parent_digest: [0; SHA256_BYTES],
             parents_complete: false,
             cleanup_member_count: 0,
+            cleanup_generic_index_count: 0,
             cleanup_revision_count: 0,
             cleanup_parent_count: 0,
             history_hold_released: false,
@@ -2295,6 +2477,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 object_keys: Mutex::new(Vec::new()),
             }),
+            test_durability(),
             LifecycleRunnerOptions {
                 scan_page_size: 8,
                 mutation_batch_size: 8,
@@ -2351,6 +2534,7 @@ mod tests {
             fixture.route,
             OwnerLossSignal::default(),
             deleter.clone(),
+            test_durability(),
             LifecycleRunnerOptions {
                 scan_page_size: 8,
                 mutation_batch_size: 8,
@@ -2387,6 +2571,7 @@ mod tests {
             fixture.route,
             OwnerLossSignal::default(),
             deleter.clone(),
+            test_durability(),
             LifecycleRunnerOptions {
                 scan_page_size: 8,
                 mutation_batch_size: 8,
@@ -2417,6 +2602,7 @@ mod tests {
             fixture.route,
             OwnerLossSignal::default(),
             deleter.clone(),
+            test_durability(),
             LifecycleRunnerOptions {
                 scan_page_size: 8,
                 mutation_batch_size: 8,
@@ -2459,6 +2645,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 object_keys: Mutex::new(Vec::new()),
             }),
+            test_durability(),
             LifecycleRunnerOptions {
                 poll_interval: Duration::from_secs(60),
                 scan_page_size: 8,
@@ -2475,6 +2662,70 @@ mod tests {
         let result = worker.join().unwrap();
         assert!(matches!(result, Err(LifecycleError::OwnerLost(_))));
         assert!(interrupted_at.elapsed() < Duration::from_secs(1));
+        assert_eq!(fixture.registry.installed_root_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn graceful_shutdown_interrupts_long_poll_without_fail_closing_the_route() {
+        let fixture = fixture();
+        let owner_loss = OwnerLossSignal::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runner = LifecycleRunner::new(
+            Arc::clone(&fixture.store),
+            Arc::clone(&fixture.registry),
+            fixture.route,
+            owner_loss,
+            Arc::new(FakeDeleter {
+                ambiguous: false,
+                calls: AtomicUsize::new(0),
+                object_keys: Mutex::new(Vec::new()),
+            }),
+            test_durability(),
+            LifecycleRunnerOptions {
+                poll_interval: Duration::from_secs(60),
+                scan_page_size: 8,
+                mutation_batch_size: 8,
+                ..LifecycleRunnerOptions::default()
+            },
+        )
+        .unwrap();
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = thread::spawn(move || {
+            runner.run_until_owner_loss_or_shutdown(worker_shutdown.as_ref())
+        });
+        thread::sleep(Duration::from_millis(40));
+
+        let interrupted_at = Instant::now();
+        shutdown.store(true, Ordering::Release);
+        worker.join().unwrap().unwrap();
+        assert!(interrupted_at.elapsed() < Duration::from_secs(1));
+        assert_eq!(fixture.registry.installed_root_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn lifecycle_owner_loss_precedes_graceful_shutdown() {
+        let fixture = fixture();
+        let owner_loss = OwnerLossSignal::default();
+        let shutdown = AtomicBool::new(true);
+        let runner = LifecycleRunner::new(
+            Arc::clone(&fixture.store),
+            Arc::clone(&fixture.registry),
+            fixture.route,
+            owner_loss.clone(),
+            Arc::new(FakeDeleter {
+                ambiguous: false,
+                calls: AtomicUsize::new(0),
+                object_keys: Mutex::new(Vec::new()),
+            }),
+            test_durability(),
+            LifecycleRunnerOptions::default(),
+        )
+        .unwrap();
+        owner_loss.fail_closed();
+
+        let result = runner.run_until_owner_loss_or_shutdown(&shutdown);
+
+        assert!(matches!(result, Err(LifecycleError::OwnerLost(_))));
         assert_eq!(fixture.registry.installed_root_count().unwrap(), 0);
     }
 
@@ -2608,6 +2859,7 @@ mod tests {
             route(),
             OwnerLossSignal::default(),
             deleter.clone(),
+            test_durability(),
             LifecycleRunnerOptions {
                 scan_page_size: 8,
                 mutation_batch_size: 8,
@@ -2673,6 +2925,7 @@ mod tests {
             successor_route,
             OwnerLossSignal::default(),
             deleter.clone(),
+            test_durability(),
             LifecycleRunnerOptions {
                 scan_page_size: 8,
                 mutation_batch_size: 8,
@@ -2984,6 +3237,7 @@ mod tests {
             route(),
             OwnerLossSignal::default(),
             Arc::new(ArtifactLifecycleDeleter::new(Arc::clone(&objects))),
+            test_durability(),
             LifecycleRunnerOptions {
                 scan_page_size: 8,
                 mutation_batch_size: 8,
@@ -3305,6 +3559,7 @@ mod tests {
             route(),
             OwnerLossSignal::default(),
             Arc::new(ArtifactLifecycleDeleter::new(Arc::clone(&objects))),
+            test_durability(),
             LifecycleRunnerOptions {
                 scan_page_size: 8,
                 mutation_batch_size: 8,

@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use super::codec::{
     change_event_key, classify_schema_marker_for_open, encode_schema_marker,
-    validate_schema_marker, SchemaMarkerVersion, SCHEMA_ID, SYSTEM_SCHEMA_KEY,
+    validate_schema_marker, SCHEMA_ID, SYSTEM_SCHEMA_KEY,
 };
 use super::keyspace::{
     keyspaces, MetadataFamily, CHANGE_EVENT, COMMAND_DEDUPE, HISTORY, RECOVERY_OUTBOX, ROOT_FENCE,
@@ -33,9 +33,10 @@ use super::records::{CommandDedupeRecord, CurrentValue, HistoryValue, RootFence}
 use super::recovery::{
     assemble_recovery_storage, decode_recovery_outbox_key, recovery_chunk_key,
     recovery_chunk_key_for_layout, recovery_genesis_digest, recovery_outbox_key,
-    recovery_outbox_scan_start, recovery_storage_chunk_count, recovery_storage_logical_length,
-    split_recovery_storage, DecodedRecoveryOutboxKey, RecoveryKeyLayout, RecoveryMutationV1,
-    RecoveryOutboxRecord, RecoveryResultV1, RecoveryState, MAX_RECOVERY_BYTES,
+    recovery_outbox_scan_start, recovery_segment_record_budget, recovery_storage_chunk_count,
+    recovery_storage_logical_length, split_recovery_storage, DecodedRecoveryOutboxKey,
+    RecoveryKeyLayout, RecoveryMutationV1, RecoveryOutboxRecord, RecoveryOutboxSegment,
+    RecoveryResultV1, RecoveryState, MAX_RECOVERY_BYTES, MAX_RECOVERY_SEGMENT_RECORDS,
     RECOVERY_CHAIN_DIGEST_BYTES,
 };
 
@@ -53,6 +54,12 @@ const MAX_DELIMITED_SCAN_ITEMS: usize = MAX_COMMAND_ITEMS * 2;
 const MAX_HISTORICAL_SCAN_PAGE_ROWS: usize = MAX_COMMAND_ITEMS;
 const MAX_HISTORICAL_SCAN_ATTEMPTS: usize = 4;
 const HISTORICAL_SCAN_RETRY_DELAYS: [Duration; MAX_HISTORICAL_SCAN_ATTEMPTS - 1] = [
+    Duration::from_millis(1),
+    Duration::from_millis(2),
+    Duration::from_millis(4),
+];
+const MAX_RECOVERY_SCAN_ATTEMPTS: usize = 4;
+const RECOVERY_SCAN_RETRY_DELAYS: [Duration; MAX_RECOVERY_SCAN_ATTEMPTS - 1] = [
     Duration::from_millis(1),
     Duration::from_millis(2),
     Duration::from_millis(4),
@@ -284,7 +291,20 @@ impl MetadataCommand {
 pub struct MetadataCommandResult {
     pub commit_version: CommitVersion,
     pub deterministic_result: Vec<u8>,
+    /// Exact RecoveryOutbox position committed in the same transaction.
+    pub recovery_lsn: u64,
+    /// Hash-chain digest at `recovery_lsn`; exact retries return the same value.
+    pub recovery_chain_digest: [u8; RECOVERY_CHAIN_DIGEST_BYTES],
     pub replayed: bool,
+}
+
+/// Read-only structural consistency result for the unique RecoveryOutbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryFsckReport {
+    pub state: RecoveryState,
+    pub outbox_records: u64,
+    pub metadata_command_records: u64,
+    pub dedupe_records: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -596,10 +616,9 @@ impl MetaShard {
 
     fn open_domain(self) -> Result<Self, MetaError> {
         let schema = self.required_value(SYSTEM.id, SYSTEM_SCHEMA_KEY, "System(schema)")?;
-        let schema_version =
-            classify_schema_marker_for_open(&schema).map_err(|error| MetaError::SchemaGate {
-                reason: error.to_string(),
-            })?;
+        classify_schema_marker_for_open(&schema).map_err(|error| MetaError::SchemaGate {
+            reason: error.to_string(),
+        })?;
         let shard = self.required_value(
             SYSTEM.id,
             SYSTEM_SHARD_IDENTITY_KEY,
@@ -644,34 +663,7 @@ impl MetaShard {
             "System(lease_clock_high_water)",
         )?;
         self.verify_recovery_chain_unlocked()?;
-        if schema_version == SchemaMarkerVersion::Format8 {
-            self.upgrade_format8_schema_marker(&schema)?;
-        }
         Ok(self)
-    }
-
-    fn upgrade_format8_schema_marker(&self, previous: &[u8]) -> Result<(), MetaError> {
-        let current = encode_schema_marker();
-        let txn = WriteTxn {
-            checks: vec![value_check(SYSTEM.id, SYSTEM_SCHEMA_KEY, previous)],
-            mutations: vec![Mutation::Put {
-                key: Key::new(SYSTEM.id, SYSTEM_SCHEMA_KEY),
-                value: current,
-            }],
-        };
-        match self.commit("upgrade format-8 schema marker", txn)? {
-            Commit::Applied => Ok(()),
-            Commit::Conflict => {
-                let observed =
-                    self.required_value(SYSTEM.id, SYSTEM_SCHEMA_KEY, "System(schema)")?;
-                match validate_schema_marker(&observed) {
-                    Ok(()) => Ok(()),
-                    Err(_) => Err(MetaError::SchemaGate {
-                        reason: "format-8 schema upgrade lost its compare-and-swap".to_owned(),
-                    }),
-                }
-            }
-        }
     }
 
     pub fn current_read_version(&self) -> Result<ReadVersion, MetaError> {
@@ -779,6 +771,33 @@ impl MetaShard {
         self.recovery_outbox_after_with_byte_budget(start_after_lsn, limit, MAX_RECOVERY_BYTES)
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_recovery_header_for_test(
+        &self,
+        recovery_lsn: u64,
+        replacement: Option<Vec<u8>>,
+    ) -> Result<(), MetaError> {
+        let _command_guard = self
+            .command_gate
+            .write()
+            .map_err(|error| internal("lock command gate", error))?;
+        let key = Key::new(RECOVERY_OUTBOX.id, recovery_outbox_key(recovery_lsn));
+        let mutation = match replacement {
+            Some(value) => Mutation::Put { key, value },
+            None => Mutation::Delete { key },
+        };
+        match self.commit(
+            "inject RecoveryOutbox test fault",
+            WriteTxn {
+                checks: Vec::new(),
+                mutations: vec![mutation],
+            },
+        )? {
+            Commit::Applied => Ok(()),
+            Commit::Conflict => Err(MetaError::WriteConflict),
+        }
+    }
+
     fn recovery_outbox_after_with_byte_budget(
         &self,
         start_after_lsn: u64,
@@ -795,6 +814,15 @@ impl MetaShard {
             .command_gate
             .read()
             .map_err(|error| internal("lock read gate", error))?;
+        self.recovery_outbox_after_unlocked(start_after_lsn, limit, max_encoded_bytes)
+    }
+
+    fn recovery_outbox_after_unlocked(
+        &self,
+        start_after_lsn: u64,
+        limit: usize,
+        max_encoded_bytes: usize,
+    ) -> Result<Vec<RecoveryOutboxRecord>, MetaError> {
         let mut rows = Vec::with_capacity(limit);
         let mut encoded_bytes = 0_usize;
         for layout in RecoveryKeyLayout::ORDERED {
@@ -863,6 +891,384 @@ impl MetaShard {
         self.verify_recovery_chain_unlocked()
     }
 
+    /// Seal one bounded canonical segment strictly after an exact local tail.
+    pub fn recovery_segment_after(
+        &self,
+        boundary: RecoveryState,
+        limit: usize,
+    ) -> Result<Option<RecoveryOutboxSegment>, MetaError> {
+        if limit == 0 || limit > MAX_RECOVERY_SEGMENT_RECORDS {
+            return Err(invalid(format!(
+                "recovery segment limit must be in 1..={MAX_RECOVERY_SEGMENT_RECORDS}"
+            )));
+        }
+        let _read_guard = self
+            .command_gate
+            .read()
+            .map_err(|error| internal("lock read gate", error))?;
+        let current = self.recovery_state_unlocked()?;
+        if boundary.applied_recovery_lsn > current.applied_recovery_lsn {
+            return Err(corrupt(
+                "RecoveryOutbox segment boundary",
+                format!(
+                    "boundary LSN {} is newer than local tail {}",
+                    boundary.applied_recovery_lsn, current.applied_recovery_lsn
+                ),
+            ));
+        }
+        let expected_boundary_digest = if boundary.applied_recovery_lsn == 0 {
+            recovery_genesis_digest(self.logical_shard_id)
+        } else {
+            self.recovery_record_at_unlocked(boundary.applied_recovery_lsn)?
+                .chain_digest
+        };
+        if boundary.chain_digest != expected_boundary_digest {
+            return Err(corrupt(
+                "RecoveryOutbox segment boundary",
+                "boundary digest does not match its local LSN",
+            ));
+        }
+        if boundary == current {
+            return Ok(None);
+        }
+        let rows = self.recovery_outbox_after_unlocked(
+            boundary.applied_recovery_lsn,
+            limit,
+            recovery_segment_record_budget(limit),
+        )?;
+        if rows.is_empty() {
+            return Err(corrupt(
+                "RecoveryOutbox segment",
+                "local tail is newer than boundary but no following row exists",
+            ));
+        }
+        let segment = RecoveryOutboxSegment::seal(self.logical_shard_id, rows)
+            .map_err(|error| corrupt("RecoveryOutbox segment", error))?;
+        segment
+            .verify_follows(boundary)
+            .map_err(|error| corrupt("RecoveryOutbox segment", error))?;
+        Ok(Some(segment))
+    }
+
+    /// Replay one exact outbox row through the ordinary authoritative write
+    /// entrypoint. Existing identical rows are idempotent; a gap fails before
+    /// any mutation is attempted.
+    pub fn replay_recovery_record(
+        &self,
+        record: &RecoveryOutboxRecord,
+    ) -> Result<RecoveryState, MetaError> {
+        record
+            .verify()
+            .map_err(|error| corrupt("RecoveryOutbox replay", error))?;
+        if let RecoveryMutationV1::MetadataCommand { command, .. } = &record.mutation {
+            if command.logical_shard_id != self.logical_shard_id {
+                return Err(corrupt(
+                    "RecoveryOutbox replay",
+                    "metadata command targets a different logical shard",
+                ));
+            }
+        }
+        let _command_guard = self
+            .command_gate
+            .write()
+            .map_err(|error| internal("lock command gate", error))?;
+        self.replay_recovery_record_unlocked(record)
+    }
+
+    /// Replay one fully validated segment after checking its entire overlap
+    /// with the target before applying the first missing row.
+    pub fn replay_recovery_segment(
+        &self,
+        segment: &RecoveryOutboxSegment,
+    ) -> Result<RecoveryState, MetaError> {
+        segment
+            .verify()
+            .map_err(|error| corrupt("RecoveryOutbox replay", error))?;
+        if segment.logical_shard_id != self.logical_shard_id {
+            return Err(corrupt(
+                "RecoveryOutbox replay",
+                "segment targets a different logical shard",
+            ));
+        }
+        let _command_guard = self
+            .command_gate
+            .write()
+            .map_err(|error| internal("lock command gate", error))?;
+        let before = self.recovery_state_unlocked()?;
+        if before.applied_recovery_lsn < segment.first_lsn {
+            segment
+                .verify_follows(before)
+                .map_err(|error| corrupt("RecoveryOutbox replay", error))?;
+        } else {
+            for record in segment
+                .records
+                .iter()
+                .take_while(|record| record.recovery_lsn <= before.applied_recovery_lsn)
+            {
+                let local = self.recovery_record_at_unlocked(record.recovery_lsn)?;
+                if &local != record {
+                    return Err(corrupt(
+                        "RecoveryOutbox replay",
+                        format!("target diverges at overlapping LSN {}", record.recovery_lsn),
+                    ));
+                }
+            }
+            if before.applied_recovery_lsn < segment.last_lsn {
+                let overlap = self.recovery_record_at_unlocked(before.applied_recovery_lsn)?;
+                if overlap.chain_digest != before.chain_digest {
+                    return Err(corrupt(
+                        "RecoveryOutbox replay",
+                        "target tail digest disagrees with its overlapping row",
+                    ));
+                }
+            }
+        }
+        for record in &segment.records {
+            if record.recovery_lsn > before.applied_recovery_lsn {
+                self.replay_recovery_record_unlocked(record)?;
+            }
+        }
+        self.recovery_state_unlocked()
+    }
+
+    /// Verify the full recovery head/chain and the bidirectional binding
+    /// between every metadata-command row and its exact dedupe result. This is
+    /// diagnostic only and never repairs, skips, or guesses a missing row.
+    pub fn fsck_recovery(&self) -> Result<RecoveryFsckReport, MetaError> {
+        let _read_guard = self
+            .command_gate
+            .read()
+            .map_err(|error| internal("lock read gate", error))?;
+        self.with_stable_recovery_scan(|state| self.fsck_recovery_at_state_unlocked(state))
+    }
+
+    fn fsck_recovery_at_state_unlocked(
+        &self,
+        state: RecoveryState,
+    ) -> Result<RecoveryFsckReport, MetaError> {
+        self.verify_recovery_chain_at_state_unlocked(state)?;
+        let mut outbox_records = 0_u64;
+        let mut metadata_command_records = 0_u64;
+        let mut after_lsn = 0_u64;
+        while after_lsn < state.applied_recovery_lsn {
+            let rows = self.recovery_outbox_after_unlocked(
+                after_lsn,
+                MAX_HISTORICAL_SCAN_PAGE_ROWS,
+                MAX_RECOVERY_BYTES,
+            )?;
+            if rows.is_empty() {
+                return Err(corrupt(
+                    "RecoveryOutbox fsck",
+                    format!("chain stopped after LSN {after_lsn}"),
+                ));
+            }
+            for row in &rows {
+                outbox_records = outbox_records
+                    .checked_add(1)
+                    .ok_or(MetaError::VersionOverflow)?;
+                if let RecoveryMutationV1::MetadataCommand { command, .. } = &row.mutation {
+                    let key = command_dedupe_key(command.root_id, command.request_id);
+                    let value = self
+                        .read_value(
+                            COMMAND_DEDUPE.id,
+                            &key,
+                            MetadataPointReadSource::Other,
+                            "fsck CommandDedupe",
+                        )?
+                        .ok_or_else(|| {
+                            corrupt(
+                                "CommandDedupe recovery binding",
+                                format!("missing dedupe result for LSN {}", row.recovery_lsn),
+                            )
+                        })?;
+                    let dedupe = CommandDedupeRecord::decode(&value)
+                        .map_err(|error| corrupt("CommandDedupe", error))?;
+                    let bound = self.validate_dedupe_recovery_binding(&key, &dedupe)?;
+                    if &bound != row {
+                        return Err(corrupt(
+                            "CommandDedupe recovery binding",
+                            format!("dedupe points away from LSN {}", row.recovery_lsn),
+                        ));
+                    }
+                    metadata_command_records = metadata_command_records
+                        .checked_add(1)
+                        .ok_or(MetaError::VersionOverflow)?;
+                }
+            }
+            after_lsn = rows
+                .last()
+                .expect("non-empty recovery fsck page")
+                .recovery_lsn;
+        }
+
+        let mut dedupe_records = 0_u64;
+        let mut after = None;
+        loop {
+            let page = self.scan_page(
+                COMMAND_DEDUPE.id,
+                &[],
+                after.as_deref(),
+                MAX_HISTORICAL_SCAN_PAGE_ROWS,
+                None,
+                0,
+                "fsck CommandDedupe",
+            )?;
+            let more = page.more;
+            for item in page.items {
+                let ScanItem::Row { key, value } = item else {
+                    return Err(corrupt(
+                        "CommandDedupe",
+                        "non-delimited scan returned a common prefix",
+                    ));
+                };
+                after = Some(key.clone());
+                let dedupe = CommandDedupeRecord::decode(&value)
+                    .map_err(|error| corrupt("CommandDedupe", error))?;
+                self.validate_dedupe_recovery_binding(&key, &dedupe)?;
+                dedupe_records = dedupe_records
+                    .checked_add(1)
+                    .ok_or(MetaError::VersionOverflow)?;
+            }
+            if !more {
+                break;
+            }
+        }
+        if outbox_records != state.applied_recovery_lsn
+            || metadata_command_records != dedupe_records
+        {
+            return Err(corrupt(
+                "CommandDedupe recovery binding",
+                format!(
+                    "outbox rows {outbox_records}, metadata commands {metadata_command_records}, dedupe rows {dedupe_records}"
+                ),
+            ));
+        }
+        Ok(RecoveryFsckReport {
+            state,
+            outbox_records,
+            metadata_command_records,
+            dedupe_records,
+        })
+    }
+
+    fn replay_recovery_record_unlocked(
+        &self,
+        record: &RecoveryOutboxRecord,
+    ) -> Result<RecoveryState, MetaError> {
+        let before = self.recovery_state_unlocked()?;
+        if before.applied_recovery_lsn >= record.recovery_lsn {
+            let local = self.recovery_record_at_unlocked(record.recovery_lsn)?;
+            if &local != record {
+                return Err(corrupt(
+                    "RecoveryOutbox replay",
+                    format!("target diverges at existing LSN {}", record.recovery_lsn),
+                ));
+            }
+            return Ok(before);
+        }
+        let expected_lsn = before
+            .applied_recovery_lsn
+            .checked_add(1)
+            .ok_or(MetaError::VersionOverflow)?;
+        if record.recovery_lsn != expected_lsn {
+            return Err(corrupt(
+                "RecoveryOutbox replay",
+                format!(
+                    "expected next LSN {expected_lsn}, found {}",
+                    record.recovery_lsn
+                ),
+            ));
+        }
+        if record.previous_chain_digest != before.chain_digest {
+            return Err(corrupt(
+                "RecoveryOutbox replay",
+                format!("LSN {expected_lsn} does not follow the target chain digest"),
+            ));
+        }
+
+        match (&record.mutation, &record.result) {
+            (
+                RecoveryMutationV1::MetadataCommand {
+                    command,
+                    lease_deadline_ms,
+                },
+                RecoveryResultV1::MetadataCommand {
+                    commit_version,
+                    deterministic_result,
+                },
+            ) => {
+                let result =
+                    self.execute_with_lease_deadline_unlocked(command, *lease_deadline_ms)?;
+                if &result.commit_version != commit_version
+                    || &result.deterministic_result != deterministic_result
+                    || result.recovery_lsn != record.recovery_lsn
+                    || result.recovery_chain_digest != record.chain_digest
+                {
+                    return Err(corrupt(
+                        "RecoveryOutbox replay",
+                        format!("metadata result changed at LSN {}", record.recovery_lsn),
+                    ));
+                }
+            }
+            (
+                RecoveryMutationV1::ObserveLeaseClock {
+                    root_id,
+                    placement_generation,
+                    owner_epoch,
+                    observed_ms,
+                },
+                RecoveryResultV1::LeaseClock {
+                    effective_high_water_ms,
+                },
+            ) => {
+                let effective = self.observe_lease_clock_unlocked(
+                    *root_id,
+                    *placement_generation,
+                    *owner_epoch,
+                    *observed_ms,
+                )?;
+                if &effective != effective_high_water_ms {
+                    return Err(corrupt(
+                        "RecoveryOutbox replay",
+                        format!("lease-clock result changed at LSN {}", record.recovery_lsn),
+                    ));
+                }
+            }
+            (
+                RecoveryMutationV1::AdvanceOwnerEpoch { expected, next },
+                RecoveryResultV1::OwnerEpoch {
+                    applied_owner_epoch,
+                },
+            ) => {
+                self.advance_owner_epoch_unlocked(*expected, *next)?;
+                if next != applied_owner_epoch {
+                    return Err(corrupt(
+                        "RecoveryOutbox replay",
+                        format!("owner result changed at LSN {}", record.recovery_lsn),
+                    ));
+                }
+            }
+            _ => {
+                return Err(corrupt(
+                    "RecoveryOutbox replay",
+                    "mutation and deterministic result variants differ",
+                ))
+            }
+        }
+        let after = self.recovery_state_unlocked()?;
+        let expected = RecoveryState {
+            applied_recovery_lsn: record.recovery_lsn,
+            chain_digest: record.chain_digest,
+        };
+        if after != expected {
+            return Err(corrupt(
+                "RecoveryOutbox replay",
+                format!("authoritative write produced a different tail at LSN {expected_lsn}"),
+            ));
+        }
+        Ok(after)
+    }
+
     /// Persist a monotonic lease-clock observation for the current owner.
     ///
     /// Wall-clock regression never moves the durable value backwards. The
@@ -878,6 +1284,16 @@ impl MetaShard {
             .command_gate
             .write()
             .map_err(|error| internal("lock command gate", error))?;
+        self.observe_lease_clock_unlocked(root_id, placement_generation, owner_epoch, observed_ms)
+    }
+
+    fn observe_lease_clock_unlocked(
+        &self,
+        root_id: RootId,
+        placement_generation: PlacementGeneration,
+        owner_epoch: OwnerEpoch,
+        observed_ms: u64,
+    ) -> Result<u64, MetaError> {
         let schema = self.required_value(SYSTEM.id, SYSTEM_SCHEMA_KEY, "System(schema)")?;
         validate_schema_marker(&schema).map_err(|error| MetaError::SchemaGate {
             reason: error.to_string(),
@@ -973,6 +1389,14 @@ impl MetaShard {
             .command_gate
             .write()
             .map_err(|error| internal("lock command gate", error))?;
+        self.advance_owner_epoch_unlocked(expected, next)
+    }
+
+    fn advance_owner_epoch_unlocked(
+        &self,
+        expected: Option<OwnerEpoch>,
+        next: OwnerEpoch,
+    ) -> Result<(), MetaError> {
         let expected_raw = expected.map(OwnerEpoch::get).unwrap_or(0);
         let schema = self.required_value(SYSTEM.id, SYSTEM_SCHEMA_KEY, "System(schema)")?;
         validate_schema_marker(&schema).map_err(|error| MetaError::SchemaGate {
@@ -1124,11 +1548,19 @@ impl MetaShard {
         if command.command_digest != command.canonical_digest() {
             return Err(MetaError::CommandDigestMismatch);
         }
-        let dedupe_key = command_dedupe_key(command.root_id, command.request_id);
         let _command_guard = self
             .command_gate
             .write()
             .map_err(|error| internal("lock command gate", error))?;
+        self.execute_with_lease_deadline_unlocked(command, lease_deadline_ms)
+    }
+
+    fn execute_with_lease_deadline_unlocked(
+        &self,
+        command: &MetadataCommand,
+        lease_deadline_ms: Option<u64>,
+    ) -> Result<MetadataCommandResult, MetaError> {
+        let dedupe_key = command_dedupe_key(command.root_id, command.request_id);
         if let Some(result) = self.replayed_result(&dedupe_key, command.command_digest)? {
             return Ok(result);
         }
@@ -1217,6 +1649,8 @@ impl MetaShard {
             Commit::Applied => Ok(MetadataCommandResult {
                 commit_version: next_version,
                 deterministic_result: command.deterministic_result.clone(),
+                recovery_lsn: state.recovery.row.recovery_lsn,
+                recovery_chain_digest: state.recovery.row.chain_digest,
                 replayed: false,
             }),
             Commit::Conflict => {
@@ -1334,6 +1768,37 @@ impl MetaShard {
                 CommandDedupeRecord::decode(&value).map_err(|error| corrupt("CommandDedupe", error))
             })
             .transpose()
+    }
+
+    /// Return one exact replay result together with its authoritative recovery
+    /// receipt. Unlike the raw dedupe inspection API, this verifies that the
+    /// dedupe payload, request identity, LSN, and RecoveryOutbox result are one
+    /// closed binding before returning it.
+    pub fn lookup_request_result(
+        &self,
+        root_id: RootId,
+        placement_generation: PlacementGeneration,
+        owner_epoch: OwnerEpoch,
+        request_id: RequestId,
+    ) -> Result<Option<MetadataCommandResult>, MetaError> {
+        let Some(dedupe) =
+            self.lookup_request(root_id, placement_generation, owner_epoch, request_id)?
+        else {
+            return Ok(None);
+        };
+        let _read_guard = self
+            .command_gate
+            .read()
+            .map_err(|error| internal("lock read gate", error))?;
+        let key = command_dedupe_key(root_id, request_id);
+        let recovery = self.validate_dedupe_recovery_binding(&key, &dedupe)?;
+        Ok(Some(MetadataCommandResult {
+            commit_version: dedupe.commit_version,
+            deterministic_result: dedupe.deterministic_result,
+            recovery_lsn: dedupe.recovery_lsn,
+            recovery_chain_digest: recovery.chain_digest,
+            replayed: true,
+        }))
     }
 
     /// Stable ordered prefix scan at one fenced read version.
@@ -2292,11 +2757,52 @@ impl MetaShard {
         if record.command_digest != digest {
             return Err(MetaError::RequestIdReused);
         }
+        let recovery = self.validate_dedupe_recovery_binding(key, &record)?;
         Ok(Some(MetadataCommandResult {
             commit_version: record.commit_version,
             deterministic_result: record.deterministic_result,
+            recovery_lsn: record.recovery_lsn,
+            recovery_chain_digest: recovery.chain_digest,
             replayed: true,
         }))
+    }
+
+    fn validate_dedupe_recovery_binding(
+        &self,
+        dedupe_key: &[u8],
+        dedupe: &CommandDedupeRecord,
+    ) -> Result<RecoveryOutboxRecord, MetaError> {
+        let row = self.recovery_record_at_unlocked(dedupe.recovery_lsn)?;
+        let (
+            RecoveryMutationV1::MetadataCommand { command, .. },
+            RecoveryResultV1::MetadataCommand {
+                commit_version,
+                deterministic_result,
+            },
+        ) = (&row.mutation, &row.result)
+        else {
+            return Err(corrupt(
+                "CommandDedupe recovery binding",
+                format!(
+                    "dedupe LSN {} does not name a metadata command",
+                    dedupe.recovery_lsn
+                ),
+            ));
+        };
+        if command_dedupe_key(command.root_id, command.request_id) != dedupe_key
+            || command.command_digest != dedupe.command_digest
+            || commit_version != &dedupe.commit_version
+            || deterministic_result != &dedupe.deterministic_result
+        {
+            return Err(corrupt(
+                "CommandDedupe recovery binding",
+                format!(
+                    "dedupe result does not match RecoveryOutbox LSN {}",
+                    dedupe.recovery_lsn
+                ),
+            ));
+        }
+        Ok(row)
     }
 
     fn recovery_state_unlocked(&self) -> Result<RecoveryState, MetaError> {
@@ -2350,7 +2856,33 @@ impl MetaShard {
     }
 
     fn verify_recovery_chain_unlocked(&self) -> Result<RecoveryState, MetaError> {
-        let state = self.recovery_state_unlocked()?;
+        self.with_stable_recovery_scan(|state| self.verify_recovery_chain_at_state_unlocked(state))
+    }
+
+    fn with_stable_recovery_scan<T>(
+        &self,
+        mut scan: impl FnMut(RecoveryState) -> Result<T, MetaError>,
+    ) -> Result<T, MetaError> {
+        for attempt in 0..MAX_RECOVERY_SCAN_ATTEMPTS {
+            let before = self.recovery_state_unlocked()?;
+            let result = scan(before);
+            let after = self.recovery_state_unlocked()?;
+            if before == after {
+                return result;
+            }
+            if let Some(delay) = RECOVERY_SCAN_RETRY_DELAYS.get(attempt) {
+                thread::sleep(*delay);
+            }
+        }
+        Err(MetaError::ReadStabilityExhausted {
+            attempts: MAX_RECOVERY_SCAN_ATTEMPTS,
+        })
+    }
+
+    fn verify_recovery_chain_at_state_unlocked(
+        &self,
+        state: RecoveryState,
+    ) -> Result<RecoveryState, MetaError> {
         let mut expected_lsn = 1_u64;
         let mut previous_chain_digest = recovery_genesis_digest(self.logical_shard_id);
         let mut expected_chunk_keys = BTreeSet::new();
@@ -2476,6 +3008,57 @@ impl MetaShard {
         let logical = assemble_recovery_storage(header, chunks)
             .map_err(|error| corrupt("RecoveryOutbox storage", error))?;
         RecoveryOutboxRecord::decode(&logical).map_err(|error| corrupt("RecoveryOutbox", error))
+    }
+
+    fn recovery_record_at_unlocked(
+        &self,
+        recovery_lsn: u64,
+    ) -> Result<RecoveryOutboxRecord, MetaError> {
+        if recovery_lsn == 0 {
+            return Err(corrupt("RecoveryOutbox", "LSN zero has no outbox row"));
+        }
+        let mut found = None;
+        for layout in RecoveryKeyLayout::ORDERED {
+            let key = recovery_outbox_scan_start(layout, recovery_lsn);
+            let Some(header) = self.read_value(
+                RECOVERY_OUTBOX.id,
+                &key,
+                MetadataPointReadSource::Other,
+                "read RecoveryOutbox header",
+            )?
+            else {
+                continue;
+            };
+            if found.is_some() {
+                return Err(corrupt(
+                    "RecoveryOutbox",
+                    format!("duplicate storage layouts contain LSN {recovery_lsn}"),
+                ));
+            }
+            let row = self.read_recovery_record(
+                DecodedRecoveryOutboxKey {
+                    recovery_lsn,
+                    layout,
+                },
+                &header,
+            )?;
+            if row.recovery_lsn != recovery_lsn {
+                return Err(corrupt(
+                    "RecoveryOutbox",
+                    format!(
+                        "key LSN {recovery_lsn} does not match row LSN {}",
+                        row.recovery_lsn
+                    ),
+                ));
+            }
+            found = Some(row);
+        }
+        found.ok_or_else(|| {
+            corrupt(
+                "RecoveryOutbox",
+                format!("missing recovery row at LSN {recovery_lsn}"),
+            )
+        })
     }
 
     #[cfg(feature = "metadata-read-stats")]
@@ -3455,12 +4038,12 @@ mod tests {
     use super::super::query_records::{ChangeEventKind, ChangeEventRecord, TypedProjection};
     use super::*;
 
-    struct UnknownCommitStore {
+    struct UnavailableCommitStore {
         inner: Arc<dyn TxnStore>,
         fail_next_commit: AtomicBool,
     }
 
-    impl TxnStore for UnknownCommitStore {
+    impl TxnStore for UnavailableCommitStore {
         fn profile(&self) -> StoreProfile {
             self.inner.profile()
         }
@@ -3471,12 +4054,42 @@ mod tests {
 
         fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
             if self.fail_next_commit.swap(false, Ordering::AcqRel) {
-                return Err(StoreError::OutcomeUnknown {
-                    state: UnknownCommit::MayCommit,
-                    reason: "injected uncertain acknowledgement".to_owned(),
-                });
+                return Err(StoreError::Unavailable(
+                    "injected definitely-not-applied commit".to_owned(),
+                ));
             }
             self.inner.commit(txn)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
+
+    struct AppliedThenLostAckStore {
+        inner: Arc<dyn TxnStore>,
+        lose_next_ack: AtomicBool,
+    }
+
+    impl TxnStore for AppliedThenLostAckStore {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            self.inner.read(batch)
+        }
+
+        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            let lose_ack = self.lose_next_ack.swap(false, Ordering::AcqRel);
+            let outcome = self.inner.commit(txn)?;
+            if lose_ack && outcome == Commit::Applied {
+                return Err(StoreError::OutcomeUnknown {
+                    state: UnknownCommit::Settled,
+                    reason: "injected acknowledgement loss after apply".to_owned(),
+                });
+            }
+            Ok(outcome)
         }
 
         fn ready(&self) -> Result<(), StoreError> {
@@ -3639,6 +4252,68 @@ mod tests {
         }
     }
 
+    struct RecoveryScanChurnStore {
+        inner: Arc<dyn TxnStore>,
+        controller: MetaShard,
+        skipped_recovery_scans: AtomicUsize,
+        remaining_advances: AtomicUsize,
+        recovery_scan_reads: AtomicUsize,
+    }
+
+    impl TxnStore for RecoveryScanChurnStore {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            let scans_recovery = batch
+                .ops
+                .iter()
+                .any(|op| matches!(op, ReadOp::Scan(scan) if scan.keyspace == RECOVERY_OUTBOX.id));
+            if scans_recovery {
+                let scan_index = self.recovery_scan_reads.fetch_add(1, Ordering::AcqRel);
+                let skip = self
+                    .skipped_recovery_scans
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok();
+                if !skip
+                    && self
+                        .remaining_advances
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                            remaining.checked_sub(1)
+                        })
+                        .is_ok()
+                {
+                    let request_fill = u8::try_from(200 + scan_index)
+                        .expect("bounded recovery scan attempts fit one request byte");
+                    let key = scoped_key(
+                        root(2),
+                        format!("recovery-scan-churn/{scan_index}").as_bytes(),
+                    );
+                    self.controller
+                        .execute(&create_command(
+                            &self.controller,
+                            request(request_fill),
+                            key,
+                            b"advance-recovery-tail",
+                        ))
+                        .expect("injected recovery-tail advancement must succeed");
+                }
+            }
+            self.inner.read(batch)
+        }
+
+        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            self.inner.commit(txn)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
+
     struct ProfileOnlyStore {
         limits: StoreLimits,
     }
@@ -3740,6 +4415,19 @@ mod tests {
         let activated = store.execute(&activate).unwrap();
         assert_eq!(activated.commit_version.get(), 3);
         store
+    }
+
+    fn recovery_scan_churn_reader() -> (MetaShard, Arc<RecoveryScanChurnStore>) {
+        let controller = ready_store();
+        let wrapper = Arc::new(RecoveryScanChurnStore {
+            inner: Arc::clone(&controller.store),
+            controller,
+            skipped_recovery_scans: AtomicUsize::new(0),
+            remaining_advances: AtomicUsize::new(0),
+            recovery_scan_reads: AtomicUsize::new(0),
+        });
+        let reader = MetaShard::open(wrapper.clone(), shard(1)).unwrap();
+        (reader, wrapper)
     }
 
     fn create_command(
@@ -3889,7 +4577,7 @@ mod tests {
     #[test]
     fn fresh_store_freezes_schema_shard_and_bootstrap_version() {
         let store = crate::workspace::test_support::memory(shard(1)).unwrap();
-        assert_eq!(keyspaces().len(), 26);
+        assert_eq!(keyspaces().len(), 29);
         assert_eq!(store.current_read_version().unwrap().get(), 1);
         assert_eq!(
             store.advance_owner_epoch(Some(epoch(1)), epoch(2)),
@@ -4114,11 +4802,11 @@ mod tests {
     }
 
     #[test]
-    fn outcome_unknown_remains_typed() {
+    fn applied_then_lost_ack_remains_typed_and_reconciles_by_request() {
         let mut store = ready_store();
-        let wrapper = Arc::new(UnknownCommitStore {
+        let wrapper = Arc::new(AppliedThenLostAckStore {
             inner: Arc::clone(&store.store),
-            fail_next_commit: AtomicBool::new(false),
+            lose_next_ack: AtomicBool::new(false),
         });
         store.store = wrapper.clone();
         let command = create_command(
@@ -4127,17 +4815,28 @@ mod tests {
             scoped_key(root(2), b"unknown-outcome"),
             b"value",
         );
-        wrapper.fail_next_commit.store(true, Ordering::Release);
+        let before = store.recovery_state().unwrap();
+        wrapper.lose_next_ack.store(true, Ordering::Release);
         assert!(matches!(
             store.execute(&command),
             Err(MetaError::Store {
                 operation: "execute metadata command",
                 source: StoreError::OutcomeUnknown {
-                    state: UnknownCommit::MayCommit,
+                    state: UnknownCommit::Settled,
                     ..
                 },
             })
         ));
+        let after_unknown = store.recovery_state().unwrap();
+        assert_eq!(
+            after_unknown.applied_recovery_lsn,
+            before.applied_recovery_lsn + 1
+        );
+
+        let reconciled = store.execute(&command).unwrap();
+        assert!(reconciled.replayed);
+        assert_eq!(reconciled.recovery_lsn, after_unknown.applied_recovery_lsn);
+        assert_eq!(reconciled.recovery_chain_digest, after_unknown.chain_digest);
     }
 
     #[test]
@@ -5407,7 +6106,12 @@ mod tests {
             scoped_key(root(2), b"recovery"),
             b"value",
         );
-        store.execute_before_lease_deadline(&command, 101).unwrap();
+        let applied = store.execute_before_lease_deadline(&command, 101).unwrap();
+        assert_eq!(applied.recovery_lsn, 5);
+        assert_eq!(
+            applied.recovery_chain_digest,
+            store.recovery_outbox_after(4, 1).unwrap()[0].chain_digest
+        );
         store.advance_owner_epoch(Some(epoch(1)), epoch(2)).unwrap();
 
         let state = store.verify_recovery_chain().unwrap();
@@ -5434,6 +6138,8 @@ mod tests {
         store.advance_owner_epoch(Some(epoch(1)), epoch(2)).unwrap();
         let replay = store.execute_before_lease_deadline(&command, 101).unwrap();
         assert!(replay.replayed);
+        assert_eq!(replay.recovery_lsn, applied.recovery_lsn);
+        assert_eq!(replay.recovery_chain_digest, applied.recovery_chain_digest);
         assert_eq!(store.recovery_state().unwrap(), state);
     }
 
@@ -5544,125 +6250,55 @@ mod tests {
     }
 
     #[test]
-    fn format8_store_upgrades_without_rewriting_legacy_recovery_rows() {
+    fn format9_store_is_rejected_without_rewriting_its_marker_or_recovery_tail() {
         let temporary = tempdir().unwrap();
         let database = temporary.path().join("metadata");
-        let expected;
+        let expected_recovery;
+        let format9_marker;
         {
             let store = ready_file_store(&database);
-            expected = store.verify_recovery_chain().unwrap();
-            assert_eq!(expected.applied_recovery_lsn, 3);
-
-            for recovery_lsn in 1..=expected.applied_recovery_lsn {
-                let current_header_key = recovery_outbox_key(recovery_lsn);
-                let header = store
-                    .required_value(
-                        RECOVERY_OUTBOX.id,
-                        &current_header_key,
-                        "RecoveryOutbox header",
-                    )
-                    .unwrap();
-                let chunk_count = recovery_storage_chunk_count(&header).unwrap();
-                raw_put(
-                    &store,
-                    RECOVERY_OUTBOX.id,
-                    &recovery_outbox_scan_start(RecoveryKeyLayout::Format8, recovery_lsn),
-                    &header,
-                );
-                raw_delete(&store, RECOVERY_OUTBOX.id, &current_header_key);
-
-                for index in 0..chunk_count {
-                    let current_chunk_key = recovery_chunk_key(recovery_lsn, index);
-                    let chunk = store
-                        .required_value(
-                            RECOVERY_OUTBOX.id,
-                            &current_chunk_key,
-                            "RecoveryOutbox chunk",
-                        )
-                        .unwrap();
-                    raw_put(
-                        &store,
-                        RECOVERY_OUTBOX.id,
-                        &recovery_chunk_key_for_layout(
-                            RecoveryKeyLayout::Format8,
-                            recovery_lsn,
-                            index,
-                        ),
-                        &chunk,
-                    );
-                    raw_delete(&store, RECOVERY_OUTBOX.id, &current_chunk_key);
-                }
-            }
-
-            let mut format8_marker = encode_schema_marker();
-            let version_start = format8_marker.len() - std::mem::size_of::<u32>();
-            format8_marker[version_start..].copy_from_slice(&8_u32.to_be_bytes());
-            raw_put(&store, SYSTEM.id, SYSTEM_SCHEMA_KEY, &format8_marker);
+            expected_recovery = store.verify_recovery_chain().unwrap();
+            format9_marker = {
+                let mut marker = encode_schema_marker();
+                let version_start = marker.len() - std::mem::size_of::<u32>();
+                marker[version_start..].copy_from_slice(&9_u32.to_be_bytes());
+                marker
+            };
+            raw_put(&store, SYSTEM.id, SYSTEM_SCHEMA_KEY, &format9_marker);
         }
 
-        let reopened = crate::workspace::test_support::open_file(&database, shard(1)).unwrap();
-        assert_eq!(reopened.verify_recovery_chain().unwrap(), expected);
-        assert_eq!(
-            reopened
-                .required_value(SYSTEM.id, SYSTEM_SCHEMA_KEY, "System(schema)")
-                .unwrap(),
-            encode_schema_marker()
-        );
-        for recovery_lsn in 1..=expected.applied_recovery_lsn {
-            reopened
-                .required_value(
-                    RECOVERY_OUTBOX.id,
-                    &recovery_outbox_scan_start(RecoveryKeyLayout::Format8, recovery_lsn),
-                    "legacy RecoveryOutbox header",
-                )
-                .unwrap();
-        }
+        assert!(matches!(
+            crate::workspace::test_support::open_file(&database, shard(1)),
+            Err(MetaError::SchemaGate { .. })
+        ));
 
-        let command = create_command(
-            &reopened,
-            request(9),
-            scoped_key(root(2), b"after-format8-upgrade"),
-            b"value",
-        );
-        reopened.execute(&command).unwrap();
-        let rows = reopened.recovery_outbox_after(0, 10).unwrap();
-        assert_eq!(
-            rows.iter().map(|row| row.recovery_lsn).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
-        );
-        assert_eq!(
-            reopened
-                .recovery_outbox_after(2, 10)
-                .unwrap()
-                .iter()
-                .map(|row| row.recovery_lsn)
-                .collect::<Vec<_>>(),
-            vec![3, 4]
-        );
-        assert_eq!(
-            reopened
-                .verify_recovery_chain()
-                .unwrap()
-                .applied_recovery_lsn,
-            4
-        );
-        reopened
-            .required_value(
-                RECOVERY_OUTBOX.id,
-                &recovery_outbox_key(4),
-                "format-9 RecoveryOutbox header",
-            )
+        let raw = crate::workspace::test_support::open_file_txn_store(&database).unwrap();
+        let snapshot = raw
+            .read(ReadBatch {
+                ops: vec![
+                    ReadOp::Get(Key::new(SYSTEM.id, SYSTEM_SCHEMA_KEY)),
+                    ReadOp::Get(Key::new(SYSTEM.id, SYSTEM_APPLIED_RECOVERY_LSN_KEY)),
+                    ReadOp::Get(Key::new(SYSTEM.id, SYSTEM_RECOVERY_CHAIN_DIGEST_KEY)),
+                ],
+            })
             .unwrap();
-        drop(reopened);
-
-        let mixed = crate::workspace::test_support::open_file(&database, shard(1)).unwrap();
+        let ReadResult::Get(marker) = &snapshot.results[0] else {
+            panic!("schema marker read must return a point value");
+        };
+        assert_eq!(marker.as_deref(), Some(format9_marker.as_slice()));
+        let ReadResult::Get(lsn) = &snapshot.results[1] else {
+            panic!("recovery LSN read must return a point value");
+        };
         assert_eq!(
-            mixed.recovery_outbox_after(3, 10).unwrap()[0].recovery_lsn,
-            4
+            lsn.as_deref(),
+            Some(encode_system_u64(expected_recovery.applied_recovery_lsn).as_slice())
         );
+        let ReadResult::Get(digest) = &snapshot.results[2] else {
+            panic!("recovery digest read must return a point value");
+        };
         assert_eq!(
-            mixed.verify_recovery_chain().unwrap().applied_recovery_lsn,
-            4
+            digest.as_deref(),
+            Some(encode_system_digest(expected_recovery.chain_digest).as_slice())
         );
     }
 
@@ -5723,62 +6359,18 @@ mod tests {
             .unwrap();
         let source_rows = source.recovery_outbox_after(0, 16).unwrap();
 
+        let encoded = RecoveryOutboxSegment::seal(shard(1), source_rows.clone())
+            .unwrap()
+            .encode()
+            .unwrap();
+        let segment = RecoveryOutboxSegment::decode(&encoded).unwrap();
         let target = crate::workspace::test_support::memory(shard(1)).unwrap();
-        for row in &source_rows {
-            match (&row.mutation, &row.result) {
-                (
-                    RecoveryMutationV1::AdvanceOwnerEpoch { expected, next },
-                    RecoveryResultV1::OwnerEpoch {
-                        applied_owner_epoch,
-                    },
-                ) => {
-                    target.advance_owner_epoch(*expected, *next).unwrap();
-                    assert_eq!(next, applied_owner_epoch);
-                }
-                (
-                    RecoveryMutationV1::ObserveLeaseClock {
-                        root_id,
-                        placement_generation,
-                        owner_epoch,
-                        observed_ms,
-                    },
-                    RecoveryResultV1::LeaseClock {
-                        effective_high_water_ms,
-                    },
-                ) => assert_eq!(
-                    target
-                        .observe_lease_clock(
-                            *root_id,
-                            *placement_generation,
-                            *owner_epoch,
-                            *observed_ms,
-                        )
-                        .unwrap(),
-                    *effective_high_water_ms
-                ),
-                (
-                    RecoveryMutationV1::MetadataCommand {
-                        command,
-                        lease_deadline_ms,
-                    },
-                    RecoveryResultV1::MetadataCommand {
-                        commit_version,
-                        deterministic_result,
-                    },
-                ) => {
-                    let replayed = match lease_deadline_ms {
-                        Some(deadline) => target
-                            .execute_before_lease_deadline(command, *deadline)
-                            .unwrap(),
-                        None => target.execute(command).unwrap(),
-                    };
-                    assert_eq!(&replayed.commit_version, commit_version);
-                    assert_eq!(&replayed.deterministic_result, deterministic_result);
-                    assert!(!replayed.replayed);
-                }
-                _ => panic!("strict recovery codec forbids mismatched mutation/result variants"),
-            }
-        }
+        let replayed = target.replay_recovery_segment(&segment).unwrap();
+        assert_eq!(replayed, source.verify_recovery_chain().unwrap());
+
+        // Response-loss replay of the exact same segment is idempotent and
+        // returns the same authoritative tail without adding another row.
+        assert_eq!(target.replay_recovery_segment(&segment).unwrap(), replayed);
 
         assert_eq!(target.recovery_outbox_after(0, 16).unwrap(), source_rows);
         assert_eq!(
@@ -5799,6 +6391,249 @@ mod tests {
                 )
                 .unwrap(),
             Some(b"payload".to_vec())
+        );
+    }
+
+    #[test]
+    fn replaying_an_older_exact_record_returns_the_current_recovery_tail() {
+        let source = ready_store();
+        let rows = source.recovery_outbox_after(0, 16).unwrap();
+        assert!(rows.len() >= 2);
+        let target = crate::workspace::test_support::memory(shard(1)).unwrap();
+        target.replay_recovery_record(&rows[0]).unwrap();
+        target.replay_recovery_record(&rows[1]).unwrap();
+        let current = target.recovery_state().unwrap();
+
+        assert_eq!(target.replay_recovery_record(&rows[0]).unwrap(), current);
+        assert_eq!(target.recovery_state().unwrap(), current);
+    }
+
+    #[test]
+    fn recovery_segment_replay_resumes_after_a_definite_middle_failure() {
+        let source = ready_store();
+        let source_rows = source.recovery_outbox_after(0, 16).unwrap();
+        let segment = RecoveryOutboxSegment::seal(shard(1), source_rows.clone()).unwrap();
+
+        let mut target = crate::workspace::test_support::memory(shard(1)).unwrap();
+        let wrapper = Arc::new(UnavailableCommitStore {
+            inner: Arc::clone(&target.store),
+            fail_next_commit: AtomicBool::new(false),
+        });
+        target.store = wrapper.clone();
+        target.replay_recovery_record(&source_rows[0]).unwrap();
+        let prefix = target.recovery_state().unwrap();
+
+        wrapper.fail_next_commit.store(true, Ordering::Release);
+        assert!(matches!(
+            target.replay_recovery_segment(&segment),
+            Err(MetaError::Store {
+                source: StoreError::Unavailable(_),
+                ..
+            })
+        ));
+        assert_eq!(target.recovery_state().unwrap(), prefix);
+
+        let recovered = target.replay_recovery_segment(&segment).unwrap();
+        assert_eq!(recovered, source.recovery_state().unwrap());
+        assert_eq!(target.recovery_outbox_after(0, 16).unwrap(), source_rows);
+    }
+
+    #[test]
+    fn recovery_segment_reconciles_an_applied_middle_record_after_lost_ack() {
+        let source = ready_store();
+        let source_rows = source.recovery_outbox_after(0, 16).unwrap();
+        let segment = RecoveryOutboxSegment::seal(shard(1), source_rows.clone()).unwrap();
+
+        let mut target = crate::workspace::test_support::memory(shard(1)).unwrap();
+        let wrapper = Arc::new(AppliedThenLostAckStore {
+            inner: Arc::clone(&target.store),
+            lose_next_ack: AtomicBool::new(false),
+        });
+        target.store = wrapper.clone();
+        target.replay_recovery_record(&source_rows[0]).unwrap();
+        let prefix = target.recovery_state().unwrap();
+
+        wrapper.lose_next_ack.store(true, Ordering::Release);
+        assert!(matches!(
+            target.replay_recovery_segment(&segment),
+            Err(MetaError::Store {
+                source: StoreError::OutcomeUnknown {
+                    state: UnknownCommit::Settled,
+                    ..
+                },
+                ..
+            })
+        ));
+        let after_unknown = target.recovery_state().unwrap();
+        assert_eq!(
+            after_unknown.applied_recovery_lsn,
+            prefix.applied_recovery_lsn + 1
+        );
+        assert_eq!(
+            target.recovery_outbox_after(0, 16).unwrap(),
+            source_rows[..2].to_vec()
+        );
+        target.fsck_recovery().unwrap();
+
+        let recovered = target.replay_recovery_segment(&segment).unwrap();
+        assert_eq!(recovered, source.recovery_state().unwrap());
+        assert_eq!(target.recovery_outbox_after(0, 16).unwrap(), source_rows);
+        let report = target.fsck_recovery().unwrap();
+        assert_eq!(report.outbox_records, source_rows.len() as u64);
+        assert_eq!(report.metadata_command_records, report.dedupe_records);
+    }
+
+    #[test]
+    fn recovery_segment_replay_rejects_foreign_shard_and_header_tamper() {
+        let source = ready_store();
+        let rows = source.recovery_outbox_after(0, 16).unwrap();
+        let segment = RecoveryOutboxSegment::seal(shard(1), rows.clone()).unwrap();
+
+        let target = crate::workspace::test_support::memory(shard(1)).unwrap();
+        let before = target.recovery_state().unwrap();
+        let foreign = RecoveryOutboxSegment::seal(shard(9), vec![rows[0].clone()]).unwrap();
+        assert!(matches!(
+            target.replay_recovery_segment(&foreign),
+            Err(MetaError::CorruptRecord { .. })
+        ));
+        assert_eq!(target.recovery_state().unwrap(), before);
+
+        let mut tampered = segment;
+        tampered.first_lsn = tampered.first_lsn.checked_add(1).unwrap();
+        assert!(matches!(
+            target.replay_recovery_segment(&tampered),
+            Err(MetaError::CorruptRecord { .. })
+        ));
+        assert_eq!(target.recovery_state().unwrap(), before);
+    }
+
+    #[test]
+    fn recovery_segment_export_is_available_at_the_command_return_boundary() {
+        let store = ready_store();
+        let before = store.recovery_state().unwrap();
+        let command = create_command(
+            &store,
+            request(61),
+            scoped_key(root(2), b"receipt-before-owner-ack"),
+            b"payload",
+        );
+
+        let result = store.execute(&command).unwrap();
+        let segment = store
+            .recovery_segment_after(before, 16)
+            .unwrap()
+            .expect("the applied command must be exportable before its caller can acknowledge it");
+
+        assert_eq!(segment.first_lsn, result.recovery_lsn);
+        assert_eq!(segment.last_lsn, result.recovery_lsn);
+        assert_eq!(segment.last_chain_digest, result.recovery_chain_digest);
+        assert_eq!(segment.records.len(), 1);
+    }
+
+    #[test]
+    fn recovery_replay_rejects_a_gap_before_mutating_the_target() {
+        let source = ready_store();
+        let source_state = source.recovery_state().unwrap();
+        let command = create_command(
+            &source,
+            request(62),
+            scoped_key(root(2), b"gap"),
+            b"payload",
+        );
+        source.execute(&command).unwrap();
+        let row = source
+            .recovery_outbox_after(source_state.applied_recovery_lsn, 1)
+            .unwrap()[0]
+            .clone();
+
+        let target = crate::workspace::test_support::memory(shard(1)).unwrap();
+        let before = target.recovery_state().unwrap();
+        assert!(matches!(
+            target.replay_recovery_record(&row),
+            Err(MetaError::CorruptRecord {
+                record: "RecoveryOutbox replay",
+                ..
+            })
+        ));
+        assert_eq!(target.recovery_state().unwrap(), before);
+    }
+
+    #[test]
+    fn recovery_fsck_binds_every_command_dedupe_record_to_its_exact_lsn() {
+        let store = ready_store();
+        let command = create_command(
+            &store,
+            request(63),
+            scoped_key(root(2), b"fsck"),
+            b"payload",
+        );
+        store.execute(&command).unwrap();
+        let clean = store.fsck_recovery().unwrap();
+        assert_eq!(clean.state, store.verify_recovery_chain().unwrap());
+        assert_eq!(clean.metadata_command_records, clean.dedupe_records);
+
+        let key = command_dedupe_key(root(2), request(63));
+        let raw = store
+            .required_value(COMMAND_DEDUPE.id, &key, "CommandDedupe")
+            .unwrap();
+        let mut dedupe = CommandDedupeRecord::decode(&raw).unwrap();
+        dedupe.recovery_lsn = 1;
+        let corrupted = dedupe.encode().unwrap();
+        raw_put(&store, COMMAND_DEDUPE.id, &key, &corrupted);
+
+        for _ in 0..2 {
+            assert!(matches!(
+                store.fsck_recovery(),
+                Err(MetaError::CorruptRecord {
+                    record: "CommandDedupe recovery binding",
+                    ..
+                })
+            ));
+            assert_eq!(
+                store
+                    .required_value(COMMAND_DEDUPE.id, &key, "CommandDedupe")
+                    .unwrap(),
+                corrupted,
+                "fsck must diagnose without repairing or guessing"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_chain_verification_retries_a_cross_instance_tail_change() {
+        let (reader, wrapper) = recovery_scan_churn_reader();
+        wrapper.remaining_advances.store(1, Ordering::Release);
+
+        let verified = reader.verify_recovery_chain().unwrap();
+        assert_eq!(verified, wrapper.controller.recovery_state().unwrap());
+    }
+
+    #[test]
+    fn recovery_fsck_retries_a_tail_change_during_the_binding_scan() {
+        let (reader, wrapper) = recovery_scan_churn_reader();
+        wrapper.skipped_recovery_scans.store(1, Ordering::Release);
+        wrapper.remaining_advances.store(1, Ordering::Release);
+
+        let report = reader.fsck_recovery().unwrap();
+        assert_eq!(report.state, wrapper.controller.recovery_state().unwrap());
+        assert_eq!(report.metadata_command_records, report.dedupe_records);
+    }
+
+    #[test]
+    fn recovery_fsck_does_not_report_corruption_while_the_tail_keeps_changing() {
+        let (reader, wrapper) = recovery_scan_churn_reader();
+        wrapper
+            .remaining_advances
+            .store(MAX_RECOVERY_SCAN_ATTEMPTS, Ordering::Release);
+
+        assert!(
+            matches!(
+                reader.fsck_recovery(),
+                Err(MetaError::ReadStabilityExhausted {
+                    attempts: MAX_RECOVERY_SCAN_ATTEMPTS
+                })
+            ),
+            "continuous cross-instance tail movement must remain a typed retryable condition"
         );
     }
 }

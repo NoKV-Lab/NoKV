@@ -14,13 +14,14 @@ use std::fmt;
 
 use nokv_object::ArtifactObjectStore;
 use nokv_protocol::{
-    sha256_digest_uri, ArtifactRevisionIdentity, CommitIdentity, CommitManifestBinding,
-    CommitPreparation, CommitRequest, CommitResult, ContentType, Digest, DigestUri, ErrorCode,
-    FinalizeRestoreRequest, GetOperationRequest, OperationIdentity, OperationKind, OperationResult,
-    OperationState, OperationStatus, PathMetadata, PrepareRestoreRequest, PublicationAuthority,
-    PublishCondition, PublishResult, RestoreManifestDescriptor, RestoreOperationPreparation,
-    RestorePreparation, RestoreResult, RestoreSource, RootIdentity, WorkbenchName,
-    WorkspaceIdentity, WorkspacePath, WorkspaceReadView,
+    sha256_digest_uri, ArtifactRevisionIdentity, BindRestoreDestinationRequest, CommitIdentity,
+    CommitManifestBinding, CommitPreparation, CommitRequest, CommitResult, ContentType, Digest,
+    DigestUri, ErrorCode, FinalizeRestoreRequest, GetOperationRequest, OperationIdentity,
+    OperationKind, OperationResult, OperationState, OperationStatus, PrepareRestoreRequest,
+    PublicationAuthority, PublishCondition, PublishResult, RestoreDestinationBinding,
+    RestoreDestinationManifestBindings, RestoreManifestDescriptor, RestoreManifestIdentity,
+    RestoreOperationPreparation, RestorePreparation, RestoreResult, RestoreSource, RootIdentity,
+    WorkbenchName, WorkspaceIdentity, WorkspacePath,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -210,10 +211,27 @@ where
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestoreWorkflowOptions {
     pub identities: RestoreWorkflowIdentities,
-    pub manifest_identities: RestoreManifestIdentities,
     pub request: RestoreWorkflowRequest,
-    pub manifest_target: WorkspacePath,
-    pub manifest_bytes: Vec<u8>,
+}
+
+/// One destination-owned canonical manifest supplied by the Agent projection
+/// boundary after metadata has frozen the source closure and timestamp.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreManifestPublication {
+    pub identity: RestoreManifestIdentity,
+    pub target: WorkspacePath,
+    pub content_type: ContentType,
+    pub bytes: Vec<u8>,
+}
+
+/// Storage-neutral late-bind intent and the two immutable objects that realize
+/// it. The SDK validates this plan against durable restore state before any
+/// binding or object publication is attempted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreDestinationPlan {
+    pub binding: BindRestoreDestinationRequest,
+    pub run_manifest: RestoreManifestPublication,
+    pub restore_manifest: RestoreManifestPublication,
 }
 
 /// Start mode for one restore workflow. `Recover` is used only when a durable
@@ -231,6 +249,7 @@ pub struct RestoreRecoveryRequest {
     pub source: RestoreSource,
     pub destination_workbench: WorkbenchName,
     pub destination_workspace_incarnation_id: WorkspaceIdentity,
+    pub destination_restore_manifest_identity: RestoreManifestIdentity,
     pub restore_manifest: RestoreManifestDescriptor,
 }
 
@@ -238,7 +257,7 @@ pub struct RestoreRecoveryRequest {
 pub struct RestoreWorkflowOutcome {
     pub result: RestoreResult,
     pub source_snapshot_read_version: Option<u64>,
-    pub manifest_metadata: PathMetadata,
+    pub destination_manifests: RestoreDestinationManifestBindings,
     pub replayed: bool,
 }
 
@@ -246,9 +265,10 @@ pub struct RestoreWorkflowOutcome {
 pub enum RestoreWorkflowError {
     Lookup(ClientError),
     Prepare(ClientError),
+    Bind(ClientError),
     Publish(ClientError),
     Finalize(ClientError),
-    ReadManifest(ClientError),
+    ReadSourceManifest(ClientError),
     Validation(ClientError),
 }
 
@@ -257,9 +277,10 @@ impl RestoreWorkflowError {
         match self {
             Self::Lookup(error)
             | Self::Prepare(error)
+            | Self::Bind(error)
             | Self::Publish(error)
             | Self::Finalize(error)
-            | Self::ReadManifest(error)
+            | Self::ReadSourceManifest(error)
             | Self::Validation(error) => error,
         }
     }
@@ -268,9 +289,10 @@ impl RestoreWorkflowError {
         match self {
             Self::Lookup(error)
             | Self::Prepare(error)
+            | Self::Bind(error)
             | Self::Publish(error)
             | Self::Finalize(error)
-            | Self::ReadManifest(error)
+            | Self::ReadSourceManifest(error)
             | Self::Validation(error) => error,
         }
     }
@@ -314,12 +336,16 @@ where
         &self,
         store: &dyn ArtifactObjectStore,
         options: RestoreWorkflowOptions,
+        build_destination: impl FnOnce(
+            &RestorePreparation,
+            &[u8],
+        ) -> Result<RestoreDestinationPlan, ClientError>,
     ) -> Result<RestoreWorkflowOutcome, RestoreWorkflowError> {
         let io = ClientWorkflowIo {
             client: self,
             store,
         };
-        drive_restore_workflow(&io, options)
+        drive_restore_workflow(&io, options, build_destination)
     }
 }
 
@@ -340,12 +366,20 @@ trait WorkflowIo {
         bytes: &[u8],
     ) -> Result<ClientCall<PublishResult>, ClientError>;
 
-    fn read_manifest(&self, target: WorkspacePath) -> Result<ArtifactReadOutcome, ClientError>;
-
     fn prepare_restore(
         &self,
         request: PrepareRestoreRequest,
     ) -> Result<ClientCall<RestorePreparation>, ClientError>;
+
+    fn bind_restore_destination(
+        &self,
+        request: BindRestoreDestinationRequest,
+    ) -> Result<ClientCall<RestorePreparation>, ClientError>;
+
+    fn read_restore_source_run_manifest(
+        &self,
+        operation_id: OperationIdentity,
+    ) -> Result<ArtifactReadOutcome, ClientError>;
 
     fn finalize_restore(
         &self,
@@ -388,17 +422,28 @@ where
             .map(|outcome| outcome.publication)
     }
 
-    fn read_manifest(&self, target: WorkspacePath) -> Result<ArtifactReadOutcome, ClientError> {
-        self.client
-            .read_artifact(self.store, None, target, WorkspaceReadView::Live)
-    }
-
     fn prepare_restore(
         &self,
         request: PrepareRestoreRequest,
     ) -> Result<ClientCall<RestorePreparation>, ClientError> {
         self.client
             .prepare_restore(self.client.new_request_id(), request)
+    }
+
+    fn bind_restore_destination(
+        &self,
+        request: BindRestoreDestinationRequest,
+    ) -> Result<ClientCall<RestorePreparation>, ClientError> {
+        self.client
+            .bind_restore_destination(self.client.new_request_id(), request)
+    }
+
+    fn read_restore_source_run_manifest(
+        &self,
+        operation_id: OperationIdentity,
+    ) -> Result<ArtifactReadOutcome, ClientError> {
+        self.client
+            .read_restore_source_run_manifest_artifact(self.store, operation_id)
     }
 
     fn finalize_restore(
@@ -571,9 +616,78 @@ fn drive_commit_workflow<ManifestError>(
     })
 }
 
+/// Terminal outcome for a restore whose durable status is `Succeeded`, built
+/// from the receipt only. The exact preparation was already authenticated by
+/// resubmitting the complete prepare DTO.
+fn succeeded_restore_outcome(
+    status: &OperationStatus,
+    durable: &RestoreOperationPreparation,
+    prepared: &RestorePreparation,
+    exact_request: &PrepareRestoreRequest,
+    options: &RestoreWorkflowOptions,
+    replayed: bool,
+) -> Result<RestoreWorkflowOutcome, RestoreWorkflowError> {
+    let result = terminal_restore_result(status, exact_request, options)
+        .map_err(RestoreWorkflowError::Validation)?;
+    validate_restore_result(&result, prepared, exact_request, options)
+        .map_err(RestoreWorkflowError::Validation)?;
+    let destination_manifests = terminal_destination_manifests(
+        durable,
+        &result,
+        exact_request,
+        options.identities.operation_id,
+    )
+    .map_err(RestoreWorkflowError::Validation)?;
+    Ok(RestoreWorkflowOutcome {
+        result,
+        source_snapshot_read_version: durable.source_snapshot_read_version,
+        destination_manifests,
+        replayed,
+    })
+}
+
+/// A concurrent exact caller may complete the shared restore between this
+/// caller's status check and its next construction step, at which point the
+/// engine rejects further construction against the terminal row. Converge on
+/// the durable `Succeeded` receipt instead of surfacing that phase conflict;
+/// any other state leaves the original step error to the caller.
+fn concurrently_completed_restore(
+    io: &impl WorkflowIo,
+    prepared: &RestorePreparation,
+    exact_request: &PrepareRestoreRequest,
+    options: &RestoreWorkflowOptions,
+) -> Result<Option<RestoreWorkflowOutcome>, RestoreWorkflowError> {
+    let Ok(status) = io.get_operation(options.identities.operation_id) else {
+        return Ok(None);
+    };
+    if status.value.state != OperationState::Succeeded {
+        return Ok(None);
+    }
+    let durable = exact_restore_operation_preparation(
+        &status.value,
+        options.identities.operation_id,
+        exact_request,
+    )
+    .map_err(RestoreWorkflowError::Validation)?;
+    validate_restore_seal(&durable, prepared).map_err(RestoreWorkflowError::Validation)?;
+    succeeded_restore_outcome(
+        &status.value,
+        &durable,
+        prepared,
+        exact_request,
+        options,
+        true,
+    )
+    .map(Some)
+}
+
 fn drive_restore_workflow(
     io: &impl WorkflowIo,
     options: RestoreWorkflowOptions,
+    build_destination: impl FnOnce(
+        &RestorePreparation,
+        &[u8],
+    ) -> Result<RestoreDestinationPlan, ClientError>,
 ) -> Result<RestoreWorkflowOutcome, RestoreWorkflowError> {
     validate_restore_options(&options).map_err(RestoreWorkflowError::Validation)?;
     let mut observed_terminal_failure = None;
@@ -659,44 +773,19 @@ fn drive_restore_workflow(
         &exact_request,
     )
     .map_err(RestoreWorkflowError::Validation)?;
-    if observed.as_ref().is_some_and(|previous| {
-        previous.request != durable.request
-            || previous.source_snapshot_read_version != durable.source_snapshot_read_version
-            || previous.sealed_member_count.is_some()
-                && (previous.sealed_member_count != durable.sealed_member_count
-                    || previous.sealed_member_digest != durable.sealed_member_digest)
-    }) {
-        return Err(RestoreWorkflowError::Validation(
-            ClientError::ResponseMismatch(
-                "restore preparation changed during exact replay".to_owned(),
-            ),
-        ));
-    }
+    validate_restore_progress(observed.as_ref(), &durable)
+        .map_err(RestoreWorkflowError::Validation)?;
     validate_restore_seal(&durable, &prepared.value).map_err(RestoreWorkflowError::Validation)?;
     match status.value.state {
         OperationState::Succeeded => {
-            let result = terminal_restore_result(&status.value, &exact_request, &options)
-                .map_err(RestoreWorkflowError::Validation)?;
-            validate_restore_result(&result, &prepared.value, &exact_request, &options)
-                .map_err(RestoreWorkflowError::Validation)?;
-            let manifest = io
-                .read_manifest(options.manifest_target.clone())
-                .map_err(RestoreWorkflowError::ReadManifest)?;
-            validate_live_manifest(
-                &manifest,
-                &options.manifest_target,
-                options.manifest_identities.revision_id,
-                exact_request.destination_workspace_incarnation_id,
-                &exact_request.restore_manifest.content_type,
-                &options.manifest_bytes,
-            )
-            .map_err(RestoreWorkflowError::Validation)?;
-            return Ok(RestoreWorkflowOutcome {
-                result,
-                source_snapshot_read_version: durable.source_snapshot_read_version,
-                manifest_metadata: manifest.metadata,
-                replayed: observed.is_some() || prepared.replayed,
-            });
+            return succeeded_restore_outcome(
+                &status.value,
+                &durable,
+                &prepared.value,
+                &exact_request,
+                &options,
+                observed.is_some() || prepared.replayed,
+            );
         }
         OperationState::Running => {
             validate_running_restore(&status.value).map_err(RestoreWorkflowError::Validation)?;
@@ -713,50 +802,176 @@ fn drive_restore_workflow(
             ));
         }
     }
-    let publication = io
+
+    let source_run_manifest =
+        match io.read_restore_source_run_manifest(options.identities.operation_id) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                if let Some(outcome) =
+                    concurrently_completed_restore(io, &prepared.value, &exact_request, &options)?
+                {
+                    return Ok(outcome);
+                }
+                return Err(RestoreWorkflowError::ReadSourceManifest(error));
+            }
+        };
+    validate_source_run_manifest(&source_run_manifest, &durable)
+        .map_err(RestoreWorkflowError::Validation)?;
+    let plan = build_destination(&prepared.value, &source_run_manifest.bytes)
+        .map_err(RestoreWorkflowError::Validation)?;
+    validate_restore_destination_plan(&plan, &prepared.value, &exact_request, &options)
+        .map_err(RestoreWorkflowError::Validation)?;
+    if let Some(binding) = durable.destination_binding.as_deref() {
+        validate_exact_destination_binding(binding, &plan.binding)
+            .map_err(RestoreWorkflowError::Validation)?;
+    }
+
+    // Bind is always resubmitted exactly, including after response loss or
+    // process recovery. The metadata operation owns idempotency; the client
+    // never invents replacement identities.
+    let bound = match io.bind_restore_destination(plan.binding.clone()) {
+        Ok(bound) => bound,
+        Err(error) => {
+            if let Some(outcome) =
+                concurrently_completed_restore(io, &prepared.value, &exact_request, &options)?
+            {
+                return Ok(outcome);
+            }
+            return Err(RestoreWorkflowError::Bind(error));
+        }
+    };
+    validate_restore_preparation(&bound.value, &exact_request, &options)
+        .map_err(RestoreWorkflowError::Validation)?;
+    validate_bound_preparation(&bound.value, &prepared.value, &plan.binding)
+        .map_err(RestoreWorkflowError::Validation)?;
+
+    let bound_status = io
+        .get_operation(options.identities.operation_id)
+        .map_err(RestoreWorkflowError::Lookup)?;
+    let bound_durable = exact_restore_operation_preparation(
+        &bound_status.value,
+        options.identities.operation_id,
+        &exact_request,
+    )
+    .map_err(RestoreWorkflowError::Validation)?;
+    validate_restore_seal(&bound_durable, &prepared.value)
+        .map_err(RestoreWorkflowError::Validation)?;
+    let durable_binding = bound_durable
+        .destination_binding
+        .as_deref()
+        .ok_or_else(|| {
+            RestoreWorkflowError::Validation(ClientError::ResponseMismatch(
+                "restore destination bind response was not durable".to_owned(),
+            ))
+        })?;
+    validate_exact_destination_binding(durable_binding, &plan.binding)
+        .map_err(RestoreWorkflowError::Validation)?;
+
+    if bound_status.value.state == OperationState::Succeeded {
+        let result = terminal_restore_result(&bound_status.value, &exact_request, &options)
+            .map_err(RestoreWorkflowError::Validation)?;
+        validate_restore_result(&result, &prepared.value, &exact_request, &options)
+            .map_err(RestoreWorkflowError::Validation)?;
+        let destination_manifests = terminal_destination_manifests(
+            &bound_durable,
+            &result,
+            &exact_request,
+            options.identities.operation_id,
+        )
+        .map_err(RestoreWorkflowError::Validation)?;
+        validate_restore_manifest_binding_matches_plan(&destination_manifests, &plan)
+            .map_err(RestoreWorkflowError::Validation)?;
+        return Ok(RestoreWorkflowOutcome {
+            result,
+            source_snapshot_read_version: bound_durable.source_snapshot_read_version,
+            destination_manifests,
+            replayed: true,
+        });
+    }
+    validate_running_restore(&bound_status.value).map_err(RestoreWorkflowError::Validation)?;
+
+    let run_publication = io
         .publish_manifest(
             ArtifactPublishOptions::new(
-                options.manifest_identities.publish_operation_id,
-                options.manifest_identities.revision_id,
-                options.manifest_target.clone(),
+                plan.run_manifest.identity.publication_operation_id,
+                plan.run_manifest.identity.artifact_revision_id,
+                plan.run_manifest.target.clone(),
                 PublishCondition::CreateOnly,
-                exact_request.restore_manifest.content_type.clone(),
+                plan.run_manifest.content_type.clone(),
             )
             .with_authority(PublicationAuthority::RestoreStaging {
                 restore_operation_id: options.identities.operation_id,
             }),
-            &options.manifest_bytes,
+            &plan.run_manifest.bytes,
         )
         .map_err(RestoreWorkflowError::Publish)?;
-    validate_publication(
-        &publication.value,
-        options.manifest_identities.publish_operation_id,
-        &options.manifest_target,
-        options.manifest_identities.revision_id,
-    )
-    .map_err(RestoreWorkflowError::Validation)?;
+    validate_restore_publication(&run_publication.value, &plan.run_manifest)
+        .map_err(RestoreWorkflowError::Validation)?;
+
+    let restore_publication = io
+        .publish_manifest(
+            ArtifactPublishOptions::new(
+                plan.restore_manifest.identity.publication_operation_id,
+                plan.restore_manifest.identity.artifact_revision_id,
+                plan.restore_manifest.target.clone(),
+                PublishCondition::CreateOnly,
+                plan.restore_manifest.content_type.clone(),
+            )
+            .with_authority(PublicationAuthority::RestoreStaging {
+                restore_operation_id: options.identities.operation_id,
+            }),
+            &plan.restore_manifest.bytes,
+        )
+        .map_err(RestoreWorkflowError::Publish)?;
+    validate_restore_publication(&restore_publication.value, &plan.restore_manifest)
+        .map_err(RestoreWorkflowError::Validation)?;
+
     let finalized = io
         .finalize_restore(options.identities.operation_id)
         .map_err(RestoreWorkflowError::Finalize)?;
     validate_restore_result(&finalized.value, &prepared.value, &exact_request, &options)
         .map_err(RestoreWorkflowError::Validation)?;
-    let manifest = io
-        .read_manifest(options.manifest_target.clone())
-        .map_err(RestoreWorkflowError::ReadManifest)?;
-    validate_live_manifest(
-        &manifest,
-        &options.manifest_target,
-        options.manifest_identities.revision_id,
-        exact_request.destination_workspace_incarnation_id,
-        &exact_request.restore_manifest.content_type,
-        &options.manifest_bytes,
+
+    // Re-read the terminal receipt rather than deriving it from a later live
+    // head. This also authenticates the final two-manifest binding after a
+    // finalize response-loss replay.
+    let terminal = io
+        .get_operation(options.identities.operation_id)
+        .map_err(RestoreWorkflowError::Lookup)?;
+    let terminal_result = terminal_restore_result(&terminal.value, &exact_request, &options)
+        .map_err(RestoreWorkflowError::Validation)?;
+    if terminal_result != finalized.value {
+        return Err(RestoreWorkflowError::Validation(
+            ClientError::ResponseMismatch(
+                "finalize response differs from the durable terminal restore receipt".to_owned(),
+            ),
+        ));
+    }
+    let terminal_preparation = exact_restore_operation_preparation(
+        &terminal.value,
+        options.identities.operation_id,
+        &exact_request,
     )
     .map_err(RestoreWorkflowError::Validation)?;
+    let destination_manifests = terminal_destination_manifests(
+        &terminal_preparation,
+        &terminal_result,
+        &exact_request,
+        options.identities.operation_id,
+    )
+    .map_err(RestoreWorkflowError::Validation)?;
+    validate_restore_manifest_binding_matches_plan(&destination_manifests, &plan)
+        .map_err(RestoreWorkflowError::Validation)?;
     Ok(RestoreWorkflowOutcome {
-        result: finalized.value,
-        source_snapshot_read_version: durable.source_snapshot_read_version,
-        manifest_metadata: manifest.metadata,
-        replayed: prepared.replayed || publication.replayed || finalized.replayed,
+        result: terminal_result,
+        source_snapshot_read_version: terminal_preparation.source_snapshot_read_version,
+        destination_manifests,
+        replayed: prepared.replayed
+            || bound.replayed
+            || run_publication.replayed
+            || restore_publication.replayed
+            || finalized.replayed
+            || terminal.replayed,
     })
 }
 
@@ -952,12 +1167,16 @@ fn terminal_commit_result(
 }
 
 fn validate_restore_options(options: &RestoreWorkflowOptions) -> Result<(), ClientError> {
-    let (destination_workbench, destination_incarnation, descriptor) = match &options.request {
-        RestoreWorkflowRequest::Fresh(request) => (
-            &request.destination_workbench,
-            request.destination_workspace_incarnation_id,
-            &request.restore_manifest,
-        ),
+    let destination_incarnation = match &options.request {
+        RestoreWorkflowRequest::Fresh(request) => {
+            if request.operation_id != options.identities.operation_id {
+                return Err(ClientError::InvalidOptions(
+                    "restore workflow operation identity does not match its preparation request"
+                        .to_owned(),
+                ));
+            }
+            request.destination_workspace_incarnation_id
+        }
         RestoreWorkflowRequest::Recover(request) => {
             if matches!(
                 request.source,
@@ -967,30 +1186,13 @@ fn validate_restore_options(options: &RestoreWorkflowOptions) -> Result<(), Clie
                     "restore recovery requires a concrete durable source selector".to_owned(),
                 ));
             }
-            (
-                &request.destination_workbench,
-                request.destination_workspace_incarnation_id,
-                &request.restore_manifest,
-            )
+            request.destination_workspace_incarnation_id
         }
     };
-    if destination_incarnation != options.identities.destination_workspace_incarnation_id
-        || &options.manifest_target.workbench != destination_workbench
-    {
+    if destination_incarnation != options.identities.destination_workspace_incarnation_id {
         return Err(ClientError::InvalidOptions(
-            "restore workflow identities and manifest target must match the preparation request"
+            "restore workflow destination incarnation does not match its deterministic identity"
                 .to_owned(),
-        ));
-    }
-    if descriptor.logical_size != u64::try_from(options.manifest_bytes.len()).unwrap_or(u64::MAX) {
-        return Err(ClientError::InvalidOptions(
-            "restore manifest size does not match its sealed descriptor".to_owned(),
-        ));
-    }
-    let digest: [u8; 32] = Sha256::digest(&options.manifest_bytes).into();
-    if sha256_digest_uri(Digest(digest)) != descriptor.body_digest {
-        return Err(ClientError::InvalidOptions(
-            "restore manifest digest does not match its sealed descriptor".to_owned(),
         ));
     }
     Ok(())
@@ -1042,6 +1244,8 @@ fn validate_restore_recovery_request(
                 && durable.destination_workbench == request.destination_workbench
                 && durable.destination_workspace_incarnation_id
                     == request.destination_workspace_incarnation_id
+                && durable.destination_restore_manifest_identity
+                    == request.destination_restore_manifest_identity
                 && durable.restore_manifest == request.restore_manifest
         }
     };
@@ -1071,6 +1275,7 @@ fn validate_restore_preparation(
     options: &RestoreWorkflowOptions,
 ) -> Result<(), ClientError> {
     if preparation.operation_id != options.identities.operation_id
+        || preparation.operation_id != exact_request.operation_id
         || preparation.destination_workbench != exact_request.destination_workbench
         || preparation.destination_workspace_incarnation_id
             != options.identities.destination_workspace_incarnation_id
@@ -1082,15 +1287,259 @@ fn validate_restore_preparation(
     Ok(())
 }
 
+fn validate_restore_progress(
+    previous: Option<&RestoreOperationPreparation>,
+    current: &RestoreOperationPreparation,
+) -> Result<(), ClientError> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    if previous.request != current.request
+        || previous.source_snapshot_read_version != current.source_snapshot_read_version
+        || previous.source_commit != current.source_commit
+        || previous.destination_committed_at_unix_seconds
+            != current.destination_committed_at_unix_seconds
+    {
+        return Err(ClientError::ResponseMismatch(
+            "restore immutable preparation changed during exact replay".to_owned(),
+        ));
+    }
+    let previous_seal = (
+        previous.source_member_count,
+        previous.source_member_digest,
+        previous.materialized_member_count,
+        previous.materialized_member_digest,
+        previous.source_matches_base_commit,
+    );
+    let current_seal = (
+        current.source_member_count,
+        current.source_member_digest,
+        current.materialized_member_count,
+        current.materialized_member_digest,
+        current.source_matches_base_commit,
+    );
+    if previous.source_member_count.is_some() && previous_seal != current_seal {
+        return Err(ClientError::ResponseMismatch(
+            "restore source closure changed during exact replay".to_owned(),
+        ));
+    }
+    if let Some(previous_binding) = previous.destination_binding.as_deref() {
+        let current_binding = current.destination_binding.as_deref().ok_or_else(|| {
+            ClientError::ResponseMismatch(
+                "restore destination binding disappeared during exact replay".to_owned(),
+            )
+        })?;
+        validate_destination_binding_progress(previous_binding, current_binding)?;
+    }
+    Ok(())
+}
+
+fn validate_destination_binding_progress(
+    previous: &RestoreDestinationBinding,
+    current: &RestoreDestinationBinding,
+) -> Result<(), ClientError> {
+    if previous.destination_commit_id != current.destination_commit_id
+        || previous.effective_content_digest != current.effective_content_digest
+        || previous.destination_run_manifest_projection_input_digest
+            != current.destination_run_manifest_projection_input_digest
+        || previous.destination_run_manifest_identity != current.destination_run_manifest_identity
+        || previous.destination_restore_manifest_identity
+            != current.destination_restore_manifest_identity
+        || previous
+            .destination_manifests
+            .as_ref()
+            .is_some_and(|manifests| current.destination_manifests.as_ref() != Some(manifests))
+    {
+        return Err(ClientError::ResponseMismatch(
+            "restore destination binding changed during exact replay".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_restore_seal(
     durable: &RestoreOperationPreparation,
     preparation: &RestorePreparation,
 ) -> Result<(), ClientError> {
-    if durable.sealed_member_count != Some(preparation.member_count)
-        || durable.sealed_member_digest != Some(preparation.member_digest)
+    if durable.source_commit != preparation.source_commit
+        || durable.destination_committed_at_unix_seconds
+            != preparation.destination_committed_at_unix_seconds
+        || durable.source_member_count != Some(preparation.source_member_count)
+        || durable.source_member_digest != Some(preparation.source_member_digest)
+        || durable.materialized_member_count != Some(preparation.materialized_member_count)
+        || durable.materialized_member_digest != Some(preparation.materialized_member_digest)
+        || durable.source_matches_base_commit != Some(preparation.source_matches_base_commit)
     {
         return Err(ClientError::ResponseMismatch(
-            "restore operation seal does not match its prepare response".to_owned(),
+            "restore raw/materialized source seals do not match the prepare response".to_owned(),
+        ));
+    }
+    match (
+        preparation.destination_binding.as_deref(),
+        durable.destination_binding.as_deref(),
+    ) {
+        (Some(compact), Some(exact)) => validate_destination_binding_progress(compact, exact)?,
+        (None, _) => {}
+        (Some(_), None) => {
+            return Err(ClientError::ResponseMismatch(
+                "restore prepare response binding is absent from durable state".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_bound_preparation(
+    bound: &RestorePreparation,
+    initial: &RestorePreparation,
+    request: &BindRestoreDestinationRequest,
+) -> Result<(), ClientError> {
+    if bound.operation_id != initial.operation_id
+        || bound.destination_workbench != initial.destination_workbench
+        || bound.destination_workspace_incarnation_id
+            != initial.destination_workspace_incarnation_id
+        || bound.source_commit != initial.source_commit
+        || bound.destination_committed_at_unix_seconds
+            != initial.destination_committed_at_unix_seconds
+        || bound.source_member_count != initial.source_member_count
+        || bound.source_member_digest != initial.source_member_digest
+        || bound.materialized_member_count != initial.materialized_member_count
+        || bound.materialized_member_digest != initial.materialized_member_digest
+        || bound.source_matches_base_commit != initial.source_matches_base_commit
+    {
+        return Err(ClientError::ResponseMismatch(
+            "destination bind changed the frozen restore preparation".to_owned(),
+        ));
+    }
+    let binding = bound.destination_binding.as_deref().ok_or_else(|| {
+        ClientError::ResponseMismatch(
+            "destination bind response omitted its exact durable binding".to_owned(),
+        )
+    })?;
+    validate_exact_destination_binding(binding, request)
+}
+
+fn validate_source_run_manifest(
+    source: &ArtifactReadOutcome,
+    durable: &RestoreOperationPreparation,
+) -> Result<(), ClientError> {
+    if source.metadata.path.workbench != durable.request.source_workbench
+        || source.metadata.path.path.as_str() != "metadata/run_manifest.json"
+        || source.metadata.workspace_incarnation_id
+            != durable.request.source_workspace_incarnation_id
+        || source.metadata.artifact_revision_id != durable.source_commit.tree_manifest_revision_id
+        || source.metadata.descriptor.content_type.as_str() != "application/json"
+        || source.metadata.descriptor.logical_size
+            != u64::try_from(source.bytes.len()).unwrap_or(u64::MAX)
+    {
+        return Err(ClientError::ResponseMismatch(
+            "restore-held source run manifest does not match its exact source commit".to_owned(),
+        ));
+    }
+    let digest: [u8; 32] = Sha256::digest(&source.bytes).into();
+    if sha256_digest_uri(Digest(digest)) != source.metadata.descriptor.body_digest {
+        return Err(ClientError::ArtifactIntegrity(
+            "restore-held source run manifest body digest mismatch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_restore_destination_plan(
+    plan: &RestoreDestinationPlan,
+    preparation: &RestorePreparation,
+    exact_request: &PrepareRestoreRequest,
+    options: &RestoreWorkflowOptions,
+) -> Result<(), ClientError> {
+    if plan.binding.operation_id != options.identities.operation_id
+        || plan.binding.operation_id != exact_request.operation_id
+        || plan.binding.destination_restore_manifest_identity
+            != exact_request.destination_restore_manifest_identity
+        || plan.binding.destination_run_manifest_identity != plan.run_manifest.identity
+        || plan.binding.destination_restore_manifest_identity != plan.restore_manifest.identity
+    {
+        return Err(ClientError::InvalidOptions(
+            "restore destination plan identities do not match the durable prepare request"
+                .to_owned(),
+        ));
+    }
+    if plan.binding.destination_commit_id == preparation.source_commit.commit_id
+        || preparation.source_matches_base_commit
+            != (plan.binding.effective_content_digest == preparation.source_commit.content_digest)
+        || plan
+            .binding
+            .destination_run_manifest_projection_input_digest
+            == Digest([0; 32])
+    {
+        return Err(ClientError::InvalidOptions(
+            "restore destination commit or effective content binding is invalid".to_owned(),
+        ));
+    }
+    if plan.run_manifest.identity == plan.restore_manifest.identity
+        || plan.run_manifest.identity.publication_operation_id
+            == plan.restore_manifest.identity.publication_operation_id
+        || plan.run_manifest.identity.artifact_revision_id
+            == plan.restore_manifest.identity.artifact_revision_id
+        || plan.run_manifest.identity.publication_operation_id == exact_request.operation_id
+        || plan.restore_manifest.identity.publication_operation_id == exact_request.operation_id
+        || plan.run_manifest.target == plan.restore_manifest.target
+        || plan.run_manifest.target.workbench != exact_request.destination_workbench
+        || plan.restore_manifest.target.workbench != exact_request.destination_workbench
+        || plan.run_manifest.target.path.as_str() != "metadata/run_manifest.json"
+        || plan.restore_manifest.target.path.as_str() != "metadata/restore_manifest.json"
+    {
+        return Err(ClientError::InvalidOptions(
+            "restore destination manifests require distinct destination-owned identities and canonical targets"
+                .to_owned(),
+        ));
+    }
+    validate_manifest_publication(&plan.run_manifest, None)?;
+    validate_manifest_publication(
+        &plan.restore_manifest,
+        Some(&exact_request.restore_manifest),
+    )?;
+    Ok(())
+}
+
+fn validate_manifest_publication(
+    publication: &RestoreManifestPublication,
+    descriptor: Option<&RestoreManifestDescriptor>,
+) -> Result<(), ClientError> {
+    if publication.content_type.as_str() != "application/json" || publication.bytes.is_empty() {
+        return Err(ClientError::InvalidOptions(
+            "restore-owned manifests must be non-empty canonical JSON".to_owned(),
+        ));
+    }
+    let logical_size = u64::try_from(publication.bytes.len()).unwrap_or(u64::MAX);
+    let digest: [u8; 32] = Sha256::digest(&publication.bytes).into();
+    let body_digest = sha256_digest_uri(Digest(digest));
+    if descriptor.is_some_and(|descriptor| {
+        descriptor.logical_size != logical_size
+            || descriptor.body_digest != body_digest
+            || descriptor.content_type != publication.content_type
+    }) {
+        return Err(ClientError::InvalidOptions(
+            "restore manifest bytes do not match the durable prepare descriptor".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exact_destination_binding(
+    actual: &RestoreDestinationBinding,
+    expected: &BindRestoreDestinationRequest,
+) -> Result<(), ClientError> {
+    if actual.destination_commit_id != expected.destination_commit_id
+        || actual.effective_content_digest != expected.effective_content_digest
+        || actual.destination_run_manifest_projection_input_digest
+            != expected.destination_run_manifest_projection_input_digest
+        || actual.destination_run_manifest_identity != expected.destination_run_manifest_identity
+        || actual.destination_restore_manifest_identity
+            != expected.destination_restore_manifest_identity
+    {
+        return Err(ClientError::ResponseMismatch(
+            "durable restore destination binding differs from the exact late-bind intent"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -1130,8 +1579,8 @@ fn validate_restore_result(
     options: &RestoreWorkflowOptions,
 ) -> Result<(), ClientError> {
     validate_restore_destination(result, exact_request, options)?;
-    if result.member_count != preparation.member_count
-        || result.member_digest != preparation.member_digest
+    if result.member_count != preparation.materialized_member_count
+        || result.member_digest != preparation.materialized_member_digest
     {
         return Err(ClientError::ResponseMismatch(
             "finalized restore does not match its sealed preparation".to_owned(),
@@ -1149,6 +1598,7 @@ fn validate_restore_destination(
         || result.destination.workbench != exact_request.destination_workbench
         || result.destination.workspace_incarnation_id
             != options.identities.destination_workspace_incarnation_id
+        || result.destination.commit_head_generation != Some(1)
     {
         return Err(ClientError::ResponseMismatch(
             "restore result does not match its requested destination".to_owned(),
@@ -1168,30 +1618,109 @@ fn validate_publication(
         || result.artifact_revision_id != revision_id
     {
         return Err(ClientError::ResponseMismatch(
+            "manifest publication returned a different immutable identity".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_restore_publication(
+    result: &PublishResult,
+    expected: &RestoreManifestPublication,
+) -> Result<(), ClientError> {
+    let digest: [u8; 32] = Sha256::digest(&expected.bytes).into();
+    if result.operation_id != expected.identity.publication_operation_id
+        || result.target != expected.target
+        || result.artifact_revision_id != expected.identity.artifact_revision_id
+        || result.logical_size != u64::try_from(expected.bytes.len()).unwrap_or(u64::MAX)
+        || result.body_digest != sha256_digest_uri(Digest(digest))
+    {
+        return Err(ClientError::ResponseMismatch(
             "staged manifest publication returned a different immutable identity".to_owned(),
         ));
     }
     Ok(())
 }
 
-fn validate_live_manifest(
-    manifest: &ArtifactReadOutcome,
-    target: &WorkspacePath,
-    revision_id: ArtifactRevisionIdentity,
-    workspace_incarnation_id: WorkspaceIdentity,
-    content_type: &ContentType,
-    expected_bytes: &[u8],
-) -> Result<(), ClientError> {
-    if &manifest.metadata.path != target
-        || manifest.metadata.workspace_incarnation_id != workspace_incarnation_id
-        || manifest.metadata.artifact_revision_id != revision_id
-        || &manifest.metadata.descriptor.content_type != content_type
-        || manifest.metadata.descriptor.logical_size
-            != u64::try_from(expected_bytes.len()).unwrap_or(u64::MAX)
-        || manifest.bytes != expected_bytes
+fn terminal_destination_manifests(
+    durable: &RestoreOperationPreparation,
+    result: &RestoreResult,
+    exact_request: &PrepareRestoreRequest,
+    operation_id: OperationIdentity,
+) -> Result<RestoreDestinationManifestBindings, ClientError> {
+    let binding = durable.destination_binding.as_deref().ok_or_else(|| {
+        ClientError::ResponseMismatch(
+            "terminal restore omitted its destination commit binding".to_owned(),
+        )
+    })?;
+    let manifests = binding.destination_manifests.as_ref().ok_or_else(|| {
+        ClientError::ResponseMismatch(
+            "terminal restore omitted its two destination manifest bindings".to_owned(),
+        )
+    })?;
+    if result.destination.commit_head != Some(binding.destination_commit_id)
+        || binding.destination_restore_manifest_identity
+            != exact_request.destination_restore_manifest_identity
+        || manifests.run_manifest.publication_operation_id
+            != binding
+                .destination_run_manifest_identity
+                .publication_operation_id
+        || manifests.run_manifest.artifact_revision_id
+            != binding
+                .destination_run_manifest_identity
+                .artifact_revision_id
+        || manifests.restore_manifest.publication_operation_id
+            != binding
+                .destination_restore_manifest_identity
+                .publication_operation_id
+        || manifests.restore_manifest.artifact_revision_id
+            != binding
+                .destination_restore_manifest_identity
+                .artifact_revision_id
+        || manifests.run_manifest.workspace_incarnation_id
+            != exact_request.destination_workspace_incarnation_id
+        || manifests.restore_manifest.workspace_incarnation_id
+            != exact_request.destination_workspace_incarnation_id
+        || manifests.restore_manifest.descriptor.body_digest
+            != exact_request.restore_manifest.body_digest
+        || manifests.restore_manifest.descriptor.logical_size
+            != exact_request.restore_manifest.logical_size
+        || manifests.restore_manifest.descriptor.content_type
+            != exact_request.restore_manifest.content_type
+        || binding
+            .destination_run_manifest_identity
+            .publication_operation_id
+            == operation_id
+        || binding
+            .destination_restore_manifest_identity
+            .publication_operation_id
+            == operation_id
     {
         return Err(ClientError::ResponseMismatch(
-            "live workflow manifest does not match its exact staged projection".to_owned(),
+            "terminal restore receipt and destination manifest bindings disagree".to_owned(),
+        ));
+    }
+    Ok(manifests.clone())
+}
+
+fn validate_restore_manifest_binding_matches_plan(
+    manifests: &RestoreDestinationManifestBindings,
+    plan: &RestoreDestinationPlan,
+) -> Result<(), ClientError> {
+    let run_digest: [u8; 32] = Sha256::digest(&plan.run_manifest.bytes).into();
+    let restore_digest: [u8; 32] = Sha256::digest(&plan.restore_manifest.bytes).into();
+    if manifests.run_manifest.descriptor.body_digest != sha256_digest_uri(Digest(run_digest))
+        || manifests.run_manifest.descriptor.logical_size
+            != u64::try_from(plan.run_manifest.bytes.len()).unwrap_or(u64::MAX)
+        || manifests.run_manifest.descriptor.content_type != plan.run_manifest.content_type
+        || manifests.restore_manifest.descriptor.body_digest
+            != sha256_digest_uri(Digest(restore_digest))
+        || manifests.restore_manifest.descriptor.logical_size
+            != u64::try_from(plan.restore_manifest.bytes.len()).unwrap_or(u64::MAX)
+        || manifests.restore_manifest.descriptor.content_type != plan.restore_manifest.content_type
+    {
+        return Err(ClientError::ResponseMismatch(
+            "terminal restore manifest descriptors differ from the exact published plan".to_owned(),
         ));
     }
     Ok(())
@@ -1273,8 +1802,8 @@ mod tests {
     use nokv_object::ArtifactReadStats;
     use nokv_protocol::{
         ArtifactDescriptor, ConflictKind, DigestUri, OperationProgress, OperationToken,
-        RelativePath, RestoreManifestDescriptor, RestoreSource, RpcFailure, SnapshotSelector,
-        WorkspaceSummary,
+        PathMetadata, RelativePath, RestoreManifestDescriptor, RestoreSource, RpcFailure,
+        SnapshotSelector, WorkspaceSummary,
     };
 
     use super::*;
@@ -1284,11 +1813,15 @@ mod tests {
         get_operations: VecDeque<Result<ClientCall<OperationStatus>, ClientError>>,
         commits: VecDeque<Result<ClientCall<OperationStatus>, ClientError>>,
         preparations: VecDeque<Result<ClientCall<RestorePreparation>, ClientError>>,
+        bindings: VecDeque<Result<ClientCall<RestorePreparation>, ClientError>>,
+        source_manifests: VecDeque<Result<ArtifactReadOutcome, ClientError>>,
         finalizations: VecDeque<Result<ClientCall<RestoreResult>, ClientError>>,
         commit_requests: Vec<CommitRequest>,
         prepare_requests: Vec<PrepareRestoreRequest>,
+        bind_requests: Vec<BindRestoreDestinationRequest>,
         finalize_requests: Vec<OperationIdentity>,
         publications: Vec<(ArtifactPublishOptions, Vec<u8>)>,
+        publication_replays: VecDeque<bool>,
         manifest: Option<ArtifactReadOutcome>,
         manifest_workspace_incarnation_id: Option<WorkspaceIdentity>,
         manifest_reads: usize,
@@ -1359,18 +1892,20 @@ mod tests {
                 bytes: bytes.to_vec(),
                 stats: ArtifactReadStats::default(),
             });
-            Ok(call(result, false))
+            let replayed = state.publication_replays.pop_front().unwrap_or(false);
+            Ok(call(result, replayed))
         }
 
-        fn read_manifest(&self, target: WorkspacePath) -> Result<ArtifactReadOutcome, ClientError> {
+        fn read_restore_source_run_manifest(
+            &self,
+            _operation_id: OperationIdentity,
+        ) -> Result<ArtifactReadOutcome, ClientError> {
             let mut state = self.state();
             state.manifest_reads += 1;
-            let manifest = state
-                .manifest
-                .clone()
-                .expect("test must publish or preload the manifest");
-            assert_eq!(manifest.metadata.path, target);
-            Ok(manifest)
+            state
+                .source_manifests
+                .pop_front()
+                .expect("test must script every restore-held source manifest read")
         }
 
         fn prepare_restore(
@@ -1383,6 +1918,18 @@ mod tests {
                 .preparations
                 .pop_front()
                 .expect("test must script every restore preparation")
+        }
+
+        fn bind_restore_destination(
+            &self,
+            request: BindRestoreDestinationRequest,
+        ) -> Result<ClientCall<RestorePreparation>, ClientError> {
+            let mut state = self.state();
+            state.bind_requests.push(request);
+            state
+                .bindings
+                .pop_front()
+                .expect("test must script every restore destination bind")
         }
 
         fn finalize_restore(
@@ -1572,7 +2119,12 @@ mod tests {
         }
     }
 
-    fn restore_fixture() -> (RestoreWorkflowOptions, RestorePreparation, RestoreResult) {
+    fn restore_fixture() -> (
+        RestoreWorkflowOptions,
+        RestorePreparation,
+        RestoreDestinationPlan,
+        RestoreResult,
+    ) {
         let root = RootIdentity([1; 16]);
         let source_incarnation = WorkspaceIdentity([2; 16]);
         let source_workbench = WorkbenchName::new("source-run").unwrap();
@@ -1584,31 +2136,79 @@ mod tests {
             7,
             &destination,
         );
-        let manifest_bytes = br#"{"restore":true}"#.to_vec();
-        let body_digest = digest_uri(&manifest_bytes);
-        let manifest_identities = identities.manifest_identities(root, body_digest.as_str());
+        let restore_bytes = br#"{"restore":true}"#.to_vec();
+        let body_digest = digest_uri(&restore_bytes);
+        let restore_identities = identities.manifest_identities(root, body_digest.as_str());
+        let restore_identity = RestoreManifestIdentity {
+            publication_operation_id: restore_identities.publish_operation_id,
+            artifact_revision_id: restore_identities.revision_id,
+        };
         let prepare_request = PrepareRestoreRequest {
+            operation_id: identities.operation_id,
             source_workbench,
             source_workspace_incarnation_id: source_incarnation,
             source: RestoreSource::Snapshot(SnapshotSelector::Id(7)),
             destination_workbench: destination.clone(),
             destination_workspace_incarnation_id: identities.destination_workspace_incarnation_id,
+            destination_restore_manifest_identity: restore_identity,
             restore_manifest: RestoreManifestDescriptor {
                 body_digest,
-                logical_size: manifest_bytes.len() as u64,
+                logical_size: restore_bytes.len() as u64,
                 content_type: ContentType::new("application/json").unwrap(),
             },
         };
-        let target = WorkspacePath {
-            workbench: destination.clone(),
-            path: RelativePath::new("metadata/restore_manifest.json").unwrap(),
+        let source_commit = nokv_protocol::RestoreSourceCommitBinding {
+            commit_id: CommitIdentity([0x30; 32]),
+            content_digest: DigestUri::new(format!("sha256:{}", "31".repeat(32))).unwrap(),
+            manifest_digest: DigestUri::new(format!("sha256:{}", "32".repeat(32))).unwrap(),
+            tree_manifest_revision_id: ArtifactRevisionIdentity([0x33; 16]),
+            member_count: 5,
+            member_digest: Digest([9; 32]),
         };
         let preparation = RestorePreparation {
             operation_id: identities.operation_id,
             destination_workbench: destination.clone(),
             destination_workspace_incarnation_id: identities.destination_workspace_incarnation_id,
-            member_count: 5,
-            member_digest: Digest([9; 32]),
+            source_commit: source_commit.clone(),
+            destination_committed_at_unix_seconds: 1_700_000_456,
+            source_member_count: 5,
+            source_member_digest: Digest([9; 32]),
+            materialized_member_count: 4,
+            materialized_member_digest: Digest([0x0b; 32]),
+            source_matches_base_commit: true,
+            destination_binding: None,
+        };
+        let run_identity = RestoreManifestIdentity {
+            publication_operation_id: OperationIdentity([0x42; 16]),
+            artifact_revision_id: ArtifactRevisionIdentity([0x43; 16]),
+        };
+        let plan = RestoreDestinationPlan {
+            binding: BindRestoreDestinationRequest {
+                operation_id: identities.operation_id,
+                destination_commit_id: CommitIdentity([0x40; 32]),
+                effective_content_digest: source_commit.content_digest.clone(),
+                destination_run_manifest_projection_input_digest: Digest([0x41; 32]),
+                destination_run_manifest_identity: run_identity,
+                destination_restore_manifest_identity: restore_identity,
+            },
+            run_manifest: RestoreManifestPublication {
+                identity: run_identity,
+                target: WorkspacePath {
+                    workbench: destination.clone(),
+                    path: RelativePath::new("metadata/run_manifest.json").unwrap(),
+                },
+                content_type: ContentType::new("application/json").unwrap(),
+                bytes: br#"{"run":"destination"}"#.to_vec(),
+            },
+            restore_manifest: RestoreManifestPublication {
+                identity: restore_identity,
+                target: WorkspacePath {
+                    workbench: destination.clone(),
+                    path: RelativePath::new("metadata/restore_manifest.json").unwrap(),
+                },
+                content_type: ContentType::new("application/json").unwrap(),
+                bytes: restore_bytes,
+            },
         };
         let result = RestoreResult {
             operation_id: identities.operation_id,
@@ -1616,23 +2216,21 @@ mod tests {
                 workbench: destination,
                 workspace_incarnation_id: identities.destination_workspace_incarnation_id,
                 workspace_revision: 1,
-                commit_head: None,
-                commit_head_generation: None,
+                commit_head: Some(plan.binding.destination_commit_id),
+                commit_head_generation: Some(1),
             },
-            member_count: preparation.member_count,
-            member_digest: preparation.member_digest,
-            metadata_rows_copied: 5,
+            member_count: preparation.materialized_member_count,
+            member_digest: preparation.materialized_member_digest,
+            metadata_rows_copied: preparation.materialized_member_count,
             object_bytes_copied: 0,
         };
         (
             RestoreWorkflowOptions {
                 identities,
-                manifest_identities,
                 request: RestoreWorkflowRequest::Fresh(prepare_request),
-                manifest_target: target,
-                manifest_bytes,
             },
             preparation,
+            plan,
             result,
         )
     }
@@ -1644,21 +2242,111 @@ mod tests {
         }
     }
 
+    fn source_run_manifest(
+        options: &RestoreWorkflowOptions,
+        preparation: &RestorePreparation,
+    ) -> ArtifactReadOutcome {
+        let request = restore_request(options);
+        let bytes = br#"{"source":"run"}"#.to_vec();
+        ArtifactReadOutcome {
+            metadata: manifest_metadata(
+                WorkspacePath {
+                    workbench: request.source_workbench,
+                    path: RelativePath::new("metadata/run_manifest.json").unwrap(),
+                },
+                preparation.source_commit.tree_manifest_revision_id,
+                request.source_workspace_incarnation_id,
+                ContentType::new("application/json").unwrap(),
+                &bytes,
+            ),
+            bytes,
+            stats: ArtifactReadStats::default(),
+        }
+    }
+
+    fn destination_manifest_binding(
+        publication: &RestoreManifestPublication,
+        workspace_incarnation_id: WorkspaceIdentity,
+    ) -> nokv_protocol::RestoreManifestBinding {
+        nokv_protocol::RestoreManifestBinding {
+            publication_operation_id: publication.identity.publication_operation_id,
+            workspace_incarnation_id,
+            artifact_revision_id: publication.identity.artifact_revision_id,
+            descriptor: ArtifactDescriptor {
+                logical_size: publication.bytes.len() as u64,
+                body_digest: digest_uri(&publication.bytes),
+                manifest_digest: digest_uri(b"restore-owned-manifest-plan"),
+                content_type: publication.content_type.clone(),
+                producer: None,
+                manifest_identity: None,
+                index_fields: Vec::new(),
+            },
+        }
+    }
+
+    fn response_binding(
+        options: &RestoreWorkflowOptions,
+        plan: &RestoreDestinationPlan,
+        terminal: bool,
+    ) -> RestoreDestinationBinding {
+        RestoreDestinationBinding {
+            destination_commit_id: plan.binding.destination_commit_id,
+            effective_content_digest: plan.binding.effective_content_digest.clone(),
+            destination_run_manifest_projection_input_digest: plan
+                .binding
+                .destination_run_manifest_projection_input_digest,
+            destination_run_manifest_identity: plan.binding.destination_run_manifest_identity,
+            destination_restore_manifest_identity: plan
+                .binding
+                .destination_restore_manifest_identity,
+            destination_manifests: terminal.then(|| RestoreDestinationManifestBindings {
+                run_manifest: destination_manifest_binding(
+                    &plan.run_manifest,
+                    options.identities.destination_workspace_incarnation_id,
+                ),
+                restore_manifest: destination_manifest_binding(
+                    &plan.restore_manifest,
+                    options.identities.destination_workspace_incarnation_id,
+                ),
+            }),
+        }
+    }
+
+    fn bound_preparation(
+        options: &RestoreWorkflowOptions,
+        preparation: &RestorePreparation,
+        plan: &RestoreDestinationPlan,
+        terminal: bool,
+    ) -> RestorePreparation {
+        let mut bound = preparation.clone();
+        bound.destination_binding = Some(Box::new(response_binding(options, plan, terminal)));
+        bound
+    }
+
     fn restore_operation_preparation(
         options: &RestoreWorkflowOptions,
         preparation: &RestorePreparation,
+        binding: Option<RestoreDestinationBinding>,
     ) -> RestoreOperationPreparation {
         RestoreOperationPreparation {
             request: restore_request(options),
             source_snapshot_read_version: Some(17),
-            sealed_member_count: Some(preparation.member_count),
-            sealed_member_digest: Some(preparation.member_digest),
+            source_commit: preparation.source_commit.clone(),
+            destination_committed_at_unix_seconds: preparation
+                .destination_committed_at_unix_seconds,
+            source_member_count: Some(preparation.source_member_count),
+            source_member_digest: Some(preparation.source_member_digest),
+            materialized_member_count: Some(preparation.materialized_member_count),
+            materialized_member_digest: Some(preparation.materialized_member_digest),
+            source_matches_base_commit: Some(preparation.source_matches_base_commit),
+            destination_binding: binding.map(Box::new),
         }
     }
 
     fn restore_status(
         options: &RestoreWorkflowOptions,
         preparation: &RestorePreparation,
+        plan: &RestoreDestinationPlan,
         result: RestoreResult,
     ) -> OperationStatus {
         OperationStatus {
@@ -1671,6 +2359,7 @@ mod tests {
             restore_preparation: Some(Box::new(restore_operation_preparation(
                 options,
                 preparation,
+                Some(response_binding(options, plan, true)),
             ))),
             state: OperationState::Succeeded,
             progress: progress(),
@@ -1682,6 +2371,7 @@ mod tests {
     fn running_restore_status(
         options: &RestoreWorkflowOptions,
         preparation: &RestorePreparation,
+        binding: Option<RestoreDestinationBinding>,
     ) -> OperationStatus {
         OperationStatus {
             token: OperationToken {
@@ -1693,6 +2383,7 @@ mod tests {
             restore_preparation: Some(Box::new(restore_operation_preparation(
                 options,
                 preparation,
+                binding,
             ))),
             state: OperationState::Running,
             progress: progress(),
@@ -1726,6 +2417,52 @@ mod tests {
                 index_fields: Vec::new(),
             },
         }
+    }
+
+    fn script_fresh_restore_success(
+        io: &FakeWorkflowIo,
+        options: &RestoreWorkflowOptions,
+        preparation: &RestorePreparation,
+        plan: &RestoreDestinationPlan,
+        result: &RestoreResult,
+        publication_replays: impl IntoIterator<Item = bool>,
+    ) {
+        let mut state = io.state();
+        state
+            .get_operations
+            .push_back(Err(rpc_error(ErrorCode::NotFound)));
+        state
+            .preparations
+            .push_back(Ok(call(preparation.clone(), false)));
+        state.get_operations.push_back(Ok(call(
+            running_restore_status(options, preparation, None),
+            false,
+        )));
+        state
+            .source_manifests
+            .push_back(Ok(source_run_manifest(options, preparation)));
+        state.bindings.push_back(Ok(call(
+            bound_preparation(options, preparation, plan, false),
+            false,
+        )));
+        state.get_operations.push_back(Ok(call(
+            running_restore_status(
+                options,
+                preparation,
+                Some(response_binding(options, plan, false)),
+            ),
+            false,
+        )));
+        state
+            .finalizations
+            .push_back(Ok(call(result.clone(), false)));
+        state.get_operations.push_back(Ok(call(
+            restore_status(options, preparation, plan, result.clone()),
+            false,
+        )));
+        state.publication_replays.extend(publication_replays);
+        state.manifest_workspace_incarnation_id =
+            Some(options.identities.destination_workspace_incarnation_id);
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -2202,7 +2939,7 @@ mod tests {
 
     #[test]
     fn restore_workflow_owns_prepare_staging_finalize_and_result_validation() {
-        let (options, preparation, result) = restore_fixture();
+        let (options, preparation, plan, result) = restore_fixture();
         let io = FakeWorkflowIo::default();
         {
             let mut state = io.state();
@@ -2213,16 +2950,41 @@ mod tests {
                 .preparations
                 .push_back(Ok(call(preparation.clone(), false)));
             state.get_operations.push_back(Ok(call(
-                running_restore_status(&options, &preparation),
+                running_restore_status(&options, &preparation, None),
+                false,
+            )));
+            state
+                .source_manifests
+                .push_back(Ok(source_run_manifest(&options, &preparation)));
+            state.bindings.push_back(Ok(call(
+                bound_preparation(&options, &preparation, &plan, false),
+                false,
+            )));
+            state.get_operations.push_back(Ok(call(
+                running_restore_status(
+                    &options,
+                    &preparation,
+                    Some(response_binding(&options, &plan, false)),
+                ),
                 false,
             )));
             state
                 .finalizations
                 .push_back(Ok(call(result.clone(), false)));
+            state.get_operations.push_back(Ok(call(
+                restore_status(&options, &preparation, &plan, result.clone()),
+                false,
+            )));
             state.manifest_workspace_incarnation_id =
                 Some(options.identities.destination_workspace_incarnation_id);
         }
-        let outcome = drive_restore_workflow(&io, options.clone()).unwrap();
+        let expected_plan = plan.clone();
+        let outcome = drive_restore_workflow(&io, options.clone(), move |actual, bytes| {
+            assert_eq!(actual, &preparation);
+            assert_eq!(bytes, br#"{"source":"run"}"#);
+            Ok(expected_plan)
+        })
+        .unwrap();
         assert_eq!(outcome.result, result);
         assert!(!outcome.replayed);
         let state = io.state();
@@ -2231,7 +2993,8 @@ mod tests {
             state.finalize_requests,
             vec![options.identities.operation_id]
         );
-        assert_eq!(state.publications.len(), 1);
+        assert_eq!(state.bind_requests, vec![plan.binding]);
+        assert_eq!(state.publications.len(), 2);
         assert_eq!(
             state.publications[0].0.authority,
             PublicationAuthority::RestoreStaging {
@@ -2242,52 +3005,365 @@ mod tests {
     }
 
     #[test]
-    fn terminal_restore_replay_validates_manifest_without_restarting_phases() {
-        let (options, preparation, result) = restore_fixture();
+    fn run_only_restore_only_and_both_published_recover_with_exact_identities() {
+        for publication_replays in [[true, false], [false, true], [true, true]] {
+            let (options, preparation, plan, result) = restore_fixture();
+            let io = FakeWorkflowIo::default();
+            script_fresh_restore_success(
+                &io,
+                &options,
+                &preparation,
+                &plan,
+                &result,
+                publication_replays,
+            );
+
+            let expected = plan.clone();
+            let outcome =
+                drive_restore_workflow(&io, options.clone(), move |_, _| Ok(expected)).unwrap();
+            assert!(outcome.replayed);
+            let state = io.state();
+            assert_eq!(state.bind_requests, vec![plan.binding.clone()]);
+            assert_eq!(state.publications.len(), 2);
+            assert_eq!(
+                state.publications[0].0.operation_id,
+                plan.run_manifest.identity.publication_operation_id
+            );
+            assert_eq!(
+                state.publications[0].0.artifact_revision_id,
+                plan.run_manifest.identity.artifact_revision_id
+            );
+            assert_eq!(
+                state.publications[1].0.operation_id,
+                plan.restore_manifest.identity.publication_operation_id
+            );
+            assert_eq!(
+                state.publications[1].0.artifact_revision_id,
+                plan.restore_manifest.identity.artifact_revision_id
+            );
+        }
+    }
+
+    #[test]
+    fn dirty_snapshot_restore_exact_binds_a_distinct_effective_digest() {
+        let (options, mut preparation, mut plan, result) = restore_fixture();
+        preparation.source_member_digest = Digest([0xa1; 32]);
+        preparation.source_matches_base_commit = false;
+        plan.binding.effective_content_digest =
+            DigestUri::new(format!("sha256:{}", "a2".repeat(32))).unwrap();
+        let io = FakeWorkflowIo::default();
+        script_fresh_restore_success(&io, &options, &preparation, &plan, &result, [false, false]);
+
+        let expected = plan.clone();
+        let outcome = drive_restore_workflow(&io, options, move |actual, _| {
+            assert!(!actual.source_matches_base_commit);
+            assert_ne!(
+                expected.binding.effective_content_digest,
+                actual.source_commit.content_digest
+            );
+            Ok(expected)
+        })
+        .unwrap();
+        assert_eq!(outcome.result, result);
+        assert_eq!(io.state().bind_requests, vec![plan.binding]);
+    }
+
+    #[test]
+    fn pre_bind_recovery_reconstructs_plan_from_durable_source_hold() {
+        let (mut options, preparation, plan, result) = restore_fixture();
+        let exact = restore_request(&options);
+        options.request = RestoreWorkflowRequest::Recover(RestoreRecoveryRequest {
+            source_workbench: exact.source_workbench.clone(),
+            source: exact.source.clone(),
+            destination_workbench: exact.destination_workbench.clone(),
+            destination_workspace_incarnation_id: exact.destination_workspace_incarnation_id,
+            destination_restore_manifest_identity: exact.destination_restore_manifest_identity,
+            restore_manifest: exact.restore_manifest.clone(),
+        });
         let io = FakeWorkflowIo::default();
         {
             let mut state = io.state();
+            let unbound = running_restore_status(
+                &RestoreWorkflowOptions {
+                    identities: options.identities,
+                    request: RestoreWorkflowRequest::Fresh(exact.clone()),
+                },
+                &preparation,
+                None,
+            );
+            state
+                .get_operations
+                .push_back(Ok(call(unbound.clone(), false)));
+            state
+                .preparations
+                .push_back(Ok(call(preparation.clone(), true)));
+            state.get_operations.push_back(Ok(call(unbound, false)));
+            state.source_manifests.push_back(Ok(source_run_manifest(
+                &RestoreWorkflowOptions {
+                    identities: options.identities,
+                    request: RestoreWorkflowRequest::Fresh(exact.clone()),
+                },
+                &preparation,
+            )));
+            state.bindings.push_back(Ok(call(
+                bound_preparation(&options, &preparation, &plan, false),
+                true,
+            )));
+            let fresh_options = RestoreWorkflowOptions {
+                identities: options.identities,
+                request: RestoreWorkflowRequest::Fresh(exact.clone()),
+            };
+            state.get_operations.push_back(Ok(call(
+                running_restore_status(
+                    &fresh_options,
+                    &preparation,
+                    Some(response_binding(&options, &plan, false)),
+                ),
+                false,
+            )));
+            state
+                .finalizations
+                .push_back(Ok(call(result.clone(), false)));
+            state.get_operations.push_back(Ok(call(
+                restore_status(&fresh_options, &preparation, &plan, result.clone()),
+                false,
+            )));
+            state.manifest_workspace_incarnation_id =
+                Some(options.identities.destination_workspace_incarnation_id);
+        }
+
+        let expected = plan.clone();
+        let outcome = drive_restore_workflow(&io, options, move |actual, bytes| {
+            assert_eq!(actual.destination_committed_at_unix_seconds, 1_700_000_456);
+            assert_eq!(bytes, br#"{"source":"run"}"#);
+            Ok(expected)
+        })
+        .unwrap();
+        assert_eq!(outcome.result, result);
+        assert_eq!(io.state().bind_requests, vec![plan.binding]);
+    }
+
+    #[test]
+    fn existing_destination_bind_mismatch_stops_before_bind_or_publication() {
+        let (options, preparation, plan, _) = restore_fixture();
+        let mut conflicting = response_binding(&options, &plan, false);
+        conflicting.destination_commit_id = CommitIdentity([0xee; 32]);
+        let io = FakeWorkflowIo::default();
+        {
+            let mut state = io.state();
+            state.get_operations.push_back(Ok(call(
+                running_restore_status(&options, &preparation, Some(conflicting.clone())),
+                false,
+            )));
             state
                 .preparations
                 .push_back(Ok(call(preparation.clone(), true)));
             state.get_operations.push_back(Ok(call(
-                restore_status(&options, &preparation, result.clone()),
+                running_restore_status(&options, &preparation, Some(conflicting)),
                 false,
             )));
-            state.get_operations.push_back(Ok(call(
-                restore_status(&options, &preparation, result.clone()),
-                false,
-            )));
-            state.manifest = Some(ArtifactReadOutcome {
-                metadata: manifest_metadata(
-                    options.manifest_target.clone(),
-                    options.manifest_identities.revision_id,
-                    options.identities.destination_workspace_incarnation_id,
-                    restore_request(&options).restore_manifest.content_type,
-                    &options.manifest_bytes,
-                ),
-                bytes: options.manifest_bytes.clone(),
-                stats: ArtifactReadStats::default(),
-            });
+            state
+                .source_manifests
+                .push_back(Ok(source_run_manifest(&options, &preparation)));
         }
-        let outcome = drive_restore_workflow(&io, options.clone()).unwrap();
+        let expected = plan.clone();
+        assert!(matches!(
+            drive_restore_workflow(&io, options, move |_, _| Ok(expected)),
+            Err(RestoreWorkflowError::Validation(
+                ClientError::ResponseMismatch(_)
+            ))
+        ));
+        let state = io.state();
+        assert!(state.bind_requests.is_empty());
+        assert!(state.publications.is_empty());
+    }
+
+    #[test]
+    fn manifest_or_projection_failure_writes_no_bind_or_object() {
+        for callback_error in [false, true] {
+            let (options, preparation, mut plan, _) = restore_fixture();
+            let io = FakeWorkflowIo::default();
+            {
+                let mut state = io.state();
+                state
+                    .get_operations
+                    .push_back(Err(rpc_error(ErrorCode::NotFound)));
+                state
+                    .preparations
+                    .push_back(Ok(call(preparation.clone(), false)));
+                state.get_operations.push_back(Ok(call(
+                    running_restore_status(&options, &preparation, None),
+                    false,
+                )));
+                state
+                    .source_manifests
+                    .push_back(Ok(source_run_manifest(&options, &preparation)));
+            }
+            if !callback_error {
+                plan.restore_manifest.bytes.push(b' ');
+            }
+            let outcome = drive_restore_workflow(&io, options, move |_, _| {
+                if callback_error {
+                    Err(ClientError::InvalidOptions(
+                        "injected projection failure".to_owned(),
+                    ))
+                } else {
+                    Ok(plan)
+                }
+            });
+            assert!(matches!(outcome, Err(RestoreWorkflowError::Validation(_))));
+            let state = io.state();
+            assert!(state.bind_requests.is_empty());
+            assert!(state.publications.is_empty());
+        }
+    }
+
+    #[test]
+    fn terminal_restore_replay_uses_receipt_without_source_or_projection() {
+        let (options, preparation, plan, result) = restore_fixture();
+        let terminal = restore_status(&options, &preparation, &plan, result.clone());
+        let io = FakeWorkflowIo::default();
+        {
+            let mut state = io.state();
+            state.preparations.push_back(Ok(call(
+                bound_preparation(&options, &preparation, &plan, true),
+                true,
+            )));
+            state
+                .get_operations
+                .push_back(Ok(call(terminal.clone(), false)));
+            state.get_operations.push_back(Ok(call(terminal, false)));
+        }
+        let outcome = drive_restore_workflow(&io, options.clone(), |_, _| {
+            panic!("terminal replay must not rebuild a destination projection")
+        })
+        .unwrap();
         assert_eq!(outcome.result, result);
         assert!(outcome.replayed);
         let state = io.state();
         assert_eq!(state.prepare_requests, vec![restore_request(&options)]);
         assert!(state.finalize_requests.is_empty());
         assert!(state.publications.is_empty());
-        assert_eq!(state.manifest_reads, 1);
+        assert_eq!(state.manifest_reads, 0);
+    }
+
+    #[test]
+    fn concurrent_completion_before_source_manifest_read_converges_on_the_receipt() {
+        // Another exact caller completes the shared restore between this
+        // caller's Running status check and its source-manifest read. The
+        // engine rejects the read against the terminal row; the workflow must
+        // converge on the durable Succeeded receipt instead of failing.
+        let (options, preparation, plan, result) = restore_fixture();
+        let terminal = restore_status(&options, &preparation, &plan, result.clone());
+        let io = FakeWorkflowIo::default();
+        {
+            let mut state = io.state();
+            state
+                .get_operations
+                .push_back(Err(rpc_error(ErrorCode::NotFound)));
+            state
+                .preparations
+                .push_back(Ok(call(preparation.clone(), false)));
+            state.get_operations.push_back(Ok(call(
+                running_restore_status(&options, &preparation, None),
+                false,
+            )));
+            state
+                .source_manifests
+                .push_back(Err(rpc_error(ErrorCode::PreconditionFailed)));
+            state.get_operations.push_back(Ok(call(terminal, false)));
+        }
+        let outcome = drive_restore_workflow(&io, options.clone(), |_, _| {
+            panic!("a concurrently completed restore must not rebuild a projection")
+        })
+        .unwrap();
+        assert_eq!(outcome.result, result);
+        assert!(outcome.replayed);
+        let state = io.state();
+        assert!(state.bind_requests.is_empty());
+        assert!(state.finalize_requests.is_empty());
+        assert!(state.publications.is_empty());
+    }
+
+    #[test]
+    fn concurrent_completion_before_bind_converges_on_the_receipt() {
+        let (options, preparation, plan, result) = restore_fixture();
+        let terminal = restore_status(&options, &preparation, &plan, result.clone());
+        let io = FakeWorkflowIo::default();
+        {
+            let mut state = io.state();
+            state
+                .get_operations
+                .push_back(Err(rpc_error(ErrorCode::NotFound)));
+            state
+                .preparations
+                .push_back(Ok(call(preparation.clone(), false)));
+            state.get_operations.push_back(Ok(call(
+                running_restore_status(&options, &preparation, None),
+                false,
+            )));
+            state
+                .source_manifests
+                .push_back(Ok(source_run_manifest(&options, &preparation)));
+            state
+                .bindings
+                .push_back(Err(rpc_error(ErrorCode::PreconditionFailed)));
+            state.get_operations.push_back(Ok(call(terminal, false)));
+        }
+        let expected_plan = plan.clone();
+        let outcome =
+            drive_restore_workflow(&io, options.clone(), move |_, _| Ok(expected_plan)).unwrap();
+        assert_eq!(outcome.result, result);
+        assert!(outcome.replayed);
+        let state = io.state();
+        assert_eq!(state.bind_requests, vec![plan.binding]);
+        assert!(state.finalize_requests.is_empty());
+        assert!(state.publications.is_empty());
+    }
+
+    #[test]
+    fn step_failure_without_completion_keeps_the_original_error() {
+        let (options, preparation, _plan, _result) = restore_fixture();
+        let io = FakeWorkflowIo::default();
+        {
+            let mut state = io.state();
+            state
+                .get_operations
+                .push_back(Err(rpc_error(ErrorCode::NotFound)));
+            state
+                .preparations
+                .push_back(Ok(call(preparation.clone(), false)));
+            state.get_operations.push_back(Ok(call(
+                running_restore_status(&options, &preparation, None),
+                false,
+            )));
+            state
+                .source_manifests
+                .push_back(Err(rpc_error(ErrorCode::ObjectUnavailable)));
+            state.get_operations.push_back(Ok(call(
+                running_restore_status(&options, &preparation, None),
+                false,
+            )));
+        }
+        let error = drive_restore_workflow(&io, options, |_, _| {
+            panic!("a failed source-manifest read must not build a projection")
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            RestoreWorkflowError::ReadSourceManifest(ref inner)
+                if inner.rpc_code() == Some(ErrorCode::ObjectUnavailable)
+        ));
     }
 
     #[test]
     fn terminal_restore_initialization_mismatch_stops_after_lookup_authentication() {
-        let (options, preparation, result) = restore_fixture();
+        let (options, preparation, plan, result) = restore_fixture();
         let io = FakeWorkflowIo::default();
         {
             let mut state = io.state();
             state.get_operations.push_back(Ok(call(
-                restore_status(&options, &preparation, result),
+                restore_status(&options, &preparation, &plan, result),
                 false,
             )));
             state
@@ -2295,7 +3371,10 @@ mod tests {
                 .push_back(Err(rpc_error(ErrorCode::RequestReplayMismatch)));
         }
 
-        let error = drive_restore_workflow(&io, options.clone()).unwrap_err();
+        let error = drive_restore_workflow(&io, options.clone(), |_, _| {
+            panic!("prepare mismatch must stop before projection")
+        })
+        .unwrap_err();
         assert_eq!(
             error.client_error().rpc_code(),
             Some(ErrorCode::RequestReplayMismatch)
@@ -2309,15 +3388,17 @@ mod tests {
 
     #[test]
     fn terminal_restore_recovery_reconstructs_the_exact_source_incarnation_from_status() {
-        let (mut options, preparation, result) = restore_fixture();
+        let (mut options, preparation, plan, result) = restore_fixture();
         let exact_request = restore_request(&options);
-        let terminal = restore_status(&options, &preparation, result.clone());
+        let terminal = restore_status(&options, &preparation, &plan, result.clone());
         options.request = RestoreWorkflowRequest::Recover(RestoreRecoveryRequest {
             source_workbench: exact_request.source_workbench.clone(),
             source: exact_request.source.clone(),
             destination_workbench: exact_request.destination_workbench.clone(),
             destination_workspace_incarnation_id: exact_request
                 .destination_workspace_incarnation_id,
+            destination_restore_manifest_identity: exact_request
+                .destination_restore_manifest_identity,
             restore_manifest: exact_request.restore_manifest.clone(),
         });
         let io = FakeWorkflowIo::default();
@@ -2326,22 +3407,17 @@ mod tests {
             state
                 .get_operations
                 .push_back(Ok(call(terminal.clone(), false)));
-            state.preparations.push_back(Ok(call(preparation, true)));
+            state.preparations.push_back(Ok(call(
+                bound_preparation(&options, &preparation, &plan, true),
+                true,
+            )));
             state.get_operations.push_back(Ok(call(terminal, false)));
-            state.manifest = Some(ArtifactReadOutcome {
-                metadata: manifest_metadata(
-                    options.manifest_target.clone(),
-                    options.manifest_identities.revision_id,
-                    options.identities.destination_workspace_incarnation_id,
-                    exact_request.restore_manifest.content_type.clone(),
-                    &options.manifest_bytes,
-                ),
-                bytes: options.manifest_bytes.clone(),
-                stats: ArtifactReadStats::default(),
-            });
         }
 
-        let outcome = drive_restore_workflow(&io, options).unwrap();
+        let outcome = drive_restore_workflow(&io, options, |_, _| {
+            panic!("terminal recovery must not read or rebuild the source projection")
+        })
+        .unwrap();
         assert_eq!(outcome.result, result);
         assert_eq!(outcome.source_snapshot_read_version, Some(17));
         let state = io.state();
@@ -2352,10 +3428,10 @@ mod tests {
 
     #[test]
     fn failed_and_quarantined_restore_statuses_are_identity_and_preparation_bound() {
-        let (options, preparation, _) = restore_fixture();
+        let (options, preparation, _, _) = restore_fixture();
         let mut cases = Vec::new();
 
-        let mut wrong_token = running_restore_status(&options, &preparation);
+        let mut wrong_token = running_restore_status(&options, &preparation, None);
         wrong_token.state = OperationState::Failed;
         wrong_token.token.operation_id = OperationIdentity([0xee; 16]);
         wrong_token.failure = Some(RpcFailure {
@@ -2368,7 +3444,7 @@ mod tests {
         });
         cases.push(wrong_token);
 
-        let mut wrong_kind = running_restore_status(&options, &preparation);
+        let mut wrong_kind = running_restore_status(&options, &preparation, None);
         wrong_kind.state = OperationState::Quarantined;
         wrong_kind.kind = OperationKind::Commit;
         wrong_kind.failure = Some(RpcFailure {
@@ -2381,7 +3457,7 @@ mod tests {
         });
         cases.push(wrong_kind);
 
-        let mut missing_preparation = running_restore_status(&options, &preparation);
+        let mut missing_preparation = running_restore_status(&options, &preparation, None);
         missing_preparation.state = OperationState::Failed;
         missing_preparation.restore_preparation = None;
         missing_preparation.failure = Some(RpcFailure {
@@ -2398,7 +3474,9 @@ mod tests {
             let io = FakeWorkflowIo::default();
             io.state().get_operations.push_back(Ok(call(status, false)));
             assert!(matches!(
-                drive_restore_workflow(&io, options.clone()),
+                drive_restore_workflow(&io, options.clone(), |_, _| {
+                    panic!("invalid terminal status must stop before projection")
+                }),
                 Err(RestoreWorkflowError::Validation(
                     ClientError::ResponseMismatch(_)
                 ))
@@ -2409,7 +3487,7 @@ mod tests {
 
     #[test]
     fn terminal_restore_exact_prepare_must_replay_the_same_durable_failure() {
-        let (options, preparation, _) = restore_fixture();
+        let (options, preparation, _, _) = restore_fixture();
         for (state_kind, code, message) in [
             (OperationState::Failed, ErrorCode::OperationFailed, "failed"),
             (
@@ -2426,7 +3504,7 @@ mod tests {
                 current_generation: None,
                 route_hint: None,
             };
-            let mut status = running_restore_status(&options, &preparation);
+            let mut status = running_restore_status(&options, &preparation, None);
             status.state = state_kind;
             status.failure = Some(failure.clone());
             let io = FakeWorkflowIo::default();
@@ -2437,7 +3515,10 @@ mod tests {
                     .preparations
                     .push_back(Err(ClientError::Rpc(failure.clone())));
             }
-            let error = drive_restore_workflow(&io, options.clone()).unwrap_err();
+            let error = drive_restore_workflow(&io, options.clone(), |_, _| {
+                panic!("durable failure must stop before projection")
+            })
+            .unwrap_err();
             assert!(matches!(
                 error,
                 RestoreWorkflowError::Prepare(ClientError::Rpc(actual)) if actual == failure
@@ -2453,7 +3534,7 @@ mod tests {
             current_generation: None,
             route_hint: None,
         };
-        let mut status = running_restore_status(&options, &preparation);
+        let mut status = running_restore_status(&options, &preparation, None);
         status.state = OperationState::Quarantined;
         status.failure = Some(expected);
         let io = FakeWorkflowIo::default();
@@ -2465,7 +3546,9 @@ mod tests {
                 .push_back(Err(rpc_error(ErrorCode::Quarantined)));
         }
         assert!(matches!(
-            drive_restore_workflow(&io, options),
+            drive_restore_workflow(&io, options, |_, _| {
+                panic!("durable failure must stop before projection")
+            }),
             Err(RestoreWorkflowError::Validation(
                 ClientError::ResponseMismatch(_)
             ))
@@ -2473,32 +3556,38 @@ mod tests {
     }
 
     #[test]
-    fn terminal_restore_rejects_a_live_manifest_from_another_incarnation() {
-        let (options, preparation, result) = restore_fixture();
-        let terminal = restore_status(&options, &preparation, result);
+    fn terminal_restore_rejects_manifest_binding_from_another_incarnation() {
+        let (options, preparation, plan, result) = restore_fixture();
+        let mut terminal = restore_status(&options, &preparation, &plan, result);
+        terminal
+            .restore_preparation
+            .as_deref_mut()
+            .unwrap()
+            .destination_binding
+            .as_deref_mut()
+            .unwrap()
+            .destination_manifests
+            .as_mut()
+            .unwrap()
+            .run_manifest
+            .workspace_incarnation_id = WorkspaceIdentity([0xff; 16]);
         let io = FakeWorkflowIo::default();
         {
             let mut state = io.state();
             state
                 .get_operations
                 .push_back(Ok(call(terminal.clone(), false)));
-            state.preparations.push_back(Ok(call(preparation, true)));
+            state.preparations.push_back(Ok(call(
+                bound_preparation(&options, &preparation, &plan, true),
+                true,
+            )));
             state.get_operations.push_back(Ok(call(terminal, false)));
-            state.manifest = Some(ArtifactReadOutcome {
-                metadata: manifest_metadata(
-                    options.manifest_target.clone(),
-                    options.manifest_identities.revision_id,
-                    WorkspaceIdentity([0xff; 16]),
-                    restore_request(&options).restore_manifest.content_type,
-                    &options.manifest_bytes,
-                ),
-                bytes: options.manifest_bytes.clone(),
-                stats: ArtifactReadStats::default(),
-            });
         }
 
         assert!(matches!(
-            drive_restore_workflow(&io, options),
+            drive_restore_workflow(&io, options, |_, _| {
+                panic!("terminal replay must not rebuild projection")
+            }),
             Err(RestoreWorkflowError::Validation(
                 ClientError::ResponseMismatch(_)
             ))

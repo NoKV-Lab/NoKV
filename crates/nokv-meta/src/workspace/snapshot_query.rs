@@ -274,13 +274,17 @@ fn decode_cursor(
 mod tests {
     use super::*;
     use nokv_types::{
-        CommandDigest, LogicalShardId, OwnerEpoch, PlacementGeneration, RequestId,
-        RootActivationState, WorkspaceIncarnationId, SHA256_BYTES,
+        ArtifactRevisionId, CommandDigest, CommitId, CommitState, ConsumerEpoch, Generation,
+        LogicalShardId, OwnerEpoch, PlacementGeneration, RequestId, RootActivationState,
+        WorkspaceIncarnationId, SHA256_BYTES,
     };
 
     use crate::workspace::{
-        create_visible_workspace, mint_snapshot, retire_snapshot, MetadataCommand,
-        RetireSnapshotRequest, RootFenceAction, RootWriteContext, SnapshotSelector, SCHEMA_ID,
+        commit_key, create_visible_workspace, mint_snapshot, retire_snapshot,
+        workbench_commit_head_key, workbench_head_commit_consumer_key, CommandMutation,
+        CommandPredicate, CommitConsumerRecord, CommitRecord, MetadataCommand,
+        RetireSnapshotRequest, RootFenceAction, RootWriteContext, SnapshotSelector,
+        WorkbenchCommitHeadRecord, SCHEMA_ID,
     };
 
     fn root() -> RootId {
@@ -363,6 +367,64 @@ mod tests {
         let incarnation = WorkspaceIncarnationId::from_bytes([4; FIXED_ID_BYTES]);
         create_visible_workspace(&store, write_context(&store, 3), &workbench, incarnation)
             .unwrap();
+        let commit_id = CommitId::from_bytes([5; SHA256_BYTES]);
+        let commit = CommitRecord {
+            source_workspace_incarnation_id: incarnation,
+            content_digest_uri: format!("sha256:{}", "11".repeat(32)),
+            manifest_digest_uri: format!("sha256:{}", "22".repeat(32)),
+            tree_manifest_revision_id: ArtifactRevisionId::from_bytes([6; FIXED_ID_BYTES]),
+            tree_digest_uri: format!("sha256:{}", "33".repeat(32)),
+            member_count: 0,
+            member_digest: [0; SHA256_BYTES],
+            unique_revision_count: 1,
+            revision_digest: [7; SHA256_BYTES],
+            parent_commits: Vec::new(),
+            parent_digest: [0; SHA256_BYTES],
+            generic_index_count: 0,
+            generic_index_digest: [0; SHA256_BYTES],
+            producer: Some("snapshot-query-test".to_owned()),
+            lineage_projection: Vec::new(),
+            consumer_count: 1,
+            consumer_epoch: ConsumerEpoch::new(1),
+            last_zero_consumer_version: None,
+            state: CommitState::Sealed,
+        };
+        let head = WorkbenchCommitHeadRecord {
+            commit_id,
+            head_generation: Generation::new(1).unwrap(),
+        };
+        let rows = vec![
+            (
+                MetadataFamily::Commit,
+                commit_key(root(), commit_id),
+                commit.encode().unwrap(),
+            ),
+            (
+                MetadataFamily::CommitConsumer,
+                workbench_head_commit_consumer_key(root(), commit_id, incarnation),
+                CommitConsumerRecord {
+                    consumer_epoch_at_add: ConsumerEpoch::new(1),
+                }
+                .encode(),
+            ),
+            (
+                MetadataFamily::WorkbenchCommitHead,
+                workbench_commit_head_key(root(), incarnation),
+                head.encode(),
+            ),
+        ];
+        let mut install = command(&store, request_id(103), RootFenceAction::RequireActive);
+        for (family, key, value) in rows {
+            install.predicates.push(CommandPredicate::Value {
+                family,
+                key: key.clone(),
+                expected: None,
+            });
+            install
+                .mutations
+                .push(CommandMutation::Put { family, key, value });
+        }
+        store.execute(&install.seal()).unwrap();
         (store, workbench, incarnation)
     }
 

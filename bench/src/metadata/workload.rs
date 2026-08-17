@@ -32,6 +32,7 @@ impl Harness {
                     path: RelativePath::new(path).map_err(|error| error.to_string())?,
                 },
                 view: WorkspaceReadView::Live,
+                expected_read_version: None,
                 range: None,
                 plan_page: None,
                 if_none_match: None,
@@ -61,6 +62,7 @@ impl Harness {
                 recursive,
                 view: WorkspaceReadView::Live,
                 expected_read_version,
+                workspace_continuation_fence: None,
                 page: PageRequest { cursor, limit },
             }),
         })

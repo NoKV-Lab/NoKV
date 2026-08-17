@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Transport-free 18-tool Workbench facade for NoKV Agent workspaces."
+description = "Transport-free Workbench and generic Agent tool facades for NoKV workspaces."
 
 [dependencies]
 base64.workspace = true

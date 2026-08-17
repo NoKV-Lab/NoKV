@@ -19,16 +19,15 @@ Every logical-shard store has one authoritative marker:
 System("schema")
   -> value_format_version = 1
      schema_id = "nokv_workspace"
-     format_version = 9
+     format_version = 10
 ```
 
 Startup is fail-closed:
 
 - an empty store is initialized with the exact supported marker and logical
   keyspace catalog;
-- a format-8 store first passes the complete shard, system-record, and recovery
-  chain validation, then atomically advances only its schema marker to version
-  9; existing recovery rows are not rewritten;
+- format-9 and older stores are rejected without writes; there is no marker-only
+  upgrade because format 10 adds authoritative Generic index families;
 - a nonempty current store opens only when its marker, value format, and
   configured adapter catalog match this contract;
 - a missing, malformed, unknown-version, or inconsistent store is rejected.
@@ -51,6 +50,7 @@ ArtifactRevisionId      16 bytes, unique within one RootId
 SnapshotId               8 bytes, unsigned big-endian and unique within one RootId;
                                   exactly the numeric Workbench facade id
 OperationId             16 bytes, unique within one RootId
+GenericIndexGenerationId 16 bytes, never reused within one RootId
 CommitId                32 bytes, root-global SHA-256 identity
 ```
 
@@ -84,7 +84,7 @@ exact key is a strict prefix of another valid path key. A child/subtree prefix
 appends NUL, so `a` cannot match `ab`. The empty path has no `PathCurrent`
 record; the workspace root is synthesized from `WorkspaceCurrent`. This path
 key layout was introduced by system format version 8 and is retained by
-version 9.
+version 10.
 
 The one shared normalizer enforces:
 
@@ -105,33 +105,42 @@ float, timestamp, bytes, and string values.
 
 ## Durable Format Registry
 
-`System.format_version` is `9`. Version 9 writes RecoveryOutbox LSNs as
+`System.format_version` is `10`. Version 10 retains the format-9 RecoveryOutbox
+LSN encoding as
 canonical fixed-width decimal keys. Numeric ordering is unchanged, while the
 sequential key shape avoids pathological underfilled Holt frames. Logical
 recovery records, deterministic results, and hash-chain bytes are unchanged.
 
-Opening a format-8 store validates its complete recovery chain before an
-atomic, one-way marker upgrade. Its `0x00`/`0x01` binary-LSN rows remain in
-place and readable; later writes use the disjoint version-9 `0x02`/`0x03`
-tags, so old and new rows retain one unambiguous chronological order. A binary
-that understands only format 8 rejects the upgraded marker rather than
-misreading the mixed physical layout. Other older or unknown markers remain
-fail-closed.
+Ordinary open does not migrate a format-9 marker, even when its old catalog is
+otherwise internally consistent. Format 9 lacks the three authoritative
+Generic index families, so marker-only upgrade would advertise records and
+lifecycle invariants that were never installed. Migration remains not
+qualified; every older or unknown marker is fail-closed and unchanged.
 
 Durable codecs are independently versioned:
-publication-owned workspace/path/revision records and immutable commit records
-use value version `2`; `ChangeEvent` and the logical recovery-outbox record use
-value version `2`; other ordinary workspace records and the recovery storage
-header/chunk records currently use value version `1`; `CommandDedupe` uses
-version `2` to bind its
-exact result to a recovery LSN; `BuildCommitOperation` uses version `5` to
-retain the complete exact commit request, opaque Agent projection-input digest,
-first owner-observed commit time, run-manifest publication condition, and
-immutable staged-manifest binding needed for head- and path-independent replay;
-and `RestoreOperation` uses version `4` to retain the complete source
-workbench/incarnation and concrete source selector needed for
-source-independent terminal replay. Unknown versions fail closed. Keys do not
-repeat a version because the store-level schema marker gates their codec.
+publication-owned workspace/path/revision records use value version `2`;
+`CommitRecord` uses version `3` and dual-decodes version `2`, while its member,
+consumer, head, and tag records remain version `2`; `ChangeEvent` and the
+logical recovery-outbox record use value version `2`; other ordinary workspace
+records and the recovery storage header/chunk records currently use value
+version `1`; `CommandDedupe` uses version `2` to bind its exact result to a
+recovery LSN. `BuildCommitOperation` and `CommitRetireOperation` use version `6`
+and dual-decode version `5`; the build record retains the complete exact commit
+request, opaque Agent projection-input digest, first owner-observed commit time,
+run-manifest publication condition, immutable staged-manifest binding, and the
+sealed Generic-index closure needed for head- and path-independent replay.
+`RestoreOperation` uses version `6` and dual-decodes version `5`; it retains the
+complete source workbench/incarnation, concrete source selector, and both path
+and Generic-index closure progress needed for source-independent terminal
+replay. Unknown versions fail closed. Keys do not repeat a version because the
+store-level schema marker gates their codec.
+Generic index current, generation, row, reference, append-receipt,
+registration-operation, and commit-member payloads use value version `1`.
+Row binding is explicit: `Directory` cannot later decorate an artifact,
+`Unbound` retains the path-keyed contract for a node created after registration,
+and `Artifact` carries the exact artifact revision and path-generation fence.
+A retired generation header remains as the permanent identity tombstone;
+payload reclamation must never make its generation ID reusable.
 
 The metadata schema assigns each logical keyspace a stable `u16` identifier
 and name. Store adapters map this catalog to their physical layout.
@@ -164,11 +173,16 @@ and name. Store adapters map this catalog to their physical layout.
 | `gc_candidate` | `0x0215` | `0x15` |
 | `gc_barrier` | `0x0216` | `0x16` |
 | `workspace_incarnation_claim` | `0x0217` | `0x17` |
+| `generic_index_current` | `0x0219` | `0x19` |
+| `generic_index_generation` | `0x021a` | `0x1a` |
+| `commit_generic_index_member` | `0x021b` | `0x1b` |
 
 System keyspaces use IDs `0x0101` through `0x0106`. Domain keyspaces use
 `0x0200 | format_tag`. The `MetadataFamily` format tags remain one byte and keep
 their existing recovery and history encoding. Reserved format tags do not name
-caller-mutable metadata families. `MetaShard` appends `recovery_outbox` rows in
+caller-mutable metadata families. Tags `0x10`, `0x14`, and `0x18` are
+permanently reserved and cannot be reassigned. `MetaShard` appends
+`recovery_outbox` rows in
 the same transaction as each authoritative mutation.
 
 Initial durable enum discriminants:
@@ -179,20 +193,29 @@ RevisionState:   Available=1, Deleting=2, Deleted=3, Quarantined=4
 CommitState:     Sealed=1, Retiring=2, Retired=3
 SnapshotState:   Active=1, ReapClaimed=2, Reaped=3, Retired=4
 ReferenceKind:   Path=1, Commit=2, RevisionDependency=3
-HistoryHoldKind: Snapshot=1, BuildCommit=2, Restore=3
+HistoryHoldKind: Snapshot=1, BuildCommit=2, Restore=3, RegisterGenericIndex=4
 HistoryHoldState: Active=1, Releasing=2
 RootActivationState: Installing=1, Active=2, Draining=3, Fenced=4
 RootPlacementLifecycle: Provisioning=1, Active=2, Draining=3, Retired=4
-CommitConsumerKind: WorkbenchHead=1, Tag=2, Lease=3, ChildCommit=4
+CommitConsumerKind: WorkbenchHead=1, Tag=2, Lease=3, ChildCommit=4, Snapshot=5
 RestoreSourceKind: Snapshot=1, Commit=2
-OperationKind:   Publish=1, BuildCommit=2, Restore=3, CommitRetire=4, Gc=5
+OperationKind:   Publish=1, BuildCommit=2, Restore=3, CommitRetire=4, Gc=5,
+                 RegisterGenericIndex=6
+GenericIndexGenerationState: Building=1, Sealed=2, Retiring=3, Retired=4
+GenericIndexRegistrationPhase: Preparing=1, Appending=2, Sealing=3,
+                               Publishing=4, Complete=5, Aborting=6,
+                               Cleaning=7, Cleaned=8, Quarantined=9
+GenericIndexReferenceKind: Current=1, Commit=2, BuildCommit=3, Restore=4,
+                           Registration=5
+GenericIndexRowBinding: Directory=1, Unbound=2, Artifact=3
 PublishPhase:    Uploading=1, Finalizing=2, Published=3, Aborting=4,
                  Cleaning=5, Cleaned=6, Quarantined=7
 BuildCommitPhase: Building=1, Sealing=2, Complete=3, Aborting=4,
                   Cleaning=5, Cleaned=6, Quarantined=7
 RestorePhase:    Preparing=1, Copying=2, SourceSealed=3, Ready=4,
                  Complete=5, Aborting=6, Cleaning=7, Cleaned=8,
-                 Quarantined=9
+                 Quarantined=9, DestinationBuilding=10,
+                 DestinationSealing=11
 CommitRetirePhase: Claiming=1, Releasing=2, Complete=3, Quarantined=4
 GcPhase:         Queued=1, Claimed=2, Deleting=3, Deleted=4, Quarantined=5
 StagedProviderState: Planned=1, Uploading=2, Uploaded=3, AbortPending=4,
@@ -459,8 +482,13 @@ commands, monotonic lease-clock observations, and physical-owner epoch
 advancement. Replays invoke those same entrypoints; there is no second
 namespace apply state machine. Reopen verifies contiguous LSNs, the complete
 hash chain, declared/missing/orphan chunks, and the `System` tail. This is
-local recovery material only: no remote consumer ACK, shared-log replication,
-checkpoint install/replay, truncation protocol, or fsck is currently wired.
+also the source for the object-backed shared-log publisher: an ACK at that
+boundary follows durable upload intent, chunks-first/manifest-last publication,
+and an owner-fenced Control CAS. `RecoverLog` validates canonical receipts,
+replays the exact durable prefix, and resumes complete or cleanly aborted
+pending uploads without a second apply path. The default build still lacks the
+published bounded Holt API required for cold checkpoint installation. Log
+truncation/compaction and fsck are not wired.
 
 ## Namespace And Workspace Visibility
 
@@ -535,9 +563,9 @@ logs
 metadata
 ```
 
-Their exact paths cannot be shadowed. They exist whenever the workspace is
-`Visible`, even with no descendants, and use the same synthesized generation
-rule.
+An exact published artifact wins at any of these paths. A virtual section exists
+whenever the workspace is `Visible`, even with no descendants, only if no exact
+artifact occupies that path. It uses the same synthesized generation rule.
 
 `WorkspaceCurrent.state == Visible` is the publication marker. `Visible` is
 terminal with respect to visibility: no operation changes it to

@@ -1,0 +1,380 @@
+{
+  "schema": "nokv.pre423.qualification_invocations.v1",
+  "typed_producers": [
+    "api-absence",
+    "api-decision",
+    "commit-replay",
+    "cursor-differential",
+    "lingtai-mcp",
+    "live-workbench",
+    "nokv-agent-unit",
+    "object-namespace-recovery",
+    "python-sdk",
+    "restore-composition",
+    "snapshot-lifecycle"
+  ],
+  "invocations": [
+    {
+      "id": "api-absence-pass",
+      "producer": "api-absence",
+      "evidence_kind": "static",
+      "script": "scripts/workbench/api_absence_qualification.py",
+      "expected_outcome": "PASS",
+      "expected_exit_code": 0,
+      "uses_rust_target": false,
+      "claims": [
+        "L02:api-absence:l02.inode-dentry-client-api-absence",
+        "L03:api-absence:l03.retired-filesystem-type-names-stay-absent",
+        "L06:api-absence:l06.filesystem-emulation-absence",
+        "L07:api-absence:l07.fuse-posix-inode-dentry-absence",
+        "L08:api-absence:l08.filesystem-cli-compatibility-absence"
+      ]
+    },
+    {
+      "id": "api-decision-pass",
+      "producer": "api-decision",
+      "evidence_kind": "static",
+      "script": "scripts/workbench/api_decision_qualification.py",
+      "expected_outcome": "PASS",
+      "expected_exit_code": 0,
+      "uses_rust_target": false,
+      "claims": [
+        "T17:api-decision:t17.snapshot-projection-decision",
+        "C18:api-decision:c18.no-checkpoints-jsonl-decision",
+        "L01:api-decision:l01.generic-profile-restoration-contract",
+        "L02:api-decision:l02.workspace-client-replacement-decision",
+        "L03:api-decision:l03.path-native-python-compatibility-contract",
+        "L04:api-decision:l04.workbench-scoped-fsspec-contract",
+        "L05:api-decision:l05.workbench-checkpoint-compatibility-contract",
+        "L06:api-decision:l06.workbench-dcp-adapter-contract"
+      ]
+    },
+    {
+      "id": "api-decision-nq",
+      "producer": "api-decision",
+      "evidence_kind": "static",
+      "script": "scripts/workbench/api_decision_qualification.py",
+      "expected_outcome": "NQ",
+      "expected_exit_code": 3,
+      "uses_rust_target": false,
+      "claims": [
+        "L08:api-decision:l08.operational-command-restoration-contract"
+      ]
+    },
+    {
+      "id": "commit-replay-pass",
+      "producer": "commit-replay",
+      "evidence_kind": "unit",
+      "script": "scripts/workbench/commit_replay_qualification.py",
+      "expected_outcome": "PASS",
+      "expected_exit_code": 0,
+      "uses_rust_target": true,
+      "claims": [
+        "T13:commit-replay:t13.commit-exact-replay",
+        "T13:commit-replay:t13.commit-conflict-and-head-authority",
+        "C04:commit-replay:c04.implicit-create-race-and-replay",
+        "C16:commit-replay:c16.canonical-identity-conflict-replay",
+        "C21:commit-replay:c21.restored-destination-owned-provenance"
+      ]
+    },
+    {
+      "id": "commit-replay-nq",
+      "producer": "commit-replay",
+      "evidence_kind": "unit",
+      "script": "scripts/workbench/commit_replay_qualification.py",
+      "expected_outcome": "NQ",
+      "expected_exit_code": 3,
+      "uses_rust_target": true,
+      "claims": [
+        "L05:commit-replay:l05.checkpoint-commit-replay"
+      ]
+    },
+    {
+      "id": "cursor-differential-pass",
+      "producer": "cursor-differential",
+      "evidence_kind": "unit",
+      "script": "scripts/workbench/cursor_differential_qualification.py",
+      "expected_outcome": "PASS",
+      "expected_exit_code": 0,
+      "uses_rust_target": true,
+      "claims": [
+        "T05:cursor-differential:t05.list-cursor-progress-and-scope",
+        "T08:cursor-differential:t08.grep-case-insensitive-pagination",
+        "T09:cursor-differential:t09.search-scope-bound-cursor",
+        "T12:cursor-differential:t12.find-case-insensitive-pagination",
+        "C11:cursor-differential:c11.all-pageable-progress-scope-and-stale-rejection",
+        "C13:cursor-differential:c13.grep-case-glob-cursor",
+        "C15:cursor-differential:c15.find-case-insensitive-pagination"
+      ]
+    },
+    {
+      "id": "cursor-differential-nq",
+      "producer": "cursor-differential",
+      "evidence_kind": "unit",
+      "script": "scripts/workbench/cursor_differential_qualification.py",
+      "expected_outcome": "NQ",
+      "expected_exit_code": 3,
+      "uses_rust_target": true,
+      "claims": [
+        "T07:cursor-differential:t07.get-page-progress-and-scope"
+      ]
+    },
+    {
+      "id": "nokv-agent-unit-pass",
+      "producer": "nokv-agent-unit",
+      "evidence_kind": "unit",
+      "script": "scripts/workbench/nokv_agent_qualification.py",
+      "expected_outcome": "PASS",
+      "expected_exit_code": 0,
+      "uses_rust_target": true,
+      "claims": [
+        "T01:schema-surface:t01.create-schema",
+        "T01:facade-contract:t01.create-result",
+        "T02:schema-surface:t02.put-schema",
+        "T02:facade-contract:t02.put-create-replace-contract",
+        "T02:output-golden:t02.put-path-native-output",
+        "T03:schema-surface:t03.append-schema",
+        "T03:facade-contract:t03.append-result-contract",
+        "T03:output-golden:t03.append-delta-generation-digest-output",
+        "T04:schema-surface:t04.edit-schema",
+        "T04:facade-contract:t04.edit-noop-and-conflict-contract",
+        "T05:facade-contract:t05.list-root-equivalence-contract",
+        "T06:facade-contract:t06.stat-metadata-only-contract",
+        "T07:facade-contract:t07.get-range-format-conditional-contract",
+        "T07:output-golden:t07.get-text-base64-page-output",
+        "T08:facade-contract:t08.grep-literal-or-glob-contract",
+        "T09:facade-contract:t09.search-query-controls-contract",
+        "T10:facade-contract:t10.aggregate-query-controls-contract",
+        "T10:output-golden:t10.aggregate-output",
+        "T11:facade-contract:t11.describe-query-capabilities-contract",
+        "T11:output-golden:t11.describe-output",
+        "T12:facade-contract:t12.find-commit-manifest-contract",
+        "T12:output-golden:t12.find-optional-manifest-output",
+        "T13:facade-contract:t13.commit-provenance-contract",
+        "T13:output-golden:t13.commit-path-native-output",
+        "T17:output-golden:t17.snapshot-projection-output",
+        "T18:output-golden:t18.restore-destination-owned-output",
+        "C01:schema-surface:c01.exact-18-tool-schema",
+        "C02:schema-surface:c02.closed-input-schema",
+        "C02:facade-contract:c02.typed-validation-error-contract",
+        "C02:output-golden:c02.typed-validation-error-output",
+        "C03:facade-contract:c03.id-section-and-path-normalization-contract",
+        "C05:facade-contract:c05.empty-path-equivalence-contract",
+        "C07:schema-surface:c07.exclusive-payload-schema",
+        "C08:facade-contract:c08.create-replace-precondition-contract",
+        "C09:facade-contract:c09.append-result-contract",
+        "C10:facade-contract:c10.edit-match-noop-conflict-contract",
+        "C12:facade-contract:c12.stat-read-range-conditional-contract",
+        "C13:facade-contract:c13.grep-literal-or-bounds-contract",
+        "C14:facade-contract:c14.query-scope-predicate-control-contract",
+        "C14:output-golden:c14.query-defined-empty-output",
+        "C15:facade-contract:c15.find-filter-projection-contract",
+        "C17:facade-contract:c17.snapshot-validation-contract",
+        "C18:output-golden:c18.snapshot-lifecycle-output",
+        "L01:schema-surface:l01.generic-seven-tool-profile-schema"
+      ]
+    },
+    {
+      "id": "nokv-agent-unit-nq",
+      "producer": "nokv-agent-unit",
+      "evidence_kind": "unit",
+      "script": "scripts/workbench/nokv_agent_qualification.py",
+      "expected_outcome": "NQ",
+      "expected_exit_code": 3,
+      "uses_rust_target": true,
+      "claims": [
+        "C04:facade-contract:c04.implicit-workbench-create-contract",
+        "C07:facade-contract:c07.payload-decode-content-type-size-contract"
+      ]
+    },
+    {
+      "id": "lingtai-mcp-nq",
+      "producer": "lingtai-mcp",
+      "evidence_kind": "live",
+      "script": "scripts/workbench/lingtai_mcp_qualification.py",
+      "expected_outcome": "NQ",
+      "expected_exit_code": 3,
+      "uses_rust_target": false,
+      "claims": [
+        "T18:lingtai-mcp-e2e:t18.restore-lingtai-restart-reconnect",
+        "C01:lingtai-mcp-e2e:c01.exact-18-tools-lingtai-live",
+        "C06:lingtai-mcp-e2e:c06.agent-root-isolation-lingtai-live",
+        "C11:lingtai-mcp-e2e:c11.pagination-lingtai-live",
+        "C21:lingtai-mcp-e2e:c21.restored-composition-lingtai-live"
+      ]
+    },
+    {
+      "id": "live-workbench-nq",
+      "producer": "live-workbench",
+      "evidence_kind": "live",
+      "script": "scripts/workbench/live_workbench.py",
+      "expected_outcome": "NQ",
+      "expected_exit_code": 3,
+      "uses_rust_target": false,
+      "claims": [
+        "T01:native-workbench-e2e:t01.create-live",
+        "T02:native-workbench-e2e:t02.put-absent-and-exact-bytes-live",
+        "T03:native-workbench-e2e:t03.append-absent-and-atomic-live",
+        "T04:native-workbench-e2e:t04.edit-revalidate-conflict-live",
+        "T05:native-workbench-e2e:t05.list-live-and-frozen-live",
+        "T06:native-workbench-e2e:t06.stat-live-frozen-root-live",
+        "T07:native-workbench-e2e:t07.get-exact-live-and-frozen-bytes",
+        "T08:native-workbench-e2e:t08.grep-empty-root-live",
+        "T09:native-workbench-e2e:t09.search-missing-root-live",
+        "T10:native-workbench-e2e:t10.aggregate-empty-root-live",
+        "T11:native-workbench-e2e:t11.describe-empty-catalog-live",
+        "T12:native-workbench-e2e:t12.find-committed-state-live",
+        "T13:native-workbench-e2e:t13.commit-absent-workbench-live",
+        "T14:native-workbench-e2e:t14.snapshot-committed-workbench-live",
+        "T15:native-workbench-e2e:t15.renew-live",
+        "T16:native-workbench-e2e:t16.retire-live",
+        "C03:native-workbench-e2e:c03.path-jail-and-five-sections-live",
+        "C04:native-workbench-e2e:c04.put-append-commit-absent-live",
+        "C05:native-workbench-e2e:c05.empty-path-equivalence-live",
+        "C06:root-authority-e2e:c06.two-persisted-rootids-isolate-all-operations",
+        "C08:native-workbench-e2e:c08.create-replace-generation-digest-live",
+        "C09:native-workbench-e2e:c09.append-absent-file-live",
+        "C10:native-workbench-e2e:c10.edit-exact-and-global-live",
+        "C11:native-workbench-e2e:c11.revision-authority-pagination-live",
+        "C12:native-workbench-e2e:c12.live-and-frozen-read-metadata-live",
+        "C13:native-workbench-e2e:c13.grep-live",
+        "C14:native-workbench-e2e:c14.query-missing-root-live",
+        "C15:native-workbench-e2e:c15.find-committed-manifest-live",
+        "C16:native-workbench-e2e:c16.commit-head-authority-live",
+        "C19:native-workbench-e2e:c19.frozen-read-after-live-mutation",
+        "C20:native-workbench-e2e:c20.restore-validation-and-publication-live",
+        "L01:native-workbench-e2e:l01.generic-seven-tool-profile-live",
+        "L02:native-workbench-e2e:l02.rootid-workspace-client-live",
+        "L08:native-workbench-e2e:l08.current-workbench-cli-live"
+      ]
+    },
+    {
+      "id": "object-namespace-recovery-nq",
+      "producer": "object-namespace-recovery",
+      "evidence_kind": "live",
+      "script": "scripts/workbench/object_namespace_recovery_gate.py",
+      "expected_outcome": "NQ",
+      "expected_exit_code": 3,
+      "uses_rust_target": false,
+      "claims": [
+        "T18:provider-recovery:t18.restore-two-manifest-publication",
+        "T18:provider-recovery:t18.restore-provider-restart",
+        "T18:provider-recovery:t18.restore-reference-fenced-gc",
+        "T18:provider-recovery:t18.restore-exact-bytes",
+        "C06:provider-recovery:c06.root-binding-survives-provider-restart",
+        "C08:provider-recovery:c08.conditional-put-provider",
+        "C08:provider-recovery:c08.conditional-put-response-loss-readback",
+        "C09:provider-recovery:c09.two-writer-no-lost-update",
+        "C09:provider-recovery:c09.same-operation-retry",
+        "C12:provider-recovery:c12.range-conditional-frozen-provider-restart",
+        "C12:provider-recovery:c12.provider-outage-read-failure",
+        "C16:provider-recovery:c16.commit-outcome-unknown-retry",
+        "C19:provider-recovery:c19.frozen-reference-retention-across-restart",
+        "C19:provider-recovery:c19.retire-reap-reference-release",
+        "C20:provider-recovery:c20.restore-cleanup-after-failure",
+        "C20:provider-recovery:c20.restore-reference-fenced-gc",
+        "C20:provider-recovery:c20.restore-exact-source-and-destination-bytes",
+        "L08:provider-recovery:l08.single-node-no-external-etcd-live",
+        "L08:provider-recovery:l08.http-health-readiness-stats-live",
+        "L08:provider-recovery:l08.metadata-backup-fresh-node-restore-live",
+        "L08:provider-recovery:l08.metadata-fsck-clean-and-corruption-detection-live",
+        "L08:provider-recovery:l08.manual-reconciliable-gc-live",
+        "L08:provider-recovery:l08.checkpoint-log-replay-live",
+        "L08:provider-recovery:l08.cross-owner-failover-live",
+        "L08:provider-recovery:l08.multishard-routing-failover-live",
+        "L08:provider-recovery:l08.v010-upgrade-recovery-matrix-live"
+      ]
+    },
+    {
+      "id": "python-sdk-nq",
+      "producer": "python-sdk",
+      "evidence_kind": "live",
+      "script": "scripts/workbench/python_sdk_qualification.py",
+      "expected_outcome": "NQ",
+      "expected_exit_code": 3,
+      "uses_rust_target": false,
+      "claims": [
+        "L03:python-sdk-e2e:l03.python-create-publish-read-stat-list-rename-remove-live",
+        "L03:python-sdk-e2e:l03.python-replace-generation-and-frozen-snapshot-live",
+        "L03:python-sdk-e2e:l03.python-range-batch-ordering-and-bounds-live",
+        "L03:python-sdk-e2e:l03.python-retry-concurrency-and-query-live",
+        "L04:python-sdk-e2e:l04.fsspec-open-mode-policy-live",
+        "L04:python-sdk-e2e:l04.fsspec-virtual-prefix-namespace-live",
+        "L04:python-sdk-e2e:l04.fsspec-move-remove-live",
+        "L04:python-sdk-e2e:l04.fsspec-write-read-range-live",
+        "L04:python-sdk-e2e:l04.fsspec-create-only-and-replace-live",
+        "L04:python-sdk-e2e:l04.fsspec-retry-and-concurrency-live",
+        "L05:python-sdk-e2e:l05.checkpoint-publish-resolve-load-exact-live",
+        "L05:python-sdk-e2e:l05.checkpoint-highest-committed-step-live",
+        "L05:python-sdk-e2e:l05.checkpoint-partial-step-invisible-live",
+        "L05:python-sdk-e2e:l05.checkpoint-distributed-shard-commit-live",
+        "L05:python-sdk-e2e:l05.checkpoint-invalid-shard-name-rejected-live",
+        "L06:python-sdk-e2e:l06.dcp-rank-semantics-live",
+        "L06:python-sdk-e2e:l06.dcp-rank-failure-propagation-live",
+        "L06:python-sdk-e2e:l06.dcp-short-range-batch-fails-live",
+        "L06:python-sdk-e2e:l06.dcp-multirank-exact-roundtrip-live"
+      ]
+    },
+    {
+      "id": "restore-composition-nq",
+      "producer": "restore-composition",
+      "evidence_kind": "live",
+      "script": "scripts/workbench/restore_composition_gate.py",
+      "expected_outcome": "NQ",
+      "expected_exit_code": 3,
+      "uses_rust_target": false,
+      "claims": [
+        "T14:restore-composition:t14.restored-destination-resnapshot",
+        "T18:restore-composition:t18.restore-independent-destination",
+        "T18:restore-composition:t18.restore-terminal-replay",
+        "C20:restore-composition:c20.hidden-staging-cow-independent-destination",
+        "C20:restore-composition:c20.restore-terminal-replay",
+        "C21:restore-composition:c21.restore-snapshot-restore-composition"
+      ]
+    },
+    {
+      "id": "snapshot-lifecycle-pass",
+      "producer": "snapshot-lifecycle",
+      "evidence_kind": "integration",
+      "script": "scripts/workbench/snapshot_lifecycle_qualification.py",
+      "expected_outcome": "PASS",
+      "expected_exit_code": 0,
+      "uses_rust_target": true,
+      "claims": [
+        "T14:snapshot-lifecycle:t14.snapshot-validation-and-lease",
+        "T15:snapshot-lifecycle:t15.renew-id-alias-and-frozen-content",
+        "T16:snapshot-lifecycle:t16.retire-terminal-idempotent-replay",
+        "T17:snapshot-lifecycle:t17.snapshot-count-and-list-projection",
+        "C18:snapshot-lifecycle:c18.snapshot-renew-list-retire-terminal-replay"
+      ]
+    },
+    {
+      "id": "snapshot-lifecycle-nq",
+      "producer": "snapshot-lifecycle",
+      "evidence_kind": "integration",
+      "script": "scripts/workbench/snapshot_lifecycle_qualification.py",
+      "expected_outcome": "NQ",
+      "expected_exit_code": 3,
+      "uses_rust_target": true,
+      "claims": [
+        "C17:snapshot-lifecycle:c17.snapshot-commit-alias-ttl-metadata-warnings",
+        "C19:snapshot-lifecycle:c19.frozen-renew-retire-reap-expire-foreign",
+        "L05:snapshot-lifecycle:l05.checkpoint-snapshot-lifecycle"
+      ]
+    }
+  ],
+  "aggregate_expectation": {
+    "expected_status": "NQ",
+    "expected_exit_code": 3,
+    "omitted_producers": [],
+    "product_artifact_manifest": true,
+    "receipt_counts": {
+      "discovered": 137,
+      "accepted": 137,
+      "selected": 137,
+      "superseded": 0,
+      "rejected": 0,
+      "invalid": 0
+    }
+  }
+}

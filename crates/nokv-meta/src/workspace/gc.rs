@@ -11,22 +11,36 @@
 use std::fmt;
 
 use nokv_types::{
-    ArtifactRevisionId, CommandDigest, CommitVersion, GcClaimState, GcPhase, LogicalShardId,
-    OperationId, OperationKind, ReadVersion, ReferenceEpoch, RevisionState, RootId, SHA256_BYTES,
+    ArtifactRevisionId, CommandDigest, CommitVersion, GcClaimState, GcPhase,
+    GenericIndexGenerationId, GenericIndexGenerationState, LogicalShardId, OperationId,
+    OperationKind, ReadVersion, ReferenceEpoch, RevisionState, RootId, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
 
 use super::codec::{
     artifact_manifest_key, artifact_manifest_prefix, artifact_revision_key,
-    decode_artifact_manifest_key, decode_gc_candidate_key, decode_revision_dependency_ref_key,
-    gc_candidate_key, gc_candidate_prefix, gc_history_barrier_key, history_hold_prefix,
-    object_block_key, operation_key, revision_dependency_ref_prefix, SCHEMA_ID,
+    decode_artifact_manifest_key, decode_gc_candidate_key, decode_generic_index_append_receipt_key,
+    decode_generic_index_generation_key, decode_generic_index_row_key,
+    decode_revision_dependency_ref_key, gc_candidate_key, gc_candidate_prefix,
+    gc_history_barrier_key, generic_index_append_receipt_key, generic_index_append_receipt_prefix,
+    generic_index_generation_key, generic_index_generation_prefix,
+    generic_index_generation_ref_prefix, generic_index_row_key, generic_index_row_prefix,
+    history_hold_prefix, object_block_key, operation_key, revision_dependency_ref_prefix,
+    SCHEMA_ID,
 };
 use super::engine::{
     CommandMutation, CommandPredicate, HistoryProjection, MetaError, MetaShard, MetadataCommand,
     MetadataCommandResult, RootFenceAction,
 };
-use super::gc_records::{GcHistoryBarrierRecord, GcOperationRecord, GcRecordError, GcTransition};
+use super::gc_records::{
+    GcHistoryBarrierRecord, GcOperationRecord, GcRecordError, GcTransition,
+    GenericIndexGcOperationRecord, GenericIndexGcPhase,
+};
+use super::generic_index_records::{
+    advance_generic_index_row_rolling_digest, generic_index_capability_digest,
+    generic_index_row_digest, GenericIndexAppendReceiptRecord, GenericIndexGenerationRecord,
+    GenericIndexRecordError, GenericIndexRowRecord,
+};
 use super::keyspace::MetadataFamily;
 use super::namespace::{RootReadContext, RootWriteContext};
 use super::publication_records::{
@@ -40,6 +54,7 @@ const GC_RESULT_FORMAT_VERSION: u8 = 1;
 const GC_RESULT_OPERATION: u8 = 1;
 const GC_RESULT_STALE_CANDIDATE: u8 = 2;
 const GC_RESULT_HISTORY_BARRIER: u8 = 3;
+const GC_RESULT_GENERIC_INDEX_OPERATION: u8 = 4;
 const MAX_META_SCAN_ROWS: usize = 256;
 // Complete mutates revision/candidate/operation plus, for each dependency,
 // its reference, owner revision, and at most one newly-zero candidate.
@@ -49,6 +64,9 @@ const _: () = assert!(MAX_DEPENDENCY_COUNT as usize * 3 + 3 <= MAX_META_SCAN_ROW
 pub const MAX_GC_BATCH_ROWS: usize = 192;
 /// Maximum candidate rows returned by one page.
 pub const MAX_GC_CANDIDATE_PAGE_SIZE: usize = 255;
+/// Maximum Generic index payload rows or append receipts deleted by one
+/// metadata command.
+pub const MAX_GENERIC_INDEX_GC_BATCH_ROWS: usize = MAX_GC_BATCH_ROWS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GcCandidateCursor {
@@ -66,6 +84,29 @@ pub struct GcCandidateEntry {
 pub struct GcCandidatePage {
     pub entries: Vec<GcCandidateEntry>,
     pub next_cursor: Option<GcCandidateCursor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GenericIndexGenerationGcCandidateCursor {
+    pub generation_id: GenericIndexGenerationId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenericIndexGenerationGcCandidate {
+    pub cursor: GenericIndexGenerationGcCandidateCursor,
+    pub reference_epoch: ReferenceEpoch,
+    pub last_zero_reference_version: CommitVersion,
+    pub capability_digest: [u8; SHA256_BYTES],
+    pub row_count: u64,
+    pub row_digest: [u8; SHA256_BYTES],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenericIndexGenerationGcCandidatePage {
+    pub entries: Vec<GenericIndexGenerationGcCandidate>,
+    /// Cursor over scanned headers, not only eligible entries. An empty page
+    /// can therefore still carry forward progress past retained generations.
+    pub next_cursor: Option<GenericIndexGenerationGcCandidateCursor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,6 +172,23 @@ pub struct ClearStaleGcCandidateRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimGenericIndexGenerationGcRequest {
+    pub context: RootWriteContext,
+    pub generation_id: GenericIndexGenerationId,
+    pub reference_epoch: ReferenceEpoch,
+    pub capability_digest: [u8; SHA256_BYTES],
+    pub row_count: u64,
+    pub row_digest: [u8; SHA256_BYTES],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectGenericIndexGenerationGcBatchRequest {
+    pub context: RootWriteContext,
+    pub expected_operation: GenericIndexGcOperationRecord,
+    pub batch_size: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GcCommandOutcome {
     pub commit_version: CommitVersion,
     pub operation: GcOperationRecord,
@@ -153,12 +211,20 @@ pub struct GcHistoryBarrierOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenericIndexGenerationGcOutcome {
+    pub commit_version: CommitVersion,
+    pub operation: GenericIndexGcOperationRecord,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GcError {
     Meta(MetaError),
     OperationCodec(GcRecordError),
     PublicationRecordCodec(PublicationRecordCodecError),
     ManifestCodec(PublishRecordError),
     SnapshotRecordCodec(SnapshotRecordError),
+    GenericIndexRecordCodec(GenericIndexRecordError),
     InvalidPageSize {
         requested: usize,
         max: usize,
@@ -175,6 +241,20 @@ pub enum GcError {
     },
     OperationNotFound {
         operation_id: OperationId,
+    },
+    GenericIndexGenerationNotFound {
+        generation_id: GenericIndexGenerationId,
+    },
+    GenericIndexGenerationNotClaimable {
+        state: GenericIndexGenerationState,
+        reference_count: u64,
+    },
+    GenericIndexGenerationSealMismatch {
+        reason: &'static str,
+    },
+    GenericIndexReferenceRowsPresent,
+    GenericIndexPayloadClosureMismatch {
+        reason: String,
     },
     RevisionNotClaimable {
         state: RevisionState,
@@ -260,6 +340,9 @@ impl fmt::Display for GcError {
             Self::SnapshotRecordCodec(error) => {
                 write!(formatter, "invalid GC history hold: {error}")
             }
+            Self::GenericIndexRecordCodec(error) => {
+                write!(formatter, "invalid Generic index GC record: {error}")
+            }
             Self::InvalidPageSize { requested, max } => {
                 write!(formatter, "GC page size {requested} is outside 1..={max}")
             }
@@ -278,6 +361,26 @@ impl fmt::Display for GcError {
                 "GC operation {:02x?} was not found",
                 operation_id.as_bytes()
             ),
+            Self::GenericIndexGenerationNotFound { generation_id } => write!(
+                formatter,
+                "Generic index GC generation {:02x?} was not found",
+                generation_id.as_bytes()
+            ),
+            Self::GenericIndexGenerationNotClaimable {
+                state,
+                reference_count,
+            } => write!(
+                formatter,
+                "Generic index generation is not GC-claimable in {state:?} with {reference_count} references"
+            ),
+            Self::GenericIndexGenerationSealMismatch { reason } => {
+                write!(formatter, "Generic index generation seal mismatch: {reason}")
+            }
+            Self::GenericIndexReferenceRowsPresent => formatter
+                .write_str("Generic index generation has strong-reference rows during GC"),
+            Self::GenericIndexPayloadClosureMismatch { reason } => {
+                write!(formatter, "Generic index payload closure mismatch: {reason}")
+            }
             Self::RevisionNotClaimable {
                 state,
                 strong_reference_count,
@@ -382,6 +485,7 @@ impl std::error::Error for GcError {
             Self::PublicationRecordCodec(source) => Some(source),
             Self::ManifestCodec(source) => Some(source),
             Self::SnapshotRecordCodec(source) => Some(source),
+            Self::GenericIndexRecordCodec(source) => Some(source),
             _ => None,
         }
     }
@@ -414,6 +518,12 @@ impl From<PublishRecordError> for GcError {
 impl From<SnapshotRecordError> for GcError {
     fn from(error: SnapshotRecordError) -> Self {
         Self::SnapshotRecordCodec(error)
+    }
+}
+
+impl From<GenericIndexRecordError> for GcError {
+    fn from(error: GenericIndexRecordError) -> Self {
+        Self::GenericIndexRecordCodec(error)
     }
 }
 
@@ -574,6 +684,72 @@ impl<'a> GcService<'a> {
             .then(|| entries.last().map(|entry| entry.cursor))
             .flatten();
         Ok(GcCandidatePage {
+            entries,
+            next_cursor,
+        })
+    }
+
+    pub fn list_generic_index_generation_candidates(
+        &self,
+        context: RootReadContext,
+        start_after: Option<GenericIndexGenerationGcCandidateCursor>,
+        page_size: usize,
+    ) -> Result<GenericIndexGenerationGcCandidatePage, GcError> {
+        validate_page_size(page_size, MAX_GC_CANDIDATE_PAGE_SIZE)?;
+        let prefix = generic_index_generation_prefix(context.root_id);
+        let start_key = start_after
+            .map(|cursor| generic_index_generation_key(context.root_id, cursor.generation_id));
+        let mut rows = self.store.scan_prefix_at(
+            context.root_id,
+            context.placement_generation,
+            context.owner_epoch,
+            MetadataFamily::GenericIndexGeneration,
+            &prefix,
+            context.read_version,
+            start_key.as_deref(),
+            page_size + 1,
+        )?;
+        let has_more = rows.len() > page_size;
+        if has_more {
+            rows.pop();
+        }
+        let next_cursor = if has_more {
+            let last = rows.last().expect("a non-empty bounded page has a cursor");
+            let generation_id = decode_generic_index_generation_key(context.root_id, &last.key)
+                .ok_or(GcError::CorruptKey {
+                    family: "GenericIndexGeneration(header)",
+                })?;
+            Some(GenericIndexGenerationGcCandidateCursor { generation_id })
+        } else {
+            None
+        };
+        let safe_history_floor = self.safe_history_floor(context)?;
+        let mut entries = Vec::with_capacity(rows.len());
+        for item in rows {
+            let generation_id = decode_generic_index_generation_key(context.root_id, &item.key)
+                .ok_or(GcError::CorruptKey {
+                    family: "GenericIndexGeneration(header)",
+                })?;
+            let generation = GenericIndexGenerationRecord::decode(&item.value)?;
+            let Some(last_zero_reference_version) = generation.last_zero_reference_version else {
+                continue;
+            };
+            if generation.state != GenericIndexGenerationState::Sealed
+                || generation.reference_count != 0
+                || safe_history_floor.get() <= last_zero_reference_version.get()
+            {
+                continue;
+            }
+            entries.push(GenericIndexGenerationGcCandidate {
+                cursor: GenericIndexGenerationGcCandidateCursor { generation_id },
+                reference_epoch: generation.reference_epoch,
+                last_zero_reference_version,
+                capability_digest: generic_index_capability_digest(&generation.capabilities)?,
+                row_count: generation.appended_row_count,
+                row_digest: generation.rolling_row_digest,
+            });
+        }
+        Ok(GenericIndexGenerationGcCandidatePage {
             entries,
             next_cursor,
         })
@@ -1061,6 +1237,257 @@ impl<'a> GcService<'a> {
         )
     }
 
+    pub fn claim_generic_index_generation(
+        &self,
+        request: ClaimGenericIndexGenerationGcRequest,
+    ) -> Result<GenericIndexGenerationGcOutcome, GcError> {
+        let input_digest = generic_index_gc_claim_input_digest(&request);
+        let operation_id = generic_index_gc_operation_id(
+            request.context.root_id,
+            request.generation_id,
+            request.reference_epoch,
+        );
+        if let Some(outcome) = replay_generic_index_gc_outcome(
+            self.store,
+            request.context,
+            input_digest,
+            operation_id,
+        )? {
+            return Ok(outcome);
+        }
+        let command = plan_generic_index_generation_gc_claim(self.store, &request)?;
+        execute_generic_index_gc_command(self.store, command, input_digest, operation_id)
+    }
+
+    pub fn collect_generic_index_generation_batch(
+        &self,
+        request: CollectGenericIndexGenerationGcBatchRequest,
+    ) -> Result<GenericIndexGenerationGcOutcome, GcError> {
+        validate_page_size(request.batch_size, MAX_GENERIC_INDEX_GC_BATCH_ROWS)?;
+        request.expected_operation.validate()?;
+        if request.expected_operation.phase != GenericIndexGcPhase::Retiring {
+            return Err(GcError::StateMismatch {
+                reason: "Generic index GC operation is not retiring".to_owned(),
+            });
+        }
+        let input_digest = generic_index_gc_collect_input_digest(&request)?;
+        if let Some(outcome) = replay_generic_index_gc_outcome(
+            self.store,
+            request.context,
+            input_digest,
+            request.expected_operation.operation_id,
+        )? {
+            return Ok(outcome);
+        }
+        let loaded =
+            load_generic_index_gc_state(self.store, request.context, &request.expected_operation)?;
+        let mut next_operation = request.expected_operation.clone();
+        let mut next_generation = None;
+        let deletions: Vec<(Vec<u8>, Vec<u8>)>;
+
+        if !next_operation.rows_complete {
+            let prefix =
+                generic_index_row_prefix(request.context.root_id, next_operation.generation_id);
+            let start_after = next_operation.row_cursor.map(|sequence| {
+                generic_index_row_key(
+                    request.context.root_id,
+                    next_operation.generation_id,
+                    sequence,
+                )
+            });
+            let mut rows = self.store.scan_prefix_at(
+                request.context.root_id,
+                request.context.placement_generation,
+                request.context.owner_epoch,
+                MetadataFamily::GenericIndexGeneration,
+                &prefix,
+                request.context.read_version,
+                start_after.as_deref(),
+                request.batch_size + 1,
+            )?;
+            let rows_complete = rows.len() <= request.batch_size;
+            if !rows_complete {
+                rows.pop();
+            }
+            let mut rolling_digest = next_operation.row_rolling_digest;
+            let mut expected_sequence = next_operation.scanned_row_count;
+            for item in &rows {
+                let sequence = decode_generic_index_row_key(
+                    request.context.root_id,
+                    next_operation.generation_id,
+                    &item.key,
+                )
+                .ok_or(GcError::CorruptKey {
+                    family: "GenericIndexGeneration(row)",
+                })?;
+                if sequence != expected_sequence {
+                    return Err(GcError::GenericIndexPayloadClosureMismatch {
+                        reason: format!(
+                            "expected contiguous row sequence {expected_sequence}, found {sequence}"
+                        ),
+                    });
+                }
+                let row = GenericIndexRowRecord::decode(&item.value)?;
+                rolling_digest = advance_generic_index_row_rolling_digest(
+                    rolling_digest,
+                    generic_index_row_digest(sequence, &row)?,
+                );
+                expected_sequence =
+                    expected_sequence
+                        .checked_add(1)
+                        .ok_or(GcError::CountOverflow {
+                            field: "Generic index GC row count",
+                        })?;
+            }
+            if expected_sequence > next_operation.expected_row_count {
+                return Err(GcError::GenericIndexPayloadClosureMismatch {
+                    reason: "generation contains more rows than its immutable header seal"
+                        .to_owned(),
+                });
+            }
+            if rows_complete
+                && (expected_sequence != next_operation.expected_row_count
+                    || rolling_digest != next_operation.expected_row_digest)
+            {
+                return Err(GcError::GenericIndexPayloadClosureMismatch {
+                    reason: "validated rows do not match the immutable count/digest seal"
+                        .to_owned(),
+                });
+            }
+            if let Some(last) = rows.last() {
+                next_operation.row_cursor = decode_generic_index_row_key(
+                    request.context.root_id,
+                    next_operation.generation_id,
+                    &last.key,
+                );
+            }
+            next_operation.scanned_row_count = expected_sequence;
+            next_operation.row_rolling_digest = rolling_digest;
+            next_operation.rows_complete = rows_complete;
+            deletions = rows
+                .into_iter()
+                .map(|item| (item.key, item.value))
+                .collect();
+        } else {
+            let prefix = generic_index_append_receipt_prefix(
+                request.context.root_id,
+                next_operation.generation_id,
+            );
+            let start_after = next_operation.receipt_cursor.map(|first_sequence| {
+                generic_index_append_receipt_key(
+                    request.context.root_id,
+                    next_operation.generation_id,
+                    first_sequence,
+                )
+            });
+            let mut receipts = self.store.scan_prefix_at(
+                request.context.root_id,
+                request.context.placement_generation,
+                request.context.owner_epoch,
+                MetadataFamily::GenericIndexGeneration,
+                &prefix,
+                request.context.read_version,
+                start_after.as_deref(),
+                request.batch_size + 1,
+            )?;
+            let receipts_complete = receipts.len() <= request.batch_size;
+            if !receipts_complete {
+                receipts.pop();
+            }
+            let mut previous = next_operation.receipt_cursor;
+            for item in &receipts {
+                let first_sequence = decode_generic_index_append_receipt_key(
+                    request.context.root_id,
+                    next_operation.generation_id,
+                    &item.key,
+                )
+                .ok_or(GcError::CorruptKey {
+                    family: "GenericIndexGeneration(append-receipt)",
+                })?;
+                if previous.is_some_and(|cursor| first_sequence <= cursor) {
+                    return Err(GcError::GenericIndexPayloadClosureMismatch {
+                        reason: "append receipts are not strictly ordered".to_owned(),
+                    });
+                }
+                let receipt = GenericIndexAppendReceiptRecord::decode(&item.value)?;
+                if receipt.first_sequence != first_sequence
+                    || receipt.resulting_row_count > next_operation.expected_row_count
+                {
+                    return Err(GcError::GenericIndexPayloadClosureMismatch {
+                        reason: "append receipt does not belong to the sealed row closure"
+                            .to_owned(),
+                    });
+                }
+                previous = Some(first_sequence);
+            }
+            next_operation.receipt_cursor = previous;
+            next_operation.deleted_receipt_count = next_operation
+                .deleted_receipt_count
+                .checked_add(
+                    u64::try_from(receipts.len()).map_err(|_| GcError::CountOverflow {
+                        field: "Generic index GC receipt count",
+                    })?,
+                )
+                .ok_or(GcError::CountOverflow {
+                    field: "Generic index GC receipt count",
+                })?;
+            next_operation.receipts_complete = receipts_complete;
+            if receipts_complete {
+                next_operation.phase = GenericIndexGcPhase::Retired;
+                let mut retired = loaded.generation.clone();
+                retired.state = GenericIndexGenerationState::Retired;
+                next_generation = Some(retired);
+            }
+            deletions = receipts
+                .into_iter()
+                .map(|item| (item.key, item.value))
+                .collect();
+        }
+        next_operation.validate()?;
+
+        let deterministic_result = encode_generic_index_gc_result(input_digest, &next_operation)?;
+        let mut command = base_command(request.context, deterministic_result);
+        if let Some(next_generation) = next_generation {
+            replace_exact(
+                &mut command,
+                MetadataFamily::GenericIndexGeneration,
+                loaded.generation_key,
+                loaded.generation_payload,
+                next_generation.encode()?,
+            );
+        } else {
+            predicate_generic_index_gc_state(&mut command, &loaded);
+        }
+        command.predicates.push(CommandPredicate::PrefixEmpty {
+            family: MetadataFamily::GenericIndexGeneration,
+            prefix: generic_index_generation_ref_prefix(
+                request.context.root_id,
+                next_operation.generation_id,
+            ),
+        });
+        replace_exact(
+            &mut command,
+            MetadataFamily::Operation,
+            loaded.operation_key,
+            loaded.operation_payload,
+            next_operation.encode()?,
+        );
+        for (key, payload) in deletions {
+            delete_exact(
+                &mut command,
+                MetadataFamily::GenericIndexGeneration,
+                key,
+                payload,
+            );
+        }
+        execute_generic_index_gc_command(
+            self.store,
+            command.seal(),
+            input_digest,
+            next_operation.operation_id,
+        )
+    }
+
     pub fn clear_stale_candidate(
         &self,
         request: ClearStaleGcCandidateRequest,
@@ -1163,6 +1590,136 @@ pub fn gc_operation_id(
     OperationId::from_bytes(bytes)
 }
 
+/// Stable recovery identity for one exact Generic index generation epoch.
+pub fn generic_index_gc_operation_id(
+    root_id: RootId,
+    generation_id: GenericIndexGenerationId,
+    reference_epoch: ReferenceEpoch,
+) -> OperationId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.gc.generic-index.operation-id\0");
+    hasher.update(root_id.as_bytes());
+    hasher.update(generation_id.as_bytes());
+    hasher.update(reference_epoch.get().to_be_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    OperationId::from_bytes(bytes)
+}
+
+fn plan_generic_index_generation_gc_claim(
+    store: &MetaShard,
+    request: &ClaimGenericIndexGenerationGcRequest,
+) -> Result<MetadataCommand, GcError> {
+    require_current_write_frontier(store, request.context)?;
+    let generation_key =
+        generic_index_generation_key(request.context.root_id, request.generation_id);
+    let generation_payload = read_current(
+        store,
+        request.context,
+        MetadataFamily::GenericIndexGeneration,
+        &generation_key,
+    )?
+    .ok_or(GcError::GenericIndexGenerationNotFound {
+        generation_id: request.generation_id,
+    })?;
+    let generation = GenericIndexGenerationRecord::decode(&generation_payload)?;
+    if generation.state != GenericIndexGenerationState::Sealed || generation.reference_count != 0 {
+        return Err(GcError::GenericIndexGenerationNotClaimable {
+            state: generation.state,
+            reference_count: generation.reference_count,
+        });
+    }
+    if generation.reference_epoch != request.reference_epoch {
+        return Err(GcError::ReferenceEpochMismatch {
+            expected: request.reference_epoch,
+            actual: generation.reference_epoch,
+        });
+    }
+    let last_zero_reference_version = generation.last_zero_reference_version.ok_or(
+        GcError::GenericIndexGenerationSealMismatch {
+            reason: "zero-reference generation lacks its last-zero version",
+        },
+    )?;
+    if generic_index_capability_digest(&generation.capabilities)? != request.capability_digest {
+        return Err(GcError::GenericIndexGenerationSealMismatch {
+            reason: "capability digest differs from the caller's immutable seal",
+        });
+    }
+    if generation.appended_row_count != request.row_count
+        || generation.declared_row_count != request.row_count
+        || generation.rolling_row_digest != request.row_digest
+    {
+        return Err(GcError::GenericIndexGenerationSealMismatch {
+            reason: "row count or digest differs from the caller's immutable seal",
+        });
+    }
+    ensure_generic_index_reference_prefix_empty(
+        store,
+        read_context(request.context),
+        request.generation_id,
+    )?;
+    let safe_history_floor =
+        GcService::new(store).safe_history_floor(read_context(request.context))?;
+    if safe_history_floor.get() <= last_zero_reference_version.get() {
+        return Err(GcError::UnsafeHistoryFloor {
+            last_zero: last_zero_reference_version.get(),
+            floor: safe_history_floor.get(),
+        });
+    }
+
+    let operation_id = generic_index_gc_operation_id(
+        request.context.root_id,
+        request.generation_id,
+        request.reference_epoch,
+    );
+    let mut operation = GenericIndexGcOperationRecord {
+        operation_id,
+        identity_digest: [0; SHA256_BYTES],
+        generation_id: request.generation_id,
+        reference_epoch: request.reference_epoch,
+        last_zero_reference_version,
+        safe_history_floor,
+        expected_capability_digest: request.capability_digest,
+        expected_row_count: request.row_count,
+        expected_row_digest: request.row_digest,
+        phase: GenericIndexGcPhase::Retiring,
+        row_cursor: None,
+        scanned_row_count: 0,
+        row_rolling_digest: [0; SHA256_BYTES],
+        rows_complete: request.row_count == 0,
+        receipt_cursor: None,
+        deleted_receipt_count: 0,
+        receipts_complete: false,
+    };
+    operation.seal_identity();
+    operation.validate()?;
+
+    let mut retiring = generation;
+    retiring.state = GenericIndexGenerationState::Retiring;
+    let input_digest = generic_index_gc_claim_input_digest(request);
+    let deterministic_result = encode_generic_index_gc_result(input_digest, &operation)?;
+    let mut command = base_command(request.context, deterministic_result);
+    command.predicates.push(CommandPredicate::PrefixEmpty {
+        family: MetadataFamily::GenericIndexGeneration,
+        prefix: generic_index_generation_ref_prefix(request.context.root_id, request.generation_id),
+    });
+    replace_exact(
+        &mut command,
+        MetadataFamily::GenericIndexGeneration,
+        generation_key,
+        generation_payload,
+        retiring.encode()?,
+    );
+    put_absent(
+        &mut command,
+        MetadataFamily::Operation,
+        operation_key(request.context.root_id, OperationKind::Gc, operation_id),
+        operation.encode()?,
+    );
+    Ok(command.seal())
+}
+
 fn validate_page_size(requested: usize, max: usize) -> Result<(), GcError> {
     if requested == 0 || requested > max {
         Err(GcError::InvalidPageSize { requested, max })
@@ -1232,6 +1789,114 @@ fn read_current(
             context.read_version,
         )
         .map_err(Into::into)
+}
+
+fn ensure_generic_index_reference_prefix_empty(
+    store: &MetaShard,
+    context: RootReadContext,
+    generation_id: GenericIndexGenerationId,
+) -> Result<(), GcError> {
+    let prefix = generic_index_generation_ref_prefix(context.root_id, generation_id);
+    if store
+        .scan_prefix_at(
+            context.root_id,
+            context.placement_generation,
+            context.owner_epoch,
+            MetadataFamily::GenericIndexGeneration,
+            &prefix,
+            context.read_version,
+            None,
+            1,
+        )?
+        .is_empty()
+    {
+        Ok(())
+    } else {
+        Err(GcError::GenericIndexReferenceRowsPresent)
+    }
+}
+
+struct LoadedGenericIndexGcState {
+    generation_key: Vec<u8>,
+    generation_payload: Vec<u8>,
+    generation: GenericIndexGenerationRecord,
+    operation_key: Vec<u8>,
+    operation_payload: Vec<u8>,
+}
+
+fn load_generic_index_gc_state(
+    store: &MetaShard,
+    context: RootWriteContext,
+    expected_operation: &GenericIndexGcOperationRecord,
+) -> Result<LoadedGenericIndexGcState, GcError> {
+    expected_operation.validate()?;
+    require_current_write_frontier(store, context)?;
+    let generation_key =
+        generic_index_generation_key(context.root_id, expected_operation.generation_id);
+    let generation_payload = read_current(
+        store,
+        context,
+        MetadataFamily::GenericIndexGeneration,
+        &generation_key,
+    )?
+    .ok_or(GcError::GenericIndexGenerationNotFound {
+        generation_id: expected_operation.generation_id,
+    })?;
+    let generation = GenericIndexGenerationRecord::decode(&generation_payload)?;
+    if generation.state != GenericIndexGenerationState::Retiring
+        || generation.reference_count != 0
+        || generation.reference_epoch != expected_operation.reference_epoch
+        || generation.last_zero_reference_version
+            != Some(expected_operation.last_zero_reference_version)
+        || generic_index_capability_digest(&generation.capabilities)?
+            != expected_operation.expected_capability_digest
+        || generation.declared_row_count != expected_operation.expected_row_count
+        || generation.appended_row_count != expected_operation.expected_row_count
+        || generation.rolling_row_digest != expected_operation.expected_row_digest
+    {
+        return Err(GcError::StateMismatch {
+            reason: "Generic index generation header differs from the claimed epoch and seal"
+                .to_owned(),
+        });
+    }
+    ensure_generic_index_reference_prefix_empty(
+        store,
+        read_context(context),
+        expected_operation.generation_id,
+    )?;
+    let operation_key = operation_key(
+        context.root_id,
+        OperationKind::Gc,
+        expected_operation.operation_id,
+    );
+    let operation_payload =
+        read_current(store, context, MetadataFamily::Operation, &operation_key)?.ok_or(
+            GcError::OperationNotFound {
+                operation_id: expected_operation.operation_id,
+            },
+        )?;
+    let operation = GenericIndexGcOperationRecord::decode(&operation_payload)?;
+    if operation != *expected_operation {
+        return Err(GcError::ConcurrentMutation);
+    }
+    Ok(LoadedGenericIndexGcState {
+        generation_key,
+        generation_payload,
+        generation,
+        operation_key,
+        operation_payload,
+    })
+}
+
+fn predicate_generic_index_gc_state(
+    command: &mut MetadataCommand,
+    state: &LoadedGenericIndexGcState,
+) {
+    command.predicates.push(CommandPredicate::Value {
+        family: MetadataFamily::GenericIndexGeneration,
+        key: state.generation_key.clone(),
+        expected: Some(state.generation_payload.clone()),
+    });
 }
 
 struct LoadedGcTriple {
@@ -1768,6 +2433,16 @@ fn execute_operation_command(
     decode_operation_outcome(result, input_digest, operation_id)
 }
 
+fn execute_generic_index_gc_command(
+    store: &MetaShard,
+    command: MetadataCommand,
+    input_digest: [u8; SHA256_BYTES],
+    operation_id: OperationId,
+) -> Result<GenericIndexGenerationGcOutcome, GcError> {
+    let result = execute_command(store, &command)?;
+    decode_generic_index_gc_outcome(result, input_digest, operation_id)
+}
+
 fn execute_candidate_clear_command(
     store: &MetaShard,
     command: MetadataCommand,
@@ -1800,7 +2475,7 @@ fn replay_operation_outcome(
     input_digest: [u8; SHA256_BYTES],
     operation_id: OperationId,
 ) -> Result<Option<GcCommandOutcome>, GcError> {
-    let Some(replay) = store.lookup_request(
+    let Some(replay) = store.lookup_request_result(
         context.root_id,
         context.placement_generation,
         context.owner_epoch,
@@ -1810,11 +2485,29 @@ fn replay_operation_outcome(
         return Ok(None);
     };
     Ok(Some(decode_operation_outcome(
-        MetadataCommandResult {
-            commit_version: replay.commit_version,
-            deterministic_result: replay.deterministic_result,
-            replayed: true,
-        },
+        replay,
+        input_digest,
+        operation_id,
+    )?))
+}
+
+fn replay_generic_index_gc_outcome(
+    store: &MetaShard,
+    context: RootWriteContext,
+    input_digest: [u8; SHA256_BYTES],
+    operation_id: OperationId,
+) -> Result<Option<GenericIndexGenerationGcOutcome>, GcError> {
+    let Some(replay) = store.lookup_request_result(
+        context.root_id,
+        context.placement_generation,
+        context.owner_epoch,
+        context.request_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(decode_generic_index_gc_outcome(
+        replay,
         input_digest,
         operation_id,
     )?))
@@ -1827,7 +2520,7 @@ fn replay_candidate_clear_outcome(
     revision: ArtifactRevisionId,
     epoch: ReferenceEpoch,
 ) -> Result<Option<GcCandidateClearOutcome>, GcError> {
-    let Some(replay) = store.lookup_request(
+    let Some(replay) = store.lookup_request_result(
         context.root_id,
         context.placement_generation,
         context.owner_epoch,
@@ -1837,11 +2530,7 @@ fn replay_candidate_clear_outcome(
         return Ok(None);
     };
     Ok(Some(decode_candidate_clear_outcome(
-        MetadataCommandResult {
-            commit_version: replay.commit_version,
-            deterministic_result: replay.deterministic_result,
-            replayed: true,
-        },
+        replay,
         input_digest,
         revision,
         epoch,
@@ -1853,7 +2542,7 @@ fn replay_history_barrier_outcome(
     context: RootWriteContext,
     input_digest: [u8; SHA256_BYTES],
 ) -> Result<Option<GcHistoryBarrierOutcome>, GcError> {
-    let Some(replay) = store.lookup_request(
+    let Some(replay) = store.lookup_request_result(
         context.root_id,
         context.placement_generation,
         context.owner_epoch,
@@ -1862,14 +2551,7 @@ fn replay_history_barrier_outcome(
     else {
         return Ok(None);
     };
-    Ok(Some(decode_history_barrier_outcome(
-        MetadataCommandResult {
-            commit_version: replay.commit_version,
-            deterministic_result: replay.deterministic_result,
-            replayed: true,
-        },
-        input_digest,
-    )?))
+    Ok(Some(decode_history_barrier_outcome(replay, input_digest)?))
 }
 
 fn encode_operation_result(
@@ -1884,6 +2566,24 @@ fn encode_operation_result(
     encoded.extend_from_slice(
         &u32::try_from(operation.len())
             .expect("bounded GC operation length fits u32")
+            .to_be_bytes(),
+    );
+    encoded.extend_from_slice(&operation);
+    Ok(encoded)
+}
+
+fn encode_generic_index_gc_result(
+    input_digest: [u8; SHA256_BYTES],
+    operation: &GenericIndexGcOperationRecord,
+) -> Result<Vec<u8>, GcError> {
+    let operation = operation.encode()?;
+    let mut encoded = Vec::with_capacity(2 + SHA256_BYTES + 4 + operation.len());
+    encoded.push(GC_RESULT_FORMAT_VERSION);
+    encoded.push(GC_RESULT_GENERIC_INDEX_OPERATION);
+    encoded.extend_from_slice(&input_digest);
+    encoded.extend_from_slice(
+        &u32::try_from(operation.len())
+            .expect("bounded Generic index GC operation length fits u32")
             .to_be_bytes(),
     );
     encoded.extend_from_slice(&operation);
@@ -1932,6 +2632,30 @@ fn decode_operation_outcome(
         });
     }
     Ok(GcCommandOutcome {
+        commit_version: result.commit_version,
+        operation,
+        replayed: result.replayed,
+    })
+}
+
+fn decode_generic_index_gc_outcome(
+    result: MetadataCommandResult,
+    expected_input_digest: [u8; SHA256_BYTES],
+    expected_operation_id: OperationId,
+) -> Result<GenericIndexGenerationGcOutcome, GcError> {
+    let mut decoder = ResultDecoder::new(&result.deterministic_result);
+    decoder.header(GC_RESULT_GENERIC_INDEX_OPERATION, expected_input_digest)?;
+    let operation_length = decoder.u32("Generic index GC operation length")? as usize;
+    let operation = GenericIndexGcOperationRecord::decode(
+        decoder.take("Generic index GC operation", operation_length)?,
+    )?;
+    decoder.finish()?;
+    if operation.operation_id != expected_operation_id {
+        return Err(GcError::DeterministicResultMismatch {
+            reason: "Generic index GC operation id differs from the request".to_owned(),
+        });
+    }
+    Ok(GenericIndexGenerationGcOutcome {
         commit_version: result.commit_version,
         operation,
         replayed: result.replayed,
@@ -1995,6 +2719,32 @@ fn claim_input_digest(
     hasher.update(revision.as_bytes());
     hasher.update(epoch.get().to_be_bytes());
     hasher.finalize().into()
+}
+
+fn generic_index_gc_claim_input_digest(
+    request: &ClaimGenericIndexGenerationGcRequest,
+) -> [u8; SHA256_BYTES] {
+    let mut hasher = input_hasher(8, request.context.root_id);
+    hasher.update(request.generation_id.as_bytes());
+    hasher.update(request.reference_epoch.get().to_be_bytes());
+    hasher.update(request.capability_digest);
+    hasher.update(request.row_count.to_be_bytes());
+    hasher.update(request.row_digest);
+    hasher.finalize().into()
+}
+
+fn generic_index_gc_collect_input_digest(
+    request: &CollectGenericIndexGenerationGcBatchRequest,
+) -> Result<[u8; SHA256_BYTES], GcError> {
+    let operation = request.expected_operation.encode()?;
+    let mut hasher = input_hasher(9, request.context.root_id);
+    hash_bytes(&mut hasher, &operation)?;
+    hasher.update(
+        u64::try_from(request.batch_size)
+            .expect("bounded Generic index GC batch size fits u64")
+            .to_be_bytes(),
+    );
+    Ok(hasher.finalize().into())
 }
 
 fn stale_candidate_input_digest(
@@ -2136,11 +2886,22 @@ mod tests {
     use tempfile::tempdir;
 
     use nokv_types::{
-        HistoryHoldState, OwnerEpoch, PlacementGeneration, RequestId, RootActivationState,
-        SnapshotId, FIXED_ID_BYTES,
+        GenericIndexGenerationId, GenericIndexGenerationState, GenericIndexReferenceKind,
+        HistoryHoldState, NormalizedRelativePath, OwnerEpoch, PlacementGeneration, RequestId,
+        RootActivationState, SnapshotId, FIXED_ID_BYTES,
     };
 
-    use super::super::codec::{revision_dependency_ref_key, snapshot_history_hold_key};
+    use super::super::codec::{
+        generic_index_append_receipt_key, generic_index_append_receipt_prefix,
+        generic_index_generation_key, generic_index_generation_ref_key,
+        generic_index_generation_ref_prefix, generic_index_row_key, generic_index_row_prefix,
+        revision_dependency_ref_key, snapshot_history_hold_key,
+    };
+    use super::super::generic_index_records::{
+        advance_generic_index_row_rolling_digest, generic_index_capability_digest,
+        generic_index_row_digest, GenericIndexAppendReceiptRecord, GenericIndexGenerationRecord,
+        GenericIndexGenerationRefRecord, GenericIndexRowBinding, GenericIndexRowRecord,
+    };
     use super::super::AppendSegment;
     use super::*;
 
@@ -2477,6 +3238,117 @@ mod tests {
             .unwrap()
     }
 
+    #[derive(Clone)]
+    struct GenericIndexGcFixture {
+        generation_id: GenericIndexGenerationId,
+        reference_epoch: ReferenceEpoch,
+        capability_digest: [u8; SHA256_BYTES],
+        row_count: u64,
+        row_digest: [u8; SHA256_BYTES],
+        rows: Vec<GenericIndexRowRecord>,
+    }
+
+    fn seed_generic_index_gc_fixture(
+        store: &MetaShard,
+        counter: &mut u128,
+        row_count: u64,
+        receipt_count: u64,
+    ) -> GenericIndexGcFixture {
+        assert!(receipt_count <= row_count);
+        let generation_id = GenericIndexGenerationId::from_bytes([0x71; FIXED_ID_BYTES]);
+        let reference_epoch = ReferenceEpoch::new(2);
+        let capabilities = Vec::new();
+        let capability_digest = generic_index_capability_digest(&capabilities).unwrap();
+        let rows = (0..row_count)
+            .map(|sequence| GenericIndexRowRecord {
+                relative_path: Some(
+                    NormalizedRelativePath::new(format!("entry-{sequence:03}")).unwrap(),
+                ),
+                binding: GenericIndexRowBinding::Unbound,
+                values: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut row_digest = [0; SHA256_BYTES];
+        let mut resulting_digests = Vec::with_capacity(rows.len());
+        for (sequence, row) in rows.iter().enumerate() {
+            row_digest = advance_generic_index_row_rolling_digest(
+                row_digest,
+                generic_index_row_digest(sequence as u64, row).unwrap(),
+            );
+            resulting_digests.push(row_digest);
+        }
+
+        let context = write_context(store, counter);
+        let commit_version =
+            CommitVersion::new(context.read_version.get().checked_add(1).unwrap()).unwrap();
+        let generation = GenericIndexGenerationRecord {
+            capabilities,
+            declared_row_count: row_count,
+            appended_row_count: row_count,
+            rolling_row_digest: row_digest,
+            reference_count: 0,
+            reference_epoch,
+            last_zero_reference_version: Some(commit_version),
+            state: GenericIndexGenerationState::Sealed,
+        };
+        let mut command = base_command(context, Vec::new());
+        put_absent(
+            &mut command,
+            MetadataFamily::GenericIndexGeneration,
+            generic_index_generation_key(root(), generation_id),
+            generation.encode().unwrap(),
+        );
+        for (sequence, row) in rows.iter().enumerate() {
+            put_absent(
+                &mut command,
+                MetadataFamily::GenericIndexGeneration,
+                generic_index_row_key(root(), generation_id, sequence as u64),
+                row.encode().unwrap(),
+            );
+        }
+        for first_sequence in 0..receipt_count {
+            put_absent(
+                &mut command,
+                MetadataFamily::GenericIndexGeneration,
+                generic_index_append_receipt_key(root(), generation_id, first_sequence),
+                GenericIndexAppendReceiptRecord {
+                    first_sequence,
+                    row_count: 1,
+                    commit_version,
+                    input_digest: [first_sequence as u8; SHA256_BYTES],
+                    resulting_row_count: first_sequence + 1,
+                    resulting_row_digest: resulting_digests[first_sequence as usize],
+                }
+                .encode()
+                .unwrap(),
+            );
+        }
+        store.execute(&command.seal()).unwrap();
+        GenericIndexGcFixture {
+            generation_id,
+            reference_epoch,
+            capability_digest,
+            row_count,
+            row_digest,
+            rows,
+        }
+    }
+
+    fn generic_index_gc_claim_request(
+        store: &MetaShard,
+        counter: &mut u128,
+        fixture: &GenericIndexGcFixture,
+    ) -> ClaimGenericIndexGenerationGcRequest {
+        ClaimGenericIndexGenerationGcRequest {
+            context: write_context(store, counter),
+            generation_id: fixture.generation_id,
+            reference_epoch: fixture.reference_epoch,
+            capability_digest: fixture.capability_digest,
+            row_count: fixture.row_count,
+            row_digest: fixture.row_digest,
+        }
+    }
+
     fn claim_and_begin(
         service: GcService<'_>,
         store: &MetaShard,
@@ -2564,6 +3436,37 @@ mod tests {
                 floor: 2,
             })
         );
+    }
+
+    #[test]
+    fn gc_exact_replay_rejects_a_corrupted_recovery_binding() {
+        let mut counter = 1;
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        initialize_store(&store, &mut counter);
+        let fixture = seed_fixture(&store, &mut counter, false, false);
+        let service = GcService::new(&store);
+        let context = write_context(&store, &mut counter);
+        let request = ClaimGcRequest {
+            context,
+            artifact_revision_id: fixture.target,
+            reference_epoch: fixture.epoch,
+        };
+        service.claim(request.clone()).unwrap();
+        let dedupe = store
+            .lookup_request(root(), placement(), owner_epoch(), context.request_id)
+            .unwrap()
+            .unwrap();
+        store
+            .replace_recovery_header_for_test(
+                dedupe.recovery_lsn,
+                Some(b"tampered GC recovery header".to_vec()),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            service.claim(request),
+            Err(GcError::Meta(MetaError::CorruptRecord { .. }))
+        ));
     }
 
     #[test]
@@ -2982,5 +3885,348 @@ mod tests {
             candidate.quarantine_evidence,
             quarantined.operation.quarantine_evidence
         );
+    }
+
+    #[test]
+    fn generic_index_gc_requires_floor_strictly_newer_than_last_zero() {
+        let mut counter = 700;
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        initialize_store(&store, &mut counter);
+        let fixture = seed_generic_index_gc_fixture(&store, &mut counter, 0, 0);
+        let service = GcService::new(&store);
+
+        let generation = GenericIndexGenerationRecord::decode(
+            &read_payload(
+                &store,
+                MetadataFamily::GenericIndexGeneration,
+                &generic_index_generation_key(root(), fixture.generation_id),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let last_zero = generation.last_zero_reference_version.unwrap();
+        assert_eq!(read_context(&store).read_version.get(), last_zero.get());
+        assert!(service
+            .list_generic_index_generation_candidates(read_context(&store), None, 8)
+            .unwrap()
+            .entries
+            .is_empty());
+        assert_eq!(
+            service.claim_generic_index_generation(generic_index_gc_claim_request(
+                &store,
+                &mut counter,
+                &fixture,
+            )),
+            Err(GcError::UnsafeHistoryFloor {
+                last_zero: last_zero.get(),
+                floor: last_zero.get(),
+            })
+        );
+
+        service
+            .advance_history_barrier(write_context(&store, &mut counter))
+            .unwrap();
+        let candidates = service
+            .list_generic_index_generation_candidates(read_context(&store), None, 8)
+            .unwrap();
+        assert_eq!(candidates.entries.len(), 1);
+        assert_eq!(
+            candidates.entries[0].cursor.generation_id,
+            fixture.generation_id
+        );
+        assert_eq!(
+            candidates.entries[0].reference_epoch,
+            fixture.reference_epoch
+        );
+        assert_eq!(candidates.entries[0].row_digest, fixture.row_digest);
+        let claimed = service
+            .claim_generic_index_generation(generic_index_gc_claim_request(
+                &store,
+                &mut counter,
+                &fixture,
+            ))
+            .unwrap();
+        assert_eq!(claimed.operation.phase, GenericIndexGcPhase::Retiring);
+    }
+
+    #[test]
+    fn generic_index_gc_validates_and_collects_rows_then_receipts_in_batches() {
+        let mut counter = 800;
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        initialize_store(&store, &mut counter);
+        let fixture = seed_generic_index_gc_fixture(&store, &mut counter, 5, 5);
+        let service = GcService::new(&store);
+        service
+            .advance_history_barrier(write_context(&store, &mut counter))
+            .unwrap();
+        let mut operation = service
+            .claim_generic_index_generation(generic_index_gc_claim_request(
+                &store,
+                &mut counter,
+                &fixture,
+            ))
+            .unwrap()
+            .operation;
+
+        let first_batch = CollectGenericIndexGenerationGcBatchRequest {
+            context: write_context(&store, &mut counter),
+            expected_operation: operation,
+            batch_size: 2,
+        };
+        let first = service
+            .collect_generic_index_generation_batch(first_batch.clone())
+            .unwrap();
+        let replay = service
+            .collect_generic_index_generation_batch(first_batch)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.commit_version, first.commit_version);
+        assert_eq!(replay.operation, first.operation);
+        operation = first.operation;
+
+        let mut calls = 1;
+        while operation.phase != GenericIndexGcPhase::Retired {
+            operation = service
+                .collect_generic_index_generation_batch(
+                    CollectGenericIndexGenerationGcBatchRequest {
+                        context: write_context(&store, &mut counter),
+                        expected_operation: operation,
+                        batch_size: 2,
+                    },
+                )
+                .unwrap()
+                .operation;
+            calls += 1;
+        }
+        assert_eq!(calls, 6);
+        assert_eq!(operation.scanned_row_count, 5);
+        assert_eq!(operation.deleted_receipt_count, 5);
+        assert!(operation.rows_complete);
+        assert!(operation.receipts_complete);
+        assert!(store
+            .scan_prefix_at(
+                root(),
+                placement(),
+                owner_epoch(),
+                MetadataFamily::GenericIndexGeneration,
+                &generic_index_row_prefix(root(), fixture.generation_id),
+                read_context(&store).read_version,
+                None,
+                1,
+            )
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .scan_prefix_at(
+                root(),
+                placement(),
+                owner_epoch(),
+                MetadataFamily::GenericIndexGeneration,
+                &generic_index_append_receipt_prefix(root(), fixture.generation_id),
+                read_context(&store).read_version,
+                None,
+                1,
+            )
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .scan_prefix_at(
+                root(),
+                placement(),
+                owner_epoch(),
+                MetadataFamily::GenericIndexGeneration,
+                &generic_index_generation_ref_prefix(root(), fixture.generation_id),
+                read_context(&store).read_version,
+                None,
+                1,
+            )
+            .unwrap()
+            .is_empty());
+        let tombstone = GenericIndexGenerationRecord::decode(
+            &read_payload(
+                &store,
+                MetadataFamily::GenericIndexGeneration,
+                &generic_index_generation_key(root(), fixture.generation_id),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tombstone.state, GenericIndexGenerationState::Retired);
+        assert_eq!(tombstone.reference_epoch, fixture.reference_epoch);
+        assert_eq!(tombstone.rolling_row_digest, fixture.row_digest);
+    }
+
+    #[test]
+    fn generic_index_gc_stale_e2_claim_fails_after_reference_aba_to_e4() {
+        let mut counter = 900;
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        initialize_store(&store, &mut counter);
+        let fixture = seed_generic_index_gc_fixture(&store, &mut counter, 0, 0);
+        let service = GcService::new(&store);
+        service
+            .advance_history_barrier(write_context(&store, &mut counter))
+            .unwrap();
+
+        let claim_request = generic_index_gc_claim_request(&store, &mut counter, &fixture);
+        let mut stale_plan =
+            plan_generic_index_generation_gc_claim(&store, &claim_request).unwrap();
+        let generation_key = generic_index_generation_key(root(), fixture.generation_id);
+        let reference_key = generic_index_generation_ref_key(
+            root(),
+            fixture.generation_id,
+            GenericIndexReferenceKind::Current,
+            [0x44; SHA256_BYTES],
+        );
+        let e2_payload = read_payload(
+            &store,
+            MetadataFamily::GenericIndexGeneration,
+            &generation_key,
+        )
+        .unwrap();
+        let mut e3 = GenericIndexGenerationRecord::decode(&e2_payload).unwrap();
+        e3.reference_epoch = ReferenceEpoch::new(3);
+        e3.reference_count = 1;
+        e3.last_zero_reference_version = None;
+        let context = write_context(&store, &mut counter);
+        let mut add = base_command(context, Vec::new());
+        replace_exact(
+            &mut add,
+            MetadataFamily::GenericIndexGeneration,
+            generation_key.clone(),
+            e2_payload,
+            e3.encode().unwrap(),
+        );
+        put_absent(
+            &mut add,
+            MetadataFamily::GenericIndexGeneration,
+            reference_key.clone(),
+            GenericIndexGenerationRefRecord {
+                kind: GenericIndexReferenceKind::Current,
+                owner_digest: [0x44; SHA256_BYTES],
+                reference_epoch_at_add: ReferenceEpoch::new(3),
+            }
+            .encode()
+            .unwrap(),
+        );
+        store.execute(&add.seal()).unwrap();
+
+        let e3_payload = read_payload(
+            &store,
+            MetadataFamily::GenericIndexGeneration,
+            &generation_key,
+        )
+        .unwrap();
+        let reference_payload = read_payload(
+            &store,
+            MetadataFamily::GenericIndexGeneration,
+            &reference_key,
+        )
+        .unwrap();
+        let context = write_context(&store, &mut counter);
+        let mut e4 = GenericIndexGenerationRecord::decode(&e3_payload).unwrap();
+        e4.reference_epoch = ReferenceEpoch::new(4);
+        e4.reference_count = 0;
+        e4.last_zero_reference_version =
+            Some(CommitVersion::new(context.read_version.get().checked_add(1).unwrap()).unwrap());
+        let mut remove = base_command(context, Vec::new());
+        replace_exact(
+            &mut remove,
+            MetadataFamily::GenericIndexGeneration,
+            generation_key.clone(),
+            e3_payload,
+            e4.encode().unwrap(),
+        );
+        delete_exact(
+            &mut remove,
+            MetadataFamily::GenericIndexGeneration,
+            reference_key,
+            reference_payload,
+        );
+        store.execute(&remove.seal()).unwrap();
+
+        let fresh = write_context(&store, &mut counter);
+        stale_plan.read_version = fresh.read_version;
+        stale_plan.request_id = fresh.request_id;
+        stale_plan.command_digest = CommandDigest::from_bytes([0; SHA256_BYTES]);
+        assert_eq!(
+            store.execute(&stale_plan.seal()),
+            Err(MetaError::PredicateFailed)
+        );
+        let persisted = GenericIndexGenerationRecord::decode(
+            &read_payload(
+                &store,
+                MetadataFamily::GenericIndexGeneration,
+                &generation_key,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.reference_epoch, ReferenceEpoch::new(4));
+        assert_eq!(persisted.state, GenericIndexGenerationState::Sealed);
+    }
+
+    #[test]
+    fn generic_index_gc_fails_closed_on_seal_and_payload_corruption() {
+        let mut counter = 1_000;
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        initialize_store(&store, &mut counter);
+        let fixture = seed_generic_index_gc_fixture(&store, &mut counter, 2, 2);
+        let service = GcService::new(&store);
+        service
+            .advance_history_barrier(write_context(&store, &mut counter))
+            .unwrap();
+
+        let mut wrong_seal = generic_index_gc_claim_request(&store, &mut counter, &fixture);
+        wrong_seal.row_digest = [0x55; SHA256_BYTES];
+        assert!(matches!(
+            service.claim_generic_index_generation(wrong_seal),
+            Err(GcError::GenericIndexGenerationSealMismatch { .. })
+        ));
+
+        let corrupt_key = generic_index_row_key(root(), fixture.generation_id, 1);
+        let corrupt_payload =
+            read_payload(&store, MetadataFamily::GenericIndexGeneration, &corrupt_key).unwrap();
+        let mut corrupt_row = fixture.rows[1].clone();
+        corrupt_row.relative_path = Some(NormalizedRelativePath::new("changed").unwrap());
+        let context = write_context(&store, &mut counter);
+        let mut corrupt = base_command(context, Vec::new());
+        replace_exact(
+            &mut corrupt,
+            MetadataFamily::GenericIndexGeneration,
+            corrupt_key.clone(),
+            corrupt_payload,
+            corrupt_row.encode().unwrap(),
+        );
+        store.execute(&corrupt.seal()).unwrap();
+
+        let claimed = service
+            .claim_generic_index_generation(generic_index_gc_claim_request(
+                &store,
+                &mut counter,
+                &fixture,
+            ))
+            .unwrap();
+        assert!(matches!(
+            service.collect_generic_index_generation_batch(
+                CollectGenericIndexGenerationGcBatchRequest {
+                    context: write_context(&store, &mut counter),
+                    expected_operation: claimed.operation,
+                    batch_size: 2,
+                }
+            ),
+            Err(GcError::GenericIndexPayloadClosureMismatch { .. })
+        ));
+        assert!(read_payload(
+            &store,
+            MetadataFamily::GenericIndexGeneration,
+            &generic_index_row_key(root(), fixture.generation_id, 0),
+        )
+        .is_some());
+        assert!(read_payload(
+            &store,
+            MetadataFamily::GenericIndexGeneration,
+            &generic_index_row_key(root(), fixture.generation_id, 1),
+        )
+        .is_some());
     }
 }

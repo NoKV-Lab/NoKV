@@ -8,7 +8,8 @@ use nokv_types::{ObjectNamespaceId, FIXED_ID_BYTES};
 
 use crate::{
     ArtifactObjectStore, ArtifactStoreCapabilities, ImmutableCreateOutcome, ObjectDeleteOutcome,
-    ObjectError, ObjectInfo, ObjectKey, ObjectRange,
+    ObjectError, ObjectInfo, ObjectKey, ObjectRange, ProviderAdmissionReceipt,
+    ProviderHandleIdentity,
 };
 
 const MARKER_MAGIC: &[u8] = b"nokv.object-namespace\0";
@@ -58,6 +59,14 @@ where
 
     fn capabilities(&self) -> ArtifactStoreCapabilities {
         self.inner.capabilities()
+    }
+
+    fn provider_handle_identity(&self) -> ProviderHandleIdentity {
+        self.inner.provider_handle_identity()
+    }
+
+    fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
+        self.inner.provider_admission_receipt()
     }
 
     fn create_immutable(

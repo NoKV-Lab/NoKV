@@ -18,6 +18,7 @@ use nokv_client::{
     StaticRouteResolver, TransportError, WorkspaceClient,
 };
 use nokv_protocol::{LogicalShardIdentity, ObjectNamespaceIdentity, RootIdentity, RootRoute};
+use nokv_types::AgentId;
 
 use super::cli::{ClientConfig, EtcdRoutingConfig, RoutingConfig, StaticRoutingConfig};
 
@@ -116,6 +117,17 @@ pub fn configured_root_id(config: &ClientConfig) -> Result<RootIdentity, Connect
 pub fn parse_logical_shard_id(value: &str) -> Result<LogicalShardIdentity, ConnectionError> {
     Ok(LogicalShardIdentity(decode_fixed_identity(
         "logical shard id",
+        value,
+    )?))
+}
+
+/// Decode the deployment-owned stable Agent identity used for root admission.
+///
+/// This identity catches misconfigured root routing; it is not an
+/// authentication credential.
+pub fn parse_agent_id(value: &str) -> Result<AgentId, ConnectionError> {
+    Ok(AgentId::from_bytes(decode_fixed_identity(
+        "--agent-id",
         value,
     )?))
 }
@@ -300,6 +312,7 @@ mod tests {
     #[test]
     fn parsed_static_route_requires_explicit_fences_before_connecting() {
         let root_id = identity(0x11);
+        let agent_id = identity(0x44);
         let logical_shard_id = identity(0x22);
         let object_namespace_id = identity(0x33);
         let parse = |extra: &[&str]| {
@@ -307,6 +320,10 @@ mod tests {
                 [
                     "--root-id",
                     root_id.as_str(),
+                    // Agent-facing commands parse only with a durable AgentId;
+                    // the static-route fence checks below happen at connect().
+                    "--agent-id",
+                    agent_id.as_str(),
                     "--metadata-address",
                     "127.0.0.1:17750",
                     "--logical-shard-id",
@@ -369,6 +386,26 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parses_only_canonical_explicit_agent_identities() {
+        let parsed = parse_agent_id(&identity(0x44)).unwrap();
+        assert_eq!(parsed.as_bytes(), &[0x44; FIXED_ID_BYTES]);
+
+        for invalid in [
+            "44".repeat(FIXED_ID_BYTES - 1),
+            "GG".repeat(FIXED_ID_BYTES),
+            "AA".repeat(FIXED_ID_BYTES),
+        ] {
+            assert!(matches!(
+                parse_agent_id(&invalid),
+                Err(ConnectionError::InvalidIdentity {
+                    option: "--agent-id",
+                    ..
+                })
+            ));
+        }
     }
 
     #[cfg(feature = "etcd")]

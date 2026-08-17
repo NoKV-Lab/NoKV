@@ -10,6 +10,7 @@
 //! `nokv-meta`. Store adapters translate these byte operations to one physical
 //! transaction system without exposing backend types through this interface.
 
+mod checkpoint;
 mod errors;
 mod store;
 mod types;
@@ -26,3 +27,8 @@ pub use types::{
 
 #[cfg(test)]
 mod tests;
+pub use checkpoint::{
+    CheckpointCatalogCommitment, CheckpointError, CheckpointFormatId, CheckpointInstallError,
+    CheckpointInstallState, FreshStoreCheckpointInstaller, StoreCheckpointEnvelope,
+    WholeStoreCheckpointSource, MAX_CHECKPOINT_IMAGE_BYTES,
+};

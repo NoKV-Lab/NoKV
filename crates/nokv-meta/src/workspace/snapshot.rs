@@ -9,15 +9,20 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use nokv_types::{
-    CommandDigest, CommitVersion, ConsumerEpoch, Generation, HistoryHoldState, OperationId,
-    SnapshotAliasName, SnapshotId, SnapshotState, WorkbenchId, WorkspaceIncarnationId,
-    WorkspaceState, SHA256_BYTES,
+    CommandDigest, CommitId, CommitState, CommitVersion, ConsumerEpoch, Generation,
+    HistoryHoldState, OperationId, SnapshotAliasName, SnapshotId, SnapshotState, WorkbenchId,
+    WorkspaceIncarnationId, WorkspaceState, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
 
 use super::codec::{
-    restore_history_hold_key, snapshot_alias_key, snapshot_history_hold_key, snapshot_id_claim_key,
-    snapshot_ref_key, workspace_current_key, SCHEMA_ID,
+    commit_key, restore_history_hold_key, snapshot_alias_key, snapshot_commit_consumer_key,
+    snapshot_history_hold_key, snapshot_id_claim_key, snapshot_ref_key, workbench_commit_head_key,
+    workbench_head_commit_consumer_key, workspace_current_key, SCHEMA_ID,
+};
+use super::commit_records::{
+    add_commit_consumer, remove_commit_consumer, CommitConsumerMutationError, CommitConsumerRecord,
+    CommitRecord, CommitRecordError, WorkbenchCommitHeadRecord,
 };
 use super::engine::{
     CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError, MetaShard,
@@ -122,6 +127,16 @@ pub enum SnapshotError {
     WorkspaceMissing {
         workbench_id: WorkbenchId,
     },
+    WorkspaceNotCommitted {
+        workbench_id: WorkbenchId,
+    },
+    SourceCommitMissing,
+    SourceCommitUnavailable {
+        state: CommitState,
+    },
+    SourceCommitBindingMismatch,
+    SourceCommitConsumerMissing,
+    SourceCommitConsumerMismatch,
     SnapshotAlreadyExists {
         snapshot_id: SnapshotId,
     },
@@ -165,6 +180,10 @@ pub enum SnapshotError {
     },
     ConsumerCountOverflow,
     ConsumerEpochOverflow,
+    CommitConsumerCountOverflow,
+    CommitConsumerCountUnderflow,
+    CommitConsumerEpochOverflow,
+    CommitVersionOverflow,
     AliasGenerationOverflow,
     RequestInputMismatch,
     DeterministicResultMismatch {
@@ -172,6 +191,7 @@ pub enum SnapshotError {
     },
     ConcurrentMutation,
     WorkspaceCodec(PublicationRecordCodecError),
+    CommitCodec(CommitRecordError),
     SnapshotCodec(SnapshotRecordError),
     QueryRecord(QueryRecordError),
     Meta(MetaError),
@@ -183,6 +203,21 @@ impl fmt::Display for SnapshotError {
             Self::WorkspaceMissing { workbench_id } => {
                 write!(formatter, "workbench {workbench_id} does not exist")
             }
+            Self::WorkspaceNotCommitted { workbench_id } => {
+                write!(formatter, "workbench {workbench_id} has no committed head")
+            }
+            Self::SourceCommitMissing => {
+                formatter.write_str("snapshot source commit is missing")
+            }
+            Self::SourceCommitUnavailable { state } => {
+                write!(formatter, "snapshot source commit is not sealed: {state:?}")
+            }
+            Self::SourceCommitBindingMismatch => formatter
+                .write_str("snapshot source commit does not belong to the visible workbench"),
+            Self::SourceCommitConsumerMissing => formatter
+                .write_str("snapshot source commit is missing its exact consumer row"),
+            Self::SourceCommitConsumerMismatch => formatter
+                .write_str("snapshot source commit consumer epoch is inconsistent"),
             Self::SnapshotAlreadyExists { snapshot_id } => {
                 write!(formatter, "snapshot {snapshot_id} already exists")
             }
@@ -244,6 +279,18 @@ impl fmt::Display for SnapshotError {
             Self::ConsumerEpochOverflow => {
                 formatter.write_str("snapshot consumer epoch overflow")
             }
+            Self::CommitConsumerCountOverflow => {
+                formatter.write_str("source commit consumer count overflow")
+            }
+            Self::CommitConsumerCountUnderflow => {
+                formatter.write_str("source commit consumer count would underflow")
+            }
+            Self::CommitConsumerEpochOverflow => {
+                formatter.write_str("source commit consumer epoch overflow")
+            }
+            Self::CommitVersionOverflow => {
+                formatter.write_str("snapshot commit version overflow")
+            }
             Self::AliasGenerationOverflow => {
                 formatter.write_str("snapshot alias generation overflow")
             }
@@ -257,6 +304,7 @@ impl fmt::Display for SnapshotError {
                 formatter.write_str("snapshot state changed concurrently")
             }
             Self::WorkspaceCodec(source) => source.fmt(formatter),
+            Self::CommitCodec(source) => source.fmt(formatter),
             Self::SnapshotCodec(source) => source.fmt(formatter),
             Self::QueryRecord(source) => source.fmt(formatter),
             Self::Meta(source) => source.fmt(formatter),
@@ -268,6 +316,7 @@ impl std::error::Error for SnapshotError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::WorkspaceCodec(source) => Some(source),
+            Self::CommitCodec(source) => Some(source),
             Self::SnapshotCodec(source) => Some(source),
             Self::QueryRecord(source) => Some(source),
             Self::Meta(source) => Some(source),
@@ -288,13 +337,20 @@ impl From<SnapshotRecordError> for SnapshotError {
     }
 }
 
+impl From<CommitRecordError> for SnapshotError {
+    fn from(source: CommitRecordError) -> Self {
+        Self::CommitCodec(source)
+    }
+}
+
 impl From<QueryRecordError> for SnapshotError {
     fn from(source: QueryRecordError) -> Self {
         Self::QueryRecord(source)
     }
 }
 
-/// Mint a new leased MVCC snapshot and its history hold atomically.
+/// Mint a new leased MVCC snapshot, its history hold, and one exact sealed
+/// source-commit consumer atomically.
 pub fn mint_snapshot(
     store: &MetaShard,
     context: RootWriteContext,
@@ -312,6 +368,7 @@ pub fn mint_snapshot(
         });
     }
     let workspace = load_visible_workspace(store, context, &request.workbench_id)?;
+    let source = load_committed_snapshot_source(store, context, &workspace)?;
     let snapshot_key = snapshot_ref_key(
         context.root_id,
         workspace.record.incarnation_id,
@@ -350,6 +407,7 @@ pub fn mint_snapshot(
         .transpose()?;
     let record = SnapshotRefRecord {
         read_version: context.read_version,
+        source_commit_id: Some(source.commit_id),
         alias: request.alias.clone(),
         lease_deadline_ms: request.lease_deadline_ms,
         state: SnapshotState::Active,
@@ -374,6 +432,34 @@ pub fn mint_snapshot(
     let deterministic_result = encode_snapshot_result(input_digest, &resolved)?;
     let mut command = base_command(context, deterministic_result);
     predicate_workspace(&mut command, &workspace);
+    predicate_exact(
+        &mut command,
+        MetadataFamily::WorkbenchCommitHead,
+        source.head_key,
+        source.head_payload,
+    );
+    predicate_exact(
+        &mut command,
+        MetadataFamily::CommitConsumer,
+        source.head_consumer_key,
+        source.head_consumer_payload,
+    );
+    replace_exact(
+        &mut command,
+        MetadataFamily::Commit,
+        source.commit_key,
+        source.commit_payload,
+        source.retained_commit.encode()?,
+    );
+    put_absent(
+        &mut command,
+        MetadataFamily::CommitConsumer,
+        snapshot_commit_consumer_key(context.root_id, source.commit_id, request.snapshot_id),
+        CommitConsumerRecord {
+            consumer_epoch_at_add: source.retained_commit.consumer_epoch,
+        }
+        .encode(),
+    );
     put_absent(
         &mut command,
         MetadataFamily::SnapshotRef,
@@ -810,6 +896,13 @@ fn terminalize_snapshot(
     let deterministic_result = encode_snapshot_result(input_digest, &next)?;
     let mut command = base_command(context, deterministic_result);
     predicate_workspace(&mut command, &workspace);
+    plan_snapshot_commit_release(
+        store,
+        context,
+        workspace.record.incarnation_id,
+        &loaded.resolved,
+        &mut command,
+    )?;
     replace_exact(
         &mut command,
         MetadataFamily::SnapshotRef,
@@ -871,6 +964,155 @@ struct LoadedWorkspace {
     key: Vec<u8>,
     payload: Vec<u8>,
     record: WorkspaceRecord,
+}
+
+struct LoadedSnapshotSourceCommit {
+    commit_id: CommitId,
+    head_key: Vec<u8>,
+    head_payload: Vec<u8>,
+    head_consumer_key: Vec<u8>,
+    head_consumer_payload: Vec<u8>,
+    commit_key: Vec<u8>,
+    commit_payload: Vec<u8>,
+    retained_commit: CommitRecord,
+}
+
+fn load_committed_snapshot_source(
+    store: &MetaShard,
+    context: RootWriteContext,
+    workspace: &LoadedWorkspace,
+) -> Result<LoadedSnapshotSourceCommit, SnapshotError> {
+    let head_key = workbench_commit_head_key(context.root_id, workspace.record.incarnation_id);
+    let head_payload = read_current(
+        store,
+        context,
+        MetadataFamily::WorkbenchCommitHead,
+        &head_key,
+    )?
+    .ok_or_else(|| SnapshotError::WorkspaceNotCommitted {
+        workbench_id: workspace.workbench_id.clone(),
+    })?;
+    let head = WorkbenchCommitHeadRecord::decode(&head_payload)?;
+    let commit_key = commit_key(context.root_id, head.commit_id);
+    let commit_payload = read_current(store, context, MetadataFamily::Commit, &commit_key)?
+        .ok_or(SnapshotError::SourceCommitMissing)?;
+    let commit = CommitRecord::decode(&commit_payload)?;
+    require_snapshot_source_commit(&commit, workspace.record.incarnation_id)?;
+
+    let head_consumer_key = workbench_head_commit_consumer_key(
+        context.root_id,
+        head.commit_id,
+        workspace.record.incarnation_id,
+    );
+    let head_consumer_payload = read_current(
+        store,
+        context,
+        MetadataFamily::CommitConsumer,
+        &head_consumer_key,
+    )?
+    .ok_or(SnapshotError::SourceCommitConsumerMissing)?;
+    let head_consumer = CommitConsumerRecord::decode(&head_consumer_payload)?;
+    validate_commit_consumer(&commit, head_consumer)?;
+    let retained_commit = add_commit_consumer(&commit).map_err(map_commit_consumer_mutation)?;
+    Ok(LoadedSnapshotSourceCommit {
+        commit_id: head.commit_id,
+        head_key,
+        head_payload,
+        head_consumer_key,
+        head_consumer_payload,
+        commit_key,
+        commit_payload,
+        retained_commit,
+    })
+}
+
+fn plan_snapshot_commit_release(
+    store: &MetaShard,
+    context: RootWriteContext,
+    workspace: WorkspaceIncarnationId,
+    snapshot: &ResolvedSnapshot,
+    command: &mut MetadataCommand,
+) -> Result<(), SnapshotError> {
+    let Some(commit_id) = snapshot.record.source_commit_id else {
+        return Ok(());
+    };
+    let commit_key = commit_key(context.root_id, commit_id);
+    let commit_payload = read_current(store, context, MetadataFamily::Commit, &commit_key)?
+        .ok_or(SnapshotError::SourceCommitMissing)?;
+    let commit = CommitRecord::decode(&commit_payload)?;
+    require_snapshot_source_commit(&commit, workspace)?;
+
+    let consumer_key =
+        snapshot_commit_consumer_key(context.root_id, commit_id, snapshot.snapshot_id);
+    let consumer_payload = read_current(
+        store,
+        context,
+        MetadataFamily::CommitConsumer,
+        &consumer_key,
+    )?
+    .ok_or(SnapshotError::SourceCommitConsumerMissing)?;
+    let consumer = CommitConsumerRecord::decode(&consumer_payload)?;
+    validate_commit_consumer(&commit, consumer)?;
+    let zero_version = CommitVersion::new(
+        context
+            .read_version
+            .get()
+            .checked_add(1)
+            .ok_or(SnapshotError::CommitVersionOverflow)?,
+    )
+    .map_err(|_| SnapshotError::CommitVersionOverflow)?;
+    let released =
+        remove_commit_consumer(&commit, zero_version).map_err(map_commit_consumer_mutation)?;
+    replace_exact(
+        command,
+        MetadataFamily::Commit,
+        commit_key,
+        commit_payload,
+        released.encode()?,
+    );
+    delete_exact(
+        command,
+        MetadataFamily::CommitConsumer,
+        consumer_key,
+        consumer_payload,
+    );
+    Ok(())
+}
+
+fn require_snapshot_source_commit(
+    commit: &CommitRecord,
+    workspace: WorkspaceIncarnationId,
+) -> Result<(), SnapshotError> {
+    if commit.state != CommitState::Sealed {
+        return Err(SnapshotError::SourceCommitUnavailable {
+            state: commit.state,
+        });
+    }
+    if commit.source_workspace_incarnation_id != workspace {
+        return Err(SnapshotError::SourceCommitBindingMismatch);
+    }
+    Ok(())
+}
+
+fn validate_commit_consumer(
+    commit: &CommitRecord,
+    consumer: CommitConsumerRecord,
+) -> Result<(), SnapshotError> {
+    if consumer.consumer_epoch_at_add == ConsumerEpoch::ZERO
+        || consumer.consumer_epoch_at_add > commit.consumer_epoch
+        || commit.consumer_count == 0
+    {
+        return Err(SnapshotError::SourceCommitConsumerMismatch);
+    }
+    Ok(())
+}
+
+fn map_commit_consumer_mutation(error: CommitConsumerMutationError) -> SnapshotError {
+    match error {
+        CommitConsumerMutationError::CountOverflow => SnapshotError::CommitConsumerCountOverflow,
+        CommitConsumerMutationError::CountUnderflow => SnapshotError::CommitConsumerCountUnderflow,
+        CommitConsumerMutationError::EpochOverflow => SnapshotError::CommitConsumerEpochOverflow,
+    }
 }
 
 #[derive(Clone)]
@@ -1123,6 +1365,19 @@ fn predicate_workspace(command: &mut MetadataCommand, workspace: &LoadedWorkspac
     });
 }
 
+fn predicate_exact(
+    command: &mut MetadataCommand,
+    family: MetadataFamily,
+    key: Vec<u8>,
+    expected: Vec<u8>,
+) {
+    command.predicates.push(CommandPredicate::Value {
+        family,
+        key,
+        expected: Some(expected),
+    });
+}
+
 fn put_absent(command: &mut MetadataCommand, family: MetadataFamily, key: Vec<u8>, value: Vec<u8>) {
     command.predicates.push(CommandPredicate::Value {
         family,
@@ -1275,7 +1530,11 @@ fn execute_snapshot_command(
                 requested: requested_deadline_ms,
             });
         }
-        Err(MetaError::PredicateFailed | MetaError::WriteConflict) => {
+        Err(
+            MetaError::PredicateFailed
+            | MetaError::WriteConflict
+            | MetaError::WriteReadVersionMismatch { .. },
+        ) => {
             return Err(SnapshotError::ConcurrentMutation);
         }
         Err(source) => return Err(SnapshotError::Meta(source)),
@@ -1293,7 +1552,7 @@ fn replay_outcome(
     context: RootWriteContext,
     input_digest: [u8; SHA256_BYTES],
 ) -> Result<Option<SnapshotWriteOutcome>, SnapshotError> {
-    let Some(replay) = store.lookup_request(
+    let Some(replay) = store.lookup_request_result(
         context.root_id,
         context.placement_generation,
         context.owner_epoch,
@@ -1633,11 +1892,17 @@ mod tests {
     use tempfile::tempdir;
 
     use nokv_types::{
-        LogicalShardId, OwnerEpoch, PlacementGeneration, ReadVersion, RequestId,
-        RootActivationState, RootId, FIXED_ID_BYTES,
+        ArtifactRevisionId, CommitId, CommitState, LogicalShardId, OwnerEpoch, PlacementGeneration,
+        ReadVersion, RequestId, RootActivationState, RootId, FIXED_ID_BYTES,
     };
 
+    use super::super::codec::{
+        commit_key, snapshot_commit_consumer_key, workbench_commit_head_key,
+        workbench_head_commit_consumer_key,
+    };
     use super::super::namespace::create_visible_workspace;
+    use super::super::snapshot_query::list_snapshots_at;
+    use super::super::{CommitConsumerRecord, CommitRecord, WorkbenchCommitHeadRecord};
     use super::*;
 
     fn shard() -> LogicalShardId {
@@ -1666,6 +1931,10 @@ mod tests {
 
     fn incarnation(fill: u8) -> WorkspaceIncarnationId {
         WorkspaceIncarnationId::from_bytes([fill; FIXED_ID_BYTES])
+    }
+
+    fn commit(fill: u8) -> CommitId {
+        CommitId::from_bytes([fill; SHA256_BYTES])
     }
 
     fn workbench(value: &str) -> WorkbenchId {
@@ -1752,7 +2021,199 @@ mod tests {
         let incarnation = incarnation(incarnation_fill);
         create_visible_workspace(store, write_context(store, request_fill), name, incarnation)
             .unwrap();
+        install_committed_head(
+            store,
+            request_fill.wrapping_add(128),
+            incarnation,
+            commit(incarnation_fill),
+        );
         incarnation
+    }
+
+    fn install_committed_head(
+        store: &MetaShard,
+        request_fill: u8,
+        workspace: WorkspaceIncarnationId,
+        commit_id: CommitId,
+    ) {
+        let context = write_context(store, request_fill);
+        let commit_record = sealed_commit_record(workspace);
+        let head = WorkbenchCommitHeadRecord {
+            commit_id,
+            head_generation: Generation::new(1).unwrap(),
+        };
+        let mut command = base_command(context, Vec::new());
+        put_absent(
+            &mut command,
+            MetadataFamily::Commit,
+            commit_key(root(), commit_id),
+            commit_record.encode().unwrap(),
+        );
+        put_absent(
+            &mut command,
+            MetadataFamily::CommitConsumer,
+            workbench_head_commit_consumer_key(root(), commit_id, workspace),
+            CommitConsumerRecord {
+                consumer_epoch_at_add: ConsumerEpoch::new(1),
+            }
+            .encode(),
+        );
+        put_absent(
+            &mut command,
+            MetadataFamily::WorkbenchCommitHead,
+            workbench_commit_head_key(root(), workspace),
+            head.encode(),
+        );
+        store.execute(&command.seal()).unwrap();
+    }
+
+    fn sealed_commit_record(workspace: WorkspaceIncarnationId) -> CommitRecord {
+        CommitRecord {
+            source_workspace_incarnation_id: workspace,
+            content_digest_uri: format!("sha256:{}", "11".repeat(32)),
+            manifest_digest_uri: format!("sha256:{}", "22".repeat(32)),
+            tree_manifest_revision_id: ArtifactRevisionId::from_bytes([0x33; FIXED_ID_BYTES]),
+            tree_digest_uri: format!("sha256:{}", "44".repeat(32)),
+            member_count: 0,
+            member_digest: [0; SHA256_BYTES],
+            unique_revision_count: 1,
+            revision_digest: [0x55; SHA256_BYTES],
+            parent_commits: Vec::new(),
+            parent_digest: [0; SHA256_BYTES],
+            generic_index_count: 0,
+            generic_index_digest: [0; SHA256_BYTES],
+            producer: Some("snapshot-test".to_owned()),
+            lineage_projection: Vec::new(),
+            consumer_count: 1,
+            consumer_epoch: ConsumerEpoch::new(1),
+            last_zero_consumer_version: None,
+            state: CommitState::Sealed,
+        }
+    }
+
+    fn switch_committed_head(
+        store: &MetaShard,
+        request_fill: u8,
+        workspace: WorkspaceIncarnationId,
+        next_commit_id: CommitId,
+    ) {
+        let context = write_context(store, request_fill);
+        let head_key = workbench_commit_head_key(root(), workspace);
+        let head_payload = read_family(store, MetadataFamily::WorkbenchCommitHead, &head_key)
+            .expect("test head exists");
+        let head = WorkbenchCommitHeadRecord::decode(&head_payload).unwrap();
+        let old_commit_key = commit_key(root(), head.commit_id);
+        let old_commit_payload = read_family(store, MetadataFamily::Commit, &old_commit_key)
+            .expect("test commit exists");
+        let old_commit = CommitRecord::decode(&old_commit_payload).unwrap();
+        let old_consumer_key =
+            workbench_head_commit_consumer_key(root(), head.commit_id, workspace);
+        let old_consumer_payload =
+            read_family(store, MetadataFamily::CommitConsumer, &old_consumer_key)
+                .expect("test head consumer exists");
+        let zero_version = CommitVersion::new(context.read_version.get() + 1).unwrap();
+        let released = remove_commit_consumer(&old_commit, zero_version).unwrap();
+        let next_commit = sealed_commit_record(workspace);
+        let next_head = WorkbenchCommitHeadRecord {
+            commit_id: next_commit_id,
+            head_generation: Generation::new(head.head_generation.get() + 1).unwrap(),
+        };
+        let mut command = base_command(context, Vec::new());
+        replace_exact(
+            &mut command,
+            MetadataFamily::WorkbenchCommitHead,
+            head_key,
+            head_payload,
+            next_head.encode(),
+        );
+        replace_exact(
+            &mut command,
+            MetadataFamily::Commit,
+            old_commit_key,
+            old_commit_payload,
+            released.encode().unwrap(),
+        );
+        delete_exact(
+            &mut command,
+            MetadataFamily::CommitConsumer,
+            old_consumer_key,
+            old_consumer_payload,
+        );
+        put_absent(
+            &mut command,
+            MetadataFamily::Commit,
+            commit_key(root(), next_commit_id),
+            next_commit.encode().unwrap(),
+        );
+        put_absent(
+            &mut command,
+            MetadataFamily::CommitConsumer,
+            workbench_head_commit_consumer_key(root(), next_commit_id, workspace),
+            CommitConsumerRecord {
+                consumer_epoch_at_add: ConsumerEpoch::new(1),
+            }
+            .encode(),
+        );
+        store.execute(&command.seal()).unwrap();
+    }
+
+    fn read_commit(store: &MetaShard, commit_id: CommitId) -> CommitRecord {
+        CommitRecord::decode(
+            &read_family(
+                store,
+                MetadataFamily::Commit,
+                &commit_key(root(), commit_id),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn install_legacy_v1_snapshot(
+        store: &MetaShard,
+        request_fill: u8,
+        workspace: WorkspaceIncarnationId,
+        snapshot_id: SnapshotId,
+        lease_deadline_ms: u64,
+    ) {
+        let context = write_context(store, request_fill);
+        let mut payload = Vec::new();
+        payload.push(1);
+        payload.extend_from_slice(&context.read_version.get().to_be_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&lease_deadline_ms.to_be_bytes());
+        payload.push(u8::from(SnapshotState::Active));
+        payload.extend_from_slice(&0_u64.to_be_bytes());
+        payload.extend_from_slice(&0_u64.to_be_bytes());
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.push(0);
+        SnapshotRefRecord::decode(&payload).unwrap();
+
+        let mut command = base_command(context, Vec::new());
+        put_absent(
+            &mut command,
+            MetadataFamily::SnapshotRef,
+            snapshot_ref_key(root(), workspace, snapshot_id),
+            payload,
+        );
+        put_absent(
+            &mut command,
+            MetadataFamily::SnapshotRef,
+            snapshot_id_claim_key(root(), snapshot_id),
+            workspace.as_bytes().to_vec(),
+        );
+        put_absent(
+            &mut command,
+            MetadataFamily::HistoryHold,
+            snapshot_history_hold_key(root(), snapshot_id),
+            HistoryHoldRecord {
+                read_version: context.read_version,
+                source_snapshot_id: None,
+                state: HistoryHoldState::Active,
+            }
+            .encode(),
+        );
+        store.execute(&command.seal()).unwrap();
     }
 
     fn mint(
@@ -1795,6 +2256,278 @@ mod tests {
                 context.read_version,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn uncommitted_mint_fails_without_retention_side_effects() {
+        let store = ready_store();
+        let name = workbench("uncommitted");
+        let workspace = incarnation(3);
+        create_visible_workspace(&store, write_context(&store, 3), &name, workspace).unwrap();
+
+        assert_eq!(
+            mint_snapshot(
+                &store,
+                write_context(&store, 4),
+                &MintSnapshotRequest {
+                    workbench_id: name.clone(),
+                    snapshot_id: SnapshotId::new(11),
+                    alias: Some(alias("must-not-exist")),
+                    lease_deadline_ms: 100,
+                    annotation: Vec::new(),
+                },
+            ),
+            Err(SnapshotError::WorkspaceNotCommitted { workbench_id: name })
+        );
+        assert_eq!(
+            read_family(
+                &store,
+                MetadataFamily::SnapshotRef,
+                &snapshot_ref_key(root(), workspace, SnapshotId::new(11)),
+            ),
+            None
+        );
+        assert_eq!(
+            read_family(
+                &store,
+                MetadataFamily::HistoryHold,
+                &snapshot_history_hold_key(root(), SnapshotId::new(11)),
+            ),
+            None
+        );
+        assert_eq!(
+            read_family(
+                &store,
+                MetadataFamily::SnapshotRef,
+                &snapshot_id_claim_key(root(), SnapshotId::new(11)),
+            ),
+            None
+        );
+        assert_eq!(
+            read_family(
+                &store,
+                MetadataFamily::SnapshotRef,
+                &snapshot_alias_key(root(), workspace, &alias("must-not-exist")),
+            ),
+            None
+        );
+        assert!(store
+            .scan_prefix_at(
+                root(),
+                placement(),
+                owner(),
+                MetadataFamily::CommitConsumer,
+                root().as_bytes(),
+                store.current_read_version().unwrap(),
+                None,
+                8,
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn mint_freezes_commit_and_retire_releases_it_once() {
+        let store = ready_store();
+        let name = workbench("committed");
+        let workspace = create_workspace(&store, 3, &name, 3);
+        let source_commit = commit(3);
+        let successor_commit = commit(4);
+        let mint_context = write_context(&store, 4);
+        let minted = mint_snapshot(
+            &store,
+            mint_context,
+            &MintSnapshotRequest {
+                workbench_id: name.clone(),
+                snapshot_id: SnapshotId::new(11),
+                alias: None,
+                lease_deadline_ms: 1_000,
+                annotation: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(minted.snapshot.record.source_commit_id, Some(source_commit));
+        let retained = read_commit(&store, source_commit);
+        assert_eq!(retained.consumer_count, 2);
+        assert_eq!(retained.consumer_epoch, ConsumerEpoch::new(2));
+        let consumer_key = snapshot_commit_consumer_key(root(), source_commit, SnapshotId::new(11));
+        assert_eq!(
+            CommitConsumerRecord::decode(
+                &read_family(&store, MetadataFamily::CommitConsumer, &consumer_key).unwrap(),
+            )
+            .unwrap()
+            .consumer_epoch_at_add,
+            ConsumerEpoch::new(2)
+        );
+
+        let renewed = renew_snapshot(
+            &store,
+            write_context(&store, 5),
+            &RenewSnapshotRequest {
+                workbench_id: name.clone(),
+                selector: SnapshotSelector::Id(SnapshotId::new(11)),
+                lease_deadline_ms: 2_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            renewed.snapshot.record.source_commit_id,
+            Some(source_commit)
+        );
+        assert_eq!(read_commit(&store, source_commit), retained);
+
+        switch_committed_head(&store, 6, workspace, successor_commit);
+        let snapshot_only_retained = read_commit(&store, source_commit);
+        assert_eq!(snapshot_only_retained.consumer_count, 1);
+        assert_eq!(snapshot_only_retained.consumer_epoch, ConsumerEpoch::new(3));
+        assert_eq!(snapshot_only_retained.last_zero_consumer_version, None);
+
+        let retire_context = write_context(&store, 7);
+        let retire_request = RetireSnapshotRequest {
+            workbench_id: name,
+            selector: SnapshotSelector::Id(SnapshotId::new(11)),
+            retire_annotation: None,
+        };
+        let retired = retire_snapshot(&store, retire_context, &retire_request).unwrap();
+        assert!(!retired.replayed);
+        let released = read_commit(&store, source_commit);
+        assert_eq!(released.consumer_count, 0);
+        assert_eq!(released.consumer_epoch, ConsumerEpoch::new(4));
+        assert_eq!(
+            released.last_zero_consumer_version,
+            Some(CommitVersion::new(retire_context.read_version.get() + 1).unwrap())
+        );
+        assert_eq!(
+            read_family(&store, MetadataFamily::CommitConsumer, &consumer_key),
+            None
+        );
+
+        let replay = retire_snapshot(&store, write_context(&store, 7), &retire_request).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.commit_version, retired.commit_version);
+        assert_eq!(read_commit(&store, source_commit), released);
+        assert_eq!(
+            read_family(
+                &store,
+                MetadataFamily::WorkbenchCommitHead,
+                &workbench_commit_head_key(root(), workspace),
+            )
+            .map(|payload| WorkbenchCommitHeadRecord::decode(&payload)
+                .unwrap()
+                .commit_id),
+            Some(successor_commit)
+        );
+    }
+
+    #[test]
+    fn stale_head_cas_cannot_freeze_a_mixed_commit() {
+        let store = ready_store();
+        let name = workbench("head-race");
+        let workspace = create_workspace(&store, 3, &name, 3);
+        let old_commit = commit(3);
+        let new_commit = commit(4);
+        let stale_context = write_context(&store, 4);
+        let request_value = MintSnapshotRequest {
+            workbench_id: name,
+            snapshot_id: SnapshotId::new(11),
+            alias: None,
+            lease_deadline_ms: 1_000,
+            annotation: Vec::new(),
+        };
+
+        switch_committed_head(&store, 5, workspace, new_commit);
+        assert_eq!(
+            mint_snapshot(&store, stale_context, &request_value),
+            Err(SnapshotError::ConcurrentMutation)
+        );
+        assert_eq!(read_commit(&store, old_commit).consumer_count, 0);
+
+        let retry = mint_snapshot(&store, write_context(&store, 4), &request_value).unwrap();
+        assert_eq!(retry.snapshot.record.source_commit_id, Some(new_commit));
+        assert_eq!(read_commit(&store, old_commit).consumer_count, 0);
+        assert_eq!(read_commit(&store, new_commit).consumer_count, 2);
+        assert_eq!(
+            read_family(
+                &store,
+                MetadataFamily::CommitConsumer,
+                &snapshot_commit_consumer_key(root(), old_commit, SnapshotId::new(11)),
+            ),
+            None
+        );
+        assert!(read_family(
+            &store,
+            MetadataFamily::CommitConsumer,
+            &snapshot_commit_consumer_key(root(), new_commit, SnapshotId::new(11)),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn legacy_v1_snapshot_renews_lists_retires_and_reaps_without_guessing_head() {
+        let store = ready_store();
+        let name = workbench("legacy");
+        let workspace = incarnation(3);
+        create_visible_workspace(&store, write_context(&store, 3), &name, workspace).unwrap();
+        install_legacy_v1_snapshot(&store, 4, workspace, SnapshotId::new(11), 1_000);
+        install_legacy_v1_snapshot(&store, 5, workspace, SnapshotId::new(12), 100);
+
+        let listed = list_snapshots_at(&store, read_context(&store), &name, None, 10).unwrap();
+        assert_eq!(listed.snapshots.len(), 2);
+        assert!(listed
+            .snapshots
+            .iter()
+            .all(|snapshot| snapshot.record.source_commit_id.is_none()));
+
+        let renewed = renew_snapshot(
+            &store,
+            write_context(&store, 6),
+            &RenewSnapshotRequest {
+                workbench_id: name.clone(),
+                selector: SnapshotSelector::Id(SnapshotId::new(11)),
+                lease_deadline_ms: 2_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(renewed.snapshot.record.source_commit_id, None);
+        assert_eq!(renewed.snapshot.record.encode().unwrap()[0], 2);
+        let retired = retire_snapshot(
+            &store,
+            write_context(&store, 7),
+            &RetireSnapshotRequest {
+                workbench_id: name.clone(),
+                selector: SnapshotSelector::Id(SnapshotId::new(11)),
+                retire_annotation: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(retired.snapshot.record.state, SnapshotState::Retired);
+        assert_eq!(retired.snapshot.record.source_commit_id, None);
+
+        let claimed = claim_expired_snapshot(
+            &store,
+            write_context(&store, 8),
+            &ClaimExpiredSnapshotRequest {
+                workbench_id: name.clone(),
+                snapshot_id: SnapshotId::new(12),
+                observed_now_ms: 150,
+                maximum_clock_skew_ms: 50,
+            },
+        )
+        .unwrap();
+        assert_eq!(claimed.snapshot.record.state, SnapshotState::ReapClaimed);
+        assert_eq!(claimed.snapshot.record.source_commit_id, None);
+        let reaped = finish_snapshot_reap(
+            &store,
+            write_context(&store, 9),
+            &FinishSnapshotReapRequest {
+                workbench_id: name,
+                snapshot_id: SnapshotId::new(12),
+            },
+        )
+        .unwrap();
+        assert_eq!(reaped.snapshot.record.state, SnapshotState::Reaped);
+        assert_eq!(reaped.snapshot.record.source_commit_id, None);
     }
 
     #[test]
@@ -1860,6 +2593,33 @@ mod tests {
             get(&store, &name, SnapshotSelector::Alias(alias("checkpoint")),).snapshot_id,
             SnapshotId::new(11)
         );
+    }
+
+    #[test]
+    fn snapshot_exact_replay_rejects_a_missing_recovery_binding() {
+        let store = ready_store();
+        let name = workbench("recovery-binding");
+        create_workspace(&store, 3, &name, 3);
+        let request_value = MintSnapshotRequest {
+            workbench_id: name,
+            snapshot_id: SnapshotId::new(11),
+            alias: None,
+            lease_deadline_ms: 100,
+            annotation: b"exact".to_vec(),
+        };
+        mint_snapshot(&store, write_context(&store, 4), &request_value).unwrap();
+        let dedupe = store
+            .lookup_request(root(), placement(), owner(), request(4))
+            .unwrap()
+            .unwrap();
+        store
+            .replace_recovery_header_for_test(dedupe.recovery_lsn, None)
+            .unwrap();
+
+        assert!(matches!(
+            mint_snapshot(&store, write_context(&store, 4), &request_value),
+            Err(SnapshotError::Meta(MetaError::CorruptRecord { .. }))
+        ));
     }
 
     #[test]
@@ -2069,18 +2829,31 @@ mod tests {
             })
         );
 
-        let claimed = claim_expired_snapshot(
-            &store,
-            write_context(&store, 6),
-            &ClaimExpiredSnapshotRequest {
-                workbench_id: name.clone(),
-                snapshot_id: SnapshotId::new(1),
-                observed_now_ms: 150,
-                maximum_clock_skew_ms: 50,
-            },
-        )
-        .unwrap();
+        let claim_context = write_context(&store, 6);
+        let claim_request = ClaimExpiredSnapshotRequest {
+            workbench_id: name.clone(),
+            snapshot_id: SnapshotId::new(1),
+            observed_now_ms: 150,
+            maximum_clock_skew_ms: 50,
+        };
+        let claimed = claim_expired_snapshot(&store, claim_context, &claim_request).unwrap();
         assert_eq!(claimed.snapshot.record.state, SnapshotState::ReapClaimed);
+        let released_commit = read_commit(&store, commit(3));
+        assert_eq!(released_commit.consumer_count, 1);
+        assert_eq!(released_commit.consumer_epoch, ConsumerEpoch::new(3));
+        assert_eq!(
+            read_family(
+                &store,
+                MetadataFamily::CommitConsumer,
+                &snapshot_commit_consumer_key(root(), commit(3), SnapshotId::new(1)),
+            ),
+            None
+        );
+        let replay =
+            claim_expired_snapshot(&store, write_context(&store, 6), &claim_request).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.commit_version, claimed.commit_version);
+        assert_eq!(read_commit(&store, commit(3)), released_commit);
         assert_eq!(
             read_family(
                 &store,

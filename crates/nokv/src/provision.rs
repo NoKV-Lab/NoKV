@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nokv_control::{
-    ControlError, ControlStore, LogicalShardId, RootId, RootObjectNamespaceBinding, RootPlacement,
+    AgentId, ControlError, ControlStore, LogicalShardId, RootAgentBinding, RootId,
+    RootObjectNamespaceBinding, RootPlacement,
 };
 use nokv_types::{ObjectNamespaceId, PlacementGeneration, RootPlacementLifecycle};
 use sha2::{Digest, Sha256};
@@ -29,6 +30,7 @@ pub struct ProvisionOutcome {
 #[derive(Debug)]
 pub enum ProvisionError {
     Control(ControlError),
+    LegacyAgentBindingAdoptionRequired(RootId),
     PlacementGenerationExhausted(RootId),
     PlacementNotActivatable {
         root_id: RootId,
@@ -41,6 +43,10 @@ impl fmt::Display for ProvisionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(error) => error.fmt(formatter),
+            Self::LegacyAgentBindingAdoptionRequired(root_id) => write!(
+                formatter,
+                "legacy root {root_id:?} has no durable Agent binding; verify its stable Agent identity, then rerun provision with --adopt-legacy-agent-binding"
+            ),
             Self::PlacementGenerationExhausted(root_id) => {
                 write!(formatter, "root placement {root_id:?} generation is exhausted")
             }
@@ -68,6 +74,53 @@ impl From<ControlError> for ProvisionError {
     fn from(error: ControlError) -> Self {
         Self::Control(error)
     }
+}
+
+/// Establish the immutable Agent identity constraint before provisioning can
+/// mutate any object namespace, logical shard, or placement record.
+///
+/// A root with an existing placement or object-namespace binding is legacy
+/// state. Such a root stays fail-closed until the operator explicitly adopts
+/// its stable Agent identity once. Exact replays are idempotent, while a
+/// different Agent can never replace the durable binding.
+pub(crate) fn ensure_root_agent_binding(
+    control: &dyn ControlStore,
+    root_id: RootId,
+    agent_id: AgentId,
+    adopt_legacy: bool,
+) -> Result<bool, ProvisionError> {
+    if let Some(existing) = control.get_root_agent_binding(&root_id)? {
+        if existing.root_id != root_id {
+            return Err(ControlError::InvalidRecord(
+                "root Agent binding key/value identity mismatch".to_owned(),
+            )
+            .into());
+        }
+        if existing.agent_id != agent_id {
+            return Err(ControlError::RootAgentAlreadyBound { root_id }.into());
+        }
+        return Ok(true);
+    }
+
+    let legacy_root = control.get_root_placement(&root_id)?.is_some()
+        || control
+            .get_root_object_namespace_binding(&root_id)?
+            .is_some();
+    if legacy_root && !adopt_legacy {
+        return Err(ProvisionError::LegacyAgentBindingAdoptionRequired(root_id));
+    }
+
+    let created = control.create_root_agent_binding(RootAgentBinding { root_id, agent_id })?;
+    if created.root_id != root_id {
+        return Err(ControlError::InvalidRecord(
+            "root Agent binding key/value identity mismatch".to_owned(),
+        )
+        .into());
+    }
+    if created.agent_id != agent_id {
+        return Err(ControlError::RootAgentAlreadyBound { root_id }.into());
+    }
+    Ok(false)
 }
 
 pub fn new_object_namespace_id(root_id: RootId) -> ObjectNamespaceId {
@@ -253,6 +306,93 @@ mod tests {
 
     fn namespace(byte: u8) -> ObjectNamespaceId {
         ObjectNamespaceId::from_bytes([byte; 16])
+    }
+
+    fn agent(byte: u8) -> nokv_types::AgentId {
+        nokv_types::AgentId::from_bytes([byte; 16])
+    }
+
+    #[test]
+    fn new_agent_binding_is_first_class_and_exact_replay_is_idempotent() {
+        let control = InMemoryControlStore::new();
+
+        assert!(!ensure_root_agent_binding(&control, root(1), agent(7), false).unwrap());
+        assert_eq!(
+            control.get_root_agent_binding(&root(1)).unwrap(),
+            Some(nokv_control::RootAgentBinding {
+                root_id: root(1),
+                agent_id: agent(7),
+            })
+        );
+        assert!(control.get_root_placement(&root(1)).unwrap().is_none());
+        assert!(control
+            .get_root_object_namespace_binding(&root(1))
+            .unwrap()
+            .is_none());
+
+        assert!(ensure_root_agent_binding(&control, root(1), agent(7), false).unwrap());
+    }
+
+    #[test]
+    fn agent_binding_mismatch_never_rebinds() {
+        let control = InMemoryControlStore::new();
+        ensure_root_agent_binding(&control, root(1), agent(7), false).unwrap();
+
+        let error = ensure_root_agent_binding(&control, root(1), agent(8), true).unwrap_err();
+        assert!(matches!(
+            error,
+            ProvisionError::Control(ControlError::RootAgentAlreadyBound { root_id })
+                if root_id == root(1)
+        ));
+        assert_eq!(
+            control
+                .get_root_agent_binding(&root(1))
+                .unwrap()
+                .unwrap()
+                .agent_id,
+            agent(7)
+        );
+    }
+
+    #[test]
+    fn legacy_root_requires_explicit_agent_adoption_without_mutation() {
+        let control = InMemoryControlStore::new();
+        provision_and_activate(&control, root(1), shard(2), namespace(3)).unwrap();
+        let placement_before = control.get_root_placement(&root(1)).unwrap();
+        let namespace_before = control.get_root_object_namespace_binding(&root(1)).unwrap();
+        let shard_before = control.get_logical_shard(&shard(2)).unwrap();
+
+        let error = ensure_root_agent_binding(&control, root(1), agent(7), false).unwrap_err();
+        assert!(matches!(
+            error,
+            ProvisionError::LegacyAgentBindingAdoptionRequired(root_id) if root_id == root(1)
+        ));
+        assert!(control.get_root_agent_binding(&root(1)).unwrap().is_none());
+        assert_eq!(
+            control.get_root_placement(&root(1)).unwrap(),
+            placement_before
+        );
+        assert_eq!(
+            control.get_root_object_namespace_binding(&root(1)).unwrap(),
+            namespace_before
+        );
+        assert_eq!(control.get_logical_shard(&shard(2)).unwrap(), shard_before);
+
+        assert!(!ensure_root_agent_binding(&control, root(1), agent(7), true).unwrap());
+        assert!(ensure_root_agent_binding(&control, root(1), agent(7), false).unwrap());
+
+        control
+            .create_root_object_namespace_binding(RootObjectNamespaceBinding {
+                root_id: root(5),
+                object_namespace_id: namespace(6),
+            })
+            .unwrap();
+        assert!(matches!(
+            ensure_root_agent_binding(&control, root(5), agent(7), false),
+            Err(ProvisionError::LegacyAgentBindingAdoptionRequired(root_id))
+                if root_id == root(5)
+        ));
+        assert!(control.get_root_agent_binding(&root(5)).unwrap().is_none());
     }
 
     #[test]

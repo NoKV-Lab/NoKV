@@ -1,0 +1,955 @@
+{
+  "schema": "nokv.workbench.pre423_contract_ledger.v1",
+  "pre_revision": "98cac201affee7ca1a654fea39373108b81d31ef",
+  "recovery_baseline_revision": "a4cee6cbf10a7bd000dcca5a547659d8dc07bc72",
+  "gate_catalog": {
+    "api-absence": "A checked-in test proves a deliberately excluded or retired surface stays absent and is not reported as product acceptance.",
+    "api-decision": "A checked-in support-matrix or decision contract names the replacement or retirement before feature work proceeds.",
+    "commit-replay": "Typed commit tests cover canonical identity, exact replay, conflict, response loss, and current commit-head authority.",
+    "cursor-differential": "Opaque cursor tests cover progress, scope binding, wrong-scope and stale rejection, and pre/current semantic differences.",
+    "facade-contract": "Transport-free nokv-agent tests assert the stable Workbench request, result, and typed error behavior.",
+    "lingtai-mcp-e2e": "The real LingTai MCPClient registers and calls the release-identity NoKV process through stdio, including restart and reconnect.",
+    "native-workbench-e2e": "The real NoKV client, server, metadata store, and object backend execute the Workbench behavior end to end.",
+    "output-golden": "A versioned golden transcript freezes supported result and error projections without inode, dentry, or filesystem fields.",
+    "provider-recovery": "Real provider and process gates cover publication, restart, response loss, cleanup, reference-fenced GC, and exact bytes.",
+    "python-sdk-e2e": "The supported path-native Python SDK or explicit materialize/collect adapter is tested against real NoKV services.",
+    "restore-composition": "A committed source can be snapshotted, restored, snapshotted again, and restored again with exact replay and independent bytes.",
+    "root-authority-e2e": "Two persisted Agent-to-RootId bindings prove isolation; changing a presentation path alone never claims storage isolation.",
+    "schema-surface": "The exact 18 tool names and closed normalized input schemas are checked against the Rust-owned frozen schema.",
+    "snapshot-lifecycle": "Typed snapshot tests cover frozen reads, renew, retire, reap, foreign identity, HistoryHold, and reference release."
+  },
+  "producer_catalog": {
+    "api-absence": {
+      "description": "Checked-in source, package-graph, and schema absence assertions.",
+      "evidence_kinds": ["static", "unit"],
+      "command": {"kind": "python-script", "entrypoint": "scripts/workbench/api_absence_qualification.py", "result_argument": "--qualification-result", "binary_argument": null, "forbidden_arguments": ["--dry-run"]},
+      "required_evidence_roles": ["producer-result"],
+      "required_subjects": [],
+      "required_dependencies": {}
+    },
+    "api-decision": {
+      "description": "Checked-in support-matrix and product-decision assertions.",
+      "evidence_kinds": ["static"],
+      "command": {"kind": "python-script", "entrypoint": "scripts/workbench/api_decision_qualification.py", "result_argument": "--qualification-result", "binary_argument": null, "forbidden_arguments": ["--dry-run"]},
+      "required_evidence_roles": ["producer-result"],
+      "required_subjects": [],
+      "required_dependencies": {}
+    },
+    "commit-replay": {
+      "description": "Typed commit identity, response-loss, and replay tests.",
+      "evidence_kinds": ["unit", "integration"],
+      "command": {"kind": "python-script", "entrypoint": "scripts/workbench/commit_replay_qualification.py", "result_argument": "--qualification-result", "binary_argument": null, "forbidden_arguments": ["--dry-run"]},
+      "required_evidence_roles": ["producer-result"],
+      "required_subjects": ["rust_toolchain"],
+      "required_dependencies": {}
+    },
+    "cursor-differential": {
+      "description": "Typed opaque-cursor differential and authority tests.",
+      "evidence_kinds": ["unit", "integration"],
+      "command": {"kind": "python-script", "entrypoint": "scripts/workbench/cursor_differential_qualification.py", "result_argument": "--qualification-result", "binary_argument": null, "forbidden_arguments": ["--dry-run"]},
+      "required_evidence_roles": ["producer-result"],
+      "required_subjects": ["rust_toolchain"],
+      "required_dependencies": {}
+    },
+    "lingtai-mcp": {
+      "description": "Real LingTai MCPClient driving a release-identity NoKV process.",
+      "evidence_kinds": ["live"],
+      "command": {"kind": "python-script", "entrypoint": "scripts/workbench/lingtai_mcp_qualification.py", "result_argument": "--qualification-result", "binary_argument": "--nokv-bin", "forbidden_arguments": ["--dry-run"]},
+      "required_evidence_roles": ["producer-result", "qualification", "mcp-transcript"],
+      "required_subjects": ["product_binary", "dependencies"],
+      "required_dependencies": {"lingtai-kernel": ["git", "sha256"], "etcd": ["sha256"], "object-store": ["oci"]}
+    },
+    "live-workbench": {
+      "description": "Shipping NoKV client and server across real metadata and object boundaries.",
+      "evidence_kinds": ["live"],
+      "command": {"kind": "python-script", "entrypoint": "scripts/workbench/live_workbench.py", "result_argument": "--qualification-result", "binary_argument": "--nokv-bin", "forbidden_arguments": ["--dry-run"]},
+      "required_evidence_roles": ["producer-result", "qualification", "mcp-transcript"],
+      "required_subjects": ["product_binary", "dependencies"],
+      "required_dependencies": {"etcd": ["sha256"], "object-store": ["oci"]}
+    },
+    "nokv-agent-unit": {
+      "description": "Transport-free nokv-agent schema, facade, and golden-output tests.",
+      "evidence_kinds": ["unit"],
+      "command": {"kind": "python-script", "entrypoint": "scripts/workbench/nokv_agent_qualification.py", "result_argument": "--qualification-result", "binary_argument": null, "forbidden_arguments": ["--dry-run"]},
+      "required_evidence_roles": ["producer-result"],
+      "required_subjects": ["rust_toolchain"],
+      "required_dependencies": {}
+    },
+    "object-namespace-recovery": {
+      "description": "Real object-provider restart, response-loss, retention, and cleanup tests.",
+      "evidence_kinds": ["live"],
+      "command": {"kind": "python-script", "entrypoint": "scripts/workbench/object_namespace_recovery_gate.py", "result_argument": "--qualification-result", "binary_argument": "--binary", "forbidden_arguments": ["--dry-run"]},
+      "required_evidence_roles": ["producer-result", "qualification"],
+      "required_subjects": ["product_binary", "dependencies"],
+      "required_dependencies": {"etcd": ["sha256"], "rustfs": ["oci"]}
+    },
+    "python-sdk": {
+      "description": "Installed supported Python SDK or adapter against real NoKV services.",
+      "evidence_kinds": ["live"],
+      "command": {"kind": "python-script", "entrypoint": "scripts/workbench/python_sdk_qualification.py", "result_argument": "--qualification-result", "binary_argument": "--nokv-bin", "forbidden_arguments": ["--dry-run"]},
+      "required_evidence_roles": ["producer-result", "qualification"],
+      "required_subjects": ["product_binary", "dependencies"],
+      "required_dependencies": {"python-sdk": ["sha256"], "etcd": ["sha256"], "object-store": ["oci"]}
+    },
+    "restore-composition": {
+      "description": "Real committed-source snapshot and repeated restore composition tests.",
+      "evidence_kinds": ["live"],
+      "command": {"kind": "python-script", "entrypoint": "scripts/workbench/restore_composition_gate.py", "result_argument": "--qualification-result", "binary_argument": "--nokv-bin", "forbidden_arguments": ["--dry-run"]},
+      "required_evidence_roles": ["producer-result", "qualification"],
+      "required_subjects": ["product_binary", "dependencies"],
+      "required_dependencies": {"etcd": ["sha256"], "rustfs": ["oci"]}
+    },
+    "snapshot-lifecycle": {
+      "description": "Typed cross-package snapshot lifecycle and retention integration tests.",
+      "evidence_kinds": ["integration"],
+      "command": {"kind": "python-script", "entrypoint": "scripts/workbench/snapshot_lifecycle_qualification.py", "result_argument": "--qualification-result", "binary_argument": null, "forbidden_arguments": ["--dry-run"]},
+      "required_evidence_roles": ["producer-result", "qualification"],
+      "required_subjects": ["rust_toolchain"],
+      "required_dependencies": {}
+    }
+  },
+  "pre_source_line_counts": {
+    "Cargo.toml": 52,
+    "crates/nokv-client/src/lib.rs": 147,
+    "crates/nokv-client/src/service_tests.rs": 3646,
+    "crates/nokv-python/python/nokv/__init__.py": 50,
+    "crates/nokv-python/python/nokv/checkpoint.py": 222,
+    "crates/nokv-python/python/nokv/fsspec.py": 336,
+    "crates/nokv-python/python/nokv/torch.py": 409,
+    "crates/nokv-python/tests/test_checkpoint.py": 179,
+    "crates/nokv-python/tests/test_fsspec_modes.py": 90,
+    "crates/nokv-python/tests/test_live_sdk.py": 170,
+    "crates/nokv-python/tests/test_torch_unit.py": 197,
+    "crates/nokv/src/bin/nokv.rs": 8222,
+    "crates/nokv/src/bin/nokv/workbench_mcp.rs": 5008,
+    "docs/development/workbench-checkpoint-lifecycle.md": 263,
+    "docs/lingtai-workbench-preflight.md": 232,
+    "scripts/lingtai-workbench/README.md": 529,
+    "scripts/lingtai-workbench/durable_restore_live_e2e.py": 3771,
+    "scripts/lingtai-workbench/workbench_contract.py": 272,
+    "scripts/lingtai-workbench/workbench_contract_test.py": 157,
+    "scripts/run-fuse-posix-gate.sh": 266
+  },
+  "expectation_profiles": {
+    "api-absence": {
+      "gate": "api-absence",
+      "allowed_evidence_kinds": ["static", "unit"],
+      "allowed_producers": ["api-absence"]
+    },
+    "api-decision": {
+      "gate": "api-decision",
+      "allowed_evidence_kinds": ["static"],
+      "allowed_producers": ["api-decision"]
+    },
+    "commit-replay": {
+      "gate": "commit-replay",
+      "allowed_evidence_kinds": ["unit", "integration"],
+      "allowed_producers": ["commit-replay"]
+    },
+    "cursor-differential": {
+      "gate": "cursor-differential",
+      "allowed_evidence_kinds": ["unit", "integration"],
+      "allowed_producers": ["cursor-differential"]
+    },
+    "facade-contract": {
+      "gate": "facade-contract",
+      "allowed_evidence_kinds": ["unit"],
+      "allowed_producers": ["nokv-agent-unit"]
+    },
+    "lingtai-mcp-e2e": {
+      "gate": "lingtai-mcp-e2e",
+      "allowed_evidence_kinds": ["live"],
+      "allowed_producers": ["lingtai-mcp"]
+    },
+    "native-workbench-e2e": {
+      "gate": "native-workbench-e2e",
+      "allowed_evidence_kinds": ["live"],
+      "allowed_producers": ["live-workbench"]
+    },
+    "output-golden": {
+      "gate": "output-golden",
+      "allowed_evidence_kinds": ["unit"],
+      "allowed_producers": ["nokv-agent-unit"]
+    },
+    "provider-recovery": {
+      "gate": "provider-recovery",
+      "allowed_evidence_kinds": ["live"],
+      "allowed_producers": ["object-namespace-recovery"]
+    },
+    "python-sdk-e2e": {
+      "gate": "python-sdk-e2e",
+      "allowed_evidence_kinds": ["live"],
+      "allowed_producers": ["python-sdk"]
+    },
+    "restore-composition": {
+      "gate": "restore-composition",
+      "allowed_evidence_kinds": ["live"],
+      "allowed_producers": ["restore-composition"]
+    },
+    "root-authority-e2e": {
+      "gate": "root-authority-e2e",
+      "allowed_evidence_kinds": ["live"],
+      "allowed_producers": ["live-workbench"]
+    },
+    "schema-surface": {
+      "gate": "schema-surface",
+      "allowed_evidence_kinds": ["unit", "live"],
+      "allowed_producers": ["nokv-agent-unit", "live-workbench"]
+    },
+    "snapshot-lifecycle": {
+      "gate": "snapshot-lifecycle",
+      "allowed_evidence_kinds": ["integration"],
+      "allowed_producers": ["snapshot-lifecycle"]
+    }
+  },
+  "items": [
+    {
+      "id": "T01",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent",
+      "boundary": "workbench_create MCP schema, facade, and result",
+      "requirement": "Create one named Workbench and return its stable logical identity and five virtual sections: input, scripts, outputs, logs, and metadata.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:165-180,621-641", "pre:crates/nokv/src/bin/nokv.rs:3542-3781"],
+      "required_gates": ["schema-surface", "facade-contract", "native-workbench-e2e"],
+      "gate_expectations": {
+        "schema-surface": {"profile": "schema-surface", "scenarios": ["t01.create-schema"]},
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["t01.create-result"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t01.create-live"]}
+      }
+    },
+    {
+      "id": "T02",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client",
+      "boundary": "workbench_put_file facade to create-only or replace-only publication",
+      "requirement": "Publish exact text or base64 bytes with create/replace semantics, including an absent-Workbench call, without restoring inode output.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:181-232,644-689", "pre:crates/nokv/src/bin/nokv.rs:5398-5531"],
+      "required_gates": ["schema-surface", "facade-contract", "native-workbench-e2e", "output-golden"],
+      "gate_expectations": {
+        "schema-surface": {"profile": "schema-surface", "scenarios": ["t02.put-schema"]},
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["t02.put-create-replace-contract"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t02.put-absent-and-exact-bytes-live"]},
+        "output-golden": {"profile": "output-golden", "scenarios": ["t02.put-path-native-output"]}
+      }
+    },
+    {
+      "id": "T03",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client",
+      "boundary": "workbench_append facade to atomic append workflow",
+      "requirement": "Append atomically, create an absent file and Workbench, and report delta, resulting size, generation, and digest.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:233-260,692-743", "pre:crates/nokv/src/bin/nokv.rs:4847-4912"],
+      "required_gates": ["schema-surface", "facade-contract", "native-workbench-e2e", "output-golden"],
+      "gate_expectations": {
+        "schema-surface": {"profile": "schema-surface", "scenarios": ["t03.append-schema"]},
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["t03.append-result-contract"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t03.append-absent-and-atomic-live"]},
+        "output-golden": {"profile": "output-golden", "scenarios": ["t03.append-delta-generation-digest-output"]}
+      }
+    },
+    {
+      "id": "T04",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent",
+      "boundary": "workbench_edit facade mutation and retry semantics",
+      "requirement": "Edit exact UTF-8 text once or globally, preserve no-op generations, and revalidate conflicts before retry.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:261-287,746-857", "pre:crates/nokv/src/bin/nokv.rs:4913-5019"],
+      "required_gates": ["schema-surface", "facade-contract", "native-workbench-e2e"],
+      "gate_expectations": {
+        "schema-surface": {"profile": "schema-surface", "scenarios": ["t04.edit-schema"]},
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["t04.edit-noop-and-conflict-contract"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t04.edit-revalidate-conflict-live"]}
+      }
+    },
+    {
+      "id": "T05",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client",
+      "boundary": "workbench_list scope normalization and typed pagination",
+      "requirement": "List live or frozen Workbench scope with opaque pagination; explicit empty path selects the same root as an omitted path.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1003-1027", "pre:crates/nokv/src/bin/nokv.rs:3997-4128,6408-7005"],
+      "required_gates": ["facade-contract", "cursor-differential", "native-workbench-e2e"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["t05.list-root-equivalence-contract"]},
+        "cursor-differential": {"profile": "cursor-differential", "scenarios": ["t05.list-cursor-progress-and-scope"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t05.list-live-and-frozen-live"]}
+      }
+    },
+    {
+      "id": "T06",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client",
+      "boundary": "workbench_stat scope normalization and metadata-only lookup",
+      "requirement": "Return live or frozen metadata without fetching object bytes; explicit empty path selects the root.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1030-1055", "pre:crates/nokv/src/bin/nokv.rs:3997-4128"],
+      "required_gates": ["facade-contract", "native-workbench-e2e"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["t06.stat-metadata-only-contract"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t06.stat-live-frozen-root-live"]}
+      }
+    },
+    {
+      "id": "T07",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client",
+      "boundary": "workbench_read range, conditional, structured, and snapshot reads",
+      "requirement": "Read exact bytes as text, base64, or structured pages with ranges, if-none-match, frozen views, and progress cursors.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1057-1105,2358-2745", "pre:crates/nokv/src/bin/nokv.rs:5020-5187,6583-6939"],
+      "required_gates": ["facade-contract", "cursor-differential", "native-workbench-e2e", "output-golden"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["t07.get-range-format-conditional-contract"]},
+        "cursor-differential": {"profile": "cursor-differential", "scenarios": ["t07.get-page-progress-and-scope"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t07.get-exact-live-and-frozen-bytes"]},
+        "output-golden": {"profile": "output-golden", "scenarios": ["t07.get-text-base64-page-output"]}
+      }
+    },
+    {
+      "id": "T08",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client",
+      "boundary": "workbench_grep scope, file scan, and result cursor",
+      "requirement": "Run ASCII case-insensitive literal OR grep with glob filtering, including empty-root scope and stable result pagination.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:289-332,1107-1134", "pre:crates/nokv/src/bin/nokv.rs:5188-5308"],
+      "required_gates": ["facade-contract", "cursor-differential", "native-workbench-e2e"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["t08.grep-literal-or-glob-contract"]},
+        "cursor-differential": {"profile": "cursor-differential", "scenarios": ["t08.grep-case-insensitive-pagination"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t08.grep-empty-root-live"]}
+      }
+    },
+    {
+      "id": "T09",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client",
+      "boundary": "workbench_search scoped indexed query and cursor",
+      "requirement": "Search optional Workbench scope with predicates, fields, facets, sort, and a scope-bound cursor; missing roots return defined empty results.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1136-1295", "pre:crates/nokv/src/bin/nokv.rs:4515-4724"],
+      "required_gates": ["facade-contract", "cursor-differential", "native-workbench-e2e"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["t09.search-query-controls-contract"]},
+        "cursor-differential": {"profile": "cursor-differential", "scenarios": ["t09.search-scope-bound-cursor"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t09.search-missing-root-live"]}
+      }
+    },
+    {
+      "id": "T10",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client",
+      "boundary": "workbench_aggregate scoped typed query",
+      "requirement": "Aggregate optional Workbench scope with predicates, measures, groups, sorting, limits, and empty-root equivalence.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1136-1295", "pre:crates/nokv/src/bin/nokv.rs:4725-4807"],
+      "required_gates": ["facade-contract", "native-workbench-e2e", "output-golden"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["t10.aggregate-query-controls-contract"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t10.aggregate-empty-root-live"]},
+        "output-golden": {"profile": "output-golden", "scenarios": ["t10.aggregate-output"]}
+      }
+    },
+    {
+      "id": "T11",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client",
+      "boundary": "workbench_catalog scoped field discovery",
+      "requirement": "Describe fields, filters, sort and facets for optional scope, including explicit empty path and defined empty catalogs.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1136-1295", "pre:crates/nokv/src/bin/nokv.rs:4808-4846"],
+      "required_gates": ["facade-contract", "native-workbench-e2e", "output-golden"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["t11.describe-query-capabilities-contract"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t11.describe-empty-catalog-live"]},
+        "output-golden": {"profile": "output-golden", "scenarios": ["t11.describe-output"]}
+      }
+    },
+    {
+      "id": "T12",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client",
+      "boundary": "workbench_find global Workbench discovery",
+      "requirement": "Filter committed state and manifest content with ASCII case-insensitive matching, stable pagination, and optional full manifest output.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1297-1370,3328-3335", "pre:crates/nokv/src/bin/nokv.rs:4129-4266"],
+      "required_gates": ["facade-contract", "cursor-differential", "native-workbench-e2e", "output-golden"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["t12.find-commit-manifest-contract"]},
+        "cursor-differential": {"profile": "cursor-differential", "scenarios": ["t12.find-case-insensitive-pagination"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t12.find-committed-state-live"]},
+        "output-golden": {"profile": "output-golden", "scenarios": ["t12.find-optional-manifest-output"]}
+      }
+    },
+    {
+      "id": "T13",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client",
+      "boundary": "workbench_commit canonical provenance workflow",
+      "requirement": "Commit valid canonical provenance with stable identity and exact replay, including an absent Workbench, without inode-shaped output.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1398-1737", "pre:crates/nokv/src/bin/nokv.rs:3782-3996"],
+      "required_gates": ["facade-contract", "commit-replay", "native-workbench-e2e", "output-golden"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["t13.commit-provenance-contract"]},
+        "commit-replay": {"profile": "commit-replay", "scenarios": ["t13.commit-exact-replay", "t13.commit-conflict-and-head-authority"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t13.commit-absent-workbench-live"]},
+        "output-golden": {"profile": "output-golden", "scenarios": ["t13.commit-path-native-output"]}
+      }
+    },
+    {
+      "id": "T14",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client + nokv-meta",
+      "boundary": "workbench_snapshot admission and leased read-version creation",
+      "requirement": "Snapshot any committed Workbench, including a restored destination, with validated alias, TTL, reason, metadata, and warnings.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1759-1928", "pre:crates/nokv/src/bin/nokv.rs:5731-5965"],
+      "required_gates": ["snapshot-lifecycle", "restore-composition", "native-workbench-e2e"],
+      "gate_expectations": {
+        "snapshot-lifecycle": {"profile": "snapshot-lifecycle", "scenarios": ["t14.snapshot-validation-and-lease"]},
+        "restore-composition": {"profile": "restore-composition", "scenarios": ["t14.restored-destination-resnapshot"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t14.snapshot-committed-workbench-live"]}
+      }
+    },
+    {
+      "id": "T15",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-meta",
+      "boundary": "workbench_snapshot_renew lifecycle transition",
+      "requirement": "Resolve a snapshot by id or alias and atomically extend its lease without changing frozen content.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1929-2230", "pre:crates/nokv/src/bin/nokv.rs:5966-6006"],
+      "required_gates": ["snapshot-lifecycle", "native-workbench-e2e"],
+      "gate_expectations": {
+        "snapshot-lifecycle": {"profile": "snapshot-lifecycle", "scenarios": ["t15.renew-id-alias-and-frozen-content"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t15.renew-live"]}
+      }
+    },
+    {
+      "id": "T16",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-meta",
+      "boundary": "workbench_snapshot_retire lifecycle transition",
+      "requirement": "Resolve and retire a snapshot with typed terminal and idempotent replay behavior.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1929-2230", "pre:crates/nokv/src/bin/nokv.rs:6059-6293"],
+      "required_gates": ["snapshot-lifecycle", "native-workbench-e2e"],
+      "gate_expectations": {
+        "snapshot-lifecycle": {"profile": "snapshot-lifecycle", "scenarios": ["t16.retire-terminal-idempotent-replay"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["t16.retire-live"]}
+      }
+    },
+    {
+      "id": "T17",
+      "scope": "core",
+      "class": "C",
+      "current_disposition": "replace",
+      "owner": "nokv-agent",
+      "boundary": "workbench_snapshot_list public result projection",
+      "requirement": "Keep snapshot lifecycle discoverable through the versioned current snapshot_count/snapshots projection; do not recreate checkpoints.jsonl or legacy checkpoint keys implicitly.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1929-2230", "pre:crates/nokv/src/bin/nokv.rs:6007-6058,6940-7060"],
+      "required_gates": ["api-decision", "snapshot-lifecycle", "output-golden"],
+      "gate_expectations": {
+        "api-decision": {"profile": "api-decision", "scenarios": ["t17.snapshot-projection-decision"]},
+        "snapshot-lifecycle": {"profile": "snapshot-lifecycle", "scenarios": ["t17.snapshot-count-and-list-projection"]},
+        "output-golden": {"profile": "output-golden", "scenarios": ["t17.snapshot-projection-output"]}
+      }
+    },
+    {
+      "id": "T18",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client + nokv-meta",
+      "boundary": "workbench_restore staged COW lifecycle and result",
+      "requirement": "Restore a frozen source into an independent destination with cleanup, exact terminal replay, destination-owned committed provenance, and no physical root projection.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:2232-2355", "pre:scripts/lingtai-workbench/durable_restore_live_e2e.py:2787-2879"],
+      "required_gates": ["restore-composition", "provider-recovery", "lingtai-mcp-e2e", "output-golden"],
+      "gate_expectations": {
+        "restore-composition": {"profile": "restore-composition", "scenarios": ["t18.restore-independent-destination", "t18.restore-terminal-replay"]},
+        "provider-recovery": {"profile": "provider-recovery", "scenarios": ["t18.restore-two-manifest-publication", "t18.restore-provider-restart", "t18.restore-reference-fenced-gc", "t18.restore-exact-bytes"]},
+        "lingtai-mcp-e2e": {"profile": "lingtai-mcp-e2e", "scenarios": ["t18.restore-lingtai-restart-reconnect"]},
+        "output-golden": {"profile": "output-golden", "scenarios": ["t18.restore-destination-owned-output"]}
+      }
+    },
+    {
+      "id": "C01",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent",
+      "boundary": "complete Workbench MCP surface",
+      "requirement": "Expose exactly 18 Workbench tools with restore capability-gated and no silent extras or omissions.",
+      "source_evidence": ["pre:scripts/lingtai-workbench/workbench_contract.py:15-38", "pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:4597-4670"],
+      "required_gates": ["schema-surface", "lingtai-mcp-e2e"],
+      "gate_expectations": {
+        "schema-surface": {"profile": "schema-surface", "scenarios": ["c01.exact-18-tool-schema"]},
+        "lingtai-mcp-e2e": {"profile": "lingtai-mcp-e2e", "scenarios": ["c01.exact-18-tools-lingtai-live"]}
+      }
+    },
+    {
+      "id": "C02",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent",
+      "boundary": "closed JSON input schemas and typed invalid arguments",
+      "requirement": "Reject unknown keys and invalid required, scalar, enum, and bound values through the stable typed error envelope.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:4597-4775", "pre:scripts/lingtai-workbench/workbench_contract_test.py"],
+      "required_gates": ["schema-surface", "facade-contract", "output-golden"],
+      "gate_expectations": {
+        "schema-surface": {"profile": "schema-surface", "scenarios": ["c02.closed-input-schema"]},
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["c02.typed-validation-error-contract"]},
+        "output-golden": {"profile": "output-golden", "scenarios": ["c02.typed-validation-error-output"]}
+      }
+    },
+    {
+      "id": "C03",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-types + nokv-agent",
+      "boundary": "Workbench id, virtual section, and normalized relative-path admission",
+      "requirement": "Enforce id grammar, the five virtual sections (input, scripts, outputs, logs, and metadata), and traversal and absolute-path jail through one storage-neutral normalizer.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:3554-3600,3682-3826", "pre:crates/nokv/src/bin/nokv.rs:4267-4325,5532-5730"],
+      "required_gates": ["facade-contract", "native-workbench-e2e"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["c03.id-section-and-path-normalization-contract"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["c03.path-jail-and-five-sections-live"]}
+      }
+    },
+    {
+      "id": "C04",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-client + nokv-meta",
+      "boundary": "implicit Workbench create within mutation admission",
+      "requirement": "Put, append, and commit against an absent id establish the same path-native Workbench exactly once and remain replay-safe under races.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:661,708,1424,3554-3600"],
+      "required_gates": ["facade-contract", "commit-replay", "native-workbench-e2e"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["c04.implicit-workbench-create-contract"]},
+        "commit-replay": {"profile": "commit-replay", "scenarios": ["c04.implicit-create-race-and-replay"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["c04.put-append-commit-absent-live"]}
+      }
+    },
+    {
+      "id": "C05",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-agent",
+      "boundary": "optional Workbench scope parsing",
+      "requirement": "For optional-scope tools, path set to the empty string is equivalent to an omitted path at Workbench or section root.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:3726-3751,4789-4803"],
+      "required_gates": ["facade-contract", "native-workbench-e2e"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["c05.empty-path-equivalence-contract"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["c05.empty-path-equivalence-live"]}
+      }
+    },
+    {
+      "id": "C06",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "replace",
+      "owner": "deployment admission + nokv-control",
+      "boundary": "durable Agent-to-RootId authority and root placement",
+      "requirement": "Identical Workbench ids owned by different agents cannot read, list, find, mutate, snapshot, or restore across their persisted RootIds; display roots are not authority.",
+      "source_evidence": ["pre:docs/lingtai-workbench-preflight.md:15-28", "pre:scripts/lingtai-workbench/README.md:68-84", "pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:3621-3649"],
+      "required_gates": ["root-authority-e2e", "lingtai-mcp-e2e", "provider-recovery"],
+      "gate_expectations": {
+        "root-authority-e2e": {"profile": "root-authority-e2e", "scenarios": ["c06.two-persisted-rootids-isolate-all-operations"]},
+        "lingtai-mcp-e2e": {"profile": "lingtai-mcp-e2e", "scenarios": ["c06.agent-root-isolation-lingtai-live"]},
+        "provider-recovery": {"profile": "provider-recovery", "scenarios": ["c06.root-binding-survives-provider-restart"]}
+      }
+    },
+    {
+      "id": "C07",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent",
+      "boundary": "Workbench payload admission",
+      "requirement": "Accept exactly one text or base64 payload, preserve or default content type, and enforce decode and size limits with typed errors.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv.rs:5136-5187,5309-5730"],
+      "required_gates": ["schema-surface", "facade-contract"],
+      "gate_expectations": {
+        "schema-surface": {"profile": "schema-surface", "scenarios": ["c07.exclusive-payload-schema"]},
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["c07.payload-decode-content-type-size-contract"]}
+      }
+    },
+    {
+      "id": "C08",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-client + nokv-meta",
+      "boundary": "conditional immutable publication",
+      "requirement": "Keep put create-only and replace-only distinct, return generation and digest, and reject the opposite precondition.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:644-689", "pre:crates/nokv/src/bin/nokv.rs:5398-5531"],
+      "required_gates": ["facade-contract", "native-workbench-e2e", "provider-recovery"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["c08.create-replace-precondition-contract"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["c08.create-replace-generation-digest-live"]},
+        "provider-recovery": {"profile": "provider-recovery", "scenarios": ["c08.conditional-put-provider", "c08.conditional-put-response-loss-readback"]}
+      }
+    },
+    {
+      "id": "C09",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-client + nokv-meta",
+      "boundary": "atomic append and generation conflict handling",
+      "requirement": "Append creates an absent file, prevents lost updates under two writers, and reports exact delta and result state.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:233-260,692-743", "pre:crates/nokv/src/bin/nokv.rs:4847-4912,7061-8214"],
+      "required_gates": ["facade-contract", "native-workbench-e2e", "provider-recovery"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["c09.append-result-contract"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["c09.append-absent-file-live"]},
+        "provider-recovery": {"profile": "provider-recovery", "scenarios": ["c09.two-writer-no-lost-update", "c09.same-operation-retry"]}
+      }
+    },
+    {
+      "id": "C10",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client",
+      "boundary": "edit revalidation and no-op semantics",
+      "requirement": "Edit performs exact UTF-8 matching, one or all replacements, no-op without generation change, and conflict-safe revalidation.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:746-857", "pre:crates/nokv/src/bin/nokv.rs:4913-5019,7061-8214"],
+      "required_gates": ["facade-contract", "native-workbench-e2e"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["c10.edit-match-noop-conflict-contract"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["c10.edit-exact-and-global-live"]}
+      }
+    },
+    {
+      "id": "C11",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "replace",
+      "owner": "nokv-agent + nokv-client + nokv-meta",
+      "boundary": "opaque scope cursor and Workbench revision fence",
+      "requirement": "Every pageable operation progresses without duplication or skipping, rejects wrong scope, and uses current revision authority rather than restoring naked offsets.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv.rs:6583-7060", "pre:scripts/lingtai-workbench/durable_restore_live_e2e.py"],
+      "required_gates": ["cursor-differential", "native-workbench-e2e", "lingtai-mcp-e2e"],
+      "gate_expectations": {
+        "cursor-differential": {"profile": "cursor-differential", "scenarios": ["c11.all-pageable-progress-scope-and-stale-rejection"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["c11.revision-authority-pagination-live"]},
+        "lingtai-mcp-e2e": {"profile": "lingtai-mcp-e2e", "scenarios": ["c11.pagination-lingtai-live"]}
+      }
+    },
+    {
+      "id": "C12",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client",
+      "boundary": "metadata stat and immutable object read",
+      "requirement": "Keep stat metadata-only and preserve ranges, formats, conditional reads, frozen reads, and total and generation metadata.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv.rs:3997-4128,5020-5187,6408-6939"],
+      "required_gates": ["facade-contract", "native-workbench-e2e", "provider-recovery"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["c12.stat-read-range-conditional-contract"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["c12.live-and-frozen-read-metadata-live"]},
+        "provider-recovery": {"profile": "provider-recovery", "scenarios": ["c12.range-conditional-frozen-provider-restart", "c12.provider-outage-read-failure"]}
+      }
+    },
+    {
+      "id": "C13",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent",
+      "boundary": "grep pattern normalization and scoped file scan",
+      "requirement": "Grep remains ASCII case-insensitive literal OR matching, not regex, with bounded alternatives and glob semantics.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:289-332", "pre:crates/nokv/src/bin/nokv.rs:4326-4514,5188-5308"],
+      "required_gates": ["facade-contract", "cursor-differential", "native-workbench-e2e"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["c13.grep-literal-or-bounds-contract"]},
+        "cursor-differential": {"profile": "cursor-differential", "scenarios": ["c13.grep-case-glob-cursor"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["c13.grep-live"]}
+      }
+    },
+    {
+      "id": "C14",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client",
+      "boundary": "search, aggregate, and catalog query semantics",
+      "requirement": "Queries honor id, section and path scope, typed predicates and result controls, and return defined empty output for a missing root.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1136-1295", "pre:crates/nokv/src/bin/nokv.rs:4515-4846"],
+      "required_gates": ["facade-contract", "native-workbench-e2e", "output-golden"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["c14.query-scope-predicate-control-contract"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["c14.query-missing-root-live"]},
+        "output-golden": {"profile": "output-golden", "scenarios": ["c14.query-defined-empty-output"]}
+      }
+    },
+    {
+      "id": "C15",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client",
+      "boundary": "global manifest discovery",
+      "requirement": "Find filters committed state and manifest content case-insensitively, paginates, and projects optional manifest data consistently.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1297-1370,3328-3335", "pre:crates/nokv/src/bin/nokv.rs:4129-4266"],
+      "required_gates": ["facade-contract", "cursor-differential", "native-workbench-e2e"],
+      "gate_expectations": {
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["c15.find-filter-projection-contract"]},
+        "cursor-differential": {"profile": "cursor-differential", "scenarios": ["c15.find-case-insensitive-pagination"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["c15.find-committed-manifest-live"]}
+      }
+    },
+    {
+      "id": "C16",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-client + nokv-meta",
+      "boundary": "commit provenance, identity, and terminal replay",
+      "requirement": "Validate and canonicalize run provenance, preserve stable commit identity, distinguish replace conflicts, and reconcile outcome-unknown retries.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1398-1737", "pre:crates/nokv/src/bin/nokv.rs:3782-3996"],
+      "required_gates": ["commit-replay", "native-workbench-e2e", "provider-recovery"],
+      "gate_expectations": {
+        "commit-replay": {"profile": "commit-replay", "scenarios": ["c16.canonical-identity-conflict-replay"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["c16.commit-head-authority-live"]},
+        "provider-recovery": {"profile": "provider-recovery", "scenarios": ["c16.commit-outcome-unknown-retry"]}
+      }
+    },
+    {
+      "id": "C17",
+      "scope": "core",
+      "class": "A",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv-meta",
+      "boundary": "snapshot admission and lease policy",
+      "requirement": "Require committed provenance and enforce alias, default and maximum TTL, annotations, metadata, and warning behavior.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1759-1792", "pre:docs/development/workbench-checkpoint-lifecycle.md:71-128,177-236"],
+      "required_gates": ["snapshot-lifecycle", "facade-contract"],
+      "gate_expectations": {
+        "snapshot-lifecycle": {"profile": "snapshot-lifecycle", "scenarios": ["c17.snapshot-commit-alias-ttl-metadata-warnings"]},
+        "facade-contract": {"profile": "facade-contract", "scenarios": ["c17.snapshot-validation-contract"]}
+      }
+    },
+    {
+      "id": "C18",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "replace",
+      "owner": "nokv-agent + nokv-meta",
+      "boundary": "typed snapshot identity, state, and public projection",
+      "requirement": "Renew, list and retire by snapshot id or alias with typed lifecycle states and terminal replay, using current snapshot output rather than checkpoints.jsonl.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:1929-2230", "pre:crates/nokv/src/bin/nokv.rs:5966-6293,6940-7060"],
+      "required_gates": ["snapshot-lifecycle", "output-golden", "api-decision"],
+      "gate_expectations": {
+        "snapshot-lifecycle": {"profile": "snapshot-lifecycle", "scenarios": ["c18.snapshot-renew-list-retire-terminal-replay"]},
+        "output-golden": {"profile": "output-golden", "scenarios": ["c18.snapshot-lifecycle-output"]},
+        "api-decision": {"profile": "api-decision", "scenarios": ["c18.no-checkpoints-jsonl-decision"]}
+      }
+    },
+    {
+      "id": "C19",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-client + nokv-meta + nokv-object",
+      "boundary": "leased MVCC snapshot and HistoryHold",
+      "requirement": "Snapshot reads remain frozen after live mutation; renew preserves content and retired, reaped, expired, or foreign snapshots fail loudly.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:2358-2745", "pre:crates/nokv/src/bin/nokv.rs:6391-7005"],
+      "required_gates": ["snapshot-lifecycle", "native-workbench-e2e", "provider-recovery"],
+      "gate_expectations": {
+        "snapshot-lifecycle": {"profile": "snapshot-lifecycle", "scenarios": ["c19.frozen-renew-retire-reap-expire-foreign"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["c19.frozen-read-after-live-mutation"]},
+        "provider-recovery": {"profile": "provider-recovery", "scenarios": ["c19.frozen-reference-retention-across-restart", "c19.retire-reap-reference-release"]}
+      }
+    },
+    {
+      "id": "C20",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-client + nokv-meta + nokv-object",
+      "boundary": "staged COW restore, publication, cleanup, and replay",
+      "requirement": "Validate source, destination and snapshot, hide staging, preserve source bytes, publish a COW destination, clean safely, and replay the same terminal result.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:2232-2355", "pre:scripts/lingtai-workbench/durable_restore_live_e2e.py:1174-1262,1355-1539,3495-3738"],
+      "required_gates": ["restore-composition", "provider-recovery", "native-workbench-e2e"],
+      "gate_expectations": {
+        "restore-composition": {"profile": "restore-composition", "scenarios": ["c20.hidden-staging-cow-independent-destination", "c20.restore-terminal-replay"]},
+        "provider-recovery": {"profile": "provider-recovery", "scenarios": ["c20.restore-cleanup-after-failure", "c20.restore-reference-fenced-gc", "c20.restore-exact-source-and-destination-bytes"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["c20.restore-validation-and-publication-live"]}
+      }
+    },
+    {
+      "id": "C21",
+      "scope": "core",
+      "class": "B",
+      "current_disposition": "restore",
+      "owner": "nokv-client + nokv-meta",
+      "boundary": "destination-owned committed provenance after restore",
+      "requirement": "A restored destination is committed and independently composable through restore to snapshot to restore without copying stale source identity.",
+      "source_evidence": ["pre:scripts/lingtai-workbench/durable_restore_live_e2e.py:2787-2879", "pre:crates/nokv/src/bin/nokv/workbench_mcp.rs:2232-2355"],
+      "required_gates": ["restore-composition", "commit-replay", "lingtai-mcp-e2e"],
+      "gate_expectations": {
+        "restore-composition": {"profile": "restore-composition", "scenarios": ["c21.restore-snapshot-restore-composition"]},
+        "commit-replay": {"profile": "commit-replay", "scenarios": ["c21.restored-destination-owned-provenance"]},
+        "lingtai-mcp-e2e": {"profile": "lingtai-mcp-e2e", "scenarios": ["c21.restored-composition-lingtai-live"]}
+      }
+    },
+    {
+      "id": "L01",
+      "scope": "legacy",
+      "class": "C",
+      "current_disposition": "restore",
+      "owner": "nokv-agent + nokv CLI",
+      "boundary": "generic seven-tool Agent MCP profile",
+      "requirement": "Restore an explicitly selectable generic Agent MCP profile with exactly ls, stat, catalog, read, aggregate, find, and grep, while retaining the explicit 18-tool Workbench profile; both profiles must route through current RootId and WorkspaceClient authority.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv.rs:190-194,230-236,2103-2135", "pre:docs/lingtai-workbench-preflight.md:13-28"],
+      "required_gates": ["api-decision", "schema-surface", "native-workbench-e2e"],
+      "gate_expectations": {
+        "api-decision": {"profile": "api-decision", "scenarios": ["l01.generic-profile-restoration-contract"]},
+        "schema-surface": {"profile": "schema-surface", "scenarios": ["l01.generic-seven-tool-profile-schema"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["l01.generic-seven-tool-profile-live"]}
+      }
+    },
+    {
+      "id": "L02",
+      "scope": "legacy",
+      "class": "C",
+      "current_disposition": "replace",
+      "owner": "nokv-client",
+      "boundary": "old Rust filesystem SDK",
+      "requirement": "Replace supported client outcomes with RootId-routed WorkspaceClient tests; inode, dentry, and raw filesystem types are not current acceptance.",
+      "source_evidence": ["pre:crates/nokv-client/src/lib.rs:1-39", "pre:crates/nokv-client/src/service_tests.rs"],
+      "required_gates": ["api-decision", "api-absence", "native-workbench-e2e"],
+      "gate_expectations": {
+        "api-decision": {"profile": "api-decision", "scenarios": ["l02.workspace-client-replacement-decision"]},
+        "api-absence": {"profile": "api-absence", "scenarios": ["l02.inode-dentry-client-api-absence"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["l02.rootid-workspace-client-live"]}
+      }
+    },
+    {
+      "id": "L03",
+      "scope": "legacy",
+      "class": "C",
+      "current_disposition": "replace",
+      "owner": "nokv-python",
+      "boundary": "old Python client and range batch API",
+      "requirement": "Preserve the old Python byte, range-batch, retry, concurrency, generation, frozen-snapshot, query, rename, and remove outcomes through the current path-native Python Client; old filesystem-shaped type names may stay absent but their behavior cannot be retired.",
+      "source_evidence": ["pre:crates/nokv-python/python/nokv/__init__.py:1-50", "pre:crates/nokv-python/tests/test_live_sdk.py:48-150"],
+      "required_gates": ["api-decision", "api-absence", "python-sdk-e2e"],
+      "gate_expectations": {
+        "api-decision": {"profile": "api-decision", "scenarios": ["l03.path-native-python-compatibility-contract"]},
+        "api-absence": {"profile": "api-absence", "scenarios": ["l03.retired-filesystem-type-names-stay-absent"]},
+        "python-sdk-e2e": {"profile": "python-sdk-e2e", "scenarios": ["l03.python-create-publish-read-stat-list-rename-remove-live", "l03.python-replace-generation-and-frozen-snapshot-live", "l03.python-range-batch-ordering-and-bounds-live", "l03.python-retry-concurrency-and-query-live"]}
+      }
+    },
+    {
+      "id": "L04",
+      "scope": "legacy",
+      "class": "C",
+      "current_disposition": "replace",
+      "owner": "nokv-python",
+      "boundary": "Workbench-scoped immutable fsspec compatibility adapter",
+      "requirement": "Provide an explicit Workbench-scoped fsspec adapter with whole-object semantics: project the five virtual sections and artifact prefixes through exists, info, list, makedirs, empty-prefix rmdir, move, and remove without creating durable directory objects; accept read, write, and exclusive-create modes; reject append and update modes; preserve exact write, read, range, create-only collision, replacement, retry, and concurrency behavior without promising POSIX directories, permissions, or inode semantics.",
+      "source_evidence": ["pre:crates/nokv-python/python/nokv/fsspec.py:1-10,62-336", "pre:crates/nokv-python/tests/test_fsspec_modes.py:63-79"],
+      "required_gates": ["api-decision", "python-sdk-e2e"],
+      "gate_expectations": {
+        "api-decision": {"profile": "api-decision", "scenarios": ["l04.workbench-scoped-fsspec-contract"]},
+        "python-sdk-e2e": {"profile": "python-sdk-e2e", "scenarios": ["l04.fsspec-open-mode-policy-live", "l04.fsspec-virtual-prefix-namespace-live", "l04.fsspec-move-remove-live", "l04.fsspec-write-read-range-live", "l04.fsspec-create-only-and-replace-live", "l04.fsspec-retry-and-concurrency-live"]}
+      }
+    },
+    {
+      "id": "L05",
+      "scope": "legacy",
+      "class": "C",
+      "current_disposition": "replace",
+      "owner": "nokv-python + nokv-agent",
+      "boundary": "Python checkpoint publish, commit, and load helpers",
+      "requirement": "Preserve checkpoint shard publication, manifest-as-commit-point visibility, highest committed-step selection, partial-checkpoint invisibility, distributed shard commit, exact shard load, invalid shard-name rejection, response-loss replay, frozen snapshot, materialize, and collect through current Workbench contracts.",
+      "source_evidence": ["pre:crates/nokv-python/python/nokv/checkpoint.py:1-19,74-222", "pre:crates/nokv-python/tests/test_checkpoint.py:98-165"],
+      "required_gates": ["api-decision", "python-sdk-e2e", "commit-replay", "snapshot-lifecycle"],
+      "gate_expectations": {
+        "api-decision": {"profile": "api-decision", "scenarios": ["l05.workbench-checkpoint-compatibility-contract"]},
+        "python-sdk-e2e": {"profile": "python-sdk-e2e", "scenarios": ["l05.checkpoint-publish-resolve-load-exact-live", "l05.checkpoint-highest-committed-step-live", "l05.checkpoint-partial-step-invisible-live", "l05.checkpoint-distributed-shard-commit-live", "l05.checkpoint-invalid-shard-name-rejected-live"]},
+        "commit-replay": {"profile": "commit-replay", "scenarios": ["l05.checkpoint-commit-replay"]},
+        "snapshot-lifecycle": {"profile": "snapshot-lifecycle", "scenarios": ["l05.checkpoint-snapshot-lifecycle"]}
+      }
+    },
+    {
+      "id": "L06",
+      "scope": "legacy",
+      "class": "C",
+      "current_disposition": "replace",
+      "owner": "external adapter + nokv-python",
+      "boundary": "torch.distributed.checkpoint integration",
+      "requirement": "Preserve the torch.distributed.checkpoint adapter over immutable Workbench publication: rank zero is used only before process-group initialization, initialized rank and rank failures propagate exactly, short range-batch results fail loudly, and multi-rank storage writer/reader round trips retain exact bytes without POSIX emulation.",
+      "source_evidence": ["pre:crates/nokv-python/python/nokv/torch.py:233-380", "pre:crates/nokv-python/tests/test_torch_unit.py:114-180"],
+      "required_gates": ["api-decision", "api-absence", "python-sdk-e2e"],
+      "gate_expectations": {
+        "api-decision": {"profile": "api-decision", "scenarios": ["l06.workbench-dcp-adapter-contract"]},
+        "api-absence": {"profile": "api-absence", "scenarios": ["l06.filesystem-emulation-absence"]},
+        "python-sdk-e2e": {"profile": "python-sdk-e2e", "scenarios": ["l06.dcp-rank-semantics-live", "l06.dcp-rank-failure-propagation-live", "l06.dcp-short-range-batch-fails-live", "l06.dcp-multirank-exact-roundtrip-live"]}
+      }
+    },
+    {
+      "id": "L07",
+      "scope": "legacy",
+      "class": "D",
+      "current_disposition": "do-not-restore",
+      "owner": "architecture policy",
+      "boundary": "FUSE and POSIX filesystem frontend",
+      "requirement": "Keep FUSE, POSIX emulation, inode and dentry acceptance outside the NoKV product architecture.",
+      "source_evidence": ["pre:Cargo.toml:1-15,35", "pre:scripts/run-fuse-posix-gate.sh:1-200"],
+      "required_gates": ["api-absence"],
+      "gate_expectations": {
+        "api-absence": {"profile": "api-absence", "scenarios": ["l07.fuse-posix-inode-dentry-absence"]}
+      }
+    },
+    {
+      "id": "L08",
+      "scope": "legacy",
+      "class": "C",
+      "current_disposition": "replace",
+      "owner": "nokv CLI + operations",
+      "boundary": "old filesystem and administration command surface",
+      "requirement": "Restore current-architecture CLI and operational equivalents for single-node service without external etcd, HTTP health/readiness/stats, metadata backup and fresh-node restore, fsck, manual reconciliable GC, checkpoint/log replay, cross-owner failover, multi-shard routing/failover, and the v0.10 upgrade/recovery matrix without filesystem compatibility shims.",
+      "source_evidence": ["pre:crates/nokv/src/bin/nokv.rs:80-194,2103-2135"],
+      "required_gates": ["api-decision", "api-absence", "native-workbench-e2e", "provider-recovery"],
+      "gate_expectations": {
+        "api-decision": {"profile": "api-decision", "scenarios": ["l08.operational-command-restoration-contract"]},
+        "api-absence": {"profile": "api-absence", "scenarios": ["l08.filesystem-cli-compatibility-absence"]},
+        "native-workbench-e2e": {"profile": "native-workbench-e2e", "scenarios": ["l08.current-workbench-cli-live"]},
+        "provider-recovery": {"profile": "provider-recovery", "scenarios": ["l08.single-node-no-external-etcd-live", "l08.http-health-readiness-stats-live", "l08.metadata-backup-fresh-node-restore-live", "l08.metadata-fsck-clean-and-corruption-detection-live", "l08.manual-reconciliable-gc-live", "l08.checkpoint-log-replay-live", "l08.cross-owner-failover-live", "l08.multishard-routing-failover-live", "l08.v010-upgrade-recovery-matrix-live"]}
+      }
+    }
+  ]
+}

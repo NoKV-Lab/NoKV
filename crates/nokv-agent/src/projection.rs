@@ -19,6 +19,7 @@ use sha2::{Digest as _, Sha256};
 pub const RUN_MANIFEST_V1_SCHEMA: &str = "nokv.workbench.run_manifest.v1";
 const RUN_MANIFEST_PROJECTION_INPUT_DOMAIN: &[u8] =
     b"nokv.workbench.run_manifest.projection_input.v1\0";
+const RESTORED_CONTENT_DIGEST_DOMAIN: &[u8] = b"nokv.workbench.restored_content_digest.v1\0";
 pub const RESTORE_MANIFEST_V1_SCHEMA: &str = "nokv.workbench.restore_manifest.v1";
 
 const RUN_MANIFEST_FIELDS: [&str; 8] = [
@@ -244,6 +245,64 @@ pub fn verify_run_manifest_v1(bytes: &[u8]) -> Result<VerifiedRunManifestV1, Pro
         canonical_envelope: bytes.to_vec(),
         envelope_digest_uri: digest_uri(bytes),
     })
+}
+
+/// Rebuild a committed run-manifest projection for a restored destination.
+///
+/// The source envelope is accepted only as canonical v1 input. Its user
+/// manifest commitment is retained, while the effective content commitment
+/// and all Workbench-owned binding fields are rebuilt for the destination
+/// through the one canonical run-manifest builder.
+pub fn build_restored_run_manifest_v1(
+    source_run_manifest: &[u8],
+    destination_workbench_id: &WorkbenchId,
+    destination_workbench_path: &str,
+    effective_content_digest_uri: &str,
+    destination_commit_identity: [u8; 32],
+    destination_committed_at_unix_seconds: u64,
+) -> Result<Vec<u8>, ProjectionError> {
+    let source = verify_run_manifest_v1(source_run_manifest)?;
+    if source.workbench_id == *destination_workbench_id {
+        return Err(ProjectionError::new(
+            "restore destination workbench must differ from its source",
+        ));
+    }
+    if destination_committed_at_unix_seconds == 0 {
+        return Err(ProjectionError::new(
+            "destination committed_at_unix_seconds must be greater than zero",
+        ));
+    }
+    build_run_manifest_v1(
+        destination_workbench_id,
+        destination_workbench_path,
+        effective_content_digest_uri,
+        &source.canonical_manifest,
+        &source.manifest_digest_uri,
+        destination_commit_identity,
+        destination_committed_at_unix_seconds,
+    )
+}
+
+/// Choose the destination content commitment for one frozen restore source.
+///
+/// An unchanged snapshot retains the caller-owned source commitment. A dirty
+/// snapshot instead commits to its exact materialized member seal under a
+/// separate domain so two different uncommitted trees cannot reuse one
+/// destination commit identity.
+pub fn restore_effective_content_digest_uri_v1(
+    source_content_digest_uri: &str,
+    source_matches_base_commit: bool,
+    materialized_member_digest: [u8; 32],
+) -> Result<String, ProjectionError> {
+    validate_digest_uri("source_content_digest_uri", source_content_digest_uri)?;
+    if source_matches_base_commit {
+        return Ok(source_content_digest_uri.to_owned());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(RESTORED_CONTENT_DIGEST_DOMAIN);
+    hasher.update(materialized_member_digest);
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok(format!("sha256:{}", lowercase_hex(&digest)))
 }
 
 pub fn build_restore_manifest_v1(
@@ -472,7 +531,7 @@ pub(crate) fn digest_uri(bytes: &[u8]) -> String {
     format!("sha256:{}", lowercase_hex(&digest))
 }
 
-fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
+pub(crate) fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
     hasher.update(value);
 }
@@ -655,6 +714,205 @@ mod tests {
             verify_run_manifest_v1(&first).unwrap().commit_identity,
             verify_run_manifest_v1(&second).unwrap().commit_identity
         );
+    }
+
+    #[test]
+    fn restored_run_manifest_rebinds_source_content_to_the_destination() {
+        let source_id = workbench("source");
+        let destination_id = workbench("destination");
+        let source_manifest = br#"{"nested":{"a":1,"b":2},"task":"ptycho"}"#;
+        let manifest_digest_uri = digest_uri(source_manifest);
+        let content_digest_uri = format!("sha256:{}", "44".repeat(32));
+        let source_commit_identity =
+            workbench_commit_identity(&source_id, &content_digest_uri, &manifest_digest_uri);
+        let source = build_run_manifest_v1(
+            &source_id,
+            "/agents/test/wb/source",
+            &content_digest_uri,
+            source_manifest,
+            &manifest_digest_uri,
+            source_commit_identity,
+            1_700_000_000,
+        )
+        .unwrap();
+        let destination_commit_identity =
+            workbench_commit_identity(&destination_id, &content_digest_uri, &manifest_digest_uri);
+
+        let restored = build_restored_run_manifest_v1(
+            &source,
+            &destination_id,
+            "/agents/test/wb/destination",
+            &content_digest_uri,
+            destination_commit_identity,
+            1_800_000_000,
+        )
+        .unwrap();
+        let verified = verify_run_manifest_v1(&restored).unwrap();
+
+        assert_eq!(verified.workbench_id, destination_id);
+        assert_eq!(verified.workbench_path, "/agents/test/wb/destination");
+        assert_eq!(verified.commit_identity, destination_commit_identity);
+        assert_eq!(verified.committed_at_unix_seconds, 1_800_000_000);
+        assert_eq!(verified.content_digest_uri, content_digest_uri);
+        assert_eq!(verified.manifest_digest_uri, manifest_digest_uri);
+        assert_eq!(verified.canonical_manifest, source_manifest);
+        assert_ne!(verified.commit_identity, source_commit_identity);
+        assert_ne!(restored, source);
+    }
+
+    #[test]
+    fn restored_run_manifest_is_deterministic_and_destination_owned() {
+        let source_id = workbench("source");
+        let source_manifest = br#"{"task":"ptycho"}"#;
+        let manifest_digest_uri = digest_uri(source_manifest);
+        let content_digest_uri = format!("sha256:{}", "55".repeat(32));
+        let source_commit_identity =
+            workbench_commit_identity(&source_id, &content_digest_uri, &manifest_digest_uri);
+        let source = build_run_manifest_v1(
+            &source_id,
+            "/agents/test/wb/source",
+            &content_digest_uri,
+            source_manifest,
+            &manifest_digest_uri,
+            source_commit_identity,
+            1,
+        )
+        .unwrap();
+        let first_destination_id = workbench("destination-one");
+        let first_destination_commit_identity = workbench_commit_identity(
+            &first_destination_id,
+            &content_digest_uri,
+            &manifest_digest_uri,
+        );
+        let second_destination_id = workbench("destination-two");
+        let second_destination_commit_identity = workbench_commit_identity(
+            &second_destination_id,
+            &content_digest_uri,
+            &manifest_digest_uri,
+        );
+
+        let first = build_restored_run_manifest_v1(
+            &source,
+            &first_destination_id,
+            "/agents/test/wb/destination-one",
+            &content_digest_uri,
+            first_destination_commit_identity,
+            2,
+        )
+        .unwrap();
+        let replay = build_restored_run_manifest_v1(
+            &source,
+            &first_destination_id,
+            "/agents/test/wb/destination-one",
+            &content_digest_uri,
+            first_destination_commit_identity,
+            2,
+        )
+        .unwrap();
+        let second = build_restored_run_manifest_v1(
+            &source,
+            &second_destination_id,
+            "/agents/test/wb/destination-two",
+            &content_digest_uri,
+            second_destination_commit_identity,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(first, replay);
+        assert_ne!(first, second);
+        assert_ne!(
+            first_destination_commit_identity,
+            second_destination_commit_identity
+        );
+    }
+
+    #[test]
+    fn restored_run_manifest_rejects_untrusted_source_or_destination_inputs() {
+        let source_id = workbench("source");
+        let destination_id = workbench("destination");
+        let source_manifest = br#"{"task":"ptycho"}"#;
+        let manifest_digest_uri = digest_uri(source_manifest);
+        let content_digest_uri = format!("sha256:{}", "66".repeat(32));
+        let source_commit_identity =
+            workbench_commit_identity(&source_id, &content_digest_uri, &manifest_digest_uri);
+        let source = build_run_manifest_v1(
+            &source_id,
+            "/agents/test/wb/source",
+            &content_digest_uri,
+            source_manifest,
+            &manifest_digest_uri,
+            source_commit_identity,
+            1,
+        )
+        .unwrap();
+        let destination_commit_identity =
+            workbench_commit_identity(&destination_id, &content_digest_uri, &manifest_digest_uri);
+
+        assert!(build_restored_run_manifest_v1(
+            &source,
+            &destination_id,
+            "/agents/test/wb/destination",
+            &content_digest_uri,
+            [9; 32],
+            2,
+        )
+        .is_err());
+        assert!(build_restored_run_manifest_v1(
+            &source,
+            &source_id,
+            "/agents/test/wb/source",
+            &content_digest_uri,
+            source_commit_identity,
+            2,
+        )
+        .is_err());
+        assert!(build_restored_run_manifest_v1(
+            &source,
+            &destination_id,
+            "/agents/test/wb/destination",
+            &content_digest_uri,
+            destination_commit_identity,
+            0,
+        )
+        .is_err());
+        assert!(build_restored_run_manifest_v1(
+            br#"{ "not": "canonical" }"#,
+            &destination_id,
+            "/agents/test/wb/destination",
+            &content_digest_uri,
+            destination_commit_identity,
+            2,
+        )
+        .is_err());
+        assert!(build_restored_run_manifest_v1(
+            br#"{"not":"a run manifest"}"#,
+            &destination_id,
+            "/agents/test/wb/destination",
+            &content_digest_uri,
+            destination_commit_identity,
+            2,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn restore_content_commitment_preserves_clean_and_separates_dirty_snapshots() {
+        let source = format!("sha256:{}", "77".repeat(32));
+        assert_eq!(
+            restore_effective_content_digest_uri_v1(&source, true, [1; 32]).unwrap(),
+            source
+        );
+
+        let first = restore_effective_content_digest_uri_v1(&source, false, [1; 32]).unwrap();
+        let replay = restore_effective_content_digest_uri_v1(&source, false, [1; 32]).unwrap();
+        let second = restore_effective_content_digest_uri_v1(&source, false, [2; 32]).unwrap();
+        assert_eq!(first, replay);
+        assert_ne!(first, source);
+        assert_ne!(first, second);
+        assert!(first.starts_with("sha256:"));
+        assert_eq!(first.len(), 71);
+        assert!(restore_effective_content_digest_uri_v1("not-a-digest", true, [1; 32]).is_err());
     }
 
     #[test]
