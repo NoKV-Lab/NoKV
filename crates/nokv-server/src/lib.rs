@@ -43,7 +43,7 @@ pub use recovery_installer::{
     MAX_RECOVERY_INSTALL_RECEIPT_BYTES, MAX_RECOVERY_INSTALL_SEGMENTS,
 };
 pub use recovery_publisher::{
-    RecoveryPublisher, RecoveryPublisherError, RecoveryPublishingExecutor,
+    RecoveryPublicationMode, RecoveryPublisher, RecoveryPublisherError, RecoveryPublishingExecutor,
 };
 pub use registry::RootOwnerRegistry;
 pub use server::{OwnerLossSignal, ServerHealth, ServerOptions, WorkspaceServer};

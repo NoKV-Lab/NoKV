@@ -24,8 +24,8 @@ use crate::recovery_installer::{
     validate_recovery_control_references, PendingRecoveryInstallOutcome,
 };
 use crate::{
-    MetadataWorkspaceRequestExecutor, RecoveryPublisher, RecoveryPublishingExecutor,
-    RootOwnerRegistry, ServerError, WorkspaceRequestExecutor,
+    MetadataWorkspaceRequestExecutor, RecoveryPublicationMode, RecoveryPublisher,
+    RecoveryPublishingExecutor, RootOwnerRegistry, ServerError, WorkspaceRequestExecutor,
 };
 
 /// Explicit metadata-store opening mode. Startup never falls back between new,
@@ -78,6 +78,9 @@ pub struct ShardBoot {
     pub lease: LeaseMode,
     /// Recovery frontier that the serving record will publish.
     pub recovery: RecoveryPublication,
+    /// Whether this owner publishes its outbox to shared recovery or keeps
+    /// the exclusive local WAL as the only recovery authority.
+    pub recovery_publication: RecoveryPublicationMode,
     /// Initial roots to fence and route through the shared executor.
     pub roots: Vec<RootAttach>,
 }
@@ -310,11 +313,12 @@ pub fn bootstrap_shard(
         ));
     }
 
-    let recovery = match RecoveryPublisher::new(
+    let recovery = match RecoveryPublisher::with_mode(
         Arc::clone(&control),
         lease.clone(),
         Arc::clone(&meta),
         recovery_objects,
+        boot.recovery_publication,
     ) {
         Ok(recovery) => Arc::new(recovery),
         Err(error) => {
@@ -416,6 +420,13 @@ pub fn bootstrap_shard(
 }
 
 fn validate_boot(boot: &ShardBoot) -> Result<(), ServerError> {
+    if boot.recovery_publication == RecoveryPublicationMode::LocalOnly
+        && matches!(boot.open, OpenMode::RecoverLog(_))
+    {
+        return Err(ServerError::InvalidBootstrap(
+            "shared-log recovery cannot install a frontier for a local-only owner; use --metadata-create or --metadata-reopen with local-only publication".to_owned(),
+        ));
+    }
     if boot.roots.is_empty() {
         return Err(ServerError::InvalidBootstrap(
             "logical-shard bootstrap requires at least one root".to_owned(),
@@ -1634,6 +1645,7 @@ mod tests {
 
     fn acquire_boot(path: PathBuf, roots: &[RootId]) -> ShardBoot {
         ShardBoot {
+            recovery_publication: RecoveryPublicationMode::Shared,
             shard_id: shard(),
             open: OpenMode::New(path),
             lease: LeaseMode::Acquire {
@@ -1663,6 +1675,7 @@ mod tests {
         seed: u8,
     ) -> ShardBoot {
         ShardBoot {
+            recovery_publication: RecoveryPublicationMode::Shared,
             shard_id: shard(),
             open: OpenMode::Existing(path),
             lease: LeaseMode::Resume { lease },
@@ -1768,6 +1781,98 @@ mod tests {
     }
 
     #[test]
+    fn local_only_owner_serves_writes_without_publishing_recovery_segments() {
+        let temporary = TempDir::new().unwrap();
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let registry = Arc::new(RootOwnerRegistry::new());
+        let namespace = ObjectNamespaceId::from_bytes([10; nokv_types::FIXED_ID_BYTES]);
+        let raw = MemoryArtifactStore::new();
+        ensure_object_namespace(&raw, namespace).unwrap();
+        let objects_before = raw.stats().unwrap().resident_objects;
+        let objects = Arc::new(BoundArtifactStore::open(raw.clone(), namespace).unwrap());
+        let mut boot = acquire_boot(temporary.path().join("metadata"), &[root_id]);
+        boot.recovery_publication = RecoveryPublicationMode::LocalOnly;
+        let owner =
+            super::bootstrap_shard(as_control(&control), Arc::clone(&registry), objects, boot)
+                .unwrap();
+        assert_eq!(
+            owner.recovery_publisher().mode(),
+            RecoveryPublicationMode::LocalOnly
+        );
+        let route = owner.routes()[0];
+        let executor = RecoveryPublishingExecutor::new(
+            Arc::new(LeaseClockExecutor {
+                meta: Arc::clone(owner.meta()),
+                root_id,
+                placement_generation: PlacementGeneration::new(route.placement_generation).unwrap(),
+                owner_epoch: owner.lease().owner_epoch,
+            }),
+            Arc::clone(owner.recovery_publisher()),
+        );
+        let local_before = owner.meta().recovery_state().unwrap().applied_recovery_lsn;
+        for fill in 0x71_u8..0x79 {
+            let request = nokv_protocol::WorkspaceRpcRequest {
+                route,
+                request_id: nokv_protocol::RequestIdentity([fill; nokv_types::FIXED_ID_BYTES]),
+                operation: nokv_protocol::WorkspaceRequest::Preflight(
+                    nokv_protocol::WorkspacePreflightRequest::new([]),
+                ),
+            };
+            let result = executor.execute(&request).unwrap();
+            assert!(matches!(
+                result.result,
+                nokv_protocol::WorkspaceResult::Preflight(_)
+            ));
+        }
+        // The local WAL advanced, but nothing was published: no control
+        // frontier, no segment references, no pending upload, no objects.
+        assert!(owner.meta().recovery_state().unwrap().applied_recovery_lsn > local_before);
+        let record = control.get_logical_shard(&shard()).unwrap().unwrap();
+        assert_eq!(record.state, nokv_control::LogicalShardState::Serving);
+        assert_eq!(record.durable_lsn, 0);
+        assert!(record.log.is_none());
+        assert!(record.checkpoint.is_none());
+        assert!(record.pending_recovery_upload.is_none());
+        assert_eq!(raw.stats().unwrap().resident_objects, objects_before);
+
+        // Release still confirms the untouched frontier and hands the lease back.
+        let released = owner.release().unwrap();
+        assert_eq!(released.durable_lsn, 0);
+        assert!(released.log.is_none());
+        assert_eq!(raw.stats().unwrap().resident_objects, objects_before);
+    }
+
+    #[test]
+    fn local_only_owner_cannot_install_a_shared_log_frontier() {
+        let temporary = TempDir::new().unwrap();
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let namespace = ObjectNamespaceId::from_bytes([10; nokv_types::FIXED_ID_BYTES]);
+        let raw = MemoryArtifactStore::new();
+        ensure_object_namespace(&raw, namespace).unwrap();
+        let objects = Arc::new(BoundArtifactStore::open(raw, namespace).unwrap());
+        let mut boot = acquire_boot(temporary.path().join("metadata"), &[root_id]);
+        boot.open = OpenMode::RecoverLog(temporary.path().join("metadata"));
+        boot.recovery_publication = RecoveryPublicationMode::LocalOnly;
+        let error = super::bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            objects,
+            boot,
+        )
+        .err()
+        .expect("local-only publication must reject shared-log recovery");
+        assert!(
+            error.to_string().contains("local-only"),
+            "unexpected error: {error}"
+        );
+        // Fail-closed validation happens before any epoch is consumed.
+        let record = control.get_logical_shard(&shard()).unwrap().unwrap();
+        assert_eq!(record.owner_epoch, None);
+    }
+
+    #[test]
     fn recovery_finalize_response_loss_reuses_the_same_epoch_and_exact_publication() {
         let temporary = TempDir::new().unwrap();
         let database = temporary.path().join("metadata");
@@ -1801,6 +1906,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects,
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
                 lease: LeaseMode::Acquire {
@@ -2203,6 +2309,7 @@ mod tests {
         let registry = Arc::new(RootOwnerRegistry::new());
 
         let boot = ShardBoot {
+            recovery_publication: RecoveryPublicationMode::Shared,
             shard_id: shard(),
             open: OpenMode::Existing(database),
             lease: LeaseMode::Acquire {
@@ -2258,6 +2365,7 @@ mod tests {
             as_control(&control),
             Arc::new(RootOwnerRegistry::new()),
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
                 lease: LeaseMode::Acquire {
@@ -2313,6 +2421,7 @@ mod tests {
             as_control(&control),
             Arc::clone(&registry),
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database.clone()),
                 lease: LeaseMode::Acquire {
@@ -2370,6 +2479,7 @@ mod tests {
             as_control(&control),
             Arc::clone(&registry),
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
                 lease: LeaseMode::Acquire {
@@ -2425,6 +2535,7 @@ mod tests {
             as_control(&control),
             Arc::new(RootOwnerRegistry::new()),
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
                 lease: LeaseMode::Acquire {
@@ -2479,6 +2590,7 @@ mod tests {
             as_control(&control),
             Arc::new(RootOwnerRegistry::new()),
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
                 lease: LeaseMode::Acquire {
@@ -2534,6 +2646,7 @@ mod tests {
             as_control(&control),
             Arc::new(RootOwnerRegistry::new()),
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
                 lease: LeaseMode::Acquire {
@@ -2598,6 +2711,7 @@ mod tests {
             as_control(&control),
             Arc::new(RootOwnerRegistry::new()),
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
                 lease: LeaseMode::Acquire {
@@ -2672,6 +2786,7 @@ mod tests {
             as_control(&control),
             Arc::new(RootOwnerRegistry::new()),
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
                 lease: LeaseMode::Acquire {
@@ -2759,6 +2874,7 @@ mod tests {
         control.release_owner(&lease).unwrap();
 
         let boot = ShardBoot {
+            recovery_publication: RecoveryPublicationMode::Shared,
             shard_id: shard(),
             open: OpenMode::New(temporary.path().join("metadata")),
             lease: LeaseMode::Acquire {
@@ -2973,6 +3089,7 @@ mod tests {
                 Arc::new(RootOwnerRegistry::new()),
                 objects.clone(),
                 ShardBoot {
+                    recovery_publication: RecoveryPublicationMode::Shared,
                     shard_id: shard(),
                     open: OpenMode::RecoverLog(target),
                     lease: LeaseMode::Acquire {
@@ -3034,6 +3151,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects,
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::RecoverLog(target),
                 lease: LeaseMode::Acquire {
@@ -3097,6 +3215,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects.clone(),
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(behind_path.clone()),
                 lease: LeaseMode::Acquire {
@@ -3158,6 +3277,7 @@ mod tests {
                 Arc::new(RootOwnerRegistry::new()),
                 objects.clone(),
                 ShardBoot {
+                    recovery_publication: RecoveryPublicationMode::Shared,
                     shard_id: shard(),
                     open: OpenMode::Existing(source_path.clone()),
                     lease: LeaseMode::Acquire {
@@ -3208,6 +3328,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects,
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::RecoverLog(target),
                 lease: LeaseMode::Acquire {
@@ -3266,6 +3387,7 @@ mod tests {
         objects.fail_delete_at(2);
         let recovered_path = temporary.path().join("recovered");
         let boot = ShardBoot {
+            recovery_publication: RecoveryPublicationMode::Shared,
             shard_id: shard(),
             open: OpenMode::RecoverLog(recovered_path.clone()),
             lease: LeaseMode::Acquire {
@@ -3341,6 +3463,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects,
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::RecoverLog(temporary.path().join("recovered")),
                 lease: LeaseMode::Acquire {
@@ -3411,6 +3534,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects,
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::RecoverLog(target),
                 lease: LeaseMode::Acquire {
@@ -3473,6 +3597,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects,
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::RecoverLog(target),
                 lease: LeaseMode::Acquire {
@@ -3528,6 +3653,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects,
             ShardBoot {
+                recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::RecoverLog(temporary.path().join("recovered")),
                 lease: LeaseMode::Acquire {

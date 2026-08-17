@@ -74,6 +74,7 @@ pub struct ServerConfig {
     pub node_id: Option<String>,
     pub metadata_store: Option<MetadataStoreConfig>,
     pub lifecycle_interval_millis: u64,
+    pub recovery_publication: RecoveryPublicationConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +82,20 @@ pub enum MetadataStoreConfig {
     Create(PathBuf),
     Reopen(PathBuf),
     RecoverLog(PathBuf),
+}
+
+/// `serve --recovery-publication` selection.
+///
+/// `Shared` uploads every applied outbox tail as immutable log segments plus
+/// control references before a response leaves the shard. `LocalOnly` keeps
+/// the exclusive local WAL as the only recovery authority and publishes
+/// nothing; it is the deployment shape to use until shared checkpoint
+/// compaction bounds the segment chain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecoveryPublicationConfig {
+    #[default]
+    Shared,
+    LocalOnly,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,6 +184,7 @@ pub enum CliError {
     InvalidRequestId(String),
     MixedRoutingOptions,
     MixedMetadataStoreOptions,
+    LocalOnlyRecoverLog,
 }
 
 impl fmt::Display for CliError {
@@ -200,6 +216,9 @@ impl fmt::Display for CliError {
             ),
             Self::MixedMetadataStoreOptions => formatter
                 .write_str("--metadata-create, --metadata-reopen, and --metadata-recover-log are mutually exclusive"),
+            Self::LocalOnlyRecoverLog => formatter.write_str(
+                "--metadata-recover-log installs a shared-log frontier and cannot be combined with --recovery-publication local-only",
+            ),
         }
     }
 }
@@ -272,6 +291,7 @@ impl Default for ServerConfig {
             node_id: None,
             metadata_store: None,
             lifecycle_interval_millis: DEFAULT_LIFECYCLE_INTERVAL_MILLIS,
+            recovery_publication: RecoveryPublicationConfig::Shared,
         }
     }
 }
@@ -431,11 +451,32 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
                     next_value(&mut arguments, &argument)?,
                 )?;
             }
+            "--recovery-publication" => {
+                let value = next_value(&mut arguments, &argument)?;
+                server.recovery_publication = match value.as_str() {
+                    "shared" => RecoveryPublicationConfig::Shared,
+                    "local-only" => RecoveryPublicationConfig::LocalOnly,
+                    _ => {
+                        return Err(CliError::InvalidOption {
+                            option: "--recovery-publication",
+                            value,
+                        })
+                    }
+                };
+            }
             "--help" => break Command::Help,
             "--version" => break Command::Version { json: false },
             _ => return Err(CliError::UnknownOption(argument)),
         }
     };
+    if server.recovery_publication == RecoveryPublicationConfig::LocalOnly
+        && matches!(
+            server.metadata_store,
+            Some(MetadataStoreConfig::RecoverLog(_))
+        )
+    {
+        return Err(CliError::LocalOnlyRecoverLog);
+    }
     client.routing = match routing_kind.unwrap_or(RoutingKind::Static) {
         RoutingKind::Static => RoutingConfig::Static(static_routing),
         RoutingKind::Etcd => RoutingConfig::Etcd(etcd_routing),
@@ -1107,6 +1148,59 @@ mod tests {
                 "mcp",
             ])),
             Err(CliError::MixedRoutingOptions)
+        );
+    }
+
+    #[test]
+    fn server_recovery_publication_defaults_to_shared_and_local_only_is_explicit() {
+        let shared = parse(args(&[
+            "--metadata-reopen",
+            "/var/lib/nokv/shard.holt",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(
+            shared.server.recovery_publication,
+            RecoveryPublicationConfig::Shared
+        );
+
+        let local_only = parse(args(&[
+            "--metadata-reopen",
+            "/var/lib/nokv/shard.holt",
+            "--recovery-publication",
+            "local-only",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(
+            local_only.server.recovery_publication,
+            RecoveryPublicationConfig::LocalOnly
+        );
+
+        assert_eq!(
+            parse(args(&[
+                "--metadata-reopen",
+                "/var/lib/nokv/shard.holt",
+                "--recovery-publication",
+                "sometimes",
+                "serve",
+            ])),
+            Err(CliError::InvalidOption {
+                option: "--recovery-publication",
+                value: "sometimes".to_owned(),
+            })
+        );
+
+        // A shared-log successor cannot be a local-only owner.
+        assert_eq!(
+            parse(args(&[
+                "--metadata-recover-log",
+                "/var/lib/nokv/recovered.holt",
+                "--recovery-publication",
+                "local-only",
+                "serve",
+            ])),
+            Err(CliError::LocalOnlyRecoverLog)
         );
     }
 

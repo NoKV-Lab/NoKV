@@ -26,6 +26,23 @@ use crate::{ExecutedRequest, WorkspaceRequestExecutor};
 
 const MAX_SEGMENTS_PER_PUBLISH: usize = 16;
 
+/// Where the metadata recovery authority lives while one owner serves a shard.
+///
+/// `Shared` publishes every locally applied outbox tail as immutable log
+/// segments and control-plane references before a response may leave the
+/// shard, so a `--metadata-recover-log` successor can rebuild the store.
+/// `LocalOnly` keeps the exclusive local WAL as the only recovery authority:
+/// nothing is uploaded, the control frontier is left untouched, and the ACK
+/// barrier degrades to proving the owner session is still live. Choose
+/// `LocalOnly` until shared checkpoint compaction exists: the shared log chain
+/// is bounded by `MAX_RECOVERY_LOG_SEGMENTS` and by the control record size,
+/// and a shard that reaches either bound stops accepting writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryPublicationMode {
+    Shared,
+    LocalOnly,
+}
+
 /// Owner-fenced publisher that makes the metadata outbox recoverable before a
 /// request result can leave the shard.
 pub struct RecoveryPublisher {
@@ -34,6 +51,7 @@ pub struct RecoveryPublisher {
     meta: Arc<MetaShard>,
     objects: Arc<dyn ArtifactObjectStore>,
     object_namespace_id: nokv_types::ObjectNamespaceId,
+    mode: RecoveryPublicationMode,
     serialized: Mutex<()>,
 }
 
@@ -62,6 +80,22 @@ impl RecoveryPublisher {
         meta: Arc<MetaShard>,
         objects: Arc<dyn ArtifactObjectStore>,
     ) -> Result<Self, RecoveryPublisherError> {
+        Self::with_mode(
+            control,
+            lease,
+            meta,
+            objects,
+            RecoveryPublicationMode::Shared,
+        )
+    }
+
+    pub fn with_mode(
+        control: Arc<dyn ControlStore>,
+        lease: LogicalShardLease,
+        meta: Arc<MetaShard>,
+        objects: Arc<dyn ArtifactObjectStore>,
+        mode: RecoveryPublicationMode,
+    ) -> Result<Self, RecoveryPublisherError> {
         let object_namespace_id = objects.object_namespace().ok_or_else(|| {
             RecoveryPublisherError::InvalidState(
                 "recovery publisher requires a verified object namespace".to_owned(),
@@ -78,8 +112,13 @@ impl RecoveryPublisher {
             meta,
             objects,
             object_namespace_id,
+            mode,
             serialized: Mutex::new(()),
         })
+    }
+
+    pub fn mode(&self) -> RecoveryPublicationMode {
+        self.mode
     }
 
     pub fn publish_current(&self) -> Result<LogicalShardRecord, RecoveryPublisherError> {
@@ -88,7 +127,28 @@ impl RecoveryPublisher {
             .lock()
             .map_err(|_| RecoveryPublisherError::Poisoned)?;
         let required = self.meta.recovery_state()?;
-        self.publish_required(required)
+        match self.mode {
+            RecoveryPublicationMode::Shared => self.publish_required(required),
+            RecoveryPublicationMode::LocalOnly => self.confirm_local_only(required),
+        }
+    }
+
+    /// Local-only ACK barrier: prove the owner session is still live and that
+    /// the local store has not fallen behind a frontier some earlier shared
+    /// owner already published, without uploading segments or touching the
+    /// control frontier.
+    fn confirm_local_only(
+        &self,
+        required: RecoveryState,
+    ) -> Result<LogicalShardRecord, RecoveryPublisherError> {
+        let record = self.control.renew_owner(&self.lease)?;
+        self.validate_control_frontier(&record, required)?;
+        if record.pending_recovery_upload.is_some() {
+            return Err(RecoveryPublisherError::InvalidState(
+                "logical shard has a pending shared recovery upload; reopen with shared recovery publication to finish or abort it before serving local-only".to_owned(),
+            ));
+        }
+        Ok(record)
     }
 
     fn publish_required(

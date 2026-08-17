@@ -372,6 +372,19 @@ checkpoint API. A Control checkpoint frontier therefore remains fail-closed in
 `RecoverLog`. Log truncation/compaction, copied-directory identity, cross-host
 checkpoint failover, and fsck also remain outside this qualification.
 
+Because no checkpoint publisher exists yet, the shared log chain only grows:
+every acknowledged mutation appends one segment reference to the Control
+logical-shard record, and Control bounds that record (`MAX_LOGICAL_SHARD_RECORD_BYTES`)
+and the chain length (`MAX_RECOVERY_LOG_SEGMENTS`). A shard that reaches either
+bound stops accepting writes until compaction exists. `nokv serve
+--recovery-publication` selects the recovery authority explicitly: `shared`
+(default) is the object-first boundary described above; `local-only` keeps the
+exclusive Holt WAL as the only recovery authority, publishes no segments, leaves
+any earlier shared frontier frozen, still proves owner liveness before every
+acknowledgement, and cannot combine with `--metadata-recover-log`. A
+`local-only` shard has no shared-log successor path: losing its Holt directory
+loses the metadata, exactly as with the `local` mode above.
+
 Durable ledgers, not object listing, recover:
 
 - staged/multipart uploads;

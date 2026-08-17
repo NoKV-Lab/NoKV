@@ -33,8 +33,9 @@ use nokv_protocol::{
 };
 use nokv_server::{
     bootstrap_shard, LeaseMode, MetadataWorkspaceRequestExecutor, OpenMode,
-    RestoreInitializationBarrier, RestoreInitializationBarrierEvidence, RootAttach,
-    RootOwnerRegistry, ServerOptions, ShardBoot, WorkspaceRequestExecutor, WorkspaceServer,
+    RecoveryPublicationMode, RestoreInitializationBarrier, RestoreInitializationBarrierEvidence,
+    RootAttach, RootOwnerRegistry, ServerOptions, ShardBoot, WorkspaceRequestExecutor,
+    WorkspaceServer,
 };
 use nokv_types::{RequestId, FIXED_ID_BYTES};
 use serde::{Deserialize, Serialize};
@@ -805,6 +806,7 @@ fn run_server(config: ServeConfig) -> Result<(), String> {
                 log: shard.log,
                 durable_lsn: shard.durable_lsn,
             },
+            recovery_publication: RecoveryPublicationMode::Shared,
             roots: placements
                 .iter()
                 .map(|placement| RootAttach {
