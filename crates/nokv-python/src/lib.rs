@@ -34,7 +34,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_module_exports_only_the_agent_sdk_configuration_surface() {
+    fn native_module_exports_the_versioned_path_native_workbench_surface() {
         Python::initialize();
         Python::attach(|py| {
             let module = PyModule::new(py, "_native").unwrap();
@@ -45,6 +45,32 @@ mod tests {
             assert!(routing.getattr("etcd").is_ok());
             assert!(module.getattr("Client").is_ok());
             assert!(module.getattr("ObjectStoreConfig").is_ok());
+
+            let client = module.getattr("Client").unwrap();
+            for method in [
+                "create_workspace",
+                "stat",
+                "exists",
+                "list",
+                "remove",
+                "rename",
+                "publish_bytes",
+                "publish_file",
+                "read",
+                "read_range",
+                "read_ranges_batch",
+                "snapshot",
+                "renew_snapshot",
+                "retire_snapshot",
+                "list_snapshots",
+                "materialize",
+                "collect",
+            ] {
+                assert!(
+                    client.getattr(method).is_ok(),
+                    "missing path-native Client method {method}"
+                );
+            }
 
             for removed in [
                 "NoKvFsClient",

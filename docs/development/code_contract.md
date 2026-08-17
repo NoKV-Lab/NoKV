@@ -36,15 +36,21 @@ These are the package boundaries:
 | `crates/nokv-control/` | Persisted root placement, shard map, owner leases and epochs, checkpoint/log pointers, movement, and failover coordination. | Own path/artifact semantics, Holt records, object GC policy, query behavior, data-cache placement, or filename-based shard routing. |
 | `crates/nokv-object/` | Immutable object upload/read, multipart and range planning, S3-compatible providers, local hot-tier soft cache, integrity verification, and in-memory test backend. | Own namespace metadata, revision reachability, metadata transactions, root placement, Holt, protobuf, FUSE, or Workbench semantics. |
 | `crates/nokv-client/` | Rust Agent SDK, routing, conditional path operations, lifecycle APIs, retries, and the direct immutable-object data path. | Depend on `nokv-meta` or `nokv-server`, know Holt keys, expose provider internals, implement FUSE semantics, or define wire DTOs. |
-| `crates/nokv-agent/` | Transport-free Workbench/Agent tool schemas, the 18-tool facade, stable result shaping, and adapters over SDK traits. | Import Holt/layout, object providers, server implementations, FUSE, or duplicate SDK state machines. |
-| `crates/nokv-python/` | Direct Python SDK plus explicit materialize/collect adapters for local executables. | Own metadata layout, bypass `nokv-client`, reimplement range/retry planning, promise fsspec/POSIX semantics, or import FUSE. |
+| `crates/nokv-agent/` | Transport-free Workbench/Agent tool schemas, the 18-tool Workbench facade, the seven-tool generic Agent profile, stable result shaping, and adapters over SDK traits. | Import Holt/layout, object providers, server implementations, FUSE, or duplicate SDK state machines. |
+| `crates/nokv-python/` | Direct Python SDK, explicit materialize/collect adapters, and Workbench-scoped immutable compatibility adapters for fsspec, checkpoint, and torch DCP callers. | Own metadata layout, bypass `nokv-client`, reimplement range/retry planning, promise POSIX directory/inode semantics or an arbitrary root filesystem, or import FUSE. |
 | `crates/nokv-server/` | Shard-owner process, versioned RPC, startup/schema gates, health, backup/log sync, and background lifecycle workers. | Own domain semantics outside `nokv-meta`, leak provider internals into RPC, or silently migrate/fallback between schemas. |
 | `crates/nokv/` | Thin `nokv` CLI and MCP wiring over client and Agent interfaces. | Own metadata semantics, durable layout, object-provider behavior, or embed a second implementation of the SDK. |
 | `bench/` | Contract, recovery, and performance workloads with explicit environment and workload profiles. | Own product APIs, add benchmark-only product behavior, or compare results from materially different profiles as equivalent. |
 
-FUSE, POSIX emulation, CSI, and generic fsspec integration are outside the NoKV
-product architecture. They must not appear in package APIs, production routes,
-tests presented as product acceptance, or Workbench behavior.
+FUSE, POSIX emulation, CSI, and arbitrary-root generic filesystem integration
+are outside the NoKV product architecture. They must not appear in production
+routes or Workbench behavior. A Python compatibility adapter may implement the
+bounded fsspec protocol only inside one explicit Workbench and its five virtual
+sections, with whole-object immutable publication, typed generations, and the
+existing `nokv-client` retry/range authority. It may project the five virtual
+sections and artifact prefixes as fsspec directory-shaped results, but must not
+create durable directory objects or emulate inodes, permissions, mounts, or
+another namespace.
 
 ## Architecture Discipline
 

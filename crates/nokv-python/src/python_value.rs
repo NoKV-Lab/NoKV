@@ -7,10 +7,10 @@ use nokv_client::{ArtifactPublishOutcome, ArtifactReadOutcome};
 use nokv_protocol::{
     AggregateFunction, AggregateResult, AggregateSpec, CatalogResult, CommitResult, FacetResult,
     FieldValue, FindWorkspacesResult, PathListEntry, PathMetadata, PathPage, PublishResult,
-    QueryOperand, QueryOperator, QueryPredicate, ScalarValue, SearchResult, SortDirection,
-    SortField, WorkspaceSummary,
+    QueryOperand, QueryOperator, QueryPredicate, ScalarValue, SearchResult, SearchRow,
+    SnapshotResult, SnapshotStatus, SortDirection, SortField, WorkspaceSummary,
 };
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
@@ -258,6 +258,46 @@ pub(crate) fn workspace_summary_to_py<'py>(
     Ok(dict)
 }
 
+pub(crate) fn snapshot_result_to_py<'py>(
+    py: Python<'py>,
+    snapshot: &SnapshotResult,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("snapshot_id", snapshot.snapshot_id)?;
+    dict.set_item("workbench", snapshot.workbench.as_str())?;
+    dict.set_item(
+        "workspace_incarnation_id",
+        hex(&snapshot.workspace_incarnation_id.0),
+    )?;
+    dict.set_item("read_version", snapshot.read_version)?;
+    dict.set_item("lease_deadline_ms", snapshot.lease_deadline_ms)?;
+    set_optional_string(
+        py,
+        &dict,
+        "alias",
+        snapshot.alias.as_ref().map(|alias| alias.as_str()),
+    )?;
+    dict.set_item("annotation", PyBytes::new(py, &snapshot.annotation))?;
+    set_optional_bytes(
+        py,
+        &dict,
+        "retire_annotation",
+        snapshot.retire_annotation.as_deref(),
+    )?;
+    dict.set_item(
+        "status",
+        match snapshot.status {
+            SnapshotStatus::Alive => "alive",
+            SnapshotStatus::Expired => "expired",
+            SnapshotStatus::ReapClaimed => "reap_claimed",
+            SnapshotStatus::Retired => "retired",
+            SnapshotStatus::Reaped => "reaped",
+        },
+    )?;
+    dict.set_item("consumer_count", snapshot.consumer_count)?;
+    Ok(dict)
+}
+
 pub(crate) fn path_metadata_to_py<'py>(
     py: Python<'py>,
     metadata: &PathMetadata,
@@ -388,7 +428,12 @@ pub(crate) fn search_result_to_py<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     let hits = PyList::empty(py);
-    for hit in &result.hits {
+    for row in &result.hits {
+        let SearchRow::Artifact(hit) = row else {
+            return Err(PyRuntimeError::new_err(
+                "ArtifactV1 search returned a generic custom-index row",
+            ));
+        };
         let item = PyDict::new(py);
         item.set_item("metadata", path_metadata_to_py(py, &hit.metadata)?)?;
         item.set_item("projection", field_values_to_py(py, &hit.projection)?)?;
@@ -618,8 +663,9 @@ fn set_optional_u64(
 mod tests {
     use super::*;
     use nokv_protocol::{
-        ArtifactDescriptor, ArtifactRevisionIdentity, ContentType, DigestUri, RelativePath,
-        WorkbenchName, WorkspaceIdentity, WorkspacePath,
+        ArtifactDescriptor, ArtifactRevisionIdentity, ContentType, DigestUri, GenericNamespaceHit,
+        GenericNamespaceKind, RelativePath, SearchHit, SearchRow, WorkbenchName, WorkspaceIdentity,
+        WorkspacePath,
     };
 
     fn dict_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> Bound<'py, PyAny> {
@@ -803,6 +849,94 @@ mod tests {
                     .unwrap(),
                 19
             );
+        });
+    }
+
+    #[test]
+    fn artifact_search_conversion_preserves_the_python_result_abi() {
+        let metadata = PathMetadata {
+            path: WorkspacePath {
+                workbench: WorkbenchName::new("run-42").unwrap(),
+                path: RelativePath::new("outputs/result.json").unwrap(),
+            },
+            workspace_incarnation_id: WorkspaceIdentity([4; 16]),
+            workspace_revision: 7,
+            generation: 3,
+            artifact_revision_id: ArtifactRevisionIdentity([5; 16]),
+            dependency_count: 2,
+            dependency_depth: 1,
+            descriptor: ArtifactDescriptor {
+                logical_size: 42,
+                body_digest: DigestUri::new(format!("sha256:{}", "06".repeat(32))).unwrap(),
+                manifest_digest: DigestUri::new(format!("sha256:{}", "07".repeat(32))).unwrap(),
+                content_type: ContentType::new("application/json").unwrap(),
+                producer: Some("agent-runner".to_owned()),
+                manifest_identity: Some("manifest-42".to_owned()),
+                index_fields: Vec::new(),
+            },
+        };
+        let result = SearchResult {
+            hits: vec![SearchRow::Artifact(SearchHit {
+                metadata,
+                projection: vec![FieldValue {
+                    field_id: "run.score".to_owned(),
+                    value: ScalarValue::Unsigned(9),
+                }],
+            })],
+            match_count: 1,
+            facets: Vec::new(),
+            next_cursor: Some(vec![0, 255]),
+            read_version: 19,
+        };
+
+        Python::initialize();
+        Python::attach(|py| {
+            let converted = search_result_to_py(py, &result).unwrap();
+            assert_eq!(converted.len(), 4, "the direct Python result ABI changed");
+            let hits = dict_item(&converted, "hits").cast_into::<PyList>().unwrap();
+            let hit = hits.get_item(0).unwrap().cast_into::<PyDict>().unwrap();
+            assert_eq!(hit.len(), 2, "the direct Python hit ABI changed");
+            let metadata = dict_item(&hit, "metadata").cast_into::<PyDict>().unwrap();
+            assert_eq!(
+                dict_item(&metadata, "path").extract::<String>().unwrap(),
+                "outputs/result.json"
+            );
+            let projection = dict_item(&hit, "projection").cast_into::<PyList>().unwrap();
+            let field = projection
+                .get_item(0)
+                .unwrap()
+                .cast_into::<PyDict>()
+                .unwrap();
+            assert_eq!(
+                dict_item(&field, "field_id").extract::<String>().unwrap(),
+                "run.score"
+            );
+            assert_eq!(dict_item(&field, "value").extract::<u64>().unwrap(), 9);
+        });
+    }
+
+    #[test]
+    fn artifact_search_conversion_rejects_generic_rows_without_fabricating_metadata() {
+        let result = SearchResult {
+            hits: vec![SearchRow::GenericNamespace(GenericNamespaceHit {
+                workbench: WorkbenchName::new("run-42").unwrap(),
+                relative_path: None,
+                kind: GenericNamespaceKind::Directory,
+                artifact: None,
+                projection: Vec::new(),
+                indexed_values: Vec::new(),
+            })],
+            match_count: 1,
+            facets: Vec::new(),
+            next_cursor: None,
+            read_version: 19,
+        };
+
+        Python::initialize();
+        Python::attach(|py| {
+            let error = search_result_to_py(py, &result).unwrap_err();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+            assert!(error.to_string().contains("ArtifactV1"));
         });
     }
 }
