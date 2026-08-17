@@ -376,14 +376,23 @@ Because no checkpoint publisher exists yet, the shared log chain only grows:
 every acknowledged mutation appends one segment reference to the Control
 logical-shard record, and Control bounds that record (`MAX_LOGICAL_SHARD_RECORD_BYTES`)
 and the chain length (`MAX_RECOVERY_LOG_SEGMENTS`). A shard that reaches either
-bound stops accepting writes until compaction exists. `nokv serve
---recovery-publication` selects the recovery authority explicitly: `shared`
-(default) is the object-first boundary described above; `local-only` keeps the
-exclusive Holt WAL as the only recovery authority, publishes no segments, leaves
-any earlier shared frontier frozen, still proves owner liveness before every
-acknowledgement, and cannot combine with `--metadata-recover-log`. A
-`local-only` shard has no shared-log successor path: losing its Holt directory
-loses the metadata, exactly as with the `local` mode above.
+bound loses its owner fence and stops serving; on the current record size that
+happens after roughly a hundred acknowledged publications. Shared publication
+is therefore an opt-in, not the resting state.
+
+`nokv serve --recovery-publication` selects the recovery authority:
+
+- `local-only` (**default**) keeps the exclusive Holt WAL as the only recovery
+  authority, publishes no segments, leaves any earlier shared frontier frozen,
+  and still proves owner liveness before every acknowledgement. Control (etcd)
+  is used for routing and the owner lease only. A `local-only` shard has no
+  shared-log successor path: losing its Holt directory loses the metadata,
+  exactly as with the `local` mode above.
+- `shared` is the object-first boundary described above. It is implied by
+  `--metadata-recover-log`, which can only resume from a shared frontier, and
+  it cannot be combined with `local-only` on that open mode. Do not select it
+  for a shard that will accept more than a bounded burst of writes until
+  checkpoint compaction lands.
 
 Durable ledgers, not object listing, recover:
 
