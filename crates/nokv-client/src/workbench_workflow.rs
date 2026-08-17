@@ -616,6 +616,71 @@ fn drive_commit_workflow<ManifestError>(
     })
 }
 
+/// Terminal outcome for a restore whose durable status is `Succeeded`, built
+/// from the receipt only. The exact preparation was already authenticated by
+/// resubmitting the complete prepare DTO.
+fn succeeded_restore_outcome(
+    status: &OperationStatus,
+    durable: &RestoreOperationPreparation,
+    prepared: &RestorePreparation,
+    exact_request: &PrepareRestoreRequest,
+    options: &RestoreWorkflowOptions,
+    replayed: bool,
+) -> Result<RestoreWorkflowOutcome, RestoreWorkflowError> {
+    let result = terminal_restore_result(status, exact_request, options)
+        .map_err(RestoreWorkflowError::Validation)?;
+    validate_restore_result(&result, prepared, exact_request, options)
+        .map_err(RestoreWorkflowError::Validation)?;
+    let destination_manifests = terminal_destination_manifests(
+        durable,
+        &result,
+        exact_request,
+        options.identities.operation_id,
+    )
+    .map_err(RestoreWorkflowError::Validation)?;
+    Ok(RestoreWorkflowOutcome {
+        result,
+        source_snapshot_read_version: durable.source_snapshot_read_version,
+        destination_manifests,
+        replayed,
+    })
+}
+
+/// A concurrent exact caller may complete the shared restore between this
+/// caller's status check and its next construction step, at which point the
+/// engine rejects further construction against the terminal row. Converge on
+/// the durable `Succeeded` receipt instead of surfacing that phase conflict;
+/// any other state leaves the original step error to the caller.
+fn concurrently_completed_restore(
+    io: &impl WorkflowIo,
+    prepared: &RestorePreparation,
+    exact_request: &PrepareRestoreRequest,
+    options: &RestoreWorkflowOptions,
+) -> Result<Option<RestoreWorkflowOutcome>, RestoreWorkflowError> {
+    let Ok(status) = io.get_operation(options.identities.operation_id) else {
+        return Ok(None);
+    };
+    if status.value.state != OperationState::Succeeded {
+        return Ok(None);
+    }
+    let durable = exact_restore_operation_preparation(
+        &status.value,
+        options.identities.operation_id,
+        exact_request,
+    )
+    .map_err(RestoreWorkflowError::Validation)?;
+    validate_restore_seal(&durable, prepared).map_err(RestoreWorkflowError::Validation)?;
+    succeeded_restore_outcome(
+        &status.value,
+        &durable,
+        prepared,
+        exact_request,
+        options,
+        true,
+    )
+    .map(Some)
+}
+
 fn drive_restore_workflow(
     io: &impl WorkflowIo,
     options: RestoreWorkflowOptions,
@@ -713,23 +778,14 @@ fn drive_restore_workflow(
     validate_restore_seal(&durable, &prepared.value).map_err(RestoreWorkflowError::Validation)?;
     match status.value.state {
         OperationState::Succeeded => {
-            let result = terminal_restore_result(&status.value, &exact_request, &options)
-                .map_err(RestoreWorkflowError::Validation)?;
-            validate_restore_result(&result, &prepared.value, &exact_request, &options)
-                .map_err(RestoreWorkflowError::Validation)?;
-            let destination_manifests = terminal_destination_manifests(
+            return succeeded_restore_outcome(
+                &status.value,
                 &durable,
-                &result,
+                &prepared.value,
                 &exact_request,
-                options.identities.operation_id,
-            )
-            .map_err(RestoreWorkflowError::Validation)?;
-            return Ok(RestoreWorkflowOutcome {
-                result,
-                source_snapshot_read_version: durable.source_snapshot_read_version,
-                destination_manifests,
-                replayed: observed.is_some() || prepared.replayed,
-            });
+                &options,
+                observed.is_some() || prepared.replayed,
+            );
         }
         OperationState::Running => {
             validate_running_restore(&status.value).map_err(RestoreWorkflowError::Validation)?;
@@ -747,9 +803,18 @@ fn drive_restore_workflow(
         }
     }
 
-    let source_run_manifest = io
-        .read_restore_source_run_manifest(options.identities.operation_id)
-        .map_err(RestoreWorkflowError::ReadSourceManifest)?;
+    let source_run_manifest =
+        match io.read_restore_source_run_manifest(options.identities.operation_id) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                if let Some(outcome) =
+                    concurrently_completed_restore(io, &prepared.value, &exact_request, &options)?
+                {
+                    return Ok(outcome);
+                }
+                return Err(RestoreWorkflowError::ReadSourceManifest(error));
+            }
+        };
     validate_source_run_manifest(&source_run_manifest, &durable)
         .map_err(RestoreWorkflowError::Validation)?;
     let plan = build_destination(&prepared.value, &source_run_manifest.bytes)
@@ -764,9 +829,17 @@ fn drive_restore_workflow(
     // Bind is always resubmitted exactly, including after response loss or
     // process recovery. The metadata operation owns idempotency; the client
     // never invents replacement identities.
-    let bound = io
-        .bind_restore_destination(plan.binding.clone())
-        .map_err(RestoreWorkflowError::Bind)?;
+    let bound = match io.bind_restore_destination(plan.binding.clone()) {
+        Ok(bound) => bound,
+        Err(error) => {
+            if let Some(outcome) =
+                concurrently_completed_restore(io, &prepared.value, &exact_request, &options)?
+            {
+                return Ok(outcome);
+            }
+            return Err(RestoreWorkflowError::Bind(error));
+        }
+    };
     validate_restore_preparation(&bound.value, &exact_request, &options)
         .map_err(RestoreWorkflowError::Validation)?;
     validate_bound_preparation(&bound.value, &prepared.value, &plan.binding)
@@ -3172,6 +3245,115 @@ mod tests {
         assert!(state.finalize_requests.is_empty());
         assert!(state.publications.is_empty());
         assert_eq!(state.manifest_reads, 0);
+    }
+
+    #[test]
+    fn concurrent_completion_before_source_manifest_read_converges_on_the_receipt() {
+        // Another exact caller completes the shared restore between this
+        // caller's Running status check and its source-manifest read. The
+        // engine rejects the read against the terminal row; the workflow must
+        // converge on the durable Succeeded receipt instead of failing.
+        let (options, preparation, plan, result) = restore_fixture();
+        let terminal = restore_status(&options, &preparation, &plan, result.clone());
+        let io = FakeWorkflowIo::default();
+        {
+            let mut state = io.state();
+            state
+                .get_operations
+                .push_back(Err(rpc_error(ErrorCode::NotFound)));
+            state
+                .preparations
+                .push_back(Ok(call(preparation.clone(), false)));
+            state.get_operations.push_back(Ok(call(
+                running_restore_status(&options, &preparation, None),
+                false,
+            )));
+            state
+                .source_manifests
+                .push_back(Err(rpc_error(ErrorCode::PreconditionFailed)));
+            state.get_operations.push_back(Ok(call(terminal, false)));
+        }
+        let outcome = drive_restore_workflow(&io, options.clone(), |_, _| {
+            panic!("a concurrently completed restore must not rebuild a projection")
+        })
+        .unwrap();
+        assert_eq!(outcome.result, result);
+        assert!(outcome.replayed);
+        let state = io.state();
+        assert!(state.bind_requests.is_empty());
+        assert!(state.finalize_requests.is_empty());
+        assert!(state.publications.is_empty());
+    }
+
+    #[test]
+    fn concurrent_completion_before_bind_converges_on_the_receipt() {
+        let (options, preparation, plan, result) = restore_fixture();
+        let terminal = restore_status(&options, &preparation, &plan, result.clone());
+        let io = FakeWorkflowIo::default();
+        {
+            let mut state = io.state();
+            state
+                .get_operations
+                .push_back(Err(rpc_error(ErrorCode::NotFound)));
+            state
+                .preparations
+                .push_back(Ok(call(preparation.clone(), false)));
+            state.get_operations.push_back(Ok(call(
+                running_restore_status(&options, &preparation, None),
+                false,
+            )));
+            state
+                .source_manifests
+                .push_back(Ok(source_run_manifest(&options, &preparation)));
+            state
+                .bindings
+                .push_back(Err(rpc_error(ErrorCode::PreconditionFailed)));
+            state.get_operations.push_back(Ok(call(terminal, false)));
+        }
+        let expected_plan = plan.clone();
+        let outcome =
+            drive_restore_workflow(&io, options.clone(), move |_, _| Ok(expected_plan)).unwrap();
+        assert_eq!(outcome.result, result);
+        assert!(outcome.replayed);
+        let state = io.state();
+        assert_eq!(state.bind_requests, vec![plan.binding]);
+        assert!(state.finalize_requests.is_empty());
+        assert!(state.publications.is_empty());
+    }
+
+    #[test]
+    fn step_failure_without_completion_keeps_the_original_error() {
+        let (options, preparation, _plan, _result) = restore_fixture();
+        let io = FakeWorkflowIo::default();
+        {
+            let mut state = io.state();
+            state
+                .get_operations
+                .push_back(Err(rpc_error(ErrorCode::NotFound)));
+            state
+                .preparations
+                .push_back(Ok(call(preparation.clone(), false)));
+            state.get_operations.push_back(Ok(call(
+                running_restore_status(&options, &preparation, None),
+                false,
+            )));
+            state
+                .source_manifests
+                .push_back(Err(rpc_error(ErrorCode::ObjectUnavailable)));
+            state.get_operations.push_back(Ok(call(
+                running_restore_status(&options, &preparation, None),
+                false,
+            )));
+        }
+        let error = drive_restore_workflow(&io, options, |_, _| {
+            panic!("a failed source-manifest read must not build a projection")
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            RestoreWorkflowError::ReadSourceManifest(ref inner)
+                if inner.rpc_code() == Some(ErrorCode::ObjectUnavailable)
+        ));
     }
 
     #[test]
