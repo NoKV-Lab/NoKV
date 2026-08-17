@@ -10,11 +10,14 @@
 mod admission;
 mod artifact;
 mod cache;
+pub(crate) mod chunked_immutable_blob;
 mod digest;
 mod local_hot;
 mod namespace;
 #[cfg(test)]
 mod provider_admission_test;
+mod recovery_checkpoint;
+mod recovery_log_segment;
 mod store;
 mod tiered;
 
@@ -38,6 +41,20 @@ pub use local_hot::{LocalHotTier, LocalHotTierOptions, LocalHotTierStats};
 pub use namespace::{
     ensure_object_namespace, load_object_namespace, verify_object_namespace, BoundArtifactStore,
     OBJECT_NAMESPACE_MARKER_KEY,
+};
+pub use recovery_checkpoint::{
+    plan_recovery_checkpoint_blob, read_recovery_checkpoint_blob,
+    write_recovery_checkpoint_blob_from_plan, RecoveryCheckpointBlob, RecoveryCheckpointBlobPlan,
+    RecoveryCheckpointBlobReceipt, RecoveryCheckpointBoundary, RecoveryCheckpointError,
+    RecoveryCheckpointIdentity, RecoveryCheckpointWrite, DEFAULT_RECOVERY_CHECKPOINT_CHUNK_SIZE,
+    MAX_RECOVERY_CHECKPOINT_CHUNKS, MAX_RECOVERY_CHECKPOINT_ENVELOPE_BYTES,
+};
+pub use recovery_log_segment::{
+    plan_recovery_log_segment, read_recovery_log_segment, write_recovery_log_segment_from_plan,
+    RecoveryLogSegment, RecoveryLogSegmentError, RecoveryLogSegmentIdentity,
+    RecoveryLogSegmentPlan, RecoveryLogSegmentReceipt, RecoveryLogSegmentWrite,
+    DEFAULT_RECOVERY_LOG_SEGMENT_CHUNK_SIZE, MAX_RECOVERY_LOG_SEGMENT_BYTES,
+    MAX_RECOVERY_LOG_SEGMENT_CHUNKS,
 };
 pub use store::{
     ArtifactObjectStore, ArtifactStoreCapabilities, ImmutableCreateOutcome, MemoryArtifactStore,
