@@ -614,12 +614,12 @@ OWNER:
   --metadata-create PATH starts the first standalone local-WAL owner
   --metadata-reopen PATH restarts the same exclusive local-WAL authority after lease loss
   --metadata-recover-log PATH installs or resumes one exact receipt-directed shared-log frontier
-  --recovery-publication shared|local-only (default shared)
+  --recovery-publication shared|local-only (default local-only; --metadata-recover-log implies shared)
+    local-only keeps the exclusive local WAL as the only recovery authority, publishes nothing,
+    and cannot combine with --metadata-recover-log
     shared publishes every applied outbox tail as immutable log segments plus control references
     before a response leaves the shard; without checkpoint compaction the chain is bounded by the
     control record size, and a shard that reaches that bound stops accepting writes
-    local-only keeps the exclusive local WAL as the only recovery authority, publishes nothing,
-    and cannot combine with --metadata-recover-log
 
 OBJECT DATA:
   --object-bucket NAME [--object-endpoint URL] [--object-root PREFIX]
