@@ -72,6 +72,13 @@ pub enum ControlError {
     },
     InvalidRecord(String),
     InvalidOptions(String),
+    /// A durable control record declares a codec version this reader does not
+    /// implement. The record itself is intact; the reader is too old.
+    UnsupportedRecordVersion {
+        record: &'static str,
+        version: u8,
+        supported: u8,
+    },
     Codec(String),
     Backend(String),
 }
@@ -196,6 +203,16 @@ impl fmt::Display for ControlError {
             Self::InvalidOptions(reason) => {
                 write!(formatter, "invalid control store options: {reason}")
             }
+            Self::UnsupportedRecordVersion {
+                record,
+                version,
+                supported,
+            } => write!(
+                formatter,
+                "control store {record} uses codec version {version}; this reader supports \
+                 versions up to {supported}, so this client or owner must be upgraded before it \
+                 can use this control plane"
+            ),
             Self::Codec(reason) => write!(formatter, "control store codec error: {reason}"),
             Self::Backend(reason) => write!(formatter, "control store backend error: {reason}"),
         }
