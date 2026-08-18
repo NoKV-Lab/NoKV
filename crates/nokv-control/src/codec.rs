@@ -5,15 +5,30 @@ use crate::store::{validate_logical_shard_record, MAX_LOGICAL_SHARD_RECORD_BYTES
 use crate::LogicalShardLease;
 use crate::{
     AgentId, CheckpointRef, ControlError, LogRef, LogSegmentRef, LogicalShardId,
-    LogicalShardRecord, LogicalShardState, NodeId, ObjectNamespaceId, OwnerEpoch,
-    PlacementGeneration, RecoveryUploadIntent, RootAgentBinding, RootId,
+    LogicalShardRecord, LogicalShardRecoveryState, LogicalShardState, NodeId, ObjectNamespaceId,
+    OwnerEpoch, PlacementGeneration, RecoveryUploadIntent, RootAgentBinding, RootId,
     RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle,
 };
 
 const ROOT_PLACEMENT_CODEC_VERSION: u8 = 1;
 const ROOT_AGENT_BINDING_CODEC_VERSION: u8 = 1;
 const ROOT_OBJECT_NAMESPACE_CODEC_VERSION: u8 = 1;
-const LOGICAL_SHARD_RECORD_CODEC_VERSION: u8 = 3;
+/// Wire version of the client-facing logical shard routing record.
+///
+/// This is a compatibility contract, not a counter: every reader that
+/// understands version 1 (every released NoKV client) must keep decoding the
+/// value stored at the logical shard record key. Owner-side recovery state is
+/// persisted under its own key and codec version so that it can evolve
+/// without touching this schema. Bumping this version is a deliberate,
+/// client-breaking release decision.
+pub const LOGICAL_SHARD_ROUTING_CODEC_VERSION: u8 = 1;
+/// Wire version of the owner-only logical shard recovery state.
+pub const LOGICAL_SHARD_RECOVERY_CODEC_VERSION: u8 = 1;
+/// Highest legacy combined record version still readable at the routing key.
+///
+/// Versions 2 and 3 folded recovery state into the routing record; owners
+/// that still write them are read but never written by this crate.
+const LEGACY_COMBINED_LOGICAL_SHARD_RECORD_MAX_VERSION: u8 = 3;
 #[cfg(any(feature = "etcd", test))]
 const OWNER_SESSION_CODEC_VERSION: u8 = 1;
 
@@ -88,6 +103,17 @@ struct LogicalShardRecordWireV1 {
     checkpoint: Option<CheckpointRefWireV2>,
     log: Option<LogRefWireV1>,
     durable_lsn: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogicalShardRecoveryWireV1 {
+    version: u8,
+    logical_shard_id: String,
+    checkpoint: Option<CheckpointRefWire>,
+    log: Option<LogRefWire>,
+    durable_lsn: u64,
+    pending_recovery_upload: Option<RecoveryUploadIntentWire>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -275,74 +301,195 @@ pub fn decode_root_object_namespace_binding(
     Ok(binding)
 }
 
-pub fn encode_logical_shard_record(record: &LogicalShardRecord) -> Result<Vec<u8>, ControlError> {
+/// Encode the client-facing routing record stored at the logical shard key.
+///
+/// The value is always the version-1 wire schema with every recovery field
+/// cleared: checkpoint and log are `null` and `durable_lsn` is zero, which is
+/// the only recovery frontier a version-1 reader can validate. The full
+/// record is validated first so an inconsistent owner state never reaches
+/// either key.
+pub fn encode_logical_shard_routing_record(
+    record: &LogicalShardRecord,
+) -> Result<Vec<u8>, ControlError> {
     validate_logical_shard_record(record)?;
-    encode_logical_shard_record_wire(record)
+    encode_logical_shard_routing_record_wire(record)
+}
+
+/// Encode the owner-side recovery state stored next to the routing record.
+///
+/// Returns `None` when the record carries no recovery state at all; the
+/// backend then removes the recovery key so that absence and emptiness are
+/// the same durable fact.
+pub fn encode_logical_shard_recovery_state(
+    record: &LogicalShardRecord,
+) -> Result<Option<Vec<u8>>, ControlError> {
+    validate_logical_shard_record(record)?;
+    encode_logical_shard_recovery_state_wire(record)
 }
 
 pub(crate) fn validate_logical_shard_record_encoded_size(
     record: &LogicalShardRecord,
 ) -> Result<(), ControlError> {
-    let encoded = encode_logical_shard_record_wire(record)?;
-    if encoded.len() > MAX_LOGICAL_SHARD_RECORD_BYTES {
+    let routing = encode_logical_shard_routing_record_wire(record)?;
+    if routing.len() > MAX_LOGICAL_SHARD_RECORD_BYTES {
         return Err(ControlError::InvalidRecord(format!(
-            "encoded logical shard record is {} bytes; maximum is {MAX_LOGICAL_SHARD_RECORD_BYTES}",
-            encoded.len()
+            "encoded logical shard routing record is {} bytes; maximum is {MAX_LOGICAL_SHARD_RECORD_BYTES}",
+            routing.len()
         )));
+    }
+    if let Some(recovery) = encode_logical_shard_recovery_state_wire(record)? {
+        if recovery.len() > MAX_LOGICAL_SHARD_RECORD_BYTES {
+            return Err(ControlError::InvalidRecord(format!(
+                "encoded logical shard recovery state is {} bytes; maximum is {MAX_LOGICAL_SHARD_RECORD_BYTES}",
+                recovery.len()
+            )));
+        }
     }
     Ok(())
 }
 
-fn encode_logical_shard_record_wire(record: &LogicalShardRecord) -> Result<Vec<u8>, ControlError> {
-    serde_json::to_vec(&LogicalShardRecordWireV3 {
-        version: LOGICAL_SHARD_RECORD_CODEC_VERSION,
+fn encode_logical_shard_routing_record_wire(
+    record: &LogicalShardRecord,
+) -> Result<Vec<u8>, ControlError> {
+    serde_json::to_vec(&LogicalShardRecordWireV1 {
+        version: LOGICAL_SHARD_ROUTING_CODEC_VERSION,
         logical_shard_id: encode_fixed_id(record.logical_shard_id.as_bytes()),
         owner: record.owner.as_ref().map(|owner| owner.as_str().to_owned()),
         owner_epoch: record.owner_epoch.map(OwnerEpoch::get),
         lease_id: record.lease_id,
         state: record.state.into(),
         endpoint: record.endpoint.clone(),
+        checkpoint: None,
+        log: None,
+        durable_lsn: 0,
+    })
+    .map_err(codec_error)
+}
+
+fn encode_logical_shard_recovery_state_wire(
+    record: &LogicalShardRecord,
+) -> Result<Option<Vec<u8>>, ControlError> {
+    if !record.has_recovery_state() {
+        return Ok(None);
+    }
+    serde_json::to_vec(&LogicalShardRecoveryWireV1 {
+        version: LOGICAL_SHARD_RECOVERY_CODEC_VERSION,
+        logical_shard_id: encode_fixed_id(record.logical_shard_id.as_bytes()),
         checkpoint: record.checkpoint.clone().map(Into::into),
         log: record.log.clone().map(Into::into),
         durable_lsn: record.durable_lsn,
         pending_recovery_upload: record.pending_recovery_upload.clone().map(Into::into),
     })
+    .map(Some)
     .map_err(codec_error)
 }
 
-pub fn decode_logical_shard_record(bytes: &[u8]) -> Result<LogicalShardRecord, ControlError> {
+/// How the value at the logical shard record key was written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalShardRecordWireKind {
+    /// The current version-1 routing record; recovery state lives separately.
+    Routing,
+    /// A legacy version-2 or version-3 record that folds recovery state in.
+    LegacyCombined { version: u8 },
+}
+
+/// One decoded logical shard record value plus how it was written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedLogicalShardRecord {
+    pub record: LogicalShardRecord,
+    pub wire: LogicalShardRecordWireKind,
+}
+
+/// Decode the value stored at the logical shard record key.
+///
+/// A version-1 value is a routing record whose recovery fields are absent by
+/// construction; the backend reattaches the separately stored recovery state.
+/// Legacy version-2/3 values written by owners before the split are complete
+/// records and take precedence over any recovery key left next to them.
+pub fn decode_logical_shard_record_value(
+    bytes: &[u8],
+) -> Result<DecodedLogicalShardRecord, ControlError> {
     let version: VersionWire = serde_json::from_slice(bytes).map_err(codec_error)?;
-    let record = match version.version {
-        1 => decode_logical_shard_record_v1(bytes)?,
-        2 => decode_logical_shard_record_v2(bytes)?,
-        LOGICAL_SHARD_RECORD_CODEC_VERSION => decode_logical_shard_record_v3(bytes)?,
+    let (record, wire) = match version.version {
+        LOGICAL_SHARD_ROUTING_CODEC_VERSION => (
+            decode_logical_shard_record_v1(bytes)?,
+            LogicalShardRecordWireKind::Routing,
+        ),
+        2 => (
+            decode_logical_shard_record_v2(bytes)?,
+            LogicalShardRecordWireKind::LegacyCombined { version: 2 },
+        ),
+        3 => (
+            decode_logical_shard_record_v3(bytes)?,
+            LogicalShardRecordWireKind::LegacyCombined { version: 3 },
+        ),
         actual => {
-            require_version(
-                "logical shard record",
-                actual,
-                LOGICAL_SHARD_RECORD_CODEC_VERSION,
-            )?;
-            unreachable!("version validator returned Ok for an unsupported version")
+            return Err(ControlError::UnsupportedRecordVersion {
+                record: "logical shard record",
+                version: actual,
+                supported: LEGACY_COMBINED_LOGICAL_SHARD_RECORD_MAX_VERSION,
+            });
         }
     };
     validate_logical_shard_record(&record)?;
-    if version.version == LOGICAL_SHARD_RECORD_CODEC_VERSION
-        && encode_logical_shard_record(&record)?.as_slice() != bytes
-    {
+    Ok(DecodedLogicalShardRecord { record, wire })
+}
+
+/// Decode the value stored at the logical shard record key into a record.
+pub fn decode_logical_shard_record(bytes: &[u8]) -> Result<LogicalShardRecord, ControlError> {
+    decode_logical_shard_record_value(bytes).map(|decoded| decoded.record)
+}
+
+/// Decode the owner-side recovery state stored next to a routing record.
+pub fn decode_logical_shard_recovery_state(
+    bytes: &[u8],
+) -> Result<LogicalShardRecoveryState, ControlError> {
+    let version: VersionWire = serde_json::from_slice(bytes).map_err(codec_error)?;
+    if version.version != LOGICAL_SHARD_RECOVERY_CODEC_VERSION {
+        return Err(ControlError::UnsupportedRecordVersion {
+            record: "logical shard recovery state",
+            version: version.version,
+            supported: LOGICAL_SHARD_RECOVERY_CODEC_VERSION,
+        });
+    }
+    let wire: LogicalShardRecoveryWireV1 = serde_json::from_slice(bytes).map_err(codec_error)?;
+    if serde_json::to_vec(&wire).map_err(codec_error)?.as_slice() != bytes {
         return Err(ControlError::Codec(
-            "logical shard record input is not canonical".to_owned(),
+            "logical shard recovery state input is not canonical".to_owned(),
         ));
     }
-    Ok(record)
+    let state = LogicalShardRecoveryState {
+        logical_shard_id: LogicalShardId::from_bytes(decode_fixed_id(
+            &wire.logical_shard_id,
+            "logical shard id",
+        )?),
+        checkpoint: wire.checkpoint.map(Into::into),
+        log: wire.log.map(Into::into),
+        durable_lsn: wire.durable_lsn,
+        pending_recovery_upload: wire
+            .pending_recovery_upload
+            .map(RecoveryUploadIntent::try_from)
+            .transpose()?,
+    };
+    if !LogicalShardRecord::unassigned(state.logical_shard_id)
+        .with_recovery_state(state.clone())?
+        .has_recovery_state()
+    {
+        return Err(ControlError::Codec(
+            "logical shard recovery state must not be stored when it is empty".to_owned(),
+        ));
+    }
+    Ok(state)
 }
 
 fn decode_logical_shard_record_v3(bytes: &[u8]) -> Result<LogicalShardRecord, ControlError> {
     let wire: LogicalShardRecordWireV3 = serde_json::from_slice(bytes).map_err(codec_error)?;
-    require_version(
-        "logical shard record",
-        wire.version,
-        LOGICAL_SHARD_RECORD_CODEC_VERSION,
-    )?;
+    require_version("logical shard record", wire.version, 3)?;
+    if serde_json::to_vec(&wire).map_err(codec_error)?.as_slice() != bytes {
+        return Err(ControlError::Codec(
+            "logical shard record v3 input is not canonical".to_owned(),
+        ));
+    }
     logical_shard_record_from_wire(
         wire.logical_shard_id,
         wire.owner,
@@ -544,13 +691,15 @@ fn decode_hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
-fn require_version(type_name: &str, actual: u8, expected: u8) -> Result<(), ControlError> {
+fn require_version(type_name: &'static str, actual: u8, expected: u8) -> Result<(), ControlError> {
     if actual == expected {
         Ok(())
     } else {
-        Err(ControlError::Codec(format!(
-            "unsupported {type_name} codec version {actual}"
-        )))
+        Err(ControlError::UnsupportedRecordVersion {
+            record: type_name,
+            version: actual,
+            supported: expected,
+        })
     }
 }
 
@@ -775,6 +924,261 @@ mod tests {
         }
     }
 
+    /// The logical shard record reader that shipped in NoKV 0.10.0, vendored
+    /// byte for byte from `crates/nokv-control/src/codec.rs` at tag `v0.10.0`.
+    ///
+    /// Every client released before the recovery-state split decodes the
+    /// routing record with these exact structs (`deny_unknown_fields`, one
+    /// exact version) and then applies the same durable-LSN consistency rule
+    /// as `validate_logical_shard_record` did at that tag. This module is the
+    /// executable form of the compatibility contract: whatever this crate
+    /// stores at the logical shard record key must decode here.
+    mod frozen_v0_10_0_reader {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        pub(super) struct RootPlacementWire {
+            pub version: u8,
+            pub root_id: String,
+            pub logical_shard_id: String,
+            pub placement_generation: u64,
+            pub lifecycle: u8,
+        }
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        pub(super) struct LogicalShardRecordWire {
+            pub version: u8,
+            pub logical_shard_id: String,
+            pub owner: Option<String>,
+            pub owner_epoch: Option<u64>,
+            pub lease_id: u64,
+            pub state: u8,
+            pub endpoint: Option<String>,
+            pub checkpoint: Option<CheckpointRefWire>,
+            pub log: Option<LogRefWire>,
+            pub durable_lsn: u64,
+        }
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        pub(super) struct CheckpointRefWire {
+            pub object_key: String,
+            pub lsn: u64,
+            pub image_bytes: u64,
+            pub image_digest: String,
+            pub digest: String,
+        }
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        pub(super) struct LogSegmentRefWire {
+            pub segment_key: String,
+            pub first_lsn: u64,
+            pub last_lsn: u64,
+            pub digest: String,
+        }
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        pub(super) struct LogRefWire {
+            pub segments: Vec<LogSegmentRefWire>,
+            pub durable_lsn: u64,
+            pub digest: String,
+        }
+
+        /// Decode exactly like the 0.10.0 client route resolver did.
+        pub(super) fn decode_logical_shard_record(
+            bytes: &[u8],
+        ) -> Result<LogicalShardRecordWire, String> {
+            let wire: LogicalShardRecordWire =
+                serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+            if wire.version != 1 {
+                return Err(format!(
+                    "unsupported logical shard record codec version {}",
+                    wire.version
+                ));
+            }
+            if serde_json::to_vec(&wire).map_err(|error| error.to_string())? != bytes {
+                return Err("logical shard record input is not canonical".to_owned());
+            }
+            let reference_lsn = match (wire.checkpoint.as_ref(), wire.log.as_ref()) {
+                (Some(checkpoint), Some(log)) => checkpoint.lsn.max(log.durable_lsn),
+                (Some(checkpoint), None) => checkpoint.lsn,
+                (None, Some(log)) => log.durable_lsn,
+                (None, None) => 0,
+            };
+            if wire.durable_lsn != reference_lsn {
+                return Err(format!(
+                    "durable LSN {} does not match recovery reference tail {reference_lsn}",
+                    wire.durable_lsn
+                ));
+            }
+            Ok(wire)
+        }
+
+        pub(super) fn decode_root_placement(bytes: &[u8]) -> Result<RootPlacementWire, String> {
+            let wire: RootPlacementWire =
+                serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+            if wire.version != 1 {
+                return Err(format!(
+                    "unsupported root placement codec version {}",
+                    wire.version
+                ));
+            }
+            Ok(wire)
+        }
+    }
+
+    fn released_record() -> LogicalShardRecord {
+        let mut record = serving_record();
+        record.owner = None;
+        record.owner_epoch = Some(OwnerEpoch::new(7).unwrap());
+        record.lease_id = 0;
+        record.state = LogicalShardState::Unassigned;
+        record.endpoint = None;
+        record
+    }
+
+    /// Records covering every routing shape the store persists, with and
+    /// without owner-side recovery state.
+    fn routing_contract_records() -> Vec<LogicalShardRecord> {
+        let mut serving_without_recovery = serving_record();
+        serving_without_recovery.checkpoint = None;
+        serving_without_recovery.log = None;
+        serving_without_recovery.durable_lsn = 0;
+        vec![
+            LogicalShardRecord::unassigned(shard_id(2)),
+            serving_without_recovery,
+            serving_record(),
+            recovering_record_with_upload(),
+            released_record(),
+        ]
+    }
+
+    #[test]
+    fn routing_record_stays_decodable_by_the_frozen_v0_10_0_reader() {
+        assert_eq!(LOGICAL_SHARD_ROUTING_CODEC_VERSION, 1);
+        for record in routing_contract_records() {
+            let bytes = encode_logical_shard_routing_record(&record).unwrap();
+            let frozen = frozen_v0_10_0_reader::decode_logical_shard_record(&bytes)
+                .unwrap_or_else(|error| panic!("a 0.10.0 client must decode {record:?}: {error}"));
+            assert_eq!(frozen.version, 1);
+            assert_eq!(
+                frozen.logical_shard_id,
+                encode_fixed_id(record.logical_shard_id.as_bytes())
+            );
+            assert_eq!(
+                frozen.owner,
+                record.owner.as_ref().map(|owner| owner.as_str().to_owned())
+            );
+            assert_eq!(frozen.owner_epoch, record.owner_epoch.map(OwnerEpoch::get));
+            assert_eq!(frozen.lease_id, record.lease_id);
+            assert_eq!(frozen.state, u8::from(record.state));
+            assert_eq!(frozen.endpoint, record.endpoint);
+            // A frozen reader sees no shared recovery frontier; the frontier
+            // lives in the recovery state that only owners read.
+            assert_eq!(frozen.checkpoint, None);
+            assert_eq!(frozen.log, None);
+            assert_eq!(frozen.durable_lsn, 0);
+        }
+        let placement = encode_root_placement(&placement()).unwrap();
+        assert_eq!(
+            frozen_v0_10_0_reader::decode_root_placement(&placement)
+                .unwrap()
+                .version,
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_state_never_leaks_into_the_routing_value() {
+        for record in routing_contract_records() {
+            let bytes = encode_logical_shard_routing_record(&record).unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(!text.contains("pending_recovery_upload"), "{text}");
+            assert!(!text.contains("receipt"), "{text}");
+            assert!(!text.contains("plan"), "{text}");
+            match encode_logical_shard_recovery_state(&record).unwrap() {
+                None => assert!(!record.has_recovery_state()),
+                Some(recovery) => {
+                    assert!(record.has_recovery_state());
+                    let state = decode_logical_shard_recovery_state(&recovery).unwrap();
+                    assert_eq!(state, record.recovery_state());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn records_written_by_a_0_10_0_owner_stay_readable_and_canonical() {
+        // Exact bytes a 0.10.0 owner wrote for a serving shard without a
+        // shared recovery frontier (field order is the 0.10.0 struct order).
+        let written_by_0_10_0 = br#"{"version":1,"logical_shard_id":"02020202020202020202020202020202","owner":"node-a","owner_epoch":7,"lease_id":42,"state":3,"endpoint":"10.0.0.1:7000","checkpoint":null,"log":null,"durable_lsn":0}"#;
+        let decoded = decode_logical_shard_record_value(written_by_0_10_0).unwrap();
+        assert_eq!(decoded.wire, LogicalShardRecordWireKind::Routing);
+        assert!(!decoded.record.has_recovery_state());
+        assert_eq!(
+            decoded.record.owner_epoch,
+            Some(OwnerEpoch::new(7).unwrap())
+        );
+        assert_eq!(decoded.record.state, LogicalShardState::Serving);
+        // Re-encoding through this crate reproduces the same bytes, so a
+        // record that predates the split is canonical without a rewrite.
+        assert_eq!(
+            encode_logical_shard_routing_record(&decoded.record).unwrap(),
+            written_by_0_10_0
+        );
+    }
+
+    #[test]
+    fn legacy_combined_values_are_read_and_resplit() {
+        // Exact bytes a 0.11.0 owner wrote (combined version 3) for the two
+        // fixture records above.
+        let serving_v3 = br#"{"version":3,"logical_shard_id":"02020202020202020202020202020202","owner":"node-a","owner_epoch":7,"lease_id":42,"state":3,"endpoint":"10.0.0.1:7000","checkpoint":{"object_key":"checkpoints/7","lsn":128,"image_bytes":4096,"image_digest":"sha256:image","digest":"state-128","receipt":[1,2,3]},"log":{"segments":[{"segment_key":"logs/129-144","first_lsn":129,"last_lsn":144,"digest":"state-144","receipt":[4,5,6]}],"durable_lsn":144,"digest":"state-144"},"durable_lsn":144,"pending_recovery_upload":null}"#;
+        let recovering_v3 = br#"{"version":3,"logical_shard_id":"02020202020202020202020202020202","owner":"node-a","owner_epoch":7,"lease_id":42,"state":2,"endpoint":"10.0.0.1:7000","checkpoint":null,"log":null,"durable_lsn":0,"pending_recovery_upload":{"object_namespace_id":"03030303030303030303030303030303","first_lsn":1,"last_lsn":2,"previous_chain_digest":"0000000000000000000000000000000000000000000000000000000000000000","last_chain_digest":"1111111111111111111111111111111111111111111111111111111111111111","segment_digest":"2222222222222222222222222222222222222222222222222222222222222222","manifest_key":"nokv/recovery/log-segments/v1/manifest","receipt":[4,5,6],"plan":[1,2,3]}}"#;
+        for (bytes, expected) in [
+            (serving_v3.as_slice(), serving_record()),
+            (recovering_v3.as_slice(), recovering_record_with_upload()),
+        ] {
+            let decoded = decode_logical_shard_record_value(bytes).unwrap();
+            assert_eq!(
+                decoded.wire,
+                LogicalShardRecordWireKind::LegacyCombined { version: 3 }
+            );
+            assert_eq!(decoded.record, expected);
+            // The very same value is unreadable by a 0.10.0 client; that is
+            // the incompatibility the split removes on the next owner write.
+            assert!(frozen_v0_10_0_reader::decode_logical_shard_record(bytes).is_err());
+            assert_eq!(round_trip_split_record(&decoded.record), expected);
+        }
+    }
+
+    #[test]
+    fn recovery_state_codec_is_strict() {
+        let empty = br#"{"version":1,"logical_shard_id":"02020202020202020202020202020202","checkpoint":null,"log":null,"durable_lsn":0,"pending_recovery_upload":null}"#;
+        assert!(matches!(
+            decode_logical_shard_recovery_state(empty),
+            Err(ControlError::Codec(_))
+        ));
+        let recovery = encode_logical_shard_recovery_state(&serving_record())
+            .unwrap()
+            .unwrap();
+        let mut foreign = decode_logical_shard_recovery_state(&recovery).unwrap();
+        foreign.logical_shard_id = shard_id(9);
+        assert!(matches!(
+            LogicalShardRecord::unassigned(shard_id(2)).with_recovery_state(foreign),
+            Err(ControlError::Codec(_))
+        ));
+        let mut trailing = recovery.clone();
+        trailing.extend_from_slice(b" ");
+        assert!(matches!(
+            decode_logical_shard_recovery_state(&trailing),
+            Err(ControlError::Codec(_))
+        ));
+    }
+
     #[test]
     fn strict_codecs_round_trip_final_records() {
         let placement = placement();
@@ -796,16 +1200,28 @@ mod tests {
             binding
         );
 
-        let record = serving_record();
-        assert_eq!(
-            decode_logical_shard_record(&encode_logical_shard_record(&record).unwrap()).unwrap(),
-            record
-        );
-        let record = recovering_record_with_upload();
-        assert_eq!(
-            decode_logical_shard_record(&encode_logical_shard_record(&record).unwrap()).unwrap(),
-            record
-        );
+        for record in [serving_record(), recovering_record_with_upload()] {
+            assert_eq!(round_trip_split_record(&record), record);
+        }
+    }
+
+    /// Persist a record the way the etcd backend does (routing value plus the
+    /// optional recovery value) and read it back through both decoders.
+    fn round_trip_split_record(record: &LogicalShardRecord) -> LogicalShardRecord {
+        let routing = encode_logical_shard_routing_record(record).unwrap();
+        let decoded = decode_logical_shard_record_value(&routing).unwrap();
+        assert_eq!(decoded.wire, LogicalShardRecordWireKind::Routing);
+        assert_eq!(decoded.record, record.routing_projection());
+        match encode_logical_shard_recovery_state(record).unwrap() {
+            None => {
+                assert!(!record.has_recovery_state());
+                decoded.record
+            }
+            Some(recovery) => decoded
+                .record
+                .with_recovery_state(decode_logical_shard_recovery_state(&recovery).unwrap())
+                .unwrap(),
+        }
     }
 
     #[test]
@@ -823,8 +1239,14 @@ mod tests {
             br#"{"version":1,"root_id":"01010101010101010101010101010101","agent_id":"04040404040404040404040404040404"}"#
         );
         assert_eq!(
-            encode_logical_shard_record(&LogicalShardRecord::unassigned(shard_id(2))).unwrap(),
-            br#"{"version":3,"logical_shard_id":"02020202020202020202020202020202","owner":null,"owner_epoch":null,"lease_id":0,"state":1,"endpoint":null,"checkpoint":null,"log":null,"durable_lsn":0,"pending_recovery_upload":null}"#
+            encode_logical_shard_routing_record(&LogicalShardRecord::unassigned(shard_id(2)))
+                .unwrap(),
+            br#"{"version":1,"logical_shard_id":"02020202020202020202020202020202","owner":null,"owner_epoch":null,"lease_id":0,"state":1,"endpoint":null,"checkpoint":null,"log":null,"durable_lsn":0}"#
+        );
+        assert_eq!(
+            encode_logical_shard_recovery_state(&LogicalShardRecord::unassigned(shard_id(2)))
+                .unwrap(),
+            None
         );
         assert_eq!(
             decode_logical_shard_record(
@@ -857,17 +1279,48 @@ mod tests {
     }
 
     #[test]
-    fn codec_rejects_unknown_versions() {
+    fn codec_rejects_unknown_versions_with_a_typed_upgrade_error() {
         let bytes = br#"{"version":99,"root_id":"01010101010101010101010101010101","logical_shard_id":"02020202020202020202020202020202","placement_generation":1,"lifecycle":1}"#;
         assert!(matches!(
             decode_root_placement(bytes),
-            Err(ControlError::Codec(_))
+            Err(ControlError::UnsupportedRecordVersion {
+                record: "root placement",
+                version: 99,
+                supported: 1,
+            })
         ));
 
         let bytes = br#"{"version":99,"root_id":"01010101010101010101010101010101","agent_id":"04040404040404040404040404040404"}"#;
         assert!(matches!(
             decode_root_agent_binding(bytes),
-            Err(ControlError::Codec(_))
+            Err(ControlError::UnsupportedRecordVersion {
+                record: "root Agent binding",
+                ..
+            })
+        ));
+
+        // A newer routing or recovery record must name the version gap before
+        // any field parsing, so an old reader reports "upgrade me" instead of
+        // an unknown-field parse error.
+        let bytes = br#"{"version":4,"logical_shard_id":"02020202020202020202020202020202","future_field":true}"#;
+        let error = decode_logical_shard_record(bytes).unwrap_err();
+        assert!(matches!(
+            error,
+            ControlError::UnsupportedRecordVersion {
+                record: "logical shard record",
+                version: 4,
+                supported: 3,
+            }
+        ));
+        assert!(error.to_string().contains("must be upgraded"));
+        let bytes = br#"{"version":2,"logical_shard_id":"02020202020202020202020202020202","future_field":true}"#;
+        assert!(matches!(
+            decode_logical_shard_recovery_state(bytes),
+            Err(ControlError::UnsupportedRecordVersion {
+                record: "logical shard recovery state",
+                version: 2,
+                supported: 1,
+            })
         ));
     }
 

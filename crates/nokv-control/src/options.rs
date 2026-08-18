@@ -130,6 +130,26 @@ impl EtcdControlStoreOptions {
         format!("{}/logical-shards/", self.normalized_key_prefix()).into_bytes()
     }
 
+    /// Owner-only recovery state stored next to the client-facing routing record.
+    ///
+    /// The prefix is deliberately disjoint from `logical-shards/` so a routing
+    /// listing never sees recovery values and readers that predate the split
+    /// never touch this key.
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn logical_shard_recovery_key(&self, logical_shard_id: &LogicalShardId) -> Vec<u8> {
+        format!(
+            "{}/logical-shard-recovery/{}",
+            self.normalized_key_prefix(),
+            encode_fixed_id(logical_shard_id.as_bytes())
+        )
+        .into_bytes()
+    }
+
+    #[cfg(feature = "etcd")]
+    pub(crate) fn logical_shard_recovery_prefix(&self) -> Vec<u8> {
+        format!("{}/logical-shard-recovery/", self.normalized_key_prefix()).into_bytes()
+    }
+
     /// Stable session key shared by every owner generation of one logical shard.
     #[cfg(any(feature = "etcd", test))]
     pub(crate) fn logical_shard_session_key(&self, logical_shard_id: &LogicalShardId) -> Vec<u8> {
@@ -198,6 +218,10 @@ mod tests {
         assert_eq!(
             String::from_utf8(options.logical_shard_record_key(&shard_id(0x02))).unwrap(),
             "/nokv/test/logical-shards/02020202020202020202020202020202"
+        );
+        assert_eq!(
+            String::from_utf8(options.logical_shard_recovery_key(&shard_id(0x02))).unwrap(),
+            "/nokv/test/logical-shard-recovery/02020202020202020202020202020202"
         );
         assert_eq!(
             String::from_utf8(options.logical_shard_session_key(&shard_id(0x02))).unwrap(),
