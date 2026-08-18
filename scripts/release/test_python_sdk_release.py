@@ -166,11 +166,15 @@ class WheelSetTest(unittest.TestCase):
 
 
 class InstalledSdkTest(unittest.TestCase):
-    def test_source_tree_import_is_not_an_installed_wheel(self) -> None:
-        # The running interpreter has no installed `nokv` distribution in a
-        # clean checkout, or imports it from a source tree; both must fail.
+    def test_wrong_version_or_missing_distribution_fails_closed(self) -> None:
+        # Whether or not the running interpreter can import `nokv`, it cannot
+        # be an installed wheel of this impossible version.
         with self.assertRaises(release.ReleaseError):
-            release.verify_installed_sdk(Path(sys.executable), "0.11.0")
+            release.verify_installed_sdk(Path(sys.executable), "0.0.0")
+
+    def test_missing_interpreter_is_a_release_error(self) -> None:
+        with self.assertRaises(release.ReleaseError):
+            release.verify_installed_sdk(Path("/nonexistent/python-interpreter"), "0.11.0")
 
 
 class WorkflowTest(unittest.TestCase):

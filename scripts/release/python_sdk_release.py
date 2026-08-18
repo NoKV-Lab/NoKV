@@ -241,12 +241,15 @@ def verify_installed_sdk(python: Path, version: str) -> None:
         "print(json.dumps({'version': nokv.__version__, 'api': nokv.API_VERSION,"
         " 'dist': m.version('nokv'), 'file': nokv.__file__}))"
     )
-    completed = subprocess.run(
-        [str(python), "-c", script],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [str(python), "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        raise ReleaseError(f"cannot run {python}: {error}") from error
     if completed.returncode != 0:
         raise ReleaseError(
             f"installed SDK import failed: {completed.stderr.strip()[-2000:]}"
