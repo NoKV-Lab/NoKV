@@ -4,8 +4,13 @@ build-backend = "maturin"
 
 [project]
 name = "nokv"
-version = "0.1.0"
+# The wheel version is the NoKV release line: it is read from
+# crates/nokv-python/Cargo.toml, which the release process keeps equal to the
+# crates/nokv package version and the canonical vMAJOR.MINOR.PATCH tag.
+dynamic = ["version"]
 description = "NoKV Python SDK for Agent workspaces and immutable artifacts."
+readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.9"
 dependencies = ["fsspec>=2024.0.0"]
 classifiers = [
@@ -21,3 +26,10 @@ torch = ["torch>=2.2"]
 module-name = "nokv._native"
 python-source = "python"
 features = ["extension-module"]
+# A checkout used with `maturin develop` leaves bytecode caches and a native
+# module next to the sources; the wheel must only ever carry the freshly built
+# native module and the tracked Python sources.
+exclude = [
+    { path = "python/**/__pycache__/**", format = ["sdist", "wheel"] },
+    { path = "python/nokv/_native.abi3.so", format = ["sdist", "wheel"] },
+]

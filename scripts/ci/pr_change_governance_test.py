@@ -111,6 +111,7 @@ class ChangeGovernancePolicyTest(unittest.TestCase):
                 "/scripts/ci/ @wchwawa @feichai0017",
                 "/scripts/workbench/ @wchwawa @feichai0017",
                 "/scripts/release/test_homebrew_source_release.py @wchwawa @feichai0017",
+                "/scripts/release/test_python_sdk_release.py @wchwawa @feichai0017",
             },
         )
 
@@ -170,6 +171,7 @@ class ChangeGovernancePolicyTest(unittest.TestCase):
             "scripts/ci/pr_change_governance.py",
             "scripts/workbench/pre423_contract_ledger.json",
             "scripts/release/test_homebrew_source_release.py",
+            "scripts/release/test_python_sdk_release.py",
         )
         for path in sensitive:
             with self.subTest(path=path):

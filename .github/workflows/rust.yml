@@ -312,6 +312,9 @@ jobs:
       - name: Check Homebrew release safety
         run: python3 scripts/release/test_homebrew_source_release.py
 
+      - name: Check Python SDK release safety
+        run: python3 scripts/release/test_python_sdk_release.py
+
       - name: Check pull request governance policy
         run: python3 scripts/ci/pr_change_governance_test.py
 
