@@ -1,3 +1,4 @@
+use crate::ControlError;
 use std::fmt;
 
 pub use nokv_types::{
@@ -149,6 +150,23 @@ pub struct LogicalShardRecord {
     pub pending_recovery_upload: Option<RecoveryUploadIntent>,
 }
 
+/// Owner-side recovery frontier of one logical shard.
+///
+/// This is the part of [`LogicalShardRecord`] that only the shard owner reads
+/// and writes: the published checkpoint and log references with their object
+/// receipts, the durable LSN they prove, and the exact upload intent installed
+/// before an immutable recovery create. Backends persist it separately from the
+/// client-facing routing fields so that clients keep decoding the routing
+/// record with the frozen version-1 wire schema while owner state evolves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalShardRecoveryState {
+    pub logical_shard_id: LogicalShardId,
+    pub checkpoint: Option<CheckpointRef>,
+    pub log: Option<LogRef>,
+    pub durable_lsn: u64,
+    pub pending_recovery_upload: Option<RecoveryUploadIntent>,
+}
+
 /// Exact owner fence presented to every owner-only mutation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogicalShardLease {
@@ -257,6 +275,62 @@ impl LogicalShardRecord {
             durable_lsn: 0,
             pending_recovery_upload: None,
         }
+    }
+
+    /// True when the owner has published or staged any recovery state.
+    pub fn has_recovery_state(&self) -> bool {
+        self.checkpoint.is_some()
+            || self.log.is_some()
+            || self.durable_lsn != 0
+            || self.pending_recovery_upload.is_some()
+    }
+
+    /// The owner-side recovery frontier carried by this record.
+    pub fn recovery_state(&self) -> LogicalShardRecoveryState {
+        LogicalShardRecoveryState {
+            logical_shard_id: self.logical_shard_id,
+            checkpoint: self.checkpoint.clone(),
+            log: self.log.clone(),
+            durable_lsn: self.durable_lsn,
+            pending_recovery_upload: self.pending_recovery_upload.clone(),
+        }
+    }
+
+    /// The client-facing routing fields with every recovery field cleared.
+    ///
+    /// This is exactly what a version-1 routing reader observes; a shard whose
+    /// recovery frontier lives in its separate recovery state therefore looks
+    /// like a shard without a published shared frontier to such a reader.
+    pub fn routing_projection(&self) -> Self {
+        Self {
+            logical_shard_id: self.logical_shard_id,
+            owner: self.owner.clone(),
+            owner_epoch: self.owner_epoch,
+            lease_id: self.lease_id,
+            state: self.state,
+            endpoint: self.endpoint.clone(),
+            checkpoint: None,
+            log: None,
+            durable_lsn: 0,
+            pending_recovery_upload: None,
+        }
+    }
+
+    /// Reattach the separately persisted recovery frontier to routing fields.
+    pub fn with_recovery_state(
+        mut self,
+        recovery: LogicalShardRecoveryState,
+    ) -> Result<Self, ControlError> {
+        if recovery.logical_shard_id != self.logical_shard_id {
+            return Err(ControlError::Codec(
+                "logical shard recovery state names a different logical shard".to_owned(),
+            ));
+        }
+        self.checkpoint = recovery.checkpoint;
+        self.log = recovery.log;
+        self.durable_lsn = recovery.durable_lsn;
+        self.pending_recovery_upload = recovery.pending_recovery_upload;
+        Ok(self)
     }
 }
 

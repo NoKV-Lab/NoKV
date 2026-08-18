@@ -1574,7 +1574,8 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use super::*;
-    use crate::{encode_logical_shard_record, AgentId, LogSegmentRef, PlacementGeneration};
+    use crate::codec::validate_logical_shard_record_encoded_size;
+    use crate::{AgentId, LogSegmentRef, PlacementGeneration};
 
     fn root_id(value: u8) -> RootId {
         RootId::from_bytes([value; 16])
@@ -2501,7 +2502,7 @@ mod tests {
                 digest: format!("{lsn:064x}"),
             });
             record.durable_lsn = lsn;
-            if encode_logical_shard_record(&record).is_err() {
+            if validate_logical_shard_record_encoded_size(&record).is_err() {
                 segments.pop();
                 let tail = segments.last().expect("one segment fits the record budget");
                 record.log = Some(LogRef {
@@ -2514,7 +2515,7 @@ mod tests {
             }
             assert!(segments.len() < MAX_RECOVERY_LOG_SEGMENTS);
         }
-        assert!(encode_logical_shard_record(&record).is_ok());
+        assert!(validate_logical_shard_record_encoded_size(&record).is_ok());
 
         let next_lsn = record.durable_lsn + 1;
         let intent = RecoveryUploadIntent {
@@ -2534,7 +2535,9 @@ mod tests {
 
         let error = prepare_recovery_upload_intent(&record, &lease, intent)
             .expect_err("prepare must reject a final record outside the persistence budget");
-        assert!(error.to_string().contains("encoded logical shard record"));
+        assert!(error
+            .to_string()
+            .contains("encoded logical shard recovery state"));
     }
 
     #[test]

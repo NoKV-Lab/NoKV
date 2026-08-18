@@ -508,6 +508,42 @@ durable `Recovering` epoch one if it did. Bootstrap never infers directory
 ownership from a path precheck or recursively deletes a prepared store; both
 would be unsafe under a concurrent path change.
 
+### Control Record Layout And Client Compatibility
+
+The control plane stores one logical shard under two etcd keys with two
+independent codec versions:
+
+- `logical-shards/<id>` holds the **routing record**: owner, owner epoch,
+  lease id, state, and endpoint. Its wire schema is frozen at version 1, the
+  same value every released NoKV client (0.10.0 and earlier) decodes with a
+  strict, exact-version reader. This key is the client compatibility contract:
+  a client that understands version 1 must keep decoding it, so no field is
+  ever added to it. Its recovery fields are always `null` and its
+  `durable_lsn` is always `0`; a client cannot consume recovery receipts and
+  therefore sees "no shared frontier", which is the only frontier a version-1
+  reader can validate.
+- `logical-shard-recovery/<id>` holds the **recovery state** only owners read:
+  the published checkpoint and log references with their object receipts, the
+  durable LSN they prove, and the pending recovery upload intent. It has its
+  own codec version and may evolve without touching the routing schema. The
+  key is absent whenever the record carries no recovery state; absence and
+  emptiness are the same durable fact.
+
+Every owner-fenced mutation writes both keys in one etcd transaction guarded
+by the routing key's modification revision, and every read fetches both keys
+in one transaction, so the pair is never observed torn. A legacy combined
+value (versions 2 and 3, written at the routing key by owners built between
+the recovery-outbox work and this split) is still decoded completely; it wins
+over any recovery key beside it and the next owner mutation re-splits it.
+Readers report a record version they do not implement as
+`ControlError::UnsupportedRecordVersion` before parsing any field, so an
+outdated client says "upgrade me" instead of failing on an unknown field.
+
+The frozen 0.10.0 reader is vendored into the `nokv-control` codec tests and
+must decode every routing value this crate writes; that test is the executable
+form of the contract above. Bumping the routing version is a deliberate,
+client-breaking release decision, never a side effect of adding owner state.
+
 The control record and the lease-backed session key have separate lifetimes.
 `Recovering` is a durable attempt token. A bootstrap rollback removes only its
 session (`suspend_recovery`) and retains the record; an ungraceful process loss
