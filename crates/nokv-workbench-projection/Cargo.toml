@@ -1,0 +1,13 @@
+[package]
+name = "nokv-workbench-projection"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+nokv-agent.workspace = true
+nokv-client.workspace = true
+nokv-types.workspace = true

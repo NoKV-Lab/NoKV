@@ -577,6 +577,11 @@
     "workbench_restore": {
       "additionalProperties": false,
       "properties": {
+        "at_commit": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64
+        },
         "at_snapshot": {
           "anyOf": [
             {
@@ -600,7 +605,6 @@
       },
       "required": [
         "id",
-        "at_snapshot",
         "destination_id"
       ],
       "type": "object"

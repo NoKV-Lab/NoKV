@@ -69,7 +69,10 @@ CONCURRENT_RESTORES = 16
 # (metadata/run_manifest.json and metadata/restore_manifest.json) and copies
 # no payload object; the destination is committed as soon as it is visible.
 RESTORE_MANIFEST_OBJECTS = 2
-RESTORE_MANIFEST_SCHEMA = "nokv.workbench.restore_manifest.v1"
+# Pinned deliberately rather than read from the binary: a gate that asks the
+# thing under test what it should have written proves nothing. Moving this
+# pin is how a durable-format change gets a human decision.
+RESTORE_MANIFEST_SCHEMA = "nokv.workbench.restore_manifest.v2"
 RUN_MANIFEST_SCHEMA = "nokv.workbench.run_manifest.v1"
 WORKBENCH_ROOT = "/agents/materials/wb"
 # Product default etcd owner lease TTL (crates/nokv/src/cli.rs).
@@ -459,9 +462,16 @@ def validate_restore_manifest(
     destination_path = f"{WORKBENCH_ROOT}/{destination}"
     if not isinstance(manifest, dict):
         raise WorkflowFailure(f"{label} is not a JSON object")
-    snapshot_id = manifest.get("snapshot_id")
     operation_id = manifest.get("operation_id")
     restored_from = manifest.get("restored_from")
+    # v2 names the source it read from, so a manifest cannot leave it implicit
+    # and a commit restore cannot masquerade as a snapshot one. This gate
+    # exercises the fork path, which restores from a snapshot.
+    snapshot_id = None
+    if isinstance(restored_from, dict):
+        restore_source = restored_from.get("source")
+        if isinstance(restore_source, dict) and restore_source.get("kind") == "snapshot":
+            snapshot_id = restore_source.get("snapshot_id")
     if (
         manifest.get("schema") != RESTORE_MANIFEST_SCHEMA
         or manifest.get("source_workbench_id") != source
@@ -469,6 +479,7 @@ def validate_restore_manifest(
         or manifest.get("destination_workbench_id") != destination
         or manifest.get("destination_path") != destination_path
         or not isinstance(snapshot_id, int)
+        or isinstance(snapshot_id, bool)
         or snapshot_id <= 0
         or not isinstance(operation_id, str)
         or len(operation_id) != 32
@@ -476,7 +487,7 @@ def validate_restore_manifest(
         != {
             "workbench_id": source,
             "path": source_path,
-            "snapshot_id": snapshot_id,
+            "source": {"kind": "snapshot", "snapshot_id": snapshot_id},
         }
     ):
         raise WorkflowFailure(f"{label} is not bound to the exact fork identities")

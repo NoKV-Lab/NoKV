@@ -143,7 +143,7 @@ def valid_evidence() -> dict[str, object]:
                     source="composition-a",
                 ),
                 "restore_manifest": {
-                    "schema": "nokv.workbench.restore_manifest.v1",
+                    "schema": "nokv.workbench.restore_manifest.v2",
                     "source_workbench_id": "composition-a",
                     "destination_workbench_id": "composition-b",
                     "operation_id": "66" * 16,
@@ -166,7 +166,7 @@ def valid_evidence() -> dict[str, object]:
                     source="composition-b",
                 ),
                 "restore_manifest": {
-                    "schema": "nokv.workbench.restore_manifest.v1",
+                    "schema": "nokv.workbench.restore_manifest.v2",
                     "source_workbench_id": "composition-b",
                     "destination_workbench_id": "composition-c",
                     "operation_id": "99" * 16,

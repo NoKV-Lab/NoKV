@@ -12,7 +12,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use nokv_client::{
     ArtifactPublishOptions, ArtifactPublishOutcome, ArtifactRangeBatchRequest, ClientError,
     ClientOptions, FramedTcpOptions, FramedTcpTransport, RouteResolver, SnapshotMintOptions,
-    SnapshotRenewOptions, SnapshotRetireOptions, WorkspaceClient,
+    SnapshotRenewOptions, SnapshotRetireOptions, WorkbenchCommitRequest, WorkbenchLifecycleFacade,
+    WorkbenchLifecycleOptions, WorkbenchRestoreOrigin, WorkbenchRestoreRequest,
+    WorkbenchRestoreSource, WorkbenchSnapshotSelector, WorkspaceClient,
 };
 use nokv_object::ArtifactObjectStore;
 use nokv_protocol::{
@@ -23,9 +25,13 @@ use nokv_protocol::{
     SearchRequest, SnapshotAlias, SnapshotSelector, WorkbenchName, WorkspaceIdentity,
     WorkspacePath, WorkspaceReadView,
 };
+use nokv_types::WorkbenchId;
+use nokv_workbench_projection::CanonicalWorkbenchProjection;
 use pyo3::exceptions::{PyFileExistsError, PyFileNotFoundError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::{PyAnyMethods, PyDictMethods, PyListMethods};
 use pyo3::types::{PyBytes, PyDict, PyList};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::local_adapter::{
     collect_local_files, create_materialized_file, join_remote_path, materialized_relative_path,
@@ -65,6 +71,13 @@ struct CollectedFile {
 pub(crate) struct PythonWorkspaceClient {
     client: Arc<RustWorkspaceClient>,
     objects: Arc<nokv_object::BoundArtifactStore<ConfiguredObjectStore>>,
+    /// Presentation root the durable run manifest records, for example
+    /// `/agents/<agent-id>/wb`. It is not addressing: artifacts resolve by
+    /// workbench name either way. But it is hashed into the commit
+    /// operation's projection digest, so a commit written here with a
+    /// different root than the CLI uses is a *different* operation over the
+    /// same content. Lifecycle calls therefore refuse to guess it.
+    workbench_root: Option<String>,
 }
 
 #[pymethods]
@@ -78,7 +91,8 @@ impl PythonWorkspaceClient {
         connect_timeout_ms = 5_000,
         read_timeout_ms = 30_000,
         write_timeout_ms = 30_000,
-        handshake_timeout_ms = 5_000
+        handshake_timeout_ms = 5_000,
+        workbench_root = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -91,6 +105,7 @@ impl PythonWorkspaceClient {
         read_timeout_ms: u64,
         write_timeout_ms: u64,
         handshake_timeout_ms: u64,
+        workbench_root: Option<String>,
     ) -> PyResult<Self> {
         let root_id = RootIdentity(parse_fixed_hex("root_id", root_id)?);
         let transport = FramedTcpTransport::new(FramedTcpOptions {
@@ -123,7 +138,158 @@ impl PythonWorkspaceClient {
         Ok(Self {
             client: Arc::new(client),
             objects: Arc::new(objects),
+            workbench_root,
         })
+    }
+
+    /// Publish or replay one canonical Workbench commit.
+    ///
+    /// `manifest` is the caller's provenance mapping; it is canonicalised and
+    /// digested exactly as the CLI does, so a commit made here and one made
+    /// by `nokv workbench workbench_commit` over the same inputs are the same
+    /// durable commit.
+    #[pyo3(signature = (workbench, manifest, content_digest_uri, replace = false))]
+    fn commit<'py>(
+        &self,
+        py: Python<'py>,
+        workbench: &str,
+        manifest: &Bound<'py, PyAny>,
+        content_digest_uri: &str,
+        replace: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let workbench_id = parse_workbench_id(workbench)?;
+        let workbench_path = self.lifecycle_workbench_path(&workbench_id)?;
+        let manifest_value = json_object_from_py(manifest)?;
+        let content_digest_uri = content_digest_uri.to_owned();
+        // The digest and the stable id come from nokv-agent, not from here:
+        // the SDK must not own metadata layout, and a second implementation
+        // would let the SDK and the CLI disagree about one commit.
+        let inputs = nokv_agent::workbench_commit_inputs(
+            &workbench_id,
+            &manifest_value,
+            &content_digest_uri,
+        )
+        .map_err(value_error)?;
+        let request = WorkbenchCommitRequest {
+            workbench_id,
+            canonical_manifest: inputs.canonical_manifest,
+            workbench_path,
+            content_digest_uri,
+            manifest_digest_uri: inputs.manifest_digest_uri,
+            stable_commit_id: inputs.stable_commit_id,
+            replace,
+        };
+        let client = Arc::clone(&self.client);
+        let objects = Arc::clone(&self.objects);
+        let max_artifact_bytes = LIFECYCLE_MAX_MANIFEST_BYTES;
+        let outcome = py
+            .detach(move || {
+                let options =
+                    WorkbenchLifecycleOptions::new(max_artifact_bytes).map_err(lifecycle_error)?;
+                WorkbenchLifecycleFacade::new(
+                    &client,
+                    objects.as_ref(),
+                    options,
+                    CanonicalWorkbenchProjection,
+                )
+                .commit(request)
+                .map_err(lifecycle_error)
+            })
+            .map_err(runtime_error)?;
+        let result = PyDict::new(py);
+        result.set_item("commit_id", hex(&outcome.commit_id))?;
+        result.set_item("commit_head_generation", outcome.commit_head_generation)?;
+        result.set_item("manifest_size_bytes", outcome.manifest_size_bytes)?;
+        result.set_item("envelope_digest_uri", outcome.envelope_digest_uri)?;
+        result.set_item("tree_digest_uri", outcome.tree_digest_uri)?;
+        result.set_item("replayed", outcome.idempotent_replay)?;
+        Ok(result)
+    }
+
+    /// Restore a frozen state into an absent destination workbench.
+    ///
+    /// Name exactly one source. `at_snapshot` takes a snapshot id or alias
+    /// and is bounded by that snapshot's lease; `at_commit` takes a commit
+    /// identity and is not, so a decision point that has to stay citable
+    /// after the lease runs out is restored from its commit.
+    #[pyo3(signature = (workbench, destination, at_snapshot = None, at_commit = None))]
+    fn restore<'py>(
+        &self,
+        py: Python<'py>,
+        workbench: &str,
+        destination: &str,
+        at_snapshot: Option<&Bound<'py, PyAny>>,
+        at_commit: Option<&str>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let source_workbench_id = parse_workbench_id(workbench)?;
+        let destination_workbench_id = parse_workbench_id(destination)?;
+        if source_workbench_id == destination_workbench_id {
+            return Err(value_error("destination must differ from workbench"));
+        }
+        let origin = match (at_snapshot, at_commit) {
+            (Some(_), Some(_)) => {
+                return Err(value_error("give at_snapshot or at_commit, not both"))
+            }
+            (None, None) => return Err(value_error("give at_snapshot or at_commit")),
+            (Some(value), None) => {
+                if let Ok(snapshot_id) = value.extract::<u64>() {
+                    if snapshot_id == 0 {
+                        return Err(value_error("at_snapshot id must be greater than zero"));
+                    }
+                    WorkbenchRestoreOrigin::Snapshot(WorkbenchSnapshotSelector::Id(snapshot_id))
+                } else {
+                    let alias: String = value
+                        .extract()
+                        .map_err(|_| value_error("at_snapshot must be an id or an alias"))?;
+                    WorkbenchRestoreOrigin::Snapshot(WorkbenchSnapshotSelector::Name(alias))
+                }
+            }
+            (None, Some(commit_id)) => WorkbenchRestoreOrigin::Commit(
+                nokv_agent::decode_commit_identity(commit_id).map_err(value_error)?,
+            ),
+        };
+        let request = WorkbenchRestoreRequest {
+            source_workbench_path: self.lifecycle_workbench_path(&source_workbench_id)?,
+            destination_workbench_path: self.lifecycle_workbench_path(&destination_workbench_id)?,
+            source_workbench_id,
+            origin,
+            destination_workbench_id,
+        };
+        let client = Arc::clone(&self.client);
+        let objects = Arc::clone(&self.objects);
+        let outcome = py
+            .detach(move || {
+                let options = WorkbenchLifecycleOptions::new(LIFECYCLE_MAX_MANIFEST_BYTES)
+                    .map_err(lifecycle_error)?;
+                WorkbenchLifecycleFacade::new(
+                    &client,
+                    objects.as_ref(),
+                    options,
+                    CanonicalWorkbenchProjection,
+                )
+                .restore(request)
+                .map_err(lifecycle_error)
+            })
+            .map_err(runtime_error)?;
+        let result = PyDict::new(py);
+        result.set_item("operation_id", hex(&outcome.operation_id))?;
+        match outcome.source {
+            WorkbenchRestoreSource::Snapshot { snapshot_id } => {
+                result.set_item("snapshot_id", snapshot_id)?;
+                result.set_item("commit_id", py.None())?;
+            }
+            WorkbenchRestoreSource::Commit { commit_id } => {
+                result.set_item("snapshot_id", py.None())?;
+                result.set_item("commit_id", hex(&commit_id))?;
+            }
+        }
+        result.set_item("read_version", outcome.source_snapshot_read_version)?;
+        result.set_item(
+            "destination_generation",
+            outcome.destination_workspace_revision,
+        )?;
+        result.set_item("replayed", outcome.idempotent_replay)?;
+        Ok(result)
     }
 
     #[pyo3(signature = (workbench, workspace_incarnation_id = None))]
@@ -857,6 +1023,18 @@ impl PythonWorkspaceClient {
 }
 
 impl PythonWorkspaceClient {
+    fn lifecycle_workbench_path(&self, workbench_id: &WorkbenchId) -> PyResult<String> {
+        let root = self.workbench_root.as_deref().ok_or_else(|| {
+            value_error(
+                "lifecycle calls need the workbench_root this deployment uses \
+                 (for example \"/agents/<agent-id>/wb\"); construct the client with it, \
+                 because the root is hashed into the commit operation and guessing it \
+                 would make this commit a different operation from the CLI's",
+            )
+        })?;
+        Ok(format!("{root}/{}", workbench_id.as_str()))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn publish_options(
         &self,
@@ -904,6 +1082,12 @@ impl PythonWorkspaceClient {
         }
         Ok(options)
     }
+}
+
+/// The presentation root a lifecycle call records in the durable manifest.
+/// Refused rather than guessed: see `PythonWorkspaceClient::workbench_root`.
+fn parse_workbench_id(raw: &str) -> PyResult<nokv_types::WorkbenchId> {
+    WorkbenchId::new(raw.to_owned()).map_err(value_error)
 }
 
 fn parse_workbench(raw: &str) -> PyResult<WorkbenchName> {
@@ -1169,6 +1353,64 @@ fn collect_workspace(
         });
     }
     Ok(collected)
+}
+
+/// Bound for the run-manifest read inside the lifecycle facade. Manifests are
+/// small; this only refuses a pathologically large one.
+const LIFECYCLE_MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+
+/// Marshals a Python mapping into the JSON object the commit manifest is.
+/// Values are restricted to what a provenance manifest can carry, so an
+/// unserialisable object fails here rather than at the digest.
+fn json_object_from_py(value: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
+    let mapping = value
+        .cast::<PyDict>()
+        .map_err(|_| value_error("manifest must be a dict"))?;
+    let mut object = JsonMap::new();
+    for (key, item) in mapping.iter() {
+        let key: String = key
+            .extract()
+            .map_err(|_| value_error("manifest keys must be strings"))?;
+        object.insert(key, json_scalar_from_py(&item)?);
+    }
+    Ok(JsonValue::Object(object))
+}
+
+fn json_scalar_from_py(value: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
+    if value.is_none() {
+        return Ok(JsonValue::Null);
+    }
+    if let Ok(flag) = value.extract::<bool>() {
+        return Ok(JsonValue::Bool(flag));
+    }
+    if let Ok(number) = value.extract::<i64>() {
+        return Ok(JsonValue::from(number));
+    }
+    if let Ok(number) = value.extract::<f64>() {
+        return serde_json::Number::from_f64(number)
+            .map(JsonValue::Number)
+            .ok_or_else(|| value_error("manifest numbers must be finite"));
+    }
+    if let Ok(text) = value.extract::<String>() {
+        return Ok(JsonValue::String(text));
+    }
+    if value.cast::<PyDict>().is_ok() {
+        return json_object_from_py(value);
+    }
+    if let Ok(items) = value.cast::<PyList>() {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items.iter() {
+            out.push(json_scalar_from_py(&item)?);
+        }
+        return Ok(JsonValue::Array(out));
+    }
+    Err(value_error(
+        "manifest values must be strings, numbers, booleans, null, lists, or dicts",
+    ))
+}
+
+fn lifecycle_error<E: std::fmt::Display>(error: E) -> String {
+    error.to_string()
 }
 
 fn value_error(error: impl std::fmt::Display) -> PyErr {

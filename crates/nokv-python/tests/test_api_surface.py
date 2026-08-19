@@ -35,6 +35,28 @@ def test_versioned_workbench_surface():
     assert hasattr(nokv.Client, "renew_snapshot")
     assert hasattr(nokv.Client, "retire_snapshot")
     assert hasattr(nokv.Client, "list_snapshots")
+
+
+def test_lifecycle_surface_is_installed():
+    """Commit and restore must ship in the wheel: without them a Python
+    caller cannot freeze a campaign or reconstruct a decision point, and has
+    to shell out to the CLI for exactly the two steps that make the record
+    citable."""
+    import inspect
+
+    assert hasattr(nokv.Client, "commit")
+    assert hasattr(nokv.Client, "restore")
+    restore = inspect.signature(nokv.Client.restore).parameters
+    # Either source can be named. A snapshot is a lease and expires; a commit
+    # is durable, so a decision point that outlives the lease needs at_commit.
+    assert "at_snapshot" in restore
+    assert "at_commit" in restore
+    commit = inspect.signature(nokv.Client.commit).parameters
+    assert "replace" in commit
+    # Lifecycle calls record a presentation root in the durable manifest, and
+    # the client refuses to guess it. pyo3 exposes the constructor's named
+    # parameters through the text signature rather than through inspect.
+    assert "workbench_root" in (nokv.Client.__text_signature__ or "")
     assert hasattr(nokv.Client, "search")
     assert hasattr(nokv.Client, "aggregate")
     assert hasattr(nokv.Client, "catalog")

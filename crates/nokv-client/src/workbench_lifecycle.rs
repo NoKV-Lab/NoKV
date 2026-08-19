@@ -40,7 +40,7 @@ struct RestoreInvocation {
     destination_restore_manifest_identity: wire::RestoreManifestIdentity,
     workflow_request: RestoreWorkflowRequest,
     canonical_restore_manifest: Vec<u8>,
-    snapshot_id: u64,
+    source: WorkbenchRestoreSource,
 }
 
 /// Client-owned input for one canonical Workbench commit lifecycle.
@@ -62,12 +62,30 @@ pub enum WorkbenchSnapshotSelector {
     Name(String),
 }
 
-/// Client-owned input for one Workbench snapshot restore lifecycle.
+/// What a caller asks a restore to read from.
+///
+/// A snapshot is a lease and expires; a commit is durable. A decision point
+/// that has to stay citable past the lease bound can only be reconstructed
+/// from its commit, so the lifecycle accepts either.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkbenchRestoreOrigin {
+    Snapshot(WorkbenchSnapshotSelector),
+    Commit([u8; 32]),
+}
+
+/// The resolved source a restore actually read from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkbenchRestoreSource {
+    Snapshot { snapshot_id: u64 },
+    Commit { commit_id: [u8; 32] },
+}
+
+/// Client-owned input for one Workbench restore lifecycle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkbenchRestoreRequest {
     pub source_workbench_id: WorkbenchId,
     pub source_workbench_path: String,
-    pub selector: WorkbenchSnapshotSelector,
+    pub origin: WorkbenchRestoreOrigin,
     pub destination_workbench_id: WorkbenchId,
     pub destination_workbench_path: String,
 }
@@ -91,7 +109,7 @@ pub struct RestoreManifestProjectionContext<'a> {
     pub source_path: &'a str,
     pub destination_workbench_id: &'a WorkbenchId,
     pub destination_path: &'a str,
-    pub snapshot_id: u64,
+    pub source: WorkbenchRestoreSource,
 }
 
 /// Inputs used to rebuild the destination run manifest during restore.
@@ -126,7 +144,7 @@ pub struct VerifiedWorkbenchRestoreManifest {
     pub source_path: String,
     pub destination_workbench_id: WorkbenchId,
     pub destination_path: String,
-    pub snapshot_id: u64,
+    pub source: WorkbenchRestoreSource,
     pub canonical_envelope: Vec<u8>,
     pub envelope_digest_uri: String,
 }
@@ -219,8 +237,10 @@ pub struct WorkbenchCommitOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkbenchRestoreOutcome {
     pub operation_id: [u8; 16],
-    pub snapshot_id: u64,
-    pub source_snapshot_read_version: u64,
+    pub source: WorkbenchRestoreSource,
+    /// Present exactly for snapshot restores; a commit restore has no
+    /// snapshot read version, and the protocol validates that asymmetry.
+    pub source_snapshot_read_version: Option<u64>,
     pub destination_workspace_revision: u64,
     pub idempotent_replay: bool,
 }
@@ -519,10 +539,7 @@ where
                     || verified.source_path != request.source_workbench_path
                     || verified.destination_workbench_id != request.destination_workbench_id
                     || verified.destination_path != request.destination_workbench_path
-                    || !restore_selector_matches_durable_snapshot(
-                        &request.selector,
-                        verified.snapshot_id,
-                    )
+                    || !restore_origin_matches_durable_source(&request.origin, verified.source)
                 {
                     return Err(WorkbenchLifecycleError::Conflict(
                         "existing destination restore manifest belongs to different provenance"
@@ -544,9 +561,7 @@ where
                 }
                 let recovery = RestoreRecoveryRequest {
                     source_workbench: workbench_name(&verified.source_workbench_id)?,
-                    source: wire::RestoreSource::Snapshot(wire::SnapshotSelector::Id(
-                        verified.snapshot_id,
-                    )),
+                    source: wire_restore_source(verified.source),
                     destination_workbench: destination.workbench,
                     destination_workspace_incarnation_id: destination.workspace_incarnation_id,
                     destination_restore_manifest_identity,
@@ -562,22 +577,44 @@ where
                     destination_restore_manifest_identity,
                     workflow_request: RestoreWorkflowRequest::Recover(recovery),
                     canonical_restore_manifest: verified.canonical_envelope,
-                    snapshot_id: verified.snapshot_id,
+                    source: verified.source,
                 }
             }
             None => {
                 let source_workspace = self.workspace(&request.source_workbench_id)?;
-                let snapshot = self.snapshot(&request.source_workbench_id, &request.selector)?;
-                if snapshot.workspace_incarnation_id != source_workspace.workspace_incarnation_id {
-                    return Err(protocol_mismatch(
-                        "snapshot resolved to a different source workspace incarnation",
-                    ));
-                }
-                let identities = RestoreWorkflowIdentities::derive_snapshot(
+                // A snapshot has to be resolved before it can be named; a
+                // commit is already a durable name, and the shard checks that
+                // it is sealed and belongs to this source workspace.
+                let source = match &request.origin {
+                    WorkbenchRestoreOrigin::Snapshot(selector) => {
+                        let snapshot = self.snapshot(&request.source_workbench_id, selector)?;
+                        if snapshot.workspace_incarnation_id
+                            != source_workspace.workspace_incarnation_id
+                        {
+                            return Err(protocol_mismatch(
+                                "snapshot resolved to a different source workspace incarnation",
+                            ));
+                        }
+                        WorkbenchRestoreSource::Snapshot {
+                            snapshot_id: snapshot.snapshot_id,
+                        }
+                    }
+                    WorkbenchRestoreOrigin::Commit(commit_id) => {
+                        if *commit_id == [0u8; 32] {
+                            return Err(WorkbenchLifecycleError::Conflict(
+                                "restore commit id must be non-zero".to_owned(),
+                            ));
+                        }
+                        WorkbenchRestoreSource::Commit {
+                            commit_id: *commit_id,
+                        }
+                    }
+                };
+                let identities = RestoreWorkflowIdentities::derive(
                     self.client.root_id(),
                     &source_workspace.workbench,
                     source_workspace.workspace_incarnation_id,
-                    snapshot.snapshot_id,
+                    source,
                     &destination_workbench,
                 );
                 let canonical_manifest = self
@@ -588,7 +625,7 @@ where
                         source_path: &request.source_workbench_path,
                         destination_workbench_id: &request.destination_workbench_id,
                         destination_path: &request.destination_workbench_path,
-                        snapshot_id: snapshot.snapshot_id,
+                        source,
                     })
                     .map_err(|source| WorkbenchLifecycleError::ProjectionInvalid {
                         context: "facade supplied invalid restore provenance",
@@ -610,9 +647,7 @@ where
                     operation_id: identities.operation_id,
                     source_workbench: source_workspace.workbench,
                     source_workspace_incarnation_id: source_workspace.workspace_incarnation_id,
-                    source: wire::RestoreSource::Snapshot(wire::SnapshotSelector::Id(
-                        snapshot.snapshot_id,
-                    )),
+                    source: wire_restore_source(source),
                     destination_workbench: destination_workbench.clone(),
                     destination_workspace_incarnation_id: identities
                         .destination_workspace_incarnation_id,
@@ -629,7 +664,7 @@ where
                     destination_restore_manifest_identity,
                     workflow_request: RestoreWorkflowRequest::Fresh(prepare),
                     canonical_restore_manifest: canonical_manifest,
-                    snapshot_id: snapshot.snapshot_id,
+                    source,
                 }
             }
         };
@@ -651,7 +686,7 @@ where
         let destination_restore_manifest_identity =
             invocation.destination_restore_manifest_identity;
         let canonical_restore_manifest = invocation.canonical_restore_manifest;
-        let snapshot_id = invocation.snapshot_id;
+        let source = invocation.source;
         let max_artifact_bytes = self.options.max_artifact_bytes;
         let workflow = self
             .client
@@ -670,7 +705,7 @@ where
                         &source_workbench_path,
                         &destination_workbench_id,
                         &destination_workbench_path,
-                        snapshot_id,
+                        source,
                         destination_restore_manifest_identity,
                         &canonical_restore_manifest,
                         max_artifact_bytes,
@@ -679,13 +714,26 @@ where
                 },
             )
             .map_err(WorkbenchLifecycleError::from)?;
-        let source_snapshot_read_version =
-            workflow.source_snapshot_read_version.ok_or_else(|| {
-                protocol_mismatch("snapshot restore operation omitted its durable read version")
-            })?;
+        // Present exactly for snapshot restores: the shard reports no read
+        // version for a commit, and the protocol refuses the other pairings.
+        let source_snapshot_read_version = match source {
+            WorkbenchRestoreSource::Snapshot { .. } => {
+                Some(workflow.source_snapshot_read_version.ok_or_else(|| {
+                    protocol_mismatch("snapshot restore operation omitted its durable read version")
+                })?)
+            }
+            WorkbenchRestoreSource::Commit { .. } => {
+                if workflow.source_snapshot_read_version.is_some() {
+                    return Err(protocol_mismatch(
+                        "commit restore operation reported a snapshot read version",
+                    ));
+                }
+                None
+            }
+        };
         Ok(WorkbenchRestoreOutcome {
             operation_id: identities.operation_id.0,
-            snapshot_id,
+            source,
             source_snapshot_read_version,
             destination_workspace_revision: workflow.result.destination.workspace_revision,
             idempotent_replay: workflow.replayed,
@@ -1000,7 +1048,7 @@ fn build_restore_destination_plan<Projection: WorkbenchProjection>(
     source_workbench_path: &str,
     destination_workbench_id: &WorkbenchId,
     destination_workbench_path: &str,
-    snapshot_id: u64,
+    restore_source: WorkbenchRestoreSource,
     destination_restore_manifest_identity: wire::RestoreManifestIdentity,
     canonical_restore_manifest: &[u8],
     max_artifact_bytes: usize,
@@ -1036,7 +1084,7 @@ fn build_restore_destination_plan<Projection: WorkbenchProjection>(
         || restore.source_path != source_workbench_path
         || restore.destination_workbench_id != *destination_workbench_id
         || restore.destination_path != destination_workbench_path
-        || restore.snapshot_id != snapshot_id
+        || restore.source != restore_source
         || preparation.destination_workbench.as_str() != destination_workbench_id.as_str()
     {
         return Err(ClientError::ResponseMismatch(
@@ -1162,13 +1210,40 @@ fn snapshot_selector(
 /// Restore operation identity stores the point-resolved numeric snapshot id.
 /// An alias is presentation input and must not be resolved again during cold
 /// destination recovery: it may have expired or been repointed since Begin.
-fn restore_selector_matches_durable_snapshot(
-    selector: &WorkbenchSnapshotSelector,
-    snapshot_id: u64,
+/// Does the durable restore manifest describe the restore being asked for?
+///
+/// An alias selector stays permissive: the alias may have been resolved to a
+/// concrete snapshot by the in-flight operation. A commit is exact, because
+/// the caller named a specific durable anchor.
+fn restore_origin_matches_durable_source(
+    origin: &WorkbenchRestoreOrigin,
+    source: WorkbenchRestoreSource,
 ) -> bool {
-    match selector {
-        WorkbenchSnapshotSelector::Id(requested) => *requested == snapshot_id,
-        WorkbenchSnapshotSelector::Name(_) => true,
+    match (origin, source) {
+        (
+            WorkbenchRestoreOrigin::Snapshot(WorkbenchSnapshotSelector::Id(requested)),
+            WorkbenchRestoreSource::Snapshot { snapshot_id },
+        ) => *requested == snapshot_id,
+        (
+            WorkbenchRestoreOrigin::Snapshot(WorkbenchSnapshotSelector::Name(_)),
+            WorkbenchRestoreSource::Snapshot { .. },
+        ) => true,
+        (
+            WorkbenchRestoreOrigin::Commit(requested),
+            WorkbenchRestoreSource::Commit { commit_id },
+        ) => *requested == commit_id,
+        _ => false,
+    }
+}
+
+fn wire_restore_source(source: WorkbenchRestoreSource) -> wire::RestoreSource {
+    match source {
+        WorkbenchRestoreSource::Snapshot { snapshot_id } => {
+            wire::RestoreSource::Snapshot(wire::SnapshotSelector::Id(snapshot_id))
+        }
+        WorkbenchRestoreSource::Commit { commit_id } => {
+            wire::RestoreSource::Commit(wire::CommitIdentity(commit_id))
+        }
     }
 }
 
@@ -1268,21 +1343,56 @@ mod tests {
 
     #[test]
     fn restore_alias_recovery_converges_on_durable_numeric_snapshot() {
-        assert!(restore_selector_matches_durable_snapshot(
-            &WorkbenchSnapshotSelector::Name("original-alias".to_owned()),
-            7,
+        let snapshot = WorkbenchRestoreSource::Snapshot { snapshot_id: 7 };
+        assert!(restore_origin_matches_durable_source(
+            &WorkbenchRestoreOrigin::Snapshot(WorkbenchSnapshotSelector::Name(
+                "original-alias".to_owned()
+            )),
+            snapshot,
         ));
-        assert!(restore_selector_matches_durable_snapshot(
-            &WorkbenchSnapshotSelector::Name("repointed-alias".to_owned()),
-            7,
+        assert!(restore_origin_matches_durable_source(
+            &WorkbenchRestoreOrigin::Snapshot(WorkbenchSnapshotSelector::Name(
+                "repointed-alias".to_owned()
+            )),
+            snapshot,
         ));
-        assert!(restore_selector_matches_durable_snapshot(
-            &WorkbenchSnapshotSelector::Id(7),
-            7,
+        assert!(restore_origin_matches_durable_source(
+            &WorkbenchRestoreOrigin::Snapshot(WorkbenchSnapshotSelector::Id(7)),
+            snapshot,
         ));
-        assert!(!restore_selector_matches_durable_snapshot(
-            &WorkbenchSnapshotSelector::Id(8),
-            7,
+        assert!(!restore_origin_matches_durable_source(
+            &WorkbenchRestoreOrigin::Snapshot(WorkbenchSnapshotSelector::Id(8)),
+            snapshot,
+        ));
+    }
+
+    #[test]
+    fn restore_commit_recovery_is_exact_and_never_matches_a_snapshot() {
+        let commit = WorkbenchRestoreSource::Commit {
+            commit_id: [0xab; 32],
+        };
+        assert!(restore_origin_matches_durable_source(
+            &WorkbenchRestoreOrigin::Commit([0xab; 32]),
+            commit,
+        ));
+        assert!(!restore_origin_matches_durable_source(
+            &WorkbenchRestoreOrigin::Commit([0xcd; 32]),
+            commit,
+        ));
+        // A restore in flight from a snapshot must never be adopted by a
+        // caller asking for a commit, or the replay would answer a different
+        // question from the one asked.
+        assert!(!restore_origin_matches_durable_source(
+            &WorkbenchRestoreOrigin::Commit([0xab; 32]),
+            WorkbenchRestoreSource::Snapshot { snapshot_id: 7 },
+        ));
+        assert!(!restore_origin_matches_durable_source(
+            &WorkbenchRestoreOrigin::Snapshot(WorkbenchSnapshotSelector::Id(7)),
+            commit,
+        ));
+        assert!(!restore_origin_matches_durable_source(
+            &WorkbenchRestoreOrigin::Snapshot(WorkbenchSnapshotSelector::Name("a".to_owned())),
+            commit,
         ));
     }
 }

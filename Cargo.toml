@@ -9,6 +9,7 @@ members = [
     "crates/nokv-object",
     "crates/nokv-client",
     "crates/nokv-agent",
+    "crates/nokv-workbench-projection",
     "crates/nokv-server",
     "crates/nokv",
     "crates/nokv-python",
@@ -32,6 +33,7 @@ nokv-meta-store = { path = "crates/nokv-meta-store", version = "0.1.0" }
 nokv-meta-holt = { path = "crates/nokv-meta-holt", version = "0.1.0" }
 nokv-meta = { path = "crates/nokv-meta", version = "0.1.0" }
 nokv-control = { path = "crates/nokv-control", version = "0.1.0" }
+nokv-workbench-projection = { path = "crates/nokv-workbench-projection", version = "0.1.0" }
 nokv-object = { path = "crates/nokv-object", version = "0.1.0" }
 nokv-client = { path = "crates/nokv-client", version = "0.1.0" }
 nokv-agent = { path = "crates/nokv-agent", version = "0.1.0" }

@@ -320,6 +320,7 @@
     },
     "workbench_restore": {
       "cleanup_pending": false,
+      "commit_id": null,
       "destination_generation": 1,
       "destination_workbench_id": "wb-restored",
       "idempotent_replay": false,

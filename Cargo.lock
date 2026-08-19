@@ -1280,6 +1280,7 @@ dependencies = [
  "nokv-protocol",
  "nokv-server",
  "nokv-types",
+ "nokv-workbench-projection",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1390,10 +1391,14 @@ dependencies = [
 name = "nokv-python"
 version = "0.11.0"
 dependencies = [
+ "nokv-agent",
  "nokv-client",
  "nokv-object",
  "nokv-protocol",
+ "nokv-types",
+ "nokv-workbench-projection",
  "pyo3",
+ "serde_json",
  "tempfile",
 ]
 
@@ -1417,6 +1422,15 @@ dependencies = [
 [[package]]
 name = "nokv-types"
 version = "0.1.0"
+
+[[package]]
+name = "nokv-workbench-projection"
+version = "0.1.0"
+dependencies = [
+ "nokv-agent",
+ "nokv-client",
+ "nokv-types",
+]
 
 [[package]]
 name = "num-bigint-dig"
