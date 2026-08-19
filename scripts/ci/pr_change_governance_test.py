@@ -16,6 +16,7 @@ from pr_change_governance import (  # noqa: E402
     GitHubApi,
     GovernanceInputError,
     evaluate_policy,
+    review_trigger_summary,
 )
 
 
@@ -119,6 +120,19 @@ class ChangeGovernancePolicyTest(unittest.TestCase):
         self.assertIn(".github/CODEOWNERS", workflow)
         self.assertIn("NOKV_CODEOWNERS_PATH", workflow)
 
+    def test_workflow_avoids_redundant_review_request_events(self) -> None:
+        workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("      - synchronize", workflow)
+        self.assertIn("  pull_request_review:", workflow)
+        self.assertIn("    types: [submitted, edited, dismissed]", workflow)
+        self.assertNotIn("      - review_requested", workflow)
+        self.assertNotIn("      - review_request_removed", workflow)
+        self.assertIn("    name: governed-change-review", workflow)
+        self.assertIn(
+            "STATUS_CONTEXT: change-governance/large-change-review", workflow
+        )
+
     def test_exact_threshold_does_not_trigger_large_change_rule(self) -> None:
         decision = evaluate_policy(pull_request(additions=3_000, deletions=2_000), [])
 
@@ -149,6 +163,44 @@ class ChangeGovernancePolicyTest(unittest.TestCase):
         self.assertEqual(decision.required_approvals, 1)
         self.assertEqual(decision.current_approval_logins, (CORE_TWO,))
         self.assertTrue(decision.allowed)
+
+    def test_review_trigger_summary_names_the_independent_policy_reasons(self) -> None:
+        ordinary = evaluate_policy(
+            pull_request(additions=10),
+            [],
+            changed_paths=("crates/nokv/src/main.rs",),
+        )
+        large = evaluate_policy(
+            pull_request(additions=5_001),
+            [],
+            head_introducer_logins=("contributor",),
+        )
+        sensitive = evaluate_policy(
+            pull_request(additions=10),
+            [],
+            head_introducer_logins=("contributor",),
+            changed_paths=(".github/workflows/rust.yml",),
+        )
+        both = evaluate_policy(
+            pull_request(additions=5_001),
+            [],
+            head_introducer_logins=("contributor",),
+            changed_paths=(".github/workflows/rust.yml",),
+        )
+
+        self.assertEqual(review_trigger_summary(ordinary), "none")
+        self.assertEqual(
+            review_trigger_summary(large), "large change (5,001 > 5,000 lines)"
+        )
+        self.assertEqual(
+            review_trigger_summary(sensitive),
+            "protected CI trust-root change (1 path)",
+        )
+        self.assertEqual(
+            review_trigger_summary(both),
+            "large change (5,001 > 5,000 lines) and "
+            "protected CI trust-root change (1 path)",
+        )
 
     def test_sensitive_workbench_gate_change_rejects_pusher_approval(self) -> None:
         decision = evaluate_policy(

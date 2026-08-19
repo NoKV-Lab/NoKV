@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail closed when a large pull request lacks core-maintainer approval."""
+"""Fail closed when a governed pull request lacks core-maintainer approval."""
 
 from __future__ import annotations
 
@@ -356,6 +356,22 @@ def governance_sensitive_paths(changed_paths: tuple[str, ...]) -> tuple[str, ...
     return tuple(sorted(sensitive))
 
 
+def review_trigger_summary(decision: GovernanceDecision) -> str:
+    triggers = []
+    if decision.is_large_change:
+        triggers.append(
+            f"large change ({decision.changed_lines:,} > "
+            f"{decision.threshold:,} lines)"
+        )
+    if decision.is_governance_sensitive:
+        path_count = len(decision.governance_sensitive_paths)
+        noun = "path" if path_count == 1 else "paths"
+        triggers.append(
+            f"protected CI trust-root change ({path_count:,} {noun})"
+        )
+    return " and ".join(triggers) or "none"
+
+
 def evaluate_policy(
     pull_request: dict[str, Any],
     reviews: list[dict[str, Any]],
@@ -417,6 +433,9 @@ def _write_step_summary(decision: GovernanceDecision) -> None:
             f"({decision.additions:,} additions + {decision.deletions:,} deletions)\n"
         )
         summary.write(f"- Changed files: **{decision.changed_files:,}**\n")
+        summary.write(
+            f"- Independent-review trigger: **{review_trigger_summary(decision)}**\n"
+        )
         sensitive_text = ", ".join(decision.governance_sensitive_paths) or "none"
         summary.write(f"- Governance-sensitive paths: **{sensitive_text}**\n")
         summary.write(f"- Current-head introducer: **{introducer_text}**\n")
@@ -509,11 +528,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    print(json.dumps(asdict(decision), sort_keys=True))
+    decision_payload = asdict(decision)
+    decision_payload["review_trigger"] = review_trigger_summary(decision)
+    print(json.dumps(decision_payload, sort_keys=True))
     _write_step_summary(decision)
     if decision.allowed:
         print(
-            f"Change governance passed: {decision.changed_lines} changed lines, "
+            "Change governance passed: "
+            f"review trigger {review_trigger_summary(decision)}, "
+            f"{decision.changed_lines} changed lines, "
             f"{len(decision.current_approval_logins)} current core maintainer approvals."
         )
         return 0
@@ -521,9 +544,10 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "::error title=Governed change lacks current core maintainer approval::"
         + _annotation(
-            f"PR #{args.pull_request} changes {decision.changed_lines} lines and "
-            f"touches {len(decision.governance_sensitive_paths)} protected CI trust-root "
-            f"paths, but has only "
+            f"PR #{args.pull_request} requires review because of "
+            f"{review_trigger_summary(decision)}. It changes "
+            f"{decision.changed_lines:,} lines; the large-change threshold is more than "
+            f"{decision.threshold:,}. It has only "
             f"{len(decision.current_approval_logins)} eligible approvals on head "
             f"{decision.head_sha}. The author, current-head introducer, bots, non-core "
             "reviewers, dismissed reviews, duplicate reviewers, and approvals on "

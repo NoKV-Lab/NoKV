@@ -12,8 +12,6 @@ on:
       - synchronize
       - ready_for_review
       - converted_to_draft
-      - review_requested
-      - review_request_removed
   pull_request_review:
     types: [submitted, edited, dismissed]
 
@@ -31,7 +29,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Keep the job id and custom status context stable for branch-protection
+  # compatibility. The visible job name reflects both policy triggers.
   large-change-review:
+    name: governed-change-review
     if: github.event.pull_request != null && github.event.pull_request.base.ref == 'main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -67,7 +68,7 @@ jobs:
               --jq .content | base64 --decode >"$destination"
           }
 
-          post_status pending "Evaluating size and protected CI trust-root review policy."
+          post_status pending "Evaluating governed-change reviewer policy."
 
           set +e
           (
@@ -97,8 +98,8 @@ jobs:
           set -e
 
           if [[ "$policy_result" -eq 0 ]]; then
-            post_status success "Change-size and CI trust-root reviewer policy passed."
+            post_status success "Governed-change reviewer policy passed."
           else
-            post_status failure "Change policy failed or could not be evaluated."
+            post_status failure "Governed-change policy failed or could not be evaluated."
           fi
           exit "$policy_result"

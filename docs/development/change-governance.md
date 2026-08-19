@@ -14,9 +14,11 @@ SDK, or Workbench rewrite.
 The `main` branch must enforce all of the following through GitHub branch
 protection:
 
-- pull requests with 5,000 or fewer changed lines do not require review;
-- a pull request with more than 5,000 changed lines requires one core
-  maintainer approval on its exact current head;
+- an ordinary pull request with 5,000 or fewer changed lines does not require
+  review;
+- a pull request with more than 5,000 changed lines, or one that changes a
+  protected CI trust root, requires one core maintainer approval on its exact
+  current head;
 - the current-head pusher cannot supply that approval;
 - unresolved review conversations block merge;
 - administrators are subject to the same restrictions;
@@ -28,11 +30,20 @@ dismissed reviews, requested changes, and approvals against an older head do
 not count. Generated files, fixtures, documentation, and deletions are not
 exempt.
 
+Protected CI trust roots are the paths owned by both core maintainers in
+[`.github/CODEOWNERS`](../../.github/CODEOWNERS): workflow and reusable-action
+definitions, governance and qualification scripts, CODEOWNERS itself, and the
+protected release test. Their review requirement is independent of change
+size because even a one-line edit can weaken the checks that authorize a
+merge or release.
+
 The `change-governance/large-change-review` status enforces the conditional
-review rule. It identifies the actor who introduced the current head from the
+review rule for both large changes and protected CI trust-root changes. Its
+legacy name remains stable because branch protection requires that exact
+context. It identifies the actor who introduced the current head from the
 earliest GitHub Actions `pull_request` run for that head. Missing, malformed,
 paginated-beyond-bound, or unavailable PR, review, workflow-run, or pusher data
-fails closed for changes above the threshold.
+fails closed for every governed change.
 
 ## Trust Boundary
 
@@ -67,11 +78,11 @@ them. This ordering avoids a fail-open migration window.
 
 ## Review Expectations
 
-For a change above the threshold, one non-pusher core maintainer approval is a
-minimum gate, not evidence that a broad rewrite is reviewable. Split a change
-when it crosses logical package or lifecycle boundaries, hides behavior changes
-among mechanical churn, or cannot be reproduced and reviewed within one focused
-diff. For storage changes, reviewers must apply the
+For a governed change, one non-pusher core maintainer approval is a minimum
+gate, not evidence that a broad rewrite is reviewable. Split a change when it
+crosses logical package or lifecycle boundaries, hides behavior changes among
+mechanical churn, or cannot be reproduced and reviewed within one focused diff.
+For storage changes, reviewers must apply the
 [PR Review Checklist](./pr_review_checklist.md) and retain exact recovery,
 failure, retry, retention, and downstream Workbench evidence.
 
