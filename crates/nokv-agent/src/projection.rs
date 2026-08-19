@@ -44,13 +44,18 @@ const RESTORE_MANIFEST_FIELDS: [&str; 8] = [
     "source_workbench_id",
 ];
 const RESTORED_FROM_FIELDS: [&str; 3] = ["path", "snapshot_id", "workbench_id"];
-const RESTORE_MANIFEST_V2_FIELDS: [&str; 6] = [
+// v2 changes exactly one thing about v1: the snapshot id becomes a
+// discriminated source that can also name a commit. Every other field keeps
+// its v1 place, because a durable format that moves fields it did not need
+// to move breaks readers for no reason.
+const RESTORE_MANIFEST_V2_FIELDS: [&str; 7] = [
     "destination_path",
     "destination_workbench_id",
     "operation_id",
     "restored_from",
     "schema",
     "source_path",
+    "source_workbench_id",
 ];
 const RESTORED_FROM_V2_FIELDS: [&str; 3] = ["path", "source", "workbench_id"];
 
@@ -417,6 +422,7 @@ pub fn build_restore_manifest_v2(
             "path": source_path,
             "source": source_value,
         },
+        "source_workbench_id": source_workbench_id.as_str(),
         "source_path": source_path,
         "destination_workbench_id": destination_workbench_id.as_str(),
         "destination_path": destination_path,
@@ -479,6 +485,10 @@ pub fn verify_restore_manifest_v2(
         "operation_id",
         require_string(object, "operation_id", "restore manifest")?,
     )?;
+    let source_workbench_id = WorkbenchId::new(
+        require_string(object, "source_workbench_id", "restore manifest")?.to_owned(),
+    )
+    .map_err(|error| ProjectionError::new(format!("invalid source_workbench_id: {error}")))?;
     let source_path = require_string(object, "source_path", "restore manifest")?.to_owned();
     let destination_workbench_id = WorkbenchId::new(
         require_string(object, "destination_workbench_id", "restore manifest")?.to_owned(),
@@ -497,10 +507,15 @@ pub fn verify_restore_manifest_v2(
         restored_from,
         &RESTORED_FROM_V2_FIELDS,
     )?;
-    let source_workbench_id = WorkbenchId::new(
-        require_string(restored_from, "workbench_id", "restored_from")?.to_owned(),
-    )
-    .map_err(|error| ProjectionError::new(format!("invalid source_workbench_id: {error}")))?;
+    // restored_from restates the source so the envelope reads on its own; the
+    // two statements have to agree or the manifest contradicts itself.
+    if require_string(restored_from, "workbench_id", "restored_from")?
+        != source_workbench_id.as_str()
+    {
+        return Err(ProjectionError::new(
+            "restore manifest restored_from disagrees with its source workbench",
+        ));
+    }
     if source_workbench_id == destination_workbench_id {
         return Err(ProjectionError::new(
             "restore destination workbench must differ from its source",

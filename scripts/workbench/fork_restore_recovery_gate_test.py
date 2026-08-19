@@ -141,9 +141,8 @@ class ForkRestoreRecoveryGateTest(unittest.TestCase):
 
     def test_restore_manifest_requires_the_complete_path_native_identity(self) -> None:
         manifest = {
-            "schema": "nokv.workbench.restore_manifest.v1",
+            "schema": "nokv.workbench.restore_manifest.v2",
             "operation_id": "11" * 16,
-            "snapshot_id": 7,
             "source_workbench_id": "source",
             "source_path": "/agents/materials/wb/source",
             "destination_workbench_id": "destination",
@@ -151,18 +150,36 @@ class ForkRestoreRecoveryGateTest(unittest.TestCase):
             "restored_from": {
                 "workbench_id": "source",
                 "path": "/agents/materials/wb/source",
-                "snapshot_id": 7,
+                "source": {"kind": "snapshot", "snapshot_id": 7},
             },
         }
         validate_restore_manifest(manifest, "source", "destination")
-        malformed = copy.deepcopy(manifest)
-        malformed["restored_from"]["snapshot_id"] = 8
-        with self.assertRaisesRegex(WorkflowFailure, "exact fork identities"):
-            validate_restore_manifest(malformed, "source", "destination")
+        # v1 carried the snapshot id twice and the gate cross-checked the two
+        # copies. v2 carries it once, so that particular mutation is no longer
+        # detectable from inside the document -- and does not need to be: the
+        # manifest is content-addressed, so an altered byte changes its digest
+        # and therefore the revision the restore is bound to. What remains
+        # worth asserting is everything the document can still contradict.
+        for mutate, why in (
+            (lambda m: m["restored_from"].__setitem__("workbench_id", "other"),
+             "restored_from names a different source workbench"),
+            (lambda m: m["restored_from"].__setitem__("path", "/agents/materials/wb/other"),
+             "restored_from names a different source path"),
+            (lambda m: m["restored_from"]["source"].__setitem__("snapshot_id", 0),
+             "a zero snapshot id is not a snapshot"),
+            (lambda m: m["restored_from"].__setitem__("source", {"kind": "commit", "commit_id": "ab" * 32}),
+             "a commit source is different provenance, not another spelling"),
+            (lambda m: m["restored_from"].__setitem__("source", {"kind": "snapshot"}),
+             "a snapshot source without its id"),
+        ):
+            malformed = copy.deepcopy(manifest)
+            mutate(malformed)
+            with self.assertRaisesRegex(WorkflowFailure, "exact fork identities", msg=why):
+                validate_restore_manifest(malformed, "source", "destination")
 
     def test_every_restore_adds_exactly_two_destination_manifests(self) -> None:
         self.assertEqual(RESTORE_MANIFEST_OBJECTS, 2)
-        restore = {"schema": "nokv.workbench.restore_manifest.v1"}
+        restore = {"schema": "nokv.workbench.restore_manifest.v2"}
         run_manifest = {"schema": "nokv.workbench.run_manifest.v1"}
         self.assertEqual(
             classify_manifest_objects({"k/a": run_manifest, "k/b": restore}, "fork"),
