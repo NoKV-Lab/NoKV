@@ -21,6 +21,7 @@ const RUN_MANIFEST_PROJECTION_INPUT_DOMAIN: &[u8] =
     b"nokv.workbench.run_manifest.projection_input.v1\0";
 const RESTORED_CONTENT_DIGEST_DOMAIN: &[u8] = b"nokv.workbench.restored_content_digest.v1\0";
 pub const RESTORE_MANIFEST_V1_SCHEMA: &str = "nokv.workbench.restore_manifest.v1";
+pub const RESTORE_MANIFEST_V2_SCHEMA: &str = "nokv.workbench.restore_manifest.v2";
 
 const RUN_MANIFEST_FIELDS: [&str; 8] = [
     "commit_identity",
@@ -43,6 +44,15 @@ const RESTORE_MANIFEST_FIELDS: [&str; 8] = [
     "source_workbench_id",
 ];
 const RESTORED_FROM_FIELDS: [&str; 3] = ["path", "snapshot_id", "workbench_id"];
+const RESTORE_MANIFEST_V2_FIELDS: [&str; 6] = [
+    "destination_path",
+    "destination_workbench_id",
+    "operation_id",
+    "restored_from",
+    "schema",
+    "source_path",
+];
+const RESTORED_FROM_V2_FIELDS: [&str; 3] = ["path", "source", "workbench_id"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectionError {
@@ -95,6 +105,39 @@ pub struct VerifiedRestoreManifestV1 {
 pub fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, ProjectionError> {
     serde_json::to_vec(&canonical_json_value(value))
         .map_err(|error| ProjectionError::new(format!("canonical JSON encoding failed: {error}")))
+}
+
+/// The canonical inputs one Workbench commit is built from.
+///
+/// Every caller -- CLI, MCP, Python SDK -- must derive these the same way:
+/// the manifest digest and the stable commit id both feed the durable commit
+/// identity and the operation's idempotency, so two callers that shape them
+/// differently would write two commits for one intent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkbenchCommitInputs {
+    pub canonical_manifest: Vec<u8>,
+    pub manifest_digest_uri: String,
+    pub stable_commit_id: [u8; 32],
+}
+
+/// Shapes the canonical inputs for one Workbench commit.
+pub fn workbench_commit_inputs(
+    workbench_id: &WorkbenchId,
+    manifest: &Value,
+    content_digest_uri: &str,
+) -> Result<WorkbenchCommitInputs, ProjectionError> {
+    if !manifest.is_object() {
+        return Err(ProjectionError::new("commit manifest must be an object"));
+    }
+    let canonical_manifest = canonical_json_bytes(manifest)?;
+    let manifest_digest_uri = digest_uri(&canonical_manifest);
+    let stable_commit_id =
+        workbench_commit_identity(workbench_id, content_digest_uri, &manifest_digest_uri);
+    Ok(WorkbenchCommitInputs {
+        canonical_manifest,
+        manifest_digest_uri,
+        stable_commit_id,
+    })
 }
 
 pub fn workbench_commit_identity(
@@ -303,6 +346,223 @@ pub fn restore_effective_content_digest_uri_v1(
     hasher.update(materialized_member_digest);
     let digest: [u8; 32] = hasher.finalize().into();
     Ok(format!("sha256:{}", lowercase_hex(&digest)))
+}
+
+/// Where a restore read its frozen state from.
+///
+/// A snapshot is a lease and expires; a commit is durable. A restore manifest
+/// has to say which one it used, or a replayed restore cannot tell whether it
+/// is the same restore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreManifestSource {
+    Snapshot { snapshot_id: u64 },
+    Commit { commit_id: [u8; 32] },
+}
+
+/// A verified restore manifest of either schema version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedRestoreManifest {
+    pub operation_id: [u8; 16],
+    pub source_workbench_id: WorkbenchId,
+    pub source_path: String,
+    pub destination_workbench_id: WorkbenchId,
+    pub destination_path: String,
+    pub source: RestoreManifestSource,
+    pub canonical_envelope: Vec<u8>,
+    pub envelope_digest_uri: String,
+}
+
+/// Builds the v2 restore manifest, which can name either source.
+pub fn build_restore_manifest_v2(
+    operation_id: [u8; 16],
+    source_workbench_id: &WorkbenchId,
+    source_path: &str,
+    destination_workbench_id: &WorkbenchId,
+    destination_path: &str,
+    source: RestoreManifestSource,
+) -> Result<Vec<u8>, ProjectionError> {
+    validate_presentation_path("source_path", source_path)?;
+    validate_presentation_path("destination_path", destination_path)?;
+    if source_workbench_id == destination_workbench_id {
+        return Err(ProjectionError::new(
+            "restore destination workbench must differ from its source",
+        ));
+    }
+    let source_value = match source {
+        RestoreManifestSource::Snapshot { snapshot_id } => {
+            if snapshot_id == 0 {
+                return Err(ProjectionError::new(
+                    "restore snapshot_id must be greater than zero",
+                ));
+            }
+            json!({ "kind": "snapshot", "snapshot_id": snapshot_id })
+        }
+        RestoreManifestSource::Commit { commit_id } => {
+            if commit_id == [0u8; 32] {
+                return Err(ProjectionError::new("restore commit_id must be non-zero"));
+            }
+            json!({ "kind": "commit", "commit_id": lowercase_hex(&commit_id) })
+        }
+    };
+    let envelope = json!({
+        "schema": RESTORE_MANIFEST_V2_SCHEMA,
+        "operation_id": lowercase_hex(&operation_id),
+        "restored_from": {
+            "workbench_id": source_workbench_id.as_str(),
+            "path": source_path,
+            "source": source_value,
+        },
+        "source_path": source_path,
+        "destination_workbench_id": destination_workbench_id.as_str(),
+        "destination_path": destination_path,
+    });
+    let bytes = canonical_json_bytes(&envelope)?;
+    verify_restore_manifest(&bytes)?;
+    Ok(bytes)
+}
+
+/// Verifies a restore manifest of either schema version.
+///
+/// v1 envelopes stay readable: they are durable artifacts inside workbenches
+/// that were restored before v2 existed.
+pub fn verify_restore_manifest(bytes: &[u8]) -> Result<VerifiedRestoreManifest, ProjectionError> {
+    let envelope: Value = serde_json::from_slice(bytes).map_err(|error| {
+        ProjectionError::new(format!("restore manifest is not valid JSON: {error}"))
+    })?;
+    let schema = envelope
+        .get("schema")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProjectionError::new("restore manifest schema is required"))?;
+    if schema == RESTORE_MANIFEST_V1_SCHEMA {
+        let verified = verify_restore_manifest_v1(bytes)?;
+        return Ok(VerifiedRestoreManifest {
+            operation_id: verified.operation_id,
+            source_workbench_id: verified.source_workbench_id,
+            source_path: verified.source_path,
+            destination_workbench_id: verified.destination_workbench_id,
+            destination_path: verified.destination_path,
+            source: RestoreManifestSource::Snapshot {
+                snapshot_id: verified.snapshot_id,
+            },
+            canonical_envelope: verified.canonical_envelope,
+            envelope_digest_uri: verified.envelope_digest_uri,
+        });
+    }
+    verify_restore_manifest_v2(bytes)
+}
+
+/// Verifies exactly the v2 schema.
+pub fn verify_restore_manifest_v2(
+    bytes: &[u8],
+) -> Result<VerifiedRestoreManifest, ProjectionError> {
+    let envelope: Value = serde_json::from_slice(bytes).map_err(|error| {
+        ProjectionError::new(format!("restore manifest is not valid JSON: {error}"))
+    })?;
+    require_canonical_bytes("restore manifest", bytes, &envelope)?;
+    let object = exact_object("restore manifest", &envelope, &RESTORE_MANIFEST_V2_FIELDS)?;
+    require_string(object, "schema", "restore manifest").and_then(|schema| {
+        require_equal(
+            "restore manifest schema",
+            schema,
+            RESTORE_MANIFEST_V2_SCHEMA,
+        )
+    })?;
+    let operation_id = decode_lowercase_hex::<16>(
+        "operation_id",
+        require_string(object, "operation_id", "restore manifest")?,
+    )?;
+    let source_path = require_string(object, "source_path", "restore manifest")?.to_owned();
+    let destination_workbench_id = WorkbenchId::new(
+        require_string(object, "destination_workbench_id", "restore manifest")?.to_owned(),
+    )
+    .map_err(|error| ProjectionError::new(format!("invalid destination_workbench_id: {error}")))?;
+    let destination_path =
+        require_string(object, "destination_path", "restore manifest")?.to_owned();
+    validate_presentation_path("source_path", &source_path)?;
+    validate_presentation_path("destination_path", &destination_path)?;
+
+    let restored_from = object
+        .get("restored_from")
+        .ok_or_else(|| ProjectionError::new("restore manifest restored_from is required"))?;
+    let restored_from = exact_object(
+        "restore manifest restored_from",
+        restored_from,
+        &RESTORED_FROM_V2_FIELDS,
+    )?;
+    let source_workbench_id = WorkbenchId::new(
+        require_string(restored_from, "workbench_id", "restored_from")?.to_owned(),
+    )
+    .map_err(|error| ProjectionError::new(format!("invalid source_workbench_id: {error}")))?;
+    if source_workbench_id == destination_workbench_id {
+        return Err(ProjectionError::new(
+            "restore destination workbench must differ from its source",
+        ));
+    }
+    if require_string(restored_from, "path", "restored_from")? != source_path {
+        return Err(ProjectionError::new(
+            "restore manifest restored_from disagrees with its source path",
+        ));
+    }
+    let source_object = restored_from
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ProjectionError::new("restored_from source must be an object"))?;
+    let kind = source_object
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProjectionError::new("restored_from source kind is required"))?;
+    let source = match kind {
+        "snapshot" => {
+            if source_object.len() != 2 {
+                return Err(ProjectionError::new(
+                    "a snapshot source carries exactly kind and snapshot_id",
+                ));
+            }
+            let snapshot_id = source_object
+                .get("snapshot_id")
+                .and_then(Value::as_u64)
+                .filter(|snapshot_id| *snapshot_id != 0)
+                .ok_or_else(|| {
+                    ProjectionError::new("restore snapshot_id must be a positive integer")
+                })?;
+            RestoreManifestSource::Snapshot { snapshot_id }
+        }
+        "commit" => {
+            if source_object.len() != 2 {
+                return Err(ProjectionError::new(
+                    "a commit source carries exactly kind and commit_id",
+                ));
+            }
+            let commit_id = decode_lowercase_hex::<32>(
+                "commit_id",
+                source_object
+                    .get("commit_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ProjectionError::new("restore commit_id is required"))?,
+            )?;
+            if commit_id == [0u8; 32] {
+                return Err(ProjectionError::new("restore commit_id must be non-zero"));
+            }
+            RestoreManifestSource::Commit { commit_id }
+        }
+        other => {
+            return Err(ProjectionError::new(format!(
+                "unknown restore source kind: {other}"
+            )))
+        }
+    };
+    let canonical_envelope = canonical_json_bytes(&envelope)?;
+    let envelope_digest_uri = digest_uri(&canonical_envelope);
+    Ok(VerifiedRestoreManifest {
+        operation_id,
+        source_workbench_id,
+        source_path,
+        destination_workbench_id,
+        destination_path,
+        source,
+        canonical_envelope,
+        envelope_digest_uri,
+    })
 }
 
 pub fn build_restore_manifest_v1(
@@ -913,6 +1173,123 @@ mod tests {
         assert!(first.starts_with("sha256:"));
         assert_eq!(first.len(), 71);
         assert!(restore_effective_content_digest_uri_v1("not-a-digest", true, [1; 32]).is_err());
+    }
+
+    #[test]
+    fn restore_manifest_v2_records_a_snapshot_source() {
+        let body = build_restore_manifest_v2(
+            [0x11; 16],
+            &workbench("source"),
+            "/agents/test/wb/source",
+            &workbench("destination"),
+            "/agents/test/wb/destination",
+            RestoreManifestSource::Snapshot { snapshot_id: 7 },
+        )
+        .unwrap();
+        let verified = verify_restore_manifest(&body).unwrap();
+        assert_eq!(verified.operation_id, [0x11; 16]);
+        assert_eq!(
+            verified.source,
+            RestoreManifestSource::Snapshot { snapshot_id: 7 }
+        );
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains(RESTORE_MANIFEST_V2_SCHEMA));
+    }
+
+    #[test]
+    fn restore_manifest_v2_records_a_commit_source() {
+        // A commit outlives every snapshot lease, so a citable decision point
+        // has to be restorable from one.
+        let body = build_restore_manifest_v2(
+            [0x22; 16],
+            &workbench("source"),
+            "/agents/test/wb/source",
+            &workbench("destination"),
+            "/agents/test/wb/destination",
+            RestoreManifestSource::Commit {
+                commit_id: [0xab; 32],
+            },
+        )
+        .unwrap();
+        let verified = verify_restore_manifest(&body).unwrap();
+        assert_eq!(
+            verified.source,
+            RestoreManifestSource::Commit {
+                commit_id: [0xab; 32]
+            }
+        );
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains("commit_id"));
+        assert!(!text.contains("snapshot_id"));
+    }
+
+    #[test]
+    fn restore_manifest_v2_distinguishes_the_two_sources() {
+        let snapshot = build_restore_manifest_v2(
+            [0x33; 16],
+            &workbench("source"),
+            "/agents/test/wb/source",
+            &workbench("destination"),
+            "/agents/test/wb/destination",
+            RestoreManifestSource::Snapshot { snapshot_id: 9 },
+        )
+        .unwrap();
+        let commit = build_restore_manifest_v2(
+            [0x33; 16],
+            &workbench("source"),
+            "/agents/test/wb/source",
+            &workbench("destination"),
+            "/agents/test/wb/destination",
+            RestoreManifestSource::Commit {
+                commit_id: [0x09; 32],
+            },
+        )
+        .unwrap();
+        assert_ne!(snapshot, commit, "the source must be part of the envelope");
+    }
+
+    #[test]
+    fn restore_manifest_reader_still_accepts_v1_envelopes() {
+        // v1 manifests are durable artifacts in already-restored workbenches;
+        // the reader has to keep understanding them.
+        let body = build_restore_manifest_v1(
+            [0x44; 16],
+            &workbench("source"),
+            "/agents/test/wb/source",
+            &workbench("destination"),
+            "/agents/test/wb/destination",
+            13,
+        )
+        .unwrap();
+        let verified = verify_restore_manifest(&body).unwrap();
+        assert_eq!(
+            verified.source,
+            RestoreManifestSource::Snapshot { snapshot_id: 13 }
+        );
+    }
+
+    #[test]
+    fn restore_manifest_v2_refuses_a_zero_snapshot_and_a_zero_commit() {
+        assert!(build_restore_manifest_v2(
+            [0x55; 16],
+            &workbench("source"),
+            "/agents/test/wb/source",
+            &workbench("destination"),
+            "/agents/test/wb/destination",
+            RestoreManifestSource::Snapshot { snapshot_id: 0 },
+        )
+        .is_err());
+        assert!(build_restore_manifest_v2(
+            [0x55; 16],
+            &workbench("source"),
+            "/agents/test/wb/source",
+            &workbench("destination"),
+            "/agents/test/wb/destination",
+            RestoreManifestSource::Commit {
+                commit_id: [0x00; 32]
+            },
+        )
+        .is_err());
     }
 
     #[test]

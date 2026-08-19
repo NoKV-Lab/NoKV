@@ -21,6 +21,7 @@ nokv-object.workspace = true
 nokv-protocol.workspace = true
 nokv-server.workspace = true
 nokv-agent.workspace = true
+nokv-workbench-projection.workspace = true
 nokv-types.workspace = true
 sha2.workspace = true
 signal-hook = { workspace = true, optional = true }

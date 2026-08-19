@@ -10,8 +10,8 @@ use std::fmt;
 
 use crate::{
     canonical_json_bytes, projection::digest_uri, projection::hash_length_prefixed,
-    projection::lowercase_hex, scan_agent_grep, verify_run_manifest_v1, workbench_commit_identity,
-    AgentError, AgentGrepScanRequest, GenericGrepScanLimits, WorkbenchToolHandler,
+    projection::lowercase_hex, scan_agent_grep, verify_run_manifest_v1, AgentError,
+    AgentGrepScanRequest, GenericGrepScanLimits, WorkbenchToolHandler,
 };
 use base64::Engine;
 use nokv_types::{
@@ -1439,11 +1439,17 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
             .get("manifest")
             .and_then(Value::as_object)
             .ok_or_else(|| AgentError::invalid_arguments("manifest must be an object"))?;
-        let canonical_manifest = canonical_json(&Value::Object(manifest.clone()))?;
-        let manifest_digest_uri = digest_uri(&canonical_manifest);
         let content_digest_uri = required_string(arguments, "content_digest_uri")?.to_owned();
-        let stable_commit_id =
-            commit_identity(&workbench_id, &content_digest_uri, &manifest_digest_uri);
+        let crate::projection::WorkbenchCommitInputs {
+            canonical_manifest,
+            manifest_digest_uri,
+            stable_commit_id,
+        } = crate::projection::workbench_commit_inputs(
+            &workbench_id,
+            &Value::Object(manifest.clone()),
+            &content_digest_uri,
+        )
+        .map_err(|error| AgentError::invalid_arguments(error.to_string()))?;
         let workbench_path = self.workbench_path(&workbench_id);
         let replace = optional_bool(arguments, "replace")?.unwrap_or(false);
         let outcome = self
@@ -2660,14 +2666,6 @@ fn canonical_json(value: &Value) -> Result<Vec<u8>, AgentError> {
             json!({}),
         )
     })
-}
-
-fn commit_identity(
-    workbench_id: &WorkbenchId,
-    content_digest_uri: &str,
-    manifest_digest_uri: &str,
-) -> [u8; 32] {
-    workbench_commit_identity(workbench_id, content_digest_uri, manifest_digest_uri)
 }
 
 fn snapshot_annotation(arguments: &Value) -> Result<Value, AgentError> {
