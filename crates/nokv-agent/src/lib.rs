@@ -100,7 +100,7 @@ const TOOL_DESCRIPTIONS: [(&str, &str); WORKBENCH_TOOL_COUNT] = [
     ),
     (
         "workbench_restore",
-        "Restore a live snapshot into an absent destination workbench while preserving the source. Staging stays hidden until atomic publication, immutable revisions are reused, and exact retries converge.",
+        "Restore a frozen state into an absent destination workbench while preserving the source. Name either at_snapshot or at_commit; a snapshot is a lease that expires, a commit is durable, so a decision point that must stay citable is restored from its commit. Staging stays hidden until atomic publication, immutable revisions are reused, and exact retries converge.",
     ),
 ];
 

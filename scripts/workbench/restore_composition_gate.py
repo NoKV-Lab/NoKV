@@ -599,7 +599,7 @@ def validate_composition_evidence(evidence: dict[str, Any]) -> None:
     ):
         restore_manifest = _mapping(value, "restore_manifest")
         if (
-            restore_manifest.get("schema") != "nokv.workbench.restore_manifest.v1"
+            restore_manifest.get("schema") != "nokv.workbench.restore_manifest.v2"
             or restore_manifest.get("source_workbench_id") != source
             or restore_manifest.get("destination_workbench_id") != destination
         ):

@@ -10,8 +10,8 @@ use std::fmt;
 
 use crate::{
     canonical_json_bytes, projection::digest_uri, projection::hash_length_prefixed,
-    projection::lowercase_hex, scan_agent_grep, verify_run_manifest_v1, workbench_commit_identity,
-    AgentError, AgentGrepScanRequest, GenericGrepScanLimits, WorkbenchToolHandler,
+    projection::lowercase_hex, scan_agent_grep, verify_run_manifest_v1, AgentError,
+    AgentGrepScanRequest, GenericGrepScanLimits, WorkbenchToolHandler,
 };
 use base64::Engine;
 use nokv_types::{
@@ -601,16 +601,31 @@ pub struct SnapshotRetireOutcome {
 pub struct RestoreRequest {
     pub source_workbench_id: WorkbenchId,
     pub source_workbench_path: String,
-    pub selector: SnapshotSelector,
+    pub origin: RestoreOrigin,
     pub destination_workbench_id: WorkbenchId,
     pub destination_workbench_path: String,
+}
+
+/// What a restore reads its frozen state from.
+///
+/// A snapshot is a lease and expires; a commit is durable. A decision point
+/// that has to stay citable past the lease bound can only be reconstructed
+/// from its commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestoreOrigin {
+    Snapshot(SnapshotSelector),
+    Commit([u8; 32]),
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RestoreOutcome {
     pub operation_id: [u8; 16],
-    pub snapshot_id: u64,
-    pub read_version: u64,
+    /// Present exactly for snapshot restores.
+    pub snapshot_id: Option<u64>,
+    /// Present exactly for snapshot restores.
+    pub read_version: Option<u64>,
+    /// Present exactly for commit restores.
+    pub commit_id: Option<[u8; 32]>,
     pub destination_generation: u64,
     pub idempotent_replay: bool,
 }
@@ -1439,11 +1454,17 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
             .get("manifest")
             .and_then(Value::as_object)
             .ok_or_else(|| AgentError::invalid_arguments("manifest must be an object"))?;
-        let canonical_manifest = canonical_json(&Value::Object(manifest.clone()))?;
-        let manifest_digest_uri = digest_uri(&canonical_manifest);
         let content_digest_uri = required_string(arguments, "content_digest_uri")?.to_owned();
-        let stable_commit_id =
-            commit_identity(&workbench_id, &content_digest_uri, &manifest_digest_uri);
+        let crate::projection::WorkbenchCommitInputs {
+            canonical_manifest,
+            manifest_digest_uri,
+            stable_commit_id,
+        } = crate::projection::workbench_commit_inputs(
+            &workbench_id,
+            &Value::Object(manifest.clone()),
+            &content_digest_uri,
+        )
+        .map_err(|error| AgentError::invalid_arguments(error.to_string()))?;
         let workbench_path = self.workbench_path(&workbench_id);
         let replace = optional_bool(arguments, "replace")?.unwrap_or(false);
         let outcome = self
@@ -1606,17 +1627,34 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
                 "destination_id must differ from id",
             ));
         }
-        let selector = parse_snapshot_selector_value(
-            arguments
-                .get("at_snapshot")
-                .ok_or_else(|| AgentError::invalid_arguments("missing at_snapshot"))?,
-        )?;
+        let origin = match (arguments.get("at_snapshot"), arguments.get("at_commit")) {
+            (Some(_), Some(_)) => {
+                return Err(AgentError::invalid_arguments(
+                    "give at_snapshot or at_commit, not both",
+                ))
+            }
+            (Some(value), None) => RestoreOrigin::Snapshot(parse_snapshot_selector_value(value)?),
+            (None, Some(value)) => {
+                let commit_id = value.as_str().ok_or_else(|| {
+                    AgentError::invalid_arguments("at_commit must be a commit identity string")
+                })?;
+                RestoreOrigin::Commit(
+                    crate::projection::decode_commit_identity(commit_id)
+                        .map_err(|error| AgentError::invalid_arguments(error.to_string()))?,
+                )
+            }
+            (None, None) => {
+                return Err(AgentError::invalid_arguments(
+                    "missing at_snapshot or at_commit",
+                ))
+            }
+        };
         let outcome = self
             .backend
             .restore(RestoreRequest {
                 source_workbench_id: source_workbench_id.clone(),
                 source_workbench_path: self.workbench_path(&source_workbench_id),
-                selector,
+                origin,
                 destination_workbench_id: destination_workbench_id.clone(),
                 destination_workbench_path: self.workbench_path(&destination_workbench_id),
             })
@@ -1647,6 +1685,7 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
             "destination_workbench_id": destination_workbench_id.as_str(),
             "snapshot_id": outcome.snapshot_id,
             "read_version": outcome.read_version,
+            "commit_id": outcome.commit_id.as_ref().map(|id| lowercase_hex(id)),
             "destination_generation": outcome.destination_generation,
             "idempotent_replay": outcome.idempotent_replay,
             "cleanup_pending": false,
@@ -2660,14 +2699,6 @@ fn canonical_json(value: &Value) -> Result<Vec<u8>, AgentError> {
             json!({}),
         )
     })
-}
-
-fn commit_identity(
-    workbench_id: &WorkbenchId,
-    content_digest_uri: &str,
-    manifest_digest_uri: &str,
-) -> [u8; 32] {
-    workbench_commit_identity(workbench_id, content_digest_uri, manifest_digest_uri)
 }
 
 fn snapshot_annotation(arguments: &Value) -> Result<Value, AgentError> {

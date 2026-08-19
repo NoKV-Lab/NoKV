@@ -1114,8 +1114,9 @@ impl WorkbenchBackend for FakeBackend {
         if state.restore_requests.contains(&request) {
             return Ok(RestoreOutcome {
                 operation_id: [0x22; 16],
-                snapshot_id: 1,
-                read_version: 46,
+                snapshot_id: Some(1),
+                read_version: Some(46),
+                commit_id: None,
                 destination_generation: 1,
                 idempotent_replay: true,
             });
@@ -1132,8 +1133,9 @@ impl WorkbenchBackend for FakeBackend {
         state.restore_requests.push(request);
         Ok(RestoreOutcome {
             operation_id: [0x22; 16],
-            snapshot_id: 1,
-            read_version: 46,
+            snapshot_id: Some(1),
+            read_version: Some(46),
+            commit_id: None,
             destination_generation: 1,
             idempotent_replay: false,
         })
