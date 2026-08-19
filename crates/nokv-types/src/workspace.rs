@@ -798,8 +798,31 @@ durable_enum! {
 /// The stored string preserves its exact UTF-8 bytes. `/` is only a component
 /// separator; repeated, leading, and trailing separators are rejected instead
 /// of being normalized away.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NormalizedRelativePath(String);
+
+/// Ordered by component, which is how the metadata store orders these paths.
+///
+/// Keys encode each component with its bytes incremented by one and join
+/// components with a NUL delimiter, so the delimiter sorts below every
+/// component byte and a shorter component wins against a longer one that
+/// extends it. Comparing the joined text instead would disagree whenever a
+/// sibling name is a prefix of another followed by a byte below `/` (0x2f):
+/// `a-b/x` precedes `a/x` as text but follows it in the store. Code that
+/// validates a scan against a cursor -- commit closure construction, for one
+/// -- then rejects rows the scan legitimately produced, so the type carries
+/// the store's order rather than the text order.
+impl Ord for NormalizedRelativePath {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.components().cmp(other.components())
+    }
+}
+
+impl PartialOrd for NormalizedRelativePath {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NormalizedRelativePathError {
@@ -1368,5 +1391,74 @@ mod tests {
                 max: NormalizedRelativePath::MAX_COMPONENTS,
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod path_order_tests {
+    use super::NormalizedRelativePath;
+
+    fn path(value: &str) -> NormalizedRelativePath {
+        NormalizedRelativePath::new(value).expect("valid path")
+    }
+
+    /// Metadata keys encode each component with its bytes incremented by one
+    /// and join components with a NUL delimiter, so the delimiter sorts below
+    /// every component byte and stored order is component order. Path
+    /// comparison has to agree with that, or code that validates a scan
+    /// against a cursor rejects rows the scan legitimately produced.
+    fn storage_key(value: &str) -> Vec<u8> {
+        let mut key = Vec::new();
+        for (index, component) in path(value).components().enumerate() {
+            if index != 0 {
+                key.push(0u8);
+            }
+            key.extend(component.as_bytes().iter().map(|byte| byte + 1));
+        }
+        key
+    }
+
+    #[test]
+    fn ordering_matches_stored_key_ordering() {
+        // '-' (0x2d) sorts below '/' (0x2f) as raw text, so raw-text ordering
+        // puts the hyphenated sibling first while stored order does not.
+        for (left, right) in [
+            ("a", "a-b"),
+            ("a/x.json", "a-b/x.json"),
+            ("outputs/t/a/x.json", "outputs/t/a-b/x.json"),
+            ("src", "src-gen"),
+            ("docs/index.md", "docs-old/index.md"),
+            ("v1/x", "v1.1/x"),
+            ("tasks/Au/x", "tasks/Au-O/x"),
+        ] {
+            assert!(
+                path(left) < path(right),
+                "{left} must precede {right} the way the store orders them"
+            );
+            assert!(
+                storage_key(left) < storage_key(right),
+                "precondition: the stored keys order {left} before {right}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordering_is_a_total_order_over_a_scan() {
+        let mut paths: Vec<_> = ["a-b/x", "a/x", "a/y", "ab/x", "a-b/y"]
+            .into_iter()
+            .map(path)
+            .collect();
+        paths.sort();
+        let sorted: Vec<_> = paths.iter().map(NormalizedRelativePath::as_str).collect();
+        assert_eq!(sorted, ["a/x", "a/y", "a-b/x", "a-b/y", "ab/x"]);
+        let keys: Vec<_> = sorted.iter().map(|value| storage_key(value)).collect();
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]), "{sorted:?}");
+    }
+
+    #[test]
+    fn ordering_still_separates_plain_siblings() {
+        assert!(path("aa/x") < path("bb/x"));
+        assert!(path("outputs/a") < path("outputs/b"));
+        assert_eq!(path("outputs/a"), path("outputs/a"));
     }
 }
