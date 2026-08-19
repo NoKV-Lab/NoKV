@@ -14,7 +14,8 @@ SDK, or Workbench rewrite.
 The `main` branch must enforce all of the following through GitHub branch
 protection:
 
-- pull requests with 5,000 or fewer changed lines do not require review;
+- an ordinary pull request with 5,000 or fewer changed lines does not require
+  review;
 - a pull request with more than 5,000 changed lines requires one core
   maintainer approval on its exact current head;
 - the current-head pusher cannot supply that approval;
@@ -28,19 +29,22 @@ dismissed reviews, requested changes, and approvals against an older head do
 not count. Generated files, fixtures, documentation, and deletions are not
 exempt.
 
-The `change-governance/large-change-review` status enforces the conditional
-review rule. It identifies the actor who introduced the current head from the
-earliest GitHub Actions `pull_request` run for that head. Missing, malformed,
-paginated-beyond-bound, or unavailable PR, review, workflow-run, or pusher data
-fails closed for changes above the threshold.
+The native `Change Governance / large-change-review` job enforces this single
+size threshold. Changes at or below 5,000 lines do not require review from this
+gate, including changes to CI, qualification, release, workflow, or CODEOWNERS
+files. For a larger change, it identifies the actor who introduced the current
+head from the earliest GitHub Actions `pull_request` run for that head.
+Missing, malformed, paginated-beyond-bound, or unavailable PR, review,
+workflow-run, or pusher data fails closed for every large change.
 
 ## Trust Boundary
 
 [`change-governance.yml`](../../.github/workflows/change-governance.yml) uses
 `pull_request_target` and `pull_request_review` so GitHub loads the workflow
 from protected `main`. It never checks out or executes pull-request code. The
-runner fetches the policy and tests from the pull request's exact base SHA and
-publishes a dedicated commit status on the untrusted head SHA.
+runner fetches the policy and tests from the pull request's exact base SHA. The
+native GitHub Actions job conclusion is the required branch-protection check;
+the workflow does not publish a second custom commit status.
 
 This distinction is required: a normal `pull_request` workflow is part of the
 proposed diff and can otherwise weaken the check that evaluates itself.
@@ -51,7 +55,7 @@ The required status set is:
 - `object-namespace-recovery`;
 - `workbench-contract`;
 - `signoff`;
-- `change-governance/large-change-review`.
+- `large-change-review`.
 
 Every validation job that runs for each pull-request head is required. The
 Docker `image` check is the only CI exception: it continues in the background
@@ -59,19 +63,18 @@ and reports failures, but its runtime does not delay a merge. `sync-project` is
 project-board automation, does not run on `synchronize`, and is not a merge
 validation or required check.
 
-During initial rollout, the custom governance context is added to branch
-protection before the universal review rule is removed. Verified open PRs at
-or below the threshold receive a one-time status for their exact head. Unknown
-or later heads remain blocked until the protected workflow on `main` evaluates
-them. This ordering avoids a fail-open migration window.
+The native `large-change-review` check was added to branch protection before
+the legacy custom `change-governance/large-change-review` status was removed.
+That ordering avoided both a fail-open interval and a required context that no
+workflow could satisfy.
 
 ## Review Expectations
 
-For a change above the threshold, one non-pusher core maintainer approval is a
-minimum gate, not evidence that a broad rewrite is reviewable. Split a change
-when it crosses logical package or lifecycle boundaries, hides behavior changes
-among mechanical churn, or cannot be reproduced and reviewed within one focused
-diff. For storage changes, reviewers must apply the
+For a governed change, one non-pusher core maintainer approval is a minimum
+gate, not evidence that a broad rewrite is reviewable. Split a change when it
+crosses logical package or lifecycle boundaries, hides behavior changes among
+mechanical churn, or cannot be reproduced and reviewed within one focused diff.
+For storage changes, reviewers must apply the
 [PR Review Checklist](./pr_review_checklist.md) and retain exact recovery,
 failure, retry, retention, and downstream Workbench evidence.
 

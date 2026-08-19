@@ -289,9 +289,15 @@ operation id, so either a hash-prefix collision or a mismatched retry fails
 closed instead of resuming the wrong restore.
 
 `metadata/restore_manifest.json` is the canonical
-`nokv.workbench.restore_manifest.v1` provenance envelope. It records the
+`nokv.workbench.restore_manifest.v2` provenance envelope. It records the
 operation id, source and destination Workbench ids and presentation paths, and
-the selected snapshot id. Its exact digest, size, and JSON content type are
+under `restored_from.source` the frozen state the restore read: either
+`{"kind": "snapshot", "snapshot_id": N}` or `{"kind": "commit", "commit_id":
+"<64 hex>"}`. A snapshot is a lease and expires; a commit is durable, so a
+decision point that has to outlive the lease bound is restored from its
+commit. Readers still accept the `v1` envelope, which carried a bare
+`snapshot_id` and remains a durable artifact inside workbenches restored
+before a commit could be named. Its exact digest, size, and JSON content type are
 bound durably when restore preparation begins and are checked again when the
 staging workspace is published. Restore member count and member digest remain
 typed metadata fields only. `MetaShard` does not generate a second JSON

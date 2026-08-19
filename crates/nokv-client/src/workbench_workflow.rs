@@ -36,6 +36,17 @@ const COMMIT_MANIFEST_REVISION_DOMAIN: &[u8] = b"nokv.cli.commit-manifest-revisi
 const RESTORE_OPERATION_DOMAIN: &[u8] = b"nokv.restore.operation.v2\0";
 const RESTORE_DESTINATION_INCARNATION_DOMAIN: &[u8] =
     b"nokv.cli.restore-destination-incarnation.v2\0";
+// A commit restore is a different operation from a snapshot restore of the
+// same frozen state, so it gets its own domains. Keeping the snapshot domains
+// untouched leaves every restore already in flight with the identity it was
+// started under.
+const RESTORE_COMMIT_DESTINATION_INCARNATION_DOMAIN: &[u8] =
+    b"nokv.restore.commit-destination-incarnation.v1\0";
+// The operation id is a frozen cross-layer contract: the shard derives the
+// same digest and refuses a request whose id disagrees. One domain covers
+// both sources, discriminated by a tag byte.
+const RESTORE_SOURCE_TAG_SNAPSHOT: u8 = 1;
+const RESTORE_SOURCE_TAG_COMMIT: u8 = 2;
 const RESTORE_MANIFEST_OPERATION_DOMAIN: &[u8] = b"nokv.cli.restore-manifest-operation\0";
 const RESTORE_MANIFEST_REVISION_DOMAIN: &[u8] = b"nokv.cli.restore-manifest-revision\0";
 
@@ -83,7 +94,35 @@ impl RestoreWorkflowIdentities {
     /// Derives the v2 snapshot restore and destination identities. The
     /// operation binds both workbench names, both workspace incarnations, and
     /// the concrete numeric snapshot selector.
-    pub fn derive_snapshot(
+    pub fn derive(
+        root_id: RootIdentity,
+        source_workbench: &WorkbenchName,
+        source_workspace_incarnation_id: WorkspaceIdentity,
+        source: crate::WorkbenchRestoreSource,
+        destination_workbench: &WorkbenchName,
+    ) -> Self {
+        match source {
+            crate::WorkbenchRestoreSource::Snapshot { snapshot_id } => Self::derive_snapshot(
+                root_id,
+                source_workbench,
+                source_workspace_incarnation_id,
+                snapshot_id,
+                destination_workbench,
+            ),
+            crate::WorkbenchRestoreSource::Commit { commit_id } => Self::derive_commit(
+                root_id,
+                source_workbench,
+                source_workspace_incarnation_id,
+                commit_id,
+                destination_workbench,
+            ),
+        }
+    }
+
+    /// Derives the v2 snapshot restore and destination identities. The
+    /// operation binds both workbench names, both workspace incarnations, and
+    /// the concrete numeric snapshot selector.
+    fn derive_snapshot(
         root_id: RootIdentity,
         source_workbench: &WorkbenchName,
         source_workspace_incarnation_id: WorkspaceIdentity,
@@ -104,7 +143,43 @@ impl RestoreWorkflowIdentities {
             root_id,
             source_workbench,
             source_workspace_incarnation_id,
-            snapshot_id,
+            RESTORE_SOURCE_TAG_SNAPSHOT,
+            &snapshot_id.to_be_bytes(),
+            destination_workbench,
+            destination_workspace_incarnation_id,
+        );
+        Self {
+            operation_id,
+            destination_workspace_incarnation_id,
+        }
+    }
+
+    /// Derives the commit restore identities under their own domains, so a
+    /// commit restore can never be mistaken for a snapshot restore of the
+    /// same frozen state.
+    fn derive_commit(
+        root_id: RootIdentity,
+        source_workbench: &WorkbenchName,
+        source_workspace_incarnation_id: WorkspaceIdentity,
+        commit_id: [u8; 32],
+        destination_workbench: &WorkbenchName,
+    ) -> Self {
+        let destination_workspace_incarnation_id = WorkspaceIdentity(stable_fixed_identity(
+            RESTORE_COMMIT_DESTINATION_INCARNATION_DOMAIN,
+            root_id,
+            &[
+                source_workbench.as_str().as_bytes(),
+                &source_workspace_incarnation_id.0,
+                &commit_id,
+                destination_workbench.as_str().as_bytes(),
+            ],
+        ));
+        let operation_id = restore_operation_identity(
+            root_id,
+            source_workbench,
+            source_workspace_incarnation_id,
+            RESTORE_SOURCE_TAG_COMMIT,
+            &commit_id,
             destination_workbench,
             destination_workspace_incarnation_id,
         );
@@ -1749,7 +1824,8 @@ fn restore_operation_identity(
     root_id: RootIdentity,
     source_workbench: &WorkbenchName,
     source_incarnation: WorkspaceIdentity,
-    snapshot_id: u64,
+    source_tag: u8,
+    source_bytes: &[u8],
     destination: &WorkbenchName,
     destination_incarnation: WorkspaceIdentity,
 ) -> OperationIdentity {
@@ -1758,8 +1834,8 @@ fn restore_operation_identity(
     hasher.update(root_id.0);
     hash_len32(&mut hasher, source_workbench.as_str().as_bytes());
     hasher.update(source_incarnation.0);
-    hasher.update([1]);
-    hasher.update(snapshot_id.to_be_bytes());
+    hasher.update([source_tag]);
+    hasher.update(source_bytes);
     hash_len32(&mut hasher, destination.as_str().as_bytes());
     hasher.update(destination_incarnation.0);
     let digest: [u8; 32] = hasher.finalize().into();
@@ -2129,11 +2205,11 @@ mod tests {
         let source_incarnation = WorkspaceIdentity([2; 16]);
         let source_workbench = WorkbenchName::new("source-run").unwrap();
         let destination = WorkbenchName::new("restored-run").unwrap();
-        let identities = RestoreWorkflowIdentities::derive_snapshot(
+        let identities = RestoreWorkflowIdentities::derive(
             root,
             &source_workbench,
             source_incarnation,
-            7,
+            crate::WorkbenchRestoreSource::Snapshot { snapshot_id: 7 },
             &destination,
         );
         let restore_bytes = br#"{"restore":true}"#.to_vec();
@@ -2469,6 +2545,8 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    const COMMIT_RESTORE_OPERATION_GOLDEN: &str = "07b6bfed3cd71168589fabd6fb5f649f";
+
     #[test]
     fn workflow_identity_domains_have_frozen_golden_bytes() {
         let root = RootIdentity([1; 16]);
@@ -2486,11 +2564,11 @@ mod tests {
             "d879f0983c8c4549e90b7026bcc52621"
         );
 
-        let restore = RestoreWorkflowIdentities::derive_snapshot(
+        let restore = RestoreWorkflowIdentities::derive(
             root,
             &WorkbenchName::new("source-run").unwrap(),
             WorkspaceIdentity([2; 16]),
-            7,
+            crate::WorkbenchRestoreSource::Snapshot { snapshot_id: 7 },
             &WorkbenchName::new("restored-run").unwrap(),
         );
         assert_eq!(
@@ -2509,6 +2587,31 @@ mod tests {
         assert_eq!(
             hex(&manifest.revision_id.0),
             "80eaf4e236db23c62e3d070517fe5301"
+        );
+
+        // The commit restore identity is a cross-layer contract too: the
+        // shard derives it from the same domain with a different source tag
+        // and refuses a request whose id disagrees. Freeze it here so a
+        // client-side change cannot drift away from the shard silently.
+        let commit_restore = RestoreWorkflowIdentities::derive(
+            root,
+            &WorkbenchName::new("run").unwrap(),
+            WorkspaceIdentity([4; 16]),
+            crate::WorkbenchRestoreSource::Commit { commit_id: [9; 32] },
+            &WorkbenchName::new("restored-run").unwrap(),
+        );
+        assert_ne!(
+            commit_restore.operation_id.0, restore.operation_id.0,
+            "a commit restore is a different operation from a snapshot restore"
+        );
+        assert_ne!(
+            commit_restore.destination_workspace_incarnation_id.0,
+            restore.destination_workspace_incarnation_id.0
+        );
+        assert_eq!(
+            hex(&commit_restore.operation_id.0),
+            COMMIT_RESTORE_OPERATION_GOLDEN,
+            "commit restore operation identity drifted"
         );
     }
 

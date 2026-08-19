@@ -15,18 +15,17 @@ use base64::Engine as _;
 use nokv_agent as agent;
 use nokv_client::{
     ArtifactAppendOptions, ArtifactPublishOptions, ArtifactReadAuthority, ClientError,
-    RestoreManifestProjectionContext, RestoredRunManifestProjectionContext,
-    RunManifestProjectionContext, SnapshotMintOptions, SnapshotRenewOptions, SnapshotRetireOptions,
-    VerifiedWorkbenchRestoreManifest, VerifiedWorkbenchRunManifest, WorkbenchAdmission,
+    SnapshotMintOptions, SnapshotRenewOptions, SnapshotRetireOptions, WorkbenchAdmission,
     WorkbenchCommitRequest, WorkbenchLifecycleError, WorkbenchLifecycleFacade,
-    WorkbenchLifecycleOptions, WorkbenchProjection, WorkbenchRestoreRequest,
-    WorkbenchSnapshotSelector,
+    WorkbenchLifecycleOptions, WorkbenchRestoreOrigin, WorkbenchRestoreRequest,
+    WorkbenchRestoreSource, WorkbenchSnapshotSelector,
 };
 use nokv_object::ArtifactObjectStore;
 use nokv_protocol as wire;
 use nokv_types::{
     ArtifactRevisionId, NormalizedRelativePath, RootId, WorkbenchId, WorkspaceIncarnationId,
 };
+use nokv_workbench_projection::CanonicalWorkbenchProjection;
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 
@@ -50,127 +49,6 @@ const WORKBENCH_ENTRY_COUNT_MAX_PAGES: usize = 4_096;
 const WORKBENCH_ENTRY_COUNT_MAX_ROWS: usize = 1_000_000;
 
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone, Copy, Debug)]
-struct AgentWorkbenchProjection;
-
-impl WorkbenchProjection for AgentWorkbenchProjection {
-    type Error = agent::ProjectionError;
-
-    fn build_run_manifest(
-        &self,
-        context: RunManifestProjectionContext<'_>,
-        committed_at_unix_seconds: u64,
-    ) -> Result<Vec<u8>, Self::Error> {
-        agent::build_run_manifest_v1(
-            context.workbench_id,
-            context.workbench_path,
-            context.content_digest_uri,
-            context.canonical_manifest,
-            context.manifest_digest_uri,
-            context.commit_identity,
-            committed_at_unix_seconds,
-        )
-    }
-
-    fn run_manifest_projection_input_digest(
-        &self,
-        context: RunManifestProjectionContext<'_>,
-    ) -> [u8; 32] {
-        agent::run_manifest_projection_input_digest_v1(
-            context.workbench_id,
-            context.workbench_path,
-            context.content_digest_uri,
-            context.canonical_manifest,
-            context.manifest_digest_uri,
-            context.commit_identity,
-        )
-    }
-
-    fn verify_run_manifest(
-        &self,
-        bytes: &[u8],
-    ) -> Result<VerifiedWorkbenchRunManifest, Self::Error> {
-        let verified = agent::verify_run_manifest_v1(bytes)?;
-        Ok(VerifiedWorkbenchRunManifest {
-            workbench_id: verified.workbench_id,
-            workbench_path: verified.workbench_path,
-            content_digest_uri: verified.content_digest_uri,
-            manifest_digest_uri: verified.manifest_digest_uri,
-            commit_identity: verified.commit_identity,
-            canonical_manifest: verified.canonical_manifest,
-            canonical_envelope: verified.canonical_envelope,
-            envelope_digest_uri: verified.envelope_digest_uri,
-        })
-    }
-
-    fn build_restore_manifest(
-        &self,
-        context: RestoreManifestProjectionContext<'_>,
-    ) -> Result<Vec<u8>, Self::Error> {
-        agent::build_restore_manifest_v1(
-            context.operation_id,
-            context.source_workbench_id,
-            context.source_path,
-            context.destination_workbench_id,
-            context.destination_path,
-            context.snapshot_id,
-        )
-    }
-
-    fn verify_restore_manifest(
-        &self,
-        bytes: &[u8],
-    ) -> Result<VerifiedWorkbenchRestoreManifest, Self::Error> {
-        let verified = agent::verify_restore_manifest_v1(bytes)?;
-        Ok(VerifiedWorkbenchRestoreManifest {
-            operation_id: verified.operation_id,
-            source_workbench_id: verified.source_workbench_id,
-            source_path: verified.source_path,
-            destination_workbench_id: verified.destination_workbench_id,
-            destination_path: verified.destination_path,
-            snapshot_id: verified.snapshot_id,
-            canonical_envelope: verified.canonical_envelope,
-            envelope_digest_uri: verified.envelope_digest_uri,
-        })
-    }
-
-    fn restore_effective_content_digest_uri(
-        &self,
-        source_content_digest_uri: &str,
-        source_matches_base_commit: bool,
-        materialized_member_digest: [u8; 32],
-    ) -> Result<String, Self::Error> {
-        agent::restore_effective_content_digest_uri_v1(
-            source_content_digest_uri,
-            source_matches_base_commit,
-            materialized_member_digest,
-        )
-    }
-
-    fn workbench_commit_identity(
-        &self,
-        workbench_id: &WorkbenchId,
-        content_digest_uri: &str,
-        manifest_digest_uri: &str,
-    ) -> [u8; 32] {
-        agent::workbench_commit_identity(workbench_id, content_digest_uri, manifest_digest_uri)
-    }
-
-    fn build_restored_run_manifest(
-        &self,
-        context: RestoredRunManifestProjectionContext<'_>,
-    ) -> Result<Vec<u8>, Self::Error> {
-        agent::build_restored_run_manifest_v1(
-            context.source_run_manifest,
-            context.destination_workbench_id,
-            context.destination_workbench_path,
-            context.effective_content_digest_uri,
-            context.destination_commit_identity,
-            context.destination_committed_at_unix_seconds,
-        )
-    }
-}
 
 const fn base64_encoded_upper_bound(raw_bytes: usize) -> usize {
     raw_bytes.saturating_add(2) / 3 * 4
@@ -268,7 +146,7 @@ impl CliWorkbenchBackend {
             '_,
             nokv_client::FramedTcpTransport,
             Arc<dyn nokv_client::RouteResolver>,
-            AgentWorkbenchProjection,
+            CanonicalWorkbenchProjection,
         >,
         agent::BackendError,
     > {
@@ -278,7 +156,7 @@ impl CliWorkbenchBackend {
             &self.client,
             self.objects.as_ref(),
             options,
-            AgentWorkbenchProjection,
+            CanonicalWorkbenchProjection,
         ))
     }
 
@@ -1819,11 +1697,16 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
         let request = WorkbenchRestoreRequest {
             source_workbench_id: request.source_workbench_id,
             source_workbench_path: request.source_workbench_path,
-            selector: match request.selector {
-                agent::SnapshotSelector::Id(snapshot_id) => {
-                    WorkbenchSnapshotSelector::Id(snapshot_id)
+            origin: match request.origin {
+                agent::RestoreOrigin::Snapshot(agent::SnapshotSelector::Id(snapshot_id)) => {
+                    WorkbenchRestoreOrigin::Snapshot(WorkbenchSnapshotSelector::Id(snapshot_id))
                 }
-                agent::SnapshotSelector::Name(name) => WorkbenchSnapshotSelector::Name(name),
+                agent::RestoreOrigin::Snapshot(agent::SnapshotSelector::Name(name)) => {
+                    WorkbenchRestoreOrigin::Snapshot(WorkbenchSnapshotSelector::Name(name))
+                }
+                agent::RestoreOrigin::Commit(commit_id) => {
+                    WorkbenchRestoreOrigin::Commit(commit_id)
+                }
             },
             destination_workbench_id: request.destination_workbench_id,
             destination_workbench_path: request.destination_workbench_path,
@@ -1832,10 +1715,15 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
             .lifecycle_facade()?
             .restore(request)
             .map_err(map_lifecycle_error)?;
+        let (snapshot_id, commit_id) = match outcome.source {
+            WorkbenchRestoreSource::Snapshot { snapshot_id } => (Some(snapshot_id), None),
+            WorkbenchRestoreSource::Commit { commit_id } => (None, Some(commit_id)),
+        };
         Ok(agent::RestoreOutcome {
             operation_id: outcome.operation_id,
-            snapshot_id: outcome.snapshot_id,
+            snapshot_id,
             read_version: outcome.source_snapshot_read_version,
+            commit_id,
             destination_generation: outcome.destination_workspace_revision,
             idempotent_replay: outcome.idempotent_replay,
         })
@@ -3648,20 +3536,20 @@ mod tests {
             wire::WorkbenchName::new(destination_workbench_id.as_str()).unwrap();
         let source_incarnation = wire::WorkspaceIdentity([0x21; 16]);
         let snapshot_id = 7;
-        let restore_identities = RestoreWorkflowIdentities::derive_snapshot(
+        let restore_identities = RestoreWorkflowIdentities::derive(
             root_id,
             &source_workbench,
             source_incarnation,
-            snapshot_id,
+            WorkbenchRestoreSource::Snapshot { snapshot_id },
             &destination_workbench,
         );
-        let restore_manifest = agent::build_restore_manifest_v1(
+        let restore_manifest = agent::build_restore_manifest_v2(
             restore_identities.operation_id.0,
             &source_workbench_id,
             &source_workbench_path,
             &destination_workbench_id,
             &destination_workbench_path,
-            snapshot_id,
+            agent::RestoreManifestSource::Snapshot { snapshot_id },
         )
         .unwrap();
         let restore_digest = digest_uri(&restore_manifest);
@@ -3810,7 +3698,7 @@ mod tests {
             agent::RestoreRequest {
                 source_workbench_id: fixture.source_workbench_id.clone(),
                 source_workbench_path: fixture.source_workbench_path.clone(),
-                selector,
+                origin: agent::RestoreOrigin::Snapshot(selector),
                 destination_workbench_id: fixture.destination_workbench_id.clone(),
                 destination_workbench_path: fixture.destination_workbench_path.clone(),
             },
@@ -6084,7 +5972,7 @@ mod tests {
             agent::RestoreRequest {
                 source_workbench_id: WorkbenchId::new("source-run").unwrap(),
                 source_workbench_path: "/agents/test/wb/source-run".to_owned(),
-                selector: agent::SnapshotSelector::Id(7),
+                origin: agent::RestoreOrigin::Snapshot(agent::SnapshotSelector::Id(7)),
                 destination_workbench_id: WorkbenchId::new("destination-run").unwrap(),
                 destination_workbench_path: "/agents/test/wb/destination-run".to_owned(),
             },
@@ -6172,7 +6060,7 @@ mod tests {
             agent::RestoreRequest {
                 source_workbench_id: source_id,
                 source_workbench_path: "/agents/test/wb/source-run".to_owned(),
-                selector: agent::SnapshotSelector::Id(7),
+                origin: agent::RestoreOrigin::Snapshot(agent::SnapshotSelector::Id(7)),
                 destination_workbench_id: destination_id,
                 destination_workbench_path: "/agents/test/wb/destination-run".to_owned(),
             },
@@ -6227,20 +6115,20 @@ mod tests {
         let destination_workbench_path = "/agents/test/wb/destination-run".to_owned();
         let source_incarnation = wire::WorkspaceIdentity([0x21; 16]);
         let snapshot_id = 7;
-        let identities = nokv_client::RestoreWorkflowIdentities::derive_snapshot(
+        let identities = nokv_client::RestoreWorkflowIdentities::derive(
             test_route().root_id,
             &wire::WorkbenchName::new(source_workbench_id.as_str()).unwrap(),
             source_incarnation,
-            snapshot_id,
+            WorkbenchRestoreSource::Snapshot { snapshot_id },
             &wire::WorkbenchName::new(destination_workbench_id.as_str()).unwrap(),
         );
-        let envelope_bytes = agent::build_restore_manifest_v1(
+        let envelope_bytes = agent::build_restore_manifest_v2(
             identities.operation_id.0,
             &source_workbench_id,
             &source_workbench_path,
             &destination_workbench_id,
             &destination_workbench_path,
-            snapshot_id,
+            agent::RestoreManifestSource::Snapshot { snapshot_id },
         )
         .unwrap()
         .len();
@@ -6281,7 +6169,7 @@ mod tests {
             agent::RestoreRequest {
                 source_workbench_id,
                 source_workbench_path,
-                selector: agent::SnapshotSelector::Id(snapshot_id),
+                origin: agent::RestoreOrigin::Snapshot(agent::SnapshotSelector::Id(snapshot_id)),
                 destination_workbench_id,
                 destination_workbench_path,
             },

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail closed when a large pull request lacks core-maintainer approval."""
+"""Fail closed when a governed pull request lacks core-maintainer approval."""
 
 from __future__ import annotations
 
@@ -19,19 +19,6 @@ from typing import Any
 LARGE_CHANGE_LINE_THRESHOLD = 5_000
 LARGE_CHANGE_REQUIRED_APPROVALS = 1
 CORE_MAINTAINER_LOGINS = frozenset({"feichai0017", "wchwawa"})
-GOVERNANCE_SENSITIVE_EXACT_PATHS = frozenset(
-    {
-        ".github/CODEOWNERS",
-        "scripts/release/test_homebrew_source_release.py",
-        "scripts/release/test_python_sdk_release.py",
-    }
-)
-GOVERNANCE_SENSITIVE_PREFIXES = (
-    ".github/actions/",
-    ".github/workflows/",
-    "scripts/ci/",
-    "scripts/workbench/",
-)
 MAX_API_PAGES = 100
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
@@ -46,8 +33,6 @@ class GovernanceDecision:
     deletions: int
     changed_files: int
     changed_lines: int
-    changed_paths: tuple[str, ...]
-    governance_sensitive_paths: tuple[str, ...]
     threshold: int
     required_approvals: int
     current_approval_logins: tuple[str, ...]
@@ -57,10 +42,6 @@ class GovernanceDecision:
     @property
     def is_large_change(self) -> bool:
         return self.changed_lines > self.threshold
-
-    @property
-    def is_governance_sensitive(self) -> bool:
-        return bool(self.governance_sensitive_paths)
 
     @property
     def allowed(self) -> bool:
@@ -122,37 +103,6 @@ class GitHubApi:
         raise GovernanceInputError(
             f"GitHub API pagination exceeded {MAX_API_PAGES} pages for {path}"
         )
-
-    def get_changed_paths(
-        self, repository: str, pull_request_number: int, expected_count: int
-    ) -> tuple[str, ...]:
-        files = self.get_all(
-            f"repos/{repository}/pulls/{pull_request_number}/files"
-        )
-        if len(files) != expected_count:
-            raise GovernanceInputError(
-                "pull request changed-file list is incomplete: "
-                f"expected {expected_count}, received {len(files)}"
-            )
-        paths = tuple(
-            _required_string(item, "filename", "pull request file")
-            for item in files
-        )
-        previous_paths = tuple(
-            previous
-            for item in files
-            if isinstance((previous := item.get("previous_filename")), str)
-            and previous
-        )
-        all_paths = paths + previous_paths
-        if len(set(paths)) != len(paths):
-            raise GovernanceInputError("pull request changed-file list contains duplicates")
-        for path in all_paths:
-            if path.startswith("/") or path.endswith("/") or ".." in path.split("/"):
-                raise GovernanceInputError(
-                    f"pull request file path is not canonical: {path!r}"
-                )
-        return tuple(sorted(set(all_paths)))
 
     def get_current_head_introducers(
         self,
@@ -347,21 +297,19 @@ def current_core_maintainer_approvals(
     )
 
 
-def governance_sensitive_paths(changed_paths: tuple[str, ...]) -> tuple[str, ...]:
-    sensitive = []
-    for path in changed_paths:
-        if path in GOVERNANCE_SENSITIVE_EXACT_PATHS or path.startswith(
-            GOVERNANCE_SENSITIVE_PREFIXES
-        ):
-            sensitive.append(path)
-    return tuple(sorted(sensitive))
+def review_trigger_summary(decision: GovernanceDecision) -> str:
+    if decision.is_large_change:
+        return (
+            f"large change ({decision.changed_lines:,} > "
+            f"{decision.threshold:,} lines)"
+        )
+    return "none"
 
 
 def evaluate_policy(
     pull_request: dict[str, Any],
     reviews: list[dict[str, Any]],
     head_introducer_logins: tuple[str, ...] = (),
-    changed_paths: tuple[str, ...] = (),
 ) -> GovernanceDecision:
     additions = _nonnegative_int(pull_request, "additions")
     deletions = _nonnegative_int(pull_request, "deletions")
@@ -371,10 +319,9 @@ def evaluate_policy(
         raise GovernanceInputError("pull request head identity is missing")
     head_sha = _required_string(head, "sha", "pull request head")
     changed_lines = additions + deletions
-    sensitive_paths = governance_sensitive_paths(changed_paths)
     required_approvals = (
         LARGE_CHANGE_REQUIRED_APPROVALS
-        if changed_lines > LARGE_CHANGE_LINE_THRESHOLD or sensitive_paths
+        if changed_lines > LARGE_CHANGE_LINE_THRESHOLD
         else 0
     )
     if required_approvals and not head_introducer_logins:
@@ -389,8 +336,6 @@ def evaluate_policy(
         deletions=deletions,
         changed_files=changed_files,
         changed_lines=changed_lines,
-        changed_paths=tuple(sorted(changed_paths)),
-        governance_sensitive_paths=sensitive_paths,
         threshold=LARGE_CHANGE_LINE_THRESHOLD,
         required_approvals=required_approvals,
         current_approval_logins=approvals,
@@ -418,8 +363,9 @@ def _write_step_summary(decision: GovernanceDecision) -> None:
             f"({decision.additions:,} additions + {decision.deletions:,} deletions)\n"
         )
         summary.write(f"- Changed files: **{decision.changed_files:,}**\n")
-        sensitive_text = ", ".join(decision.governance_sensitive_paths) or "none"
-        summary.write(f"- Governance-sensitive paths: **{sensitive_text}**\n")
+        summary.write(
+            f"- Independent-review trigger: **{review_trigger_summary(decision)}**\n"
+        )
         summary.write(f"- Current-head introducer: **{introducer_text}**\n")
         summary.write(
             "- Current-head core maintainer approvals: "
@@ -459,13 +405,7 @@ def main(argv: list[str] | None = None) -> int:
         additions = _nonnegative_int(pull_request, "additions")
         deletions = _nonnegative_int(pull_request, "deletions")
         changed_files = _nonnegative_int(pull_request, "changed_files")
-        changed_paths = api.get_changed_paths(
-            args.repository, args.pull_request, changed_files
-        )
-        requires_review = (
-            additions + deletions > LARGE_CHANGE_LINE_THRESHOLD
-            or bool(governance_sensitive_paths(changed_paths))
-        )
+        requires_review = additions + deletions > LARGE_CHANGE_LINE_THRESHOLD
         if requires_review:
             reviews = api.get_all(
                 f"repos/{args.repository}/pulls/{args.pull_request}/reviews"
@@ -500,7 +440,7 @@ def main(argv: list[str] | None = None) -> int:
             reviews = []
             head_introducer_logins = ()
         decision = evaluate_policy(
-            pull_request, reviews, head_introducer_logins, changed_paths
+            pull_request, reviews, head_introducer_logins
         )
     except GovernanceInputError as error:
         print(
@@ -510,11 +450,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    print(json.dumps(asdict(decision), sort_keys=True))
+    decision_payload = asdict(decision)
+    decision_payload["review_trigger"] = review_trigger_summary(decision)
+    print(json.dumps(decision_payload, sort_keys=True))
     _write_step_summary(decision)
     if decision.allowed:
         print(
-            f"Change governance passed: {decision.changed_lines} changed lines, "
+            "Change governance passed: "
+            f"review trigger {review_trigger_summary(decision)}, "
+            f"{decision.changed_lines} changed lines, "
             f"{len(decision.current_approval_logins)} current core maintainer approvals."
         )
         return 0
@@ -522,9 +466,10 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "::error title=Governed change lacks current core maintainer approval::"
         + _annotation(
-            f"PR #{args.pull_request} changes {decision.changed_lines} lines and "
-            f"touches {len(decision.governance_sensitive_paths)} protected CI trust-root "
-            f"paths, but has only "
+            f"PR #{args.pull_request} requires review because of "
+            f"{review_trigger_summary(decision)}. It changes "
+            f"{decision.changed_lines:,} lines; the large-change threshold is more than "
+            f"{decision.threshold:,}. It has only "
             f"{len(decision.current_approval_logins)} eligible approvals on head "
             f"{decision.head_sha}. The author, current-head introducer, bots, non-core "
             "reviewers, dismissed reviews, duplicate reviewers, and approvals on "

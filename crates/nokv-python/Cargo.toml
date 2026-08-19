@@ -21,10 +21,14 @@ default = []
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
+nokv-agent.workspace = true
 nokv-client = { workspace = true, features = ["etcd"] }
+nokv-workbench-projection.workspace = true
 nokv-object.workspace = true
 nokv-protocol.workspace = true
+nokv-types.workspace = true
 pyo3 = { version = "0.29.0", features = ["abi3-py39"] }
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
