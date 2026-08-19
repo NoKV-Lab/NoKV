@@ -2012,11 +2012,28 @@ fn maximum_cleanup_operation(
     ready.source_generic_index_seal = Some(ready.source_generic_index_rolling_digest);
     ready.source_generic_indexes_match_base_commit = Some(true);
     ready.source_eof = true;
-    // Preserve the independently accumulated raw-source closure. It may
-    // contain one or two provenance manifests that are deliberately absent
-    // from the ordinary RestoreMember ledger. Collapsing it to the
-    // materialized closure would make a commit source appear to diverge from
-    // its immutable CommitRecord and under-size snapshot cleanup records.
+    // The raw-source closure is accumulated independently of the ordinary
+    // RestoreMember ledger, because it also covers the one or two provenance
+    // manifests that are deliberately never materialized. It must not be
+    // collapsed to the materialized closure: that would under-size snapshot
+    // cleanup records and make a commit source look like it diverged from
+    // its immutable CommitRecord.
+    //
+    // It must, however, be projected to where the operation is going, the
+    // same way the Generic-index closure is projected just above. A commit
+    // source ends with a raw closure equal to its CommitRecord -- that is
+    // exactly what SealSource asserts and what the validator enforces -- so
+    // leaving this at whatever a mid-copy batch happened to reach models a
+    // record the validator must reject, and the capacity pre-check then
+    // refuses a restore that is itself legal. A snapshot source has no such
+    // equality to project onto and keeps its accumulated value.
+    if matches!(ready.source, RestoreSource::Commit { .. }) {
+        ready.source_member_count = provenance.source_commit.member_count;
+        ready.source_member_rolling_digest = provenance.source_commit.member_digest;
+    }
+    // Both projected fields are fixed width on the wire (a big-endian u64 and
+    // a 32-byte digest), so this cannot shrink the modelled record and the
+    // transaction-size guarantee the pre-check exists for is unchanged.
     let source_member_seal = ready.source_member_rolling_digest;
     ready = ready.apply(
         RestorePhase::Copying,
@@ -9696,6 +9713,128 @@ mod tests {
             .unwrap();
             assert_eq!(generation.record.reference_count, 1);
         }
+    }
+
+    fn commit_restore_request(
+        source: &SeededSource,
+        destination: &str,
+        destination_incarnation: WorkspaceIncarnationId,
+    ) -> BeginRestoreRequest {
+        bind_operation_identity(BeginRestoreRequest {
+            operation_id: OperationId::from_bytes([0; 16]),
+            source_workbench_id: source.source_workbench.clone(),
+            expected_source_workspace_incarnation_id: source.source_incarnation,
+            source: RestoreSourceSelector::Commit(source.source_commit_id),
+            destination_workbench_id: workbench(destination),
+            destination_workspace_incarnation_id: destination_incarnation,
+            destination_restore_manifest_identity: RestoreManifestIdentity {
+                publication_operation_id: OperationId::from_bytes([0xf3; 16]),
+                artifact_revision_id: revision(0xe5),
+            },
+            destination_committed_at_unix_seconds: 1,
+            restore_manifest: restore_manifest_descriptor(&source.initialization),
+        })
+    }
+
+    #[test]
+    fn commit_restore_copies_across_more_than_one_batch() {
+        // A commit source is the only lease-free way back to a frozen state,
+        // so it has to survive a source larger than one copy page. The copy
+        // loop below asks for two members at a time against a wider source,
+        // which is the ordinary shape once a campaign holds more than a
+        // handful of records.
+        let mut counter = 4100_u128;
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        let current_owner = owner(1);
+        activate_root(&store, &mut counter, current_owner);
+        let source = seed_source(&store, &mut counter, current_owner, 6);
+        let begun = begin_restore(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            &commit_restore_request(&source, "commit-multi-batch", incarnation(41)),
+        )
+        .unwrap();
+        let operation_id = begun.operation.operation_id;
+        let mut outcome = start_restore_copy(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        let mut batches = 0_usize;
+        while !outcome.operation.source_eof {
+            batches += 1;
+            assert!(batches <= 8, "copy did not converge");
+            outcome = copy_restore_batch(
+                &store,
+                write_context(&store, &mut counter, current_owner),
+                CopyRestoreBatchRequest {
+                    operation_id,
+                    limit: 2,
+                },
+            )
+            .expect("a commit-source copy must survive a non-final batch")
+            .command;
+        }
+        assert!(
+            batches > 1,
+            "the fixture must span more than one batch to be the case under test"
+        );
+        // Sealing is where the raw closure is compared with the immutable
+        // commit closure, so drive it: a copy that merely finished proves
+        // nothing if the seal then rejects what it produced.
+        let sealed = seal_restore_source(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            RestoreOperationRequest { operation_id },
+        )
+        .expect("a completed commit-source copy must seal");
+        assert_eq!(
+            sealed.operation.source_matches_base_commit,
+            Some(true),
+            "the completed raw closure must equal the immutable commit closure"
+        );
+        assert_eq!(sealed.operation.phase, RestorePhase::SourceSealed);
+    }
+
+    #[test]
+    fn maximum_cleanup_model_stays_valid_mid_copy_for_a_commit_source() {
+        // The capacity pre-check models the largest later shape of the
+        // operation. For a commit source that model has to remain a record
+        // the validator would accept, or the pre-check rejects a restore
+        // that is itself perfectly legal.
+        let mut counter = 4200_u128;
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        let current_owner = owner(1);
+        activate_root(&store, &mut counter, current_owner);
+        let source = seed_source(&store, &mut counter, current_owner, 6);
+        let begun = begin_restore(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            &commit_restore_request(&source, "commit-mid-copy", incarnation(42)),
+        )
+        .unwrap();
+        let operation_id = begun.operation.operation_id;
+        let started = start_restore_copy(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        let mid = copy_restore_batch(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            CopyRestoreBatchRequest {
+                operation_id,
+                limit: 2,
+            },
+        )
+        .unwrap()
+        .command;
+        assert!(!mid.operation.source_eof, "this must be a non-final batch");
+        let _ = started;
+        maximum_cleanup_operation(&mid.operation)
+            .expect("the modelled cleanup record must be valid mid-copy");
     }
 
     #[test]
