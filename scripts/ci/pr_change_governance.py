@@ -23,6 +23,7 @@ GOVERNANCE_SENSITIVE_EXACT_PATHS = frozenset(
     {
         ".github/CODEOWNERS",
         "scripts/release/test_homebrew_source_release.py",
+        "scripts/release/test_python_sdk_release.py",
     }
 )
 GOVERNANCE_SENSITIVE_PREFIXES = (

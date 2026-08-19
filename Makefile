@@ -42,6 +42,8 @@ workbench-test:
 
 governance-test:
 	python3 scripts/ci/pr_change_governance_test.py
+	python3 scripts/release/test_homebrew_source_release.py
+	python3 scripts/release/test_python_sdk_release.py
 
 verify:
 	cargo fmt --manifest-path $(NOKV_MANIFEST) --all -- --check
@@ -57,6 +59,8 @@ verify:
 	python3 scripts/workbench/workbench_contract_test.py
 	python3 scripts/workbench/live_workbench_test.py
 	python3 scripts/ci/pr_change_governance_test.py
+	python3 scripts/release/test_homebrew_source_release.py
+	python3 scripts/release/test_python_sdk_release.py
 	git diff --check
 
 clean:

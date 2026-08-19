@@ -1,0 +1,76 @@
+# Copyright 2024-2026 The NoKV Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Python SDK
+
+# The release workflow builds the same wheel per platform from a validated tag.
+# This job proves on every change that the manylinux wheel still builds from
+# the tree, installs into a clean interpreter, and passes the SDK tests
+# against the installed distribution rather than the source checkout.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    name: manylinux wheel builds and installs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+
+      - name: Check the release identities the wheel will carry
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release/test_python_sdk_release.py
+          python3 scripts/release/python_sdk_release.py sdk-version --repository .
+
+      - name: Build manylinux_2_28 wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
+        with:
+          command: build
+          working-directory: crates/nokv-python
+          args: --release --out ../../dist
+          manylinux: 2_28
+          before-script-linux: |
+            set -euo pipefail
+            dnf install -y protobuf-compiler
+            protoc --version
+
+      - name: Install the built wheel into a clean environment and test it
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l dist
+          version="$(python3 scripts/release/python_sdk_release.py sdk-version --repository .)"
+          venv="$RUNNER_TEMP/nokv-sdk-venv"
+          python3 -m venv "$venv"
+          "$venv/bin/python" -m pip install --quiet --upgrade pip
+          "$venv/bin/python" -m pip install --quiet pytest fsspec
+          "$venv/bin/python" -m pip install --quiet --no-index --find-links dist "nokv==$version"
+          python3 scripts/release/python_sdk_release.py verify-install \
+            --python "$venv/bin/python" --version "$version"
+          cd "$RUNNER_TEMP"
+          "$venv/bin/python" -m pytest -q "$GITHUB_WORKSPACE/crates/nokv-python/tests"
+
+      - name: Upload wheel for inspection
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: nokv-python-sdk-${{ github.sha }}-linux-x86_64
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
