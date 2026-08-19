@@ -42,9 +42,6 @@ Closes | Fixes | Relates to #
       current-head pusher approved the exact current head commit. The author,
       bots, non-core reviewers, duplicate reviewers, dismissed reviews, and
       stale approvals do not count.
-- [ ] If this changes a protected CI trust root listed in `.github/CODEOWNERS`,
-      one core maintainer other than the current-head pusher approved the exact
-      current head regardless of change size.
 - [ ] This change is still small enough for a focused review; approval count is
       not being used to justify mixed package or lifecycle boundaries.
 

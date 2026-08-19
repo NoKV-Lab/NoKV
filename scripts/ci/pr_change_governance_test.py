@@ -25,9 +25,6 @@ OLD_HEAD = "b" * 40
 CORE_ONE = "wchwawa"
 CORE_TWO = "feichai0017"
 REPO = Path(__file__).resolve().parents[2]
-CODEOWNERS_PATH = Path(
-    os.environ.get("NOKV_CODEOWNERS_PATH", REPO / ".github/CODEOWNERS")
-)
 WORKFLOW_PATH = Path(
     os.environ.get(
         "NOKV_CHANGE_GOVERNANCE_WORKFLOW_PATH",
@@ -96,30 +93,13 @@ class FakeGitHubApi(GitHubApi):
 
 
 class ChangeGovernancePolicyTest(unittest.TestCase):
-    def test_codeowners_protects_only_ci_trust_roots(self) -> None:
-        lines = {
-            line.strip()
-            for line in CODEOWNERS_PATH.read_text(encoding="utf-8").splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
-        }
-        self.assertNotIn("* @wchwawa @feichai0017", lines)
-        self.assertEqual(
-            lines,
-            {
-                "/.github/CODEOWNERS @wchwawa @feichai0017",
-                "/.github/actions/ @wchwawa @feichai0017",
-                "/.github/workflows/ @wchwawa @feichai0017",
-                "/scripts/ci/ @wchwawa @feichai0017",
-                "/scripts/workbench/ @wchwawa @feichai0017",
-                "/scripts/release/test_homebrew_source_release.py @wchwawa @feichai0017",
-                "/scripts/release/test_python_sdk_release.py @wchwawa @feichai0017",
-            },
-        )
-
-    def test_base_owned_workflow_fetches_codeowners_before_policy_tests(self) -> None:
+    def test_base_owned_workflow_fetches_policy_and_tests(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertIn("scripts/ci/pr_change_governance.py", workflow)
+        self.assertIn("scripts/ci/pr_change_governance_test.py", workflow)
         self.assertIn(".github/CODEOWNERS", workflow)
         self.assertIn("NOKV_CODEOWNERS_PATH", workflow)
+        self.assertNotIn("actions/checkout", workflow)
 
     def test_workflow_avoids_redundant_review_request_events(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -129,10 +109,10 @@ class ChangeGovernancePolicyTest(unittest.TestCase):
         self.assertIn("    types: [submitted, edited, dismissed]", workflow)
         self.assertNotIn("      - review_requested", workflow)
         self.assertNotIn("      - review_request_removed", workflow)
-        self.assertIn("    name: governed-change-review", workflow)
-        self.assertIn(
-            "STATUS_CONTEXT: change-governance/large-change-review", workflow
-        )
+        self.assertIn("    name: large-change-review", workflow)
+        self.assertNotIn("statuses: write", workflow)
+        self.assertNotIn("STATUS_CONTEXT", workflow)
+        self.assertNotIn("post_status", workflow)
 
     def test_exact_threshold_does_not_trigger_large_change_rule(self) -> None:
         decision = evaluate_policy(pull_request(additions=3_000, deletions=2_000), [])
@@ -142,104 +122,35 @@ class ChangeGovernancePolicyTest(unittest.TestCase):
         self.assertEqual(decision.required_approvals, 0)
 
     def test_small_ordinary_change_keeps_fast_path_without_review(self) -> None:
-        decision = evaluate_policy(
-            pull_request(additions=10), [], changed_paths=("crates/nokv/src/main.rs",)
-        )
+        decision = evaluate_policy(pull_request(additions=10), [])
 
         self.assertFalse(decision.is_large_change)
-        self.assertFalse(decision.is_governance_sensitive)
         self.assertEqual(decision.required_approvals, 0)
         self.assertTrue(decision.allowed)
 
-    def test_small_governance_change_requires_non_pusher_core_review(self) -> None:
+    def test_small_ci_trust_root_change_does_not_require_review(self) -> None:
         decision = evaluate_policy(
             pull_request(additions=10),
-            [review(CORE_TWO)],
-            head_introducer_logins=("contributor",),
-            changed_paths=(".github/workflows/rust.yml",),
+            [],
         )
 
         self.assertFalse(decision.is_large_change)
-        self.assertTrue(decision.is_governance_sensitive)
-        self.assertEqual(decision.required_approvals, 1)
-        self.assertEqual(decision.current_approval_logins, (CORE_TWO,))
+        self.assertEqual(decision.required_approvals, 0)
+        self.assertEqual(decision.current_approval_logins, ())
         self.assertTrue(decision.allowed)
 
-    def test_review_trigger_summary_names_the_independent_policy_reasons(self) -> None:
-        ordinary = evaluate_policy(
-            pull_request(additions=10),
-            [],
-            changed_paths=("crates/nokv/src/main.rs",),
-        )
+    def test_review_trigger_summary_names_only_the_size_threshold(self) -> None:
+        ordinary = evaluate_policy(pull_request(additions=10), [])
         large = evaluate_policy(
             pull_request(additions=5_001),
             [],
             head_introducer_logins=("contributor",),
-        )
-        sensitive = evaluate_policy(
-            pull_request(additions=10),
-            [],
-            head_introducer_logins=("contributor",),
-            changed_paths=(".github/workflows/rust.yml",),
-        )
-        both = evaluate_policy(
-            pull_request(additions=5_001),
-            [],
-            head_introducer_logins=("contributor",),
-            changed_paths=(".github/workflows/rust.yml",),
         )
 
         self.assertEqual(review_trigger_summary(ordinary), "none")
         self.assertEqual(
             review_trigger_summary(large), "large change (5,001 > 5,000 lines)"
         )
-        self.assertEqual(
-            review_trigger_summary(sensitive),
-            "protected CI trust-root change (1 path)",
-        )
-        self.assertEqual(
-            review_trigger_summary(both),
-            "large change (5,001 > 5,000 lines) and "
-            "protected CI trust-root change (1 path)",
-        )
-
-    def test_sensitive_workbench_gate_change_rejects_pusher_approval(self) -> None:
-        decision = evaluate_policy(
-            pull_request(additions=10),
-            [review(CORE_ONE)],
-            head_introducer_logins=(CORE_ONE,),
-            changed_paths=("scripts/workbench/live_workbench.py",),
-        )
-
-        self.assertTrue(decision.is_governance_sensitive)
-        self.assertFalse(decision.allowed)
-        self.assertEqual(decision.current_approval_logins, ())
-
-    def test_all_trust_root_paths_are_sensitive_but_docs_are_not(self) -> None:
-        sensitive = (
-            ".github/CODEOWNERS",
-            ".github/actions/verify/action.yml",
-            ".github/workflows/rust.yml",
-            "scripts/ci/pr_change_governance.py",
-            "scripts/workbench/pre423_contract_ledger.json",
-            "scripts/release/test_homebrew_source_release.py",
-            "scripts/release/test_python_sdk_release.py",
-        )
-        for path in sensitive:
-            with self.subTest(path=path):
-                decision = evaluate_policy(
-                    pull_request(additions=1),
-                    [review(CORE_TWO)],
-                    head_introducer_logins=("contributor",),
-                    changed_paths=(path,),
-                )
-                self.assertTrue(decision.is_governance_sensitive)
-        decision = evaluate_policy(
-            pull_request(additions=1),
-            [],
-            changed_paths=("docs/development/code_contract.md",),
-        )
-        self.assertFalse(decision.is_governance_sensitive)
 
     def test_one_line_over_threshold_requires_one_core_approval(self) -> None:
         decision = evaluate_policy(
@@ -480,36 +391,6 @@ class ChangeGovernancePolicyTest(unittest.TestCase):
             api.get_current_head_introducers(
                 "NoKV-Lab/NoKV", HEAD, 17, 101, "feature", "2026-08-15T00:00:00Z"
             )
-
-    def test_changed_paths_are_complete_canonical_and_sorted(self) -> None:
-        api = FakeGitHubApi(
-            [
-                {
-                    "filename": "docs/live_workbench.py",
-                    "previous_filename": "scripts/workbench/live_workbench.py",
-                },
-                {"filename": ".github/workflows/rust.yml"},
-            ]
-        )
-
-        self.assertEqual(
-            api.get_changed_paths("NoKV-Lab/NoKV", 17, 2),
-            (
-                ".github/workflows/rust.yml",
-                "docs/live_workbench.py",
-                "scripts/workbench/live_workbench.py",
-            ),
-        )
-
-    def test_incomplete_or_noncanonical_changed_paths_fail_closed(self) -> None:
-        incomplete = FakeGitHubApi([{"filename": ".github/workflows/rust.yml"}])
-        with self.assertRaisesRegex(GovernanceInputError, "incomplete"):
-            incomplete.get_changed_paths("NoKV-Lab/NoKV", 17, 2)
-
-        noncanonical = FakeGitHubApi([{"filename": "../rust.yml"}])
-        with self.assertRaisesRegex(GovernanceInputError, "canonical"):
-            noncanonical.get_changed_paths("NoKV-Lab/NoKV", 17, 1)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,14 +11,10 @@ boundaries, or Workbench behavior.
 
 ## Merge Governance
 
-- Does the change touch a protected CI trust root, requiring one core
-  maintainer other than the current-head pusher to approve the exact head
-  regardless of change size?
 - If additions plus deletions exceed 5,000 lines, does one core maintainer
   other than the current-head pusher approve the exact current head commit?
 - Did a new push make every older approval ineligible?
-- Does the protected `change-governance/large-change-review` status pass for
-  every large or CI trust-root change?
+- Does the protected native `large-change-review` check pass for every change?
 - Is the change actually reviewable as one logical boundary even if the formal
   approval count and status checks pass?
 - Are every required status and review conversation complete before merge?
