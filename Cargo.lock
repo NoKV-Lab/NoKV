@@ -1270,7 +1270,7 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
 name = "nokv"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "base64 0.23.0",
  "nokv-agent",
