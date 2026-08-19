@@ -279,6 +279,69 @@ class LiveWorkbenchTest(unittest.TestCase):
             "one-day snapshot lease", record["acceptance_gates"]["0"]["reason"]
         )
 
+    def test_restore_manifest_v2_is_exactly_bound_to_the_live_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            current = config(Path(directory) / "evidence")
+        operation_id = "ab" * 16
+        snapshot_id = 7
+        restore = {
+            "operation_id": operation_id,
+            "snapshot_id": snapshot_id,
+            "source_workbench_id": current.workbench,
+            "destination_workbench_id": current.restored,
+        }
+        snapshot = {"snapshot_id": snapshot_id}
+        source_path = f"{current.workbench_root}/{current.workbench}"
+        destination_path = f"{current.workbench_root}/{current.restored}"
+        manifest = {
+            "schema": harness.RESTORE_MANIFEST_SCHEMA,
+            "operation_id": operation_id,
+            "restored_from": {
+                "workbench_id": current.workbench,
+                "path": source_path,
+                "source": {"kind": "snapshot", "snapshot_id": snapshot_id},
+            },
+            "source_workbench_id": current.workbench,
+            "source_path": source_path,
+            "destination_workbench_id": current.restored,
+            "destination_path": destination_path,
+        }
+
+        harness.assert_restore_manifest_v2(manifest, restore, snapshot, current)
+
+        malformed_cases = {
+            "legacy schema": {
+                **manifest,
+                "schema": "nokv.workbench.restore_manifest.v1",
+            },
+            "wrong operation": {**manifest, "operation_id": "cd" * 16},
+            "extra field": {**manifest, "unexpected": "value"},
+            "commit source": {
+                **manifest,
+                "restored_from": {
+                    **manifest["restored_from"],
+                    "source": {"kind": "commit", "commit_id": "ef" * 32},
+                },
+            },
+        }
+        for label, malformed in malformed_cases.items():
+            with (
+                self.subTest(label=label),
+                self.assertRaisesRegex(
+                    harness.WorkflowFailure, "projection differs from v2"
+                ),
+            ):
+                harness.assert_restore_manifest_v2(
+                    malformed, restore, snapshot, current
+                )
+
+        with self.assertRaisesRegex(
+            harness.WorkflowFailure, "not bound to the minted snapshot"
+        ):
+            harness.assert_restore_manifest_v2(
+                manifest, restore, {"snapshot_id": snapshot_id + 1}, current
+            )
+
     def test_phase_one_assertions_emit_reviewable_ledger_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             current = config(Path(directory) / "evidence")
