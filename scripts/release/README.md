@@ -74,11 +74,36 @@ The generated archive comes from `git archive` at the validated commit and is
 gzip-compressed with a fixed timestamp. GitHub-generated tag archives and
 `latest` URLs are rejected.
 
+## Python SDK wheels
+
+`.github/workflows/release-python-sdk.yml` publishes the Python SDK for the
+same canonical stable tag. It validates the tag exactly like the Homebrew
+workflow, then builds one abi3 wheel per supported platform on the platform
+itself (Linux x86_64 and aarch64 inside the official `manylinux_2_28` images,
+macOS Apple Silicon and Intel natively), installs every wheel into a clean
+interpreter, runs the SDK tests against the installed distribution, and only
+after all four platform gates pass uploads the wheels together with
+`nokv-<version>-python-sdk.json` (tag, commit, per-wheel SHA-256) and
+`nokv-<version>-python-sdk-SHA256SUMS` to the GitHub release. Release assets
+are immutable: an existing asset with the same name must be byte-identical or
+the run stops. It never publishes to PyPI.
+
+`scripts/release/python_sdk_release.py` owns the identities that must agree:
+the tag, the `crates/nokv` package version, and the `crates/nokv-python`
+package version, which the Python project reads through
+`dynamic = ["version"]`. Bump both crates in the release change; the wheel
+version test refuses a diverged pair. Every pull request builds the Linux
+wheel and installs it (`python-sdk.yml`), so the packaging cannot rot between
+releases. Consumer instructions live in `crates/nokv-python/README.md`.
+
 ## Operator flow
 
-1. Merge the release PR, including the `crates/nokv` version update.
+1. Merge the release PR, including the `crates/nokv` and `crates/nokv-python`
+   version updates.
 2. Create the matching stable tag on that exact commit.
-3. Dispatch `Release Homebrew Source Formula` with that tag.
+3. Dispatch `Release Homebrew Source Formula` and `Release Python SDK` with
+   that tag; either may create the GitHub release, and each only adds its own
+   immutable assets.
 4. The workflow builds one deterministic source release candidate.
 5. Apple Silicon and Intel macOS runners each install, test, and inspect the
    same candidate through Homebrew.
@@ -101,8 +126,10 @@ directly to the tap's default branch.
 
 ```shell
 python3 scripts/release/test_homebrew_source_release.py
+python3 scripts/release/test_python_sdk_release.py
 python3 scripts/workbench/workbench_contract_test.py
 actionlint .github/workflows/release-homebrew.yml
+actionlint .github/workflows/release-python-sdk.yml
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace

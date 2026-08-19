@@ -11,3 +11,4 @@
 /scripts/ci/ @wchwawa @feichai0017
 /scripts/workbench/ @wchwawa @feichai0017
 /scripts/release/test_homebrew_source_release.py @wchwawa @feichai0017
+/scripts/release/test_python_sdk_release.py @wchwawa @feichai0017

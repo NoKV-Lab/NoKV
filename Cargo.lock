@@ -1388,7 +1388,7 @@ dependencies = [
 
 [[package]]
 name = "nokv-python"
-version = "0.1.0"
+version = "0.11.0"
 dependencies = [
  "nokv-client",
  "nokv-object",
