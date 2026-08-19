@@ -13,7 +13,8 @@ use nokv_client::{
     ArtifactPublishOptions, ArtifactPublishOutcome, ArtifactRangeBatchRequest, ClientError,
     ClientOptions, FramedTcpOptions, FramedTcpTransport, RouteResolver, SnapshotMintOptions,
     SnapshotRenewOptions, SnapshotRetireOptions, WorkbenchCommitRequest, WorkbenchLifecycleFacade,
-    WorkbenchLifecycleOptions, WorkspaceClient,
+    WorkbenchLifecycleOptions, WorkbenchRestoreOrigin, WorkbenchRestoreRequest,
+    WorkbenchRestoreSource, WorkbenchSnapshotSelector, WorkspaceClient,
 };
 use nokv_object::ArtifactObjectStore;
 use nokv_protocol::{
@@ -201,6 +202,92 @@ impl PythonWorkspaceClient {
         result.set_item("manifest_size_bytes", outcome.manifest_size_bytes)?;
         result.set_item("envelope_digest_uri", outcome.envelope_digest_uri)?;
         result.set_item("tree_digest_uri", outcome.tree_digest_uri)?;
+        result.set_item("replayed", outcome.idempotent_replay)?;
+        Ok(result)
+    }
+
+    /// Restore a frozen state into an absent destination workbench.
+    ///
+    /// Name exactly one source. `at_snapshot` takes a snapshot id or alias
+    /// and is bounded by that snapshot's lease; `at_commit` takes a commit
+    /// identity and is not, so a decision point that has to stay citable
+    /// after the lease runs out is restored from its commit.
+    #[pyo3(signature = (workbench, destination, at_snapshot = None, at_commit = None))]
+    fn restore<'py>(
+        &self,
+        py: Python<'py>,
+        workbench: &str,
+        destination: &str,
+        at_snapshot: Option<&Bound<'py, PyAny>>,
+        at_commit: Option<&str>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let source_workbench_id = parse_workbench_id(workbench)?;
+        let destination_workbench_id = parse_workbench_id(destination)?;
+        if source_workbench_id == destination_workbench_id {
+            return Err(value_error("destination must differ from workbench"));
+        }
+        let origin = match (at_snapshot, at_commit) {
+            (Some(_), Some(_)) => {
+                return Err(value_error("give at_snapshot or at_commit, not both"))
+            }
+            (None, None) => return Err(value_error("give at_snapshot or at_commit")),
+            (Some(value), None) => {
+                if let Ok(snapshot_id) = value.extract::<u64>() {
+                    if snapshot_id == 0 {
+                        return Err(value_error("at_snapshot id must be greater than zero"));
+                    }
+                    WorkbenchRestoreOrigin::Snapshot(WorkbenchSnapshotSelector::Id(snapshot_id))
+                } else {
+                    let alias: String = value
+                        .extract()
+                        .map_err(|_| value_error("at_snapshot must be an id or an alias"))?;
+                    WorkbenchRestoreOrigin::Snapshot(WorkbenchSnapshotSelector::Name(alias))
+                }
+            }
+            (None, Some(commit_id)) => WorkbenchRestoreOrigin::Commit(
+                nokv_agent::decode_commit_identity(commit_id).map_err(value_error)?,
+            ),
+        };
+        let request = WorkbenchRestoreRequest {
+            source_workbench_path: self.lifecycle_workbench_path(&source_workbench_id)?,
+            destination_workbench_path: self.lifecycle_workbench_path(&destination_workbench_id)?,
+            source_workbench_id,
+            origin,
+            destination_workbench_id,
+        };
+        let client = Arc::clone(&self.client);
+        let objects = Arc::clone(&self.objects);
+        let outcome = py
+            .detach(move || {
+                let options = WorkbenchLifecycleOptions::new(LIFECYCLE_MAX_MANIFEST_BYTES)
+                    .map_err(lifecycle_error)?;
+                WorkbenchLifecycleFacade::new(
+                    &client,
+                    objects.as_ref(),
+                    options,
+                    CanonicalWorkbenchProjection,
+                )
+                .restore(request)
+                .map_err(lifecycle_error)
+            })
+            .map_err(runtime_error)?;
+        let result = PyDict::new(py);
+        result.set_item("operation_id", hex(&outcome.operation_id))?;
+        match outcome.source {
+            WorkbenchRestoreSource::Snapshot { snapshot_id } => {
+                result.set_item("snapshot_id", snapshot_id)?;
+                result.set_item("commit_id", py.None())?;
+            }
+            WorkbenchRestoreSource::Commit { commit_id } => {
+                result.set_item("snapshot_id", py.None())?;
+                result.set_item("commit_id", hex(&commit_id))?;
+            }
+        }
+        result.set_item("read_version", outcome.source_snapshot_read_version)?;
+        result.set_item(
+            "destination_generation",
+            outcome.destination_workspace_revision,
+        )?;
         result.set_item("replayed", outcome.idempotent_replay)?;
         Ok(result)
     }

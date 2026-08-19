@@ -40,9 +40,13 @@ const RESTORE_DESTINATION_INCARNATION_DOMAIN: &[u8] =
 // same frozen state, so it gets its own domains. Keeping the snapshot domains
 // untouched leaves every restore already in flight with the identity it was
 // started under.
-const RESTORE_COMMIT_OPERATION_DOMAIN: &[u8] = b"nokv.restore.commit-operation.v1\0";
 const RESTORE_COMMIT_DESTINATION_INCARNATION_DOMAIN: &[u8] =
     b"nokv.restore.commit-destination-incarnation.v1\0";
+// The operation id is a frozen cross-layer contract: the shard derives the
+// same digest and refuses a request whose id disagrees. One domain covers
+// both sources, discriminated by a tag byte.
+const RESTORE_SOURCE_TAG_SNAPSHOT: u8 = 1;
+const RESTORE_SOURCE_TAG_COMMIT: u8 = 2;
 const RESTORE_MANIFEST_OPERATION_DOMAIN: &[u8] = b"nokv.cli.restore-manifest-operation\0";
 const RESTORE_MANIFEST_REVISION_DOMAIN: &[u8] = b"nokv.cli.restore-manifest-revision\0";
 
@@ -139,10 +143,10 @@ impl RestoreWorkflowIdentities {
             root_id,
             source_workbench,
             source_workspace_incarnation_id,
+            RESTORE_SOURCE_TAG_SNAPSHOT,
             &snapshot_id.to_be_bytes(),
             destination_workbench,
             destination_workspace_incarnation_id,
-            RESTORE_OPERATION_DOMAIN,
         );
         Self {
             operation_id,
@@ -174,10 +178,10 @@ impl RestoreWorkflowIdentities {
             root_id,
             source_workbench,
             source_workspace_incarnation_id,
+            RESTORE_SOURCE_TAG_COMMIT,
             &commit_id,
             destination_workbench,
             destination_workspace_incarnation_id,
-            RESTORE_COMMIT_OPERATION_DOMAIN,
         );
         Self {
             operation_id,
@@ -1820,17 +1824,17 @@ fn restore_operation_identity(
     root_id: RootIdentity,
     source_workbench: &WorkbenchName,
     source_incarnation: WorkspaceIdentity,
+    source_tag: u8,
     source_bytes: &[u8],
     destination: &WorkbenchName,
     destination_incarnation: WorkspaceIdentity,
-    domain: &[u8],
 ) -> OperationIdentity {
     let mut hasher = Sha256::new();
-    hasher.update(domain);
+    hasher.update(RESTORE_OPERATION_DOMAIN);
     hasher.update(root_id.0);
     hash_len32(&mut hasher, source_workbench.as_str().as_bytes());
     hasher.update(source_incarnation.0);
-    hasher.update([1]);
+    hasher.update([source_tag]);
     hasher.update(source_bytes);
     hash_len32(&mut hasher, destination.as_str().as_bytes());
     hasher.update(destination_incarnation.0);
@@ -2541,6 +2545,8 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    const COMMIT_RESTORE_OPERATION_GOLDEN: &str = "07b6bfed3cd71168589fabd6fb5f649f";
+
     #[test]
     fn workflow_identity_domains_have_frozen_golden_bytes() {
         let root = RootIdentity([1; 16]);
@@ -2581,6 +2587,31 @@ mod tests {
         assert_eq!(
             hex(&manifest.revision_id.0),
             "80eaf4e236db23c62e3d070517fe5301"
+        );
+
+        // The commit restore identity is a cross-layer contract too: the
+        // shard derives it from the same domain with a different source tag
+        // and refuses a request whose id disagrees. Freeze it here so a
+        // client-side change cannot drift away from the shard silently.
+        let commit_restore = RestoreWorkflowIdentities::derive(
+            root,
+            &WorkbenchName::new("run").unwrap(),
+            WorkspaceIdentity([4; 16]),
+            crate::WorkbenchRestoreSource::Commit { commit_id: [9; 32] },
+            &WorkbenchName::new("restored-run").unwrap(),
+        );
+        assert_ne!(
+            commit_restore.operation_id.0, restore.operation_id.0,
+            "a commit restore is a different operation from a snapshot restore"
+        );
+        assert_ne!(
+            commit_restore.destination_workspace_incarnation_id.0,
+            restore.destination_workspace_incarnation_id.0
+        );
+        assert_eq!(
+            hex(&commit_restore.operation_id.0),
+            COMMIT_RESTORE_OPERATION_GOLDEN,
+            "commit restore operation identity drifted"
         );
     }
 
