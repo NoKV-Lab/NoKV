@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nokv_client::{
     ClientOptions, ControlRouteResolver, EtcdRouteOptions, FramedTcpOptions, FramedTcpTransport,
-    RestoreWorkflowIdentities, WorkspaceClient,
+    RestoreWorkflowIdentities, WorkbenchRestoreSource, WorkspaceClient,
 };
 use nokv_control::{
     ControlStore, EtcdControlStore, EtcdControlStoreOptions, NodeId, RecoveryPublication, RootId,
@@ -97,11 +97,13 @@ impl CrashArm {
                     .to_owned(),
             );
         }
-        let expected = RestoreWorkflowIdentities::derive_snapshot(
+        let expected = RestoreWorkflowIdentities::derive(
             self.root_id,
             &self.source_workbench,
             self.source_workspace_incarnation_id,
-            self.snapshot_id,
+            WorkbenchRestoreSource::Snapshot {
+                snapshot_id: self.snapshot_id,
+            },
             &self.destination_workbench,
         );
         if expected.operation_id != self.operation_id
@@ -342,11 +344,13 @@ fn run_arm(config: ArmConfig) -> Result<(), String> {
         })
         .map_err(|error| error.to_string())?
         .value;
-    let identities = RestoreWorkflowIdentities::derive_snapshot(
+    let identities = RestoreWorkflowIdentities::derive(
         config.route.root_id,
         &config.source_workbench,
         source.workspace_incarnation_id,
-        config.snapshot_id,
+        WorkbenchRestoreSource::Snapshot {
+            snapshot_id: config.snapshot_id,
+        },
         &config.destination_workbench,
     );
     let arm = CrashArm {
@@ -912,11 +916,11 @@ mod tests {
         let source_workspace_incarnation_id = WorkspaceIdentity([0x22; FIXED_ID_BYTES]);
         let snapshot_id = 7;
         let destination_workbench = WorkbenchName::new("restored-run").unwrap();
-        let identities = RestoreWorkflowIdentities::derive_snapshot(
+        let identities = RestoreWorkflowIdentities::derive(
             root_id,
             &source_workbench,
             source_workspace_incarnation_id,
-            snapshot_id,
+            WorkbenchRestoreSource::Snapshot { snapshot_id },
             &destination_workbench,
         );
         CrashArm {

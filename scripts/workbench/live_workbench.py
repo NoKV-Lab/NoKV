@@ -37,6 +37,7 @@ from workbench_contract import (
 
 SCHEMA = "nokv.workbench.live_evidence.v1"
 PROTOCOL_VERSION = "2025-11-25"
+RESTORE_MANIFEST_SCHEMA = "nokv.workbench.restore_manifest.v2"
 HEX_ID = re.compile(r"^[0-9a-f]{32}$")
 WORKBENCH_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 SECRET_FLAGS = {"--object-secret-access-key"}
@@ -1016,6 +1017,45 @@ def document(result: dict[str, Any], label: str) -> dict[str, Any]:
     return items[0]["value"]
 
 
+def assert_restore_manifest_v2(
+    manifest: dict[str, Any],
+    restore: dict[str, Any],
+    snapshot: dict[str, Any],
+    config: Config,
+) -> None:
+    operation_id = restore.get("operation_id")
+    snapshot_id = restore.get("snapshot_id")
+    if (
+        not isinstance(operation_id, str)
+        or not HEX_ID.fullmatch(operation_id)
+        or not isinstance(snapshot_id, int)
+        or isinstance(snapshot_id, bool)
+        or snapshot_id <= 0
+        or snapshot.get("snapshot_id") != snapshot_id
+        or restore.get("source_workbench_id") != config.workbench
+        or restore.get("destination_workbench_id") != config.restored
+    ):
+        raise WorkflowFailure("restore result is not bound to the minted snapshot")
+
+    source_path = f"{config.workbench_root}/{config.workbench}"
+    destination_path = f"{config.workbench_root}/{config.restored}"
+    expected = {
+        "schema": RESTORE_MANIFEST_SCHEMA,
+        "operation_id": operation_id,
+        "restored_from": {
+            "workbench_id": config.workbench,
+            "path": source_path,
+            "source": {"kind": "snapshot", "snapshot_id": snapshot_id},
+        },
+        "source_workbench_id": config.workbench,
+        "source_path": source_path,
+        "destination_workbench_id": config.restored,
+        "destination_path": destination_path,
+    }
+    if manifest != expected:
+        raise WorkflowFailure("restore manifest projection differs from v2")
+
+
 def assert_phase_one_results(
     results: dict[str, dict[str, Any]],
     config: Config,
@@ -1261,12 +1301,12 @@ def assert_results(
     ):
         raise WorkflowFailure("snapshot frozen/live/restore relationship differs")
     restore_manifest = document(results["read-restore-manifest"], "restore manifest")
-    if (
-        restore_manifest.get("schema") != "nokv.workbench.restore_manifest.v1"
-        or restore_manifest.get("source_workbench_id") != config.workbench
-        or restore_manifest.get("destination_workbench_id") != config.restored
-    ):
-        raise WorkflowFailure("restore manifest projection differs from v1")
+    assert_restore_manifest_v2(
+        restore_manifest,
+        results["restore"],
+        results["snapshot"],
+        config,
+    )
     reject_internal_keys(run_manifest, "run manifest")
     reject_internal_keys(restore_manifest, "restore manifest")
     minted = results["snapshot"]
