@@ -45,7 +45,8 @@ pub use workbench_lifecycle::{
     RunManifestProjectionContext, VerifiedWorkbenchRestoreManifest, VerifiedWorkbenchRunManifest,
     WorkbenchAdmission, WorkbenchCommitOutcome, WorkbenchCommitRequest, WorkbenchLifecycleError,
     WorkbenchLifecycleFacade, WorkbenchLifecycleOptions, WorkbenchProjection,
-    WorkbenchRestoreOutcome, WorkbenchRestoreRequest, WorkbenchSnapshotSelector,
+    WorkbenchRestoreOrigin, WorkbenchRestoreOutcome, WorkbenchRestoreRequest,
+    WorkbenchRestoreSource, WorkbenchSnapshotSelector,
 };
 pub use workbench_workflow::{
     CommitRecoveryRequest, CommitWorkflowError, CommitWorkflowIdentities, CommitWorkflowOptions,

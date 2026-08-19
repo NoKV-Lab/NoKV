@@ -36,6 +36,13 @@ const COMMIT_MANIFEST_REVISION_DOMAIN: &[u8] = b"nokv.cli.commit-manifest-revisi
 const RESTORE_OPERATION_DOMAIN: &[u8] = b"nokv.restore.operation.v2\0";
 const RESTORE_DESTINATION_INCARNATION_DOMAIN: &[u8] =
     b"nokv.cli.restore-destination-incarnation.v2\0";
+// A commit restore is a different operation from a snapshot restore of the
+// same frozen state, so it gets its own domains. Keeping the snapshot domains
+// untouched leaves every restore already in flight with the identity it was
+// started under.
+const RESTORE_COMMIT_OPERATION_DOMAIN: &[u8] = b"nokv.restore.commit-operation.v1\0";
+const RESTORE_COMMIT_DESTINATION_INCARNATION_DOMAIN: &[u8] =
+    b"nokv.restore.commit-destination-incarnation.v1\0";
 const RESTORE_MANIFEST_OPERATION_DOMAIN: &[u8] = b"nokv.cli.restore-manifest-operation\0";
 const RESTORE_MANIFEST_REVISION_DOMAIN: &[u8] = b"nokv.cli.restore-manifest-revision\0";
 
@@ -83,7 +90,35 @@ impl RestoreWorkflowIdentities {
     /// Derives the v2 snapshot restore and destination identities. The
     /// operation binds both workbench names, both workspace incarnations, and
     /// the concrete numeric snapshot selector.
-    pub fn derive_snapshot(
+    pub fn derive(
+        root_id: RootIdentity,
+        source_workbench: &WorkbenchName,
+        source_workspace_incarnation_id: WorkspaceIdentity,
+        source: crate::WorkbenchRestoreSource,
+        destination_workbench: &WorkbenchName,
+    ) -> Self {
+        match source {
+            crate::WorkbenchRestoreSource::Snapshot { snapshot_id } => Self::derive_snapshot(
+                root_id,
+                source_workbench,
+                source_workspace_incarnation_id,
+                snapshot_id,
+                destination_workbench,
+            ),
+            crate::WorkbenchRestoreSource::Commit { commit_id } => Self::derive_commit(
+                root_id,
+                source_workbench,
+                source_workspace_incarnation_id,
+                commit_id,
+                destination_workbench,
+            ),
+        }
+    }
+
+    /// Derives the v2 snapshot restore and destination identities. The
+    /// operation binds both workbench names, both workspace incarnations, and
+    /// the concrete numeric snapshot selector.
+    fn derive_snapshot(
         root_id: RootIdentity,
         source_workbench: &WorkbenchName,
         source_workspace_incarnation_id: WorkspaceIdentity,
@@ -104,9 +139,45 @@ impl RestoreWorkflowIdentities {
             root_id,
             source_workbench,
             source_workspace_incarnation_id,
-            snapshot_id,
+            &snapshot_id.to_be_bytes(),
             destination_workbench,
             destination_workspace_incarnation_id,
+            RESTORE_OPERATION_DOMAIN,
+        );
+        Self {
+            operation_id,
+            destination_workspace_incarnation_id,
+        }
+    }
+
+    /// Derives the commit restore identities under their own domains, so a
+    /// commit restore can never be mistaken for a snapshot restore of the
+    /// same frozen state.
+    fn derive_commit(
+        root_id: RootIdentity,
+        source_workbench: &WorkbenchName,
+        source_workspace_incarnation_id: WorkspaceIdentity,
+        commit_id: [u8; 32],
+        destination_workbench: &WorkbenchName,
+    ) -> Self {
+        let destination_workspace_incarnation_id = WorkspaceIdentity(stable_fixed_identity(
+            RESTORE_COMMIT_DESTINATION_INCARNATION_DOMAIN,
+            root_id,
+            &[
+                source_workbench.as_str().as_bytes(),
+                &source_workspace_incarnation_id.0,
+                &commit_id,
+                destination_workbench.as_str().as_bytes(),
+            ],
+        ));
+        let operation_id = restore_operation_identity(
+            root_id,
+            source_workbench,
+            source_workspace_incarnation_id,
+            &commit_id,
+            destination_workbench,
+            destination_workspace_incarnation_id,
+            RESTORE_COMMIT_OPERATION_DOMAIN,
         );
         Self {
             operation_id,
@@ -1749,17 +1820,18 @@ fn restore_operation_identity(
     root_id: RootIdentity,
     source_workbench: &WorkbenchName,
     source_incarnation: WorkspaceIdentity,
-    snapshot_id: u64,
+    source_bytes: &[u8],
     destination: &WorkbenchName,
     destination_incarnation: WorkspaceIdentity,
+    domain: &[u8],
 ) -> OperationIdentity {
     let mut hasher = Sha256::new();
-    hasher.update(RESTORE_OPERATION_DOMAIN);
+    hasher.update(domain);
     hasher.update(root_id.0);
     hash_len32(&mut hasher, source_workbench.as_str().as_bytes());
     hasher.update(source_incarnation.0);
     hasher.update([1]);
-    hasher.update(snapshot_id.to_be_bytes());
+    hasher.update(source_bytes);
     hash_len32(&mut hasher, destination.as_str().as_bytes());
     hasher.update(destination_incarnation.0);
     let digest: [u8; 32] = hasher.finalize().into();
@@ -2129,11 +2201,11 @@ mod tests {
         let source_incarnation = WorkspaceIdentity([2; 16]);
         let source_workbench = WorkbenchName::new("source-run").unwrap();
         let destination = WorkbenchName::new("restored-run").unwrap();
-        let identities = RestoreWorkflowIdentities::derive_snapshot(
+        let identities = RestoreWorkflowIdentities::derive(
             root,
             &source_workbench,
             source_incarnation,
-            7,
+            crate::WorkbenchRestoreSource::Snapshot { snapshot_id: 7 },
             &destination,
         );
         let restore_bytes = br#"{"restore":true}"#.to_vec();
@@ -2486,11 +2558,11 @@ mod tests {
             "d879f0983c8c4549e90b7026bcc52621"
         );
 
-        let restore = RestoreWorkflowIdentities::derive_snapshot(
+        let restore = RestoreWorkflowIdentities::derive(
             root,
             &WorkbenchName::new("source-run").unwrap(),
             WorkspaceIdentity([2; 16]),
-            7,
+            crate::WorkbenchRestoreSource::Snapshot { snapshot_id: 7 },
             &WorkbenchName::new("restored-run").unwrap(),
         );
         assert_eq!(

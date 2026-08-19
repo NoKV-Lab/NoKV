@@ -140,6 +140,11 @@ pub fn workbench_commit_inputs(
     })
 }
 
+/// Decodes a commit identity as the CLI and SDK present it: 64 lowercase hex.
+pub fn decode_commit_identity(value: &str) -> Result<[u8; 32], ProjectionError> {
+    decode_lowercase_hex::<32>("commit_id", value)
+}
+
 pub fn workbench_commit_identity(
     workbench_id: &WorkbenchId,
     content_digest_uri: &str,
@@ -429,6 +434,9 @@ pub fn verify_restore_manifest(bytes: &[u8]) -> Result<VerifiedRestoreManifest, 
     let envelope: Value = serde_json::from_slice(bytes).map_err(|error| {
         ProjectionError::new(format!("restore manifest is not valid JSON: {error}"))
     })?;
+    // Canonicality first, exactly as each version checks it: a non-canonical
+    // envelope must be reported as such rather than as a missing field.
+    require_canonical_bytes("restore manifest", bytes, &envelope)?;
     let schema = envelope
         .get("schema")
         .and_then(Value::as_str)

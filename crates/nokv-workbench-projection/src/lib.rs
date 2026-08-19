@@ -16,10 +16,11 @@
 
 #![forbid(unsafe_code)]
 
+use nokv_agent::RestoreManifestSource;
 use nokv_client::{
     RestoreManifestProjectionContext, RestoredRunManifestProjectionContext,
     RunManifestProjectionContext, VerifiedWorkbenchRestoreManifest, VerifiedWorkbenchRunManifest,
-    WorkbenchProjection,
+    WorkbenchProjection, WorkbenchRestoreSource,
 };
 use nokv_types::WorkbenchId;
 
@@ -81,13 +82,13 @@ impl WorkbenchProjection for CanonicalWorkbenchProjection {
         &self,
         context: RestoreManifestProjectionContext<'_>,
     ) -> Result<Vec<u8>, Self::Error> {
-        nokv_agent::build_restore_manifest_v1(
+        nokv_agent::build_restore_manifest_v2(
             context.operation_id,
             context.source_workbench_id,
             context.source_path,
             context.destination_workbench_id,
             context.destination_path,
-            context.snapshot_id,
+            manifest_source(context.source),
         )
     }
 
@@ -95,14 +96,16 @@ impl WorkbenchProjection for CanonicalWorkbenchProjection {
         &self,
         bytes: &[u8],
     ) -> Result<VerifiedWorkbenchRestoreManifest, Self::Error> {
-        let verified = nokv_agent::verify_restore_manifest_v1(bytes)?;
+        // Reads either schema: v1 envelopes are durable artifacts inside
+        // workbenches restored before a commit could be named.
+        let verified = nokv_agent::verify_restore_manifest(bytes)?;
         Ok(VerifiedWorkbenchRestoreManifest {
             operation_id: verified.operation_id,
             source_workbench_id: verified.source_workbench_id,
             source_path: verified.source_path,
             destination_workbench_id: verified.destination_workbench_id,
             destination_path: verified.destination_path,
-            snapshot_id: verified.snapshot_id,
+            source: client_source(verified.source),
             canonical_envelope: verified.canonical_envelope,
             envelope_digest_uri: verified.envelope_digest_uri,
         })
@@ -142,5 +145,23 @@ impl WorkbenchProjection for CanonicalWorkbenchProjection {
             context.destination_commit_identity,
             context.destination_committed_at_unix_seconds,
         )
+    }
+}
+
+fn manifest_source(source: WorkbenchRestoreSource) -> RestoreManifestSource {
+    match source {
+        WorkbenchRestoreSource::Snapshot { snapshot_id } => {
+            RestoreManifestSource::Snapshot { snapshot_id }
+        }
+        WorkbenchRestoreSource::Commit { commit_id } => RestoreManifestSource::Commit { commit_id },
+    }
+}
+
+fn client_source(source: RestoreManifestSource) -> WorkbenchRestoreSource {
+    match source {
+        RestoreManifestSource::Snapshot { snapshot_id } => {
+            WorkbenchRestoreSource::Snapshot { snapshot_id }
+        }
+        RestoreManifestSource::Commit { commit_id } => WorkbenchRestoreSource::Commit { commit_id },
     }
 }
