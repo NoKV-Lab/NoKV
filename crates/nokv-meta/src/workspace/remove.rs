@@ -238,7 +238,7 @@ pub fn remove_path(
             actual: path.generation.get(),
         });
     }
-    let projection = TypedProjection::decode(&path.typed_index_projection)?;
+    let projection = TypedProjection::decode_stored(&path.typed_index_projection)?;
 
     let revision_key = artifact_revision_key(request.context.root_id, path.artifact_revision_id);
     let revision_payload = read_current(

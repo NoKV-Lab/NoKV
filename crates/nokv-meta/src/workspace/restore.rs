@@ -3334,7 +3334,8 @@ pub fn cleanup_restore_batch(
         let additional = match &current {
             None => 1,
             Some(path) => {
-                let projection = TypedProjection::decode(&path.record.typed_index_projection)?;
+                let projection =
+                    TypedProjection::decode_stored(&path.record.typed_index_projection)?;
                 let new_revision = revisions.insert(path.record.artifact_revision_id);
                 3 + projection.fields().len() + if new_revision { 2 } else { 0 }
             }
@@ -4803,7 +4804,7 @@ fn secondary_index_rows(
     path: &nokv_types::NormalizedRelativePath,
     entry: &PathEntry,
 ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, RestoreError> {
-    let projection = TypedProjection::decode(&entry.typed_index_projection)?;
+    let projection = TypedProjection::decode_stored(&entry.typed_index_projection)?;
     let payload = SecondaryIndexRecord {
         path_generation: entry.generation,
         compact_projection: projection.clone(),
@@ -5486,7 +5487,7 @@ fn plan_restore_commit_member_batch(
             family: "PathCurrent(destination)",
         })?;
         let entry = PathEntry::decode(&row.value)?;
-        TypedProjection::decode(&entry.typed_index_projection)?;
+        TypedProjection::decode_stored(&entry.typed_index_projection)?;
         let member = CommitMemberRecord {
             artifact_revision_id: entry.artifact_revision_id,
             path_generation: entry.generation,
@@ -6061,11 +6062,11 @@ fn validate_initialization(
 ) -> Result<(), RestoreError> {
     let manifest = &initialization.restore_manifest;
     manifest.encode()?;
-    TypedProjection::decode(&manifest.typed_index_projection)?;
+    TypedProjection::decode_stored(&manifest.typed_index_projection)?;
     if manifest.logical_size != operation.restore_manifest.logical_size
         || manifest.body_digest_uri != operation.restore_manifest.body_digest_uri
         || manifest.content_type != operation.restore_manifest.content_type
-        || !TypedProjection::decode(&manifest.typed_index_projection)?
+        || !TypedProjection::decode_stored(&manifest.typed_index_projection)?
             .fields()
             .is_empty()
     {

@@ -1569,7 +1569,8 @@ impl<'a> CommitService<'a> {
             return Err(CommitError::HeadConflict);
         }
         if let Some(current) = current_path.as_ref() {
-            let projection = TypedProjection::decode(&current.record.typed_index_projection)?;
+            let projection =
+                TypedProjection::decode_stored(&current.record.typed_index_projection)?;
             if !projection.fields().is_empty() {
                 return Err(CommitError::ClosureMismatch {
                     closure: "run manifest secondary index",
@@ -5178,6 +5179,38 @@ mod tests {
         let replayed = service.begin_build(exact_replace).unwrap();
         assert!(replayed.replayed);
         assert_eq!(replayed.operation, begun.operation);
+    }
+
+    #[test]
+    fn the_run_manifest_projection_commit_installs_is_readable_by_commit() {
+        // finalize_build *requires* the virtual run-manifest member to carry
+        // an empty typed projection, and installs those bytes verbatim into
+        // the durable PathCurrent row. The next commit on the same workbench
+        // reads that row back before publishing its own run manifest. Writer
+        // and reader therefore have to agree on what "no projection" looks
+        // like once it is durable.
+        let installed_by_commit: Vec<u8> = Vec::new();
+        assert!(
+            TypedProjection::decode(&installed_by_commit).is_err(),
+            "the canonical decoder cannot express the durable empty form, so a \
+             reader of stored bytes that uses it rejects what commit wrote"
+        );
+        let read_back = TypedProjection::decode_stored(&installed_by_commit)
+            .expect("the durable-record decoder accepts what commit installs");
+        assert!(read_back.fields().is_empty());
+        // And it must stay strict about everything else: decode_stored differs
+        // from decode only on the empty slice.
+        assert!(TypedProjection::decode_stored(&[0xff]).is_err());
+        let canonical = TypedProjection::empty().encode().unwrap();
+        assert!(
+            !canonical.is_empty(),
+            "an empty projection still encodes to bytes"
+        );
+        assert_eq!(
+            TypedProjection::decode_stored(&canonical).unwrap(),
+            TypedProjection::decode(&canonical).unwrap(),
+            "the two decoders agree on every canonical encoding"
+        );
     }
 
     #[test]
