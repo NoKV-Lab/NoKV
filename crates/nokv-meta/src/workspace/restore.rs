@@ -13361,4 +13361,303 @@ mod tests {
             .is_some());
         }
     }
+    /// A second commit on one workbench must publish.
+    ///
+    /// The first commit installs `metadata/run_manifest.json` from a virtual
+    /// commit member whose `typed_projection` is hard-coded empty
+    /// (`commit.rs` -> `typed_projection: Vec::new()`), and copies that field
+    /// straight into the durable `PathCurrent` row. Every *strict* reader of
+    /// that field then rejects it; the second commit is the first caller to
+    /// read it back, in `finalize_publish` of the round-two run manifest.
+    ///
+    /// Nothing here touches commit retirement, the LifecycleRunner, or the
+    /// command dedupe result: the failing bytes are a durable record field.
+    #[test]
+    fn a_second_commit_reads_back_the_run_manifest_projection_the_first_one_wrote() {
+        let mut counter = 0_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+
+        let wb = workbench("two-rounds");
+        let inc = incarnation(10);
+        create_visible_workspace(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &wb,
+            inc,
+        )
+        .unwrap();
+
+        // Round one: one artifact, one commit. This is the whole pre-pilot.
+        publish_text_file(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &wb,
+            inc,
+            "input/note.txt",
+            b"round one",
+            revision(0x11),
+            operation(0x21),
+        );
+        drive_commit_wire_calls(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &wb,
+            inc,
+            CommitId::from_bytes([0x42; SHA256_BYTES]),
+            operation(0x31),
+            operation(0x32),
+            revision(0x12),
+            br#"{"schema":"nokv.workbench.run_manifest.v1","round":1}"#,
+        );
+
+        // The durable evidence, written by the FIRST commit: the run-manifest
+        // path row carries zero projection bytes. The tolerant decoder accepts
+        // that; the strict one produces exactly the error the CLI reports.
+        let manifest_path = NormalizedRelativePath::new(RUN_MANIFEST_PATH).unwrap();
+        let after_round_one = get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &wb,
+            &manifest_path,
+        )
+        .unwrap()
+        .expect("the first commit installs the run manifest");
+        assert!(
+            after_round_one.typed_index_projection.is_empty(),
+            "commit installs the run manifest with a zero-byte typed projection"
+        );
+        assert!(TypedProjection::decode_stored(&after_round_one.typed_index_projection).is_ok());
+        assert_eq!(
+            TypedProjection::decode(&after_round_one.typed_index_projection)
+                .unwrap_err()
+                .to_string(),
+            "truncated value_format_version: need 1 bytes, have 0"
+        );
+
+        // Round two: one more artifact, then the same wire calls again.
+        publish_text_file(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &wb,
+            inc,
+            "input/note2.txt",
+            b"round two",
+            revision(0x13),
+            operation(0x22),
+        );
+
+        let commits = CommitService::new(&store);
+        let head = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::WorkbenchCommitHead,
+            &workbench_commit_head_key(root(), inc),
+            WorkbenchCommitHeadRecord::decode,
+        )
+        .unwrap()
+        .expect("round one installed a commit head");
+        let round_two_manifest: &[u8] = br#"{"schema":"nokv.workbench.run_manifest.v1","round":2}"#;
+        let round_two_revision = revision(0x14);
+        let round_two_commit_operation = operation(0x33);
+        let run_manifest_condition = CommitManifestCondition::ReplaceOnly {
+            expected_generation: after_round_one.generation,
+        };
+        let begun = commits
+            .begin_build(BeginBuildCommitRequest {
+                context: write_context(&store, &mut counter, owner_epoch),
+                operation_id: round_two_commit_operation,
+                workbench_id: wb.clone(),
+                expected_source_workspace_incarnation_id: inc,
+                commit_id: CommitId::from_bytes([0x43; SHA256_BYTES]),
+                content_digest_uri: format!("sha256:{:064x}", 0x430),
+                manifest_digest_uri: body_digest_uri(round_two_manifest),
+                projection_input_digest: [0; SHA256_BYTES],
+                tree_manifest_revision_id: round_two_revision,
+                replace: true,
+                run_manifest_condition,
+                committed_at_unix_seconds: 1_700_000_100,
+                expected_head_generation: Some(head.record.head_generation),
+                producer: None,
+                lineage_projection: Vec::new(),
+                parent_commits: vec![head.record.commit_id],
+            })
+            .expect("round two begin_build succeeds: nothing has read the bad field yet");
+        assert_eq!(begun.operation.phase, BuildCommitPhase::Building);
+
+        // The round-two run-manifest publication. Every step but the last one
+        // succeeds; finalize_publish is the first reader of the round-one
+        // projection bytes.
+        let service = PublicationService::new(&store);
+        let (staged, manifest) = single_object_rows(round_two_revision, round_two_manifest);
+        let mut publish = wire_publish_operation(
+            operation(0x34),
+            round_two_revision,
+            &wb,
+            inc,
+            manifest_path.clone(),
+            PublishAuthority::CommitStaging {
+                commit_operation_id: round_two_commit_operation,
+            },
+            owner_epoch,
+            &staged,
+            &manifest,
+        );
+        publish.claim = PublishClaim::ReplaceOnly {
+            expected_generation: after_round_one.generation,
+        };
+        seal_publish_operation(&mut publish);
+        let manifest_digest_uri = sha256_digest_uri(publish.manifest_seal);
+        let mut operation_record = service
+            .begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter, owner_epoch),
+                operation: publish,
+            })
+            .unwrap()
+            .operation;
+        for batch in staged.chunks(MAX_PUBLICATION_BATCH_ROWS) {
+            operation_record = service
+                .stage_objects_batch(StageObjectsBatchRequest {
+                    context: publication_context(&store, &mut counter, owner_epoch),
+                    expected_operation: operation_record,
+                    staged_objects: batch.to_vec(),
+                })
+                .unwrap()
+                .operation;
+        }
+        let uploads: Vec<StagedObjectUpdate> = staged
+            .iter()
+            .cloned()
+            .map(|expected| {
+                let mut next = expected.clone();
+                next.provider_state = StagedProviderState::Uploaded;
+                StagedObjectUpdate { expected, next }
+            })
+            .collect();
+        for batch in uploads.chunks(MAX_PUBLICATION_BATCH_ROWS) {
+            operation_record = service
+                .mark_objects_uploaded_batch(MarkObjectsUploadedBatchRequest {
+                    context: publication_context(&store, &mut counter, owner_epoch),
+                    expected_operation: operation_record,
+                    staged_object_updates: batch.to_vec(),
+                })
+                .unwrap()
+                .operation;
+        }
+        for batch in manifest.chunks(MAX_PUBLICATION_BATCH_ROWS) {
+            operation_record = service
+                .stage_manifest_batch(StageManifestBatchRequest {
+                    context: publication_context(&store, &mut counter, owner_epoch),
+                    expected_operation: operation_record,
+                    manifest_rows: batch.to_vec(),
+                    dependency_owner_revision_ids: Vec::new(),
+                })
+                .unwrap()
+                .operation;
+        }
+        let operation_record = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter, owner_epoch),
+                expected_operation: operation_record,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        service
+            .finalize_publish(FinalizePublishRequest {
+                context: publication_context(&store, &mut counter, owner_epoch),
+                artifact: PublishedArtifact {
+                    logical_size: round_two_manifest.len() as u64,
+                    body_digest_uri: body_digest_uri(round_two_manifest),
+                    manifest_digest_uri,
+                    content_type: "application/json".to_owned(),
+                    producer: None,
+                    manifest_id: None,
+                    typed_index_projection: TypedProjection::empty().encode().unwrap(),
+                },
+                expected_operation: operation_record,
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .expect("commit-staging publication returns before the visible-path projection read");
+
+        // Every remaining build step succeeds. finalize_build is the first and
+        // only reader of the round-one projection bytes.
+        loop {
+            let outcome = commits
+                .build_members(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter, owner_epoch),
+                    operation_id: round_two_commit_operation,
+                    limit: MAX_COMMIT_MEMBER_BATCH_ROWS,
+                })
+                .expect("build_members copies the bad field without decoding it");
+            if outcome.operation.members_complete {
+                break;
+            }
+        }
+        loop {
+            let outcome = commits
+                .seal_revisions(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter, owner_epoch),
+                    operation_id: round_two_commit_operation,
+                    limit: MAX_COMMIT_REVISION_BATCH_ROWS,
+                })
+                .unwrap();
+            if outcome.operation.revisions_complete {
+                break;
+            }
+        }
+        commits
+            .attach_parents(BuildCommitStepRequest {
+                context: write_context(&store, &mut counter, owner_epoch),
+                operation_id: round_two_commit_operation,
+                limit: MAX_COMMIT_PARENT_BATCH_ROWS,
+            })
+            .unwrap();
+        commits
+            .begin_sealing(
+                write_context(&store, &mut counter, owner_epoch),
+                round_two_commit_operation,
+            )
+            .unwrap();
+        let sealed = commits
+            .finalize_build(
+                write_context(&store, &mut counter, owner_epoch),
+                round_two_commit_operation,
+            )
+            .expect("the round-two commit reads back what the round-one commit installed");
+        let result = sealed
+            .operation
+            .result
+            .expect("a finalized build carries its result");
+        assert_eq!(
+            result.head_generation,
+            Generation::new(2).unwrap(),
+            "the second round advances the commit head"
+        );
+
+        // And the row it just installed is the same shape, so a third round
+        // reads the same field again rather than a one-off.
+        let after_round_two = get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &wb,
+            &manifest_path,
+        )
+        .unwrap()
+        .expect("round two installs its own run manifest");
+        assert!(
+            after_round_two.typed_index_projection.is_empty(),
+            "every commit installs the run manifest with a zero-byte projection"
+        );
+        assert!(
+            TypedProjection::decode_stored(&after_round_two.typed_index_projection)
+                .unwrap()
+                .fields()
+                .is_empty()
+        );
+    }
 }
