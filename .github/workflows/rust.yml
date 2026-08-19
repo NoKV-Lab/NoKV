@@ -24,8 +24,22 @@ jobs:
 
       - name: Install protobuf compiler for typed qualification
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          set -euo pipefail
+          # apt has hung on an unreachable mirror long enough to wedge a
+          # required check for half an hour, and the step it wedges is not
+          # the code under test, so the red lands nowhere useful. Bound each
+          # call and retry rather than letting a mirror decide the build.
+          for attempt in 1 2 3; do
+            if sudo timeout 300 apt-get update \
+              && sudo timeout 300 apt-get install -y protobuf-compiler; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt} failed or timed out; retrying" >&2
+            sudo pkill -f apt-get || true
+            sleep $((attempt * 15))
+          done
+          echo "apt-get could not install protobuf-compiler after 3 attempts" >&2
+          exit 1
 
       - name: Cache typed qualification targets
         uses: Swatinem/rust-cache@v2
@@ -333,8 +347,22 @@ jobs:
 
       - name: Install protobuf compiler
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          set -euo pipefail
+          # apt has hung on an unreachable mirror long enough to wedge a
+          # required check for half an hour, and the step it wedges is not
+          # the code under test, so the red lands nowhere useful. Bound each
+          # call and retry rather than letting a mirror decide the build.
+          for attempt in 1 2 3; do
+            if sudo timeout 300 apt-get update \
+              && sudo timeout 300 apt-get install -y protobuf-compiler; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt} failed or timed out; retrying" >&2
+            sudo pkill -f apt-get || true
+            sleep $((attempt * 15))
+          done
+          echo "apt-get could not install protobuf-compiler after 3 attempts" >&2
+          exit 1
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -375,7 +403,12 @@ jobs:
           set -euo pipefail
           archive="$RUNNER_TEMP/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
           install_dir="$RUNNER_TEMP/etcd-$ETCD_VERSION"
-          curl --fail --location --retry 3 \
+          # --retry alone does not cover a reset connection: curl treats it
+          # as fatal and exits without a single retry, which is how a 220 ms
+          # network blip has failed a required check. --retry-all-errors is
+          # what makes the retry budget apply to it.
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 30 --max-time 600 \
             --output "$archive" \
             "https://github.com/etcd-io/etcd/releases/download/$ETCD_VERSION/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
           echo "$ETCD_LINUX_AMD64_SHA256  $archive" | sha256sum --check
@@ -552,8 +585,22 @@ jobs:
 
       - name: Install protobuf compiler
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          set -euo pipefail
+          # apt has hung on an unreachable mirror long enough to wedge a
+          # required check for half an hour, and the step it wedges is not
+          # the code under test, so the red lands nowhere useful. Bound each
+          # call and retry rather than letting a mirror decide the build.
+          for attempt in 1 2 3; do
+            if sudo timeout 300 apt-get update \
+              && sudo timeout 300 apt-get install -y protobuf-compiler; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt} failed or timed out; retrying" >&2
+            sudo pkill -f apt-get || true
+            sleep $((attempt * 15))
+          done
+          echo "apt-get could not install protobuf-compiler after 3 attempts" >&2
+          exit 1
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -564,7 +611,12 @@ jobs:
           set -euo pipefail
           archive="$RUNNER_TEMP/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
           install_dir="$RUNNER_TEMP/etcd-$ETCD_VERSION"
-          curl --fail --location --retry 3 \
+          # --retry alone does not cover a reset connection: curl treats it
+          # as fatal and exits without a single retry, which is how a 220 ms
+          # network blip has failed a required check. --retry-all-errors is
+          # what makes the retry budget apply to it.
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 30 --max-time 600 \
             --output "$archive" \
             "https://github.com/etcd-io/etcd/releases/download/$ETCD_VERSION/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
           echo "$ETCD_LINUX_AMD64_SHA256  $archive" | sha256sum --check
@@ -614,8 +666,22 @@ jobs:
 
       - name: Install protobuf compiler
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          set -euo pipefail
+          # apt has hung on an unreachable mirror long enough to wedge a
+          # required check for half an hour, and the step it wedges is not
+          # the code under test, so the red lands nowhere useful. Bound each
+          # call and retry rather than letting a mirror decide the build.
+          for attempt in 1 2 3; do
+            if sudo timeout 300 apt-get update \
+              && sudo timeout 300 apt-get install -y protobuf-compiler; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt} failed or timed out; retrying" >&2
+            sudo pkill -f apt-get || true
+            sleep $((attempt * 15))
+          done
+          echo "apt-get could not install protobuf-compiler after 3 attempts" >&2
+          exit 1
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -626,7 +692,12 @@ jobs:
           set -euo pipefail
           archive="$RUNNER_TEMP/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
           install_dir="$RUNNER_TEMP/etcd-$ETCD_VERSION"
-          curl --fail --location --retry 3 \
+          # --retry alone does not cover a reset connection: curl treats it
+          # as fatal and exits without a single retry, which is how a 220 ms
+          # network blip has failed a required check. --retry-all-errors is
+          # what makes the retry budget apply to it.
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 30 --max-time 600 \
             --output "$archive" \
             "https://github.com/etcd-io/etcd/releases/download/$ETCD_VERSION/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
           echo "$ETCD_LINUX_AMD64_SHA256  $archive" | sha256sum --check

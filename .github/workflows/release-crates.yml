@@ -35,8 +35,22 @@ jobs:
 
       - name: Install protobuf compiler
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          set -euo pipefail
+          # apt has hung on an unreachable mirror long enough to wedge a
+          # required check for half an hour, and the step it wedges is not
+          # the code under test, so the red lands nowhere useful. Bound each
+          # call and retry rather than letting a mirror decide the build.
+          for attempt in 1 2 3; do
+            if sudo timeout 300 apt-get update \
+              && sudo timeout 300 apt-get install -y protobuf-compiler; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt} failed or timed out; retrying" >&2
+            sudo pkill -f apt-get || true
+            sleep $((attempt * 15))
+          done
+          echo "apt-get could not install protobuf-compiler after 3 attempts" >&2
+          exit 1
 
       - name: Resolve crate list
         id: crates
