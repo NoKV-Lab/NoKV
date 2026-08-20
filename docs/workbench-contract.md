@@ -7,10 +7,14 @@ SPDX-License-Identifier: Apache-2.0
 
 Status: normative Agent-facing contract.
 
-The Workbench profile is NoKV's stable Agent-facing product surface. The
-workspace architecture implements this profile while keeping physical namespace
-records, object keys, operation journals, and routing state outside the
-Workbench contract.
+The Workbench profile is NoKV's stable Agent-facing semantic contract. The
+native full `nokv` CLI is the primary delivery surface, and the direct Python
+SDK is the secondary embedded surface. The exact 18-tool MCP endpoint is an
+optional sidecar for hosts that require MCP discovery and JSON-RPC transport.
+Downstream Agent systems should normally expose skills over the CLI, or use the
+Python SDK in process. The workspace architecture implements the same profile
+while keeping physical namespace records, object keys, operation journals, and
+routing state outside the Workbench contract.
 
 The contract sources are:
 
@@ -21,11 +25,14 @@ The contract sources are:
 - `scripts/workbench/workbench_contract.py` for checking tool names and
   normalized input schemas.
 
-CLI and MCP wiring are consumers of this contract, not schema authorities.
+CLI, SDK, and MCP-sidecar wiring are consumers of this contract, not schema
+authorities. The sidecar delegates to the transport-free facade and is neither
+a required deployment component nor a separate state machine.
 
-A supported Workbench deployment exposes exactly all 18 tools. Registration
-fails closed unless every possible destination owner supports the durable
-restore contract and the complete schema.
+The native CLI accepts exactly these 18 names under `nokv workbench`. When the
+optional MCP sidecar is enabled, it registers the same 18 tools and fails
+closed unless every possible destination owner supports the durable restore
+contract and the complete schema.
 
 ## Product Boundary
 
@@ -59,9 +66,10 @@ The deployment root is `/agents/{agent_id}/wb` and must not be `/`.
 
 This root is durable presentation configuration. It shapes returned paths and
 the presentation-path fields in canonical run/restore manifest v1 envelopes,
-so a deployment must retain the same value across MCP/CLI restarts and exact
-operation replay. It is not a namespace, routing, Holt-key, object-key, or
-sharding identity; `RootId` remains the storage and routing authority.
+so a deployment must retain the same value across CLI or MCP-sidecar restarts
+and exact operation replay. It is not a namespace, routing, Holt-key,
+object-key, or sharding identity; `RootId` remains the storage and routing
+authority.
 
 A workbench id:
 

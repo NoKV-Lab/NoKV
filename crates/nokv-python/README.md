@@ -1,5 +1,10 @@
 # NoKV Python SDK
 
+The native full `nokv` CLI is NoKV's primary product and integration surface.
+This direct Python SDK is the secondary choice for callers that need an
+in-process API. Agent frameworks should normally expose skills over the CLI;
+they do not need the optional 18-tool MCP sidecar to use this package.
+
 This package exposes API version `1` for path-native Workbenches and immutable
 artifacts. The version is available as `nokv.API_VERSION`; the stable package
 exports are listed by `nokv.__all__`. `nokv.__version__` is the NoKV release

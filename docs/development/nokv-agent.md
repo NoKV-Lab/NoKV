@@ -14,11 +14,16 @@ The normative behavior is [Workbench Contract](../workbench-contract.md).
 ## Package Position
 
 ```text
-CLI / MCP adapter
+native full CLI (primary) / optional MCP sidecar
   -> nokv-agent
   -> nokv-client traits
   -> versioned protocol and direct object data path
 ```
+
+The direct Python SDK is the secondary embedded product surface and calls the
+client boundary without requiring MCP. Downstream Agent frameworks should
+normally implement skills over the CLI. The MCP adapter is transport wiring
+only and must never become a second facade or state machine.
 
 Allowed dependencies are storage-neutral types and SDK interfaces. The crate
 must not import:
@@ -34,7 +39,7 @@ second namespace, publication, snapshot, commit, or restore implementation.
 
 ## Stable Tool Surface
 
-A supported deployment exposes exactly:
+The transport-free facade defines exactly:
 
 ```text
 workbench_create
@@ -59,7 +64,8 @@ workbench_restore
 
 The normalized input schemas are frozen in
 `crates/nokv-agent/workbench_contract_schema.json`. Tool registration
-fails closed when a name or normalized schema differs.
+fails closed when a name or normalized schema differs. The native CLI exposes
+the same operations directly; the optional sidecar registers them as MCP tools.
 
 ## Adapter Responsibilities
 

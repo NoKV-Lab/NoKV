@@ -5,10 +5,12 @@ SPDX-License-Identifier: Apache-2.0
 
 # Workbench Validation
 
-These assets validate the same 18-tool Workbench surface exported by
-`crates/nokv-agent` and served by `nokv mcp`. They do not define a
-runtime-specific metadata layout, capability alias, migration helper, or
-filesystem frontend.
+These assets validate the same 18-tool Workbench semantics exported by
+`crates/nokv-agent`. The native full CLI is the primary integration surface,
+and the direct Python SDK is second for embedded callers. The MCP-focused
+assets here qualify the optional `nokv mcp` sidecar; they do not make MCP a
+required deployment component or define a runtime-specific metadata layout,
+capability alias, migration helper, or filesystem frontend.
 
 The checked-in integration assets are deliberately small:
 
@@ -93,8 +95,8 @@ PYTHONPATH=scripts/workbench python3 -m unittest \
 python3 scripts/workbench/fork_restore_recovery_gate_test.py
 ```
 
-Register the built binary in any MCP-compatible Agent runtime as a stdio MCP
-command:
+To qualify the optional sidecar, register the built binary in an MCP-compatible
+Agent runtime as a stdio MCP command:
 
 ```text
 /absolute/path/to/nokv <root, route, object, and workbench options> mcp
@@ -257,8 +259,8 @@ uploads its complete evidence directory even on failure.
 
 ## Restore-composition evidence
 
-The composition gate uses a real flat `nokv mcp` process for the stable
-18-tool Workbench surface. Atomic path mutations use the separate,
+The composition gate uses a real flat `nokv mcp` sidecar for the stable 18-tool
+Workbench surface. Atomic path mutations use the separate,
 Workbench-scoped custom CLI and never absolute paths:
 
 ```text
@@ -365,9 +367,10 @@ one failure at a time:
   replacement. The bench-only exact barrier qualifies restore restart without
   exposing a production hook; provider recovery and GC drain remain separate
   gates.
-- an optional second Agent-runtime entry must consume the same flat MCP launch
-  and produce the same transcript contract; it cannot weaken or substitute for
-  the native gate.
+- an optional second Agent-runtime entry must consume the same flat MCP sidecar
+  launch and produce the same transcript contract; it cannot weaken or
+  substitute for the native sidecar gate.
+
 ## Path-native fork-to-restore recovery evidence
 
 The fork gate exercises the supported whole-Workbench restore contract. It

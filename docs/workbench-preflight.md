@@ -3,11 +3,13 @@ Copyright 2024-2026 The NoKV Authors.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Workbench Deployment Preflight
+# Workbench MCP Sidecar Preflight
 
-This guide prepares any MCP-compatible Agent runtime to use the normal
-`nokv mcp` stdio endpoint. There is no runtime-specific metadata format or
-compatibility route.
+This guide qualifies the optional `nokv mcp` stdio sidecar for an
+MCP-compatible Agent runtime. It is not the default NoKV integration guide:
+downstream systems should normally provide skills over the native full CLI,
+and embedded callers should use the Python SDK. The sidecar uses the same
+workspace format and grants no additional authority or compatibility route.
 
 ## Required Inputs
 
@@ -63,11 +65,12 @@ recovery path itself. It is switched on implicitly by
 The corresponding invariant for operators: back up the Holt directory. In the
 default shape it is the only copy of the metadata.
 
-## Live Contract Check
+## Live Sidecar Contract Check
 
-Start `nokv mcp` with the same root, route, owner, and object configuration that
-the Agent runtime will use. Send `initialize`, then `tools/list`, and validate
-the response with `workbench_contract.validate_tool_contract`.
+If the host requires MCP, start the optional `nokv mcp` sidecar with the same
+root, route, owner, and object configuration that its CLI or SDK path would
+use. Send `initialize`, then `tools/list`, and validate the response with
+`workbench_contract.validate_tool_contract`.
 
 For the complete live Workbench path, run
 `scripts/workbench/live_workbench.py`. It calls `nokv provision`,
