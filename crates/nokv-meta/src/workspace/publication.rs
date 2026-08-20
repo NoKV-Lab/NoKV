@@ -2906,7 +2906,7 @@ impl PublicationService<'_> {
             || path.record.content_type != RESTORE_MANIFEST_CONTENT_TYPE
             || path.record.producer.is_some()
             || path.record.manifest_id.is_some()
-            || !TypedProjection::decode(&path.record.typed_index_projection)?
+            || !TypedProjection::decode_stored(&path.record.typed_index_projection)?
                 .fields()
                 .is_empty()
         {
@@ -3545,7 +3545,7 @@ impl PublicationService<'_> {
         )?;
         let current_projection = current_path
             .as_ref()
-            .map(|current| TypedProjection::decode(&current.record.typed_index_projection))
+            .map(|current| TypedProjection::decode_stored(&current.record.typed_index_projection))
             .transpose()?;
         let next_path_generation =
             validate_path_claim(&request.expected_operation.claim, current_path.as_ref())?;

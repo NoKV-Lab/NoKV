@@ -298,7 +298,7 @@ pub fn rename_path(
         source.artifact_revision_id,
     );
 
-    let projection = TypedProjection::decode(&source.typed_index_projection)?;
+    let projection = TypedProjection::decode_stored(&source.typed_index_projection)?;
     let mut predicates = Vec::new();
     let mut mutations = Vec::new();
     let mut history_projection = Vec::new();
