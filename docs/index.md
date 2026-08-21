@@ -4,7 +4,7 @@ layout: home
 hero:
   name: NoKV
   text: Agent-native distributed workspace and artifact storage.
-  tagline: A stable Workbench, SDK, CLI, and MCP surface over path-primary ordered metadata and immutable object-backed revisions.
+  tagline: A native full CLI and direct Python SDK over path-primary ordered metadata, with an optional Workbench MCP sidecar.
   image:
     src: /img/logo.png
     alt: NoKV
@@ -23,7 +23,7 @@ hero:
       link: /development/workspace-acceptance
 features:
   - title: Stable Agent surface
-    details: Preserve the complete 18-tool NoKV Workbench contract and expose the same semantics through SDK, custom CLI, and MCP adapters.
+    details: Use the native full CLI first, the direct Python SDK for embedded callers, and the exact 18-tool MCP endpoint only as an optional sidecar.
   - title: Path-primary metadata
     details: One normalized full path is namespace truth. Exact artifacts use point reads; child listing uses component-safe delimiter scans.
   - title: Immutable revisions
@@ -48,9 +48,9 @@ SPDX-License-Identifier: Apache-2.0
   <div class="nokv-grid-3">
     <div class="nokv-card">
       <div class="nokv-card-kicker">Application surface</div>
-      <h3>Workbench · SDK · CLI · MCP</h3>
-      <p>Agents keep familiar list/read/search/commit/snapshot/restore behavior
-      while storage internals change underneath.</p>
+      <h3>CLI · Python SDK · MCP sidecar</h3>
+      <p>Downstream skills use the native CLI by default; embedded callers use
+      the Python SDK, and MCP hosts can opt into the same 18-tool semantics.</p>
     </div>
     <div class="nokv-card">
       <div class="nokv-card-kicker">Metadata layer</div>
@@ -72,7 +72,7 @@ SPDX-License-Identifier: Apache-2.0
     <p class="nokv-eyebrow">Core flow</p>
     <h2 class="nokv-h2">Upload bytes first; publish identity last</h2>
   </div>
-  <pre class="nokv-code"><code>Agent SDK
+  <pre class="nokv-code"><code>Native CLI or direct Python SDK
   -&gt; route RootId to one logical shard
   -&gt; allocate publish operation + immutable revision
   -&gt; stream and verify object blocks
@@ -94,7 +94,7 @@ SPDX-License-Identifier: Apache-2.0
   [RustFS Provider Profile](./rustfs.md).
 - Workloads and evidence: [AI Training Workload](./ai-training.md),
   [Benchmarks](./benchmarks.md),
-  [Workbench Deployment Preflight](./workbench-preflight.md), and
+  [Workbench MCP Sidecar Preflight](./workbench-preflight.md), and
   [Workspace Acceptance](./development/workspace-acceptance.md).
 - Development: [Code Contract](./development/code_contract.md),
   [`nokv-agent` Handbook](./development/nokv-agent.md),

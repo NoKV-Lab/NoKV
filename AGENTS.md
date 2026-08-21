@@ -17,6 +17,21 @@ the user explicitly asks for Yanex work. Yanex artifacts are historical
 benchmark/demo material only; they must not drive new NoKV behavior, scripts,
 docs, naming, preflight decisions, or compatibility paths.
 
+## Interface Delivery Priority
+
+Treat the native full `nokv` CLI as the primary product and integration
+surface. Treat the direct Python SDK as the second-choice embedded surface.
+Downstream Agent systems should normally provide their own skills that invoke
+the CLI, or use the Python SDK when they need an in-process integration.
+
+The exact 18-tool Workbench MCP endpoint remains supported only as an optional
+sidecar for hosts that specifically need MCP discovery and JSON-RPC transport.
+It must delegate to the same client and transport-free Agent facade; it is not
+the canonical API, a required deployment component, or a separate state
+machine. Preserve the 18-tool names and semantics while keeping documentation,
+examples, release guidance, and reviews ordered as CLI first, Python SDK
+second, MCP sidecar third.
+
 Before reviewing or editing a PR:
 
 1. Read `docs/development/code_contract.md`.

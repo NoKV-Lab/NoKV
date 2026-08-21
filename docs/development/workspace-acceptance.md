@@ -7,9 +7,11 @@ SPDX-License-Identifier: Apache-2.0
 
 Status: normative qualification gates for the supported NoKV workspace.
 
-NoKV is qualified as one Agent-facing system: Workbench contract, SDK, custom
-CLI, MCP adapters, metadata semantics, object publication, root routing,
-recovery, and garbage collection must run against the same workspace format.
+NoKV is qualified as one Agent-facing system: Workbench semantics, the primary
+native full CLI, the secondary direct Python SDK, the optional MCP sidecar,
+metadata semantics, object publication, root routing, recovery, and garbage
+collection must run against the same workspace format. An MCP-only result does
+not qualify the CLI or Python SDK paths.
 Passing a codec or Holt microbenchmark alone does not qualify the product.
 
 Every applicable gate reports exactly one status:
@@ -39,18 +41,23 @@ Performance records additionally retain warm/cold state, object and metadata
 payload distributions, concurrency, duration, retries, error counts,
 throughput, and p50/p95/p99/maximum latency.
 
-## Gate 0: Workbench Contract And Live Workflow
+## Gate 0: Workbench Contract And Live Workflows
 
 The scientific reconstruction workflow must exercise the complete 18-tool
-Workbench surface through the real adapter boundary.
-The black-box runner is
-[`scripts/workbench/live_workbench.py`](../../scripts/workbench/live_workbench.py).
-Its dry-run proves only command construction and tool coverage. A live run
-retains exact MCP and process evidence; absent etcd, S3-compatible storage, or
-the requested binary is `NOT QUALIFIED`, never `PASS`.
+Workbench semantics through the primary native CLI boundary. The direct Python
+SDK must independently exercise its supported programmatic path. The existing
+black-box runner,
+[`scripts/workbench/live_workbench.py`](../../scripts/workbench/live_workbench.py),
+qualifies the optional MCP sidecar only. Its dry-run proves only command
+construction and tool coverage; a live run retains exact sidecar and process
+evidence. It cannot substitute for native CLI or Python SDK evidence. Absent
+etcd, S3-compatible storage, or the requested binary is `NOT QUALIFIED`, never
+`PASS`.
 
 Required evidence:
 
+- a native CLI transcript covering the complete 18-operation workflow;
+- an installed Python SDK workflow covering its declared direct API;
 - exact normalized schemas for all 18 tools;
 - golden result and error transcripts, not only input-schema validation;
 - create-only and replace-only publication, never upsert;
@@ -270,17 +277,21 @@ Required evidence:
   CLI builds contain no fault hook, flag, environment branch, or arbitrary
   executor injection surface.
 
-## Gate 7: SDK, CLI, MCP, And Package Boundaries
+## Gate 7: CLI, Python SDK, MCP Sidecar, And Package Boundaries
 
 Required evidence:
 
-- the SDK routes by root placement and never imports Holt layout;
+- the native full CLI remains the primary integration surface and delegates to
+  client and Agent interfaces;
+- the Rust SDK routes by root placement and never imports Holt layout;
 - direct immutable-object reads and uploads obey server-issued plans and
   integrity checks;
-- Python uses the SDK and explicit materialize/collect adapters;
+- the direct Python SDK remains the secondary embedded surface and uses
+  explicit materialize/collect adapters;
 - `nokv-agent` remains transport-free and shapes the stable 18 tools over SDK
   traits;
-- CLI and MCP are thin consumers of client and Agent interfaces;
+- the optional MCP sidecar is a thin consumer of the same Agent facade and is
+  neither a required deployment component nor a second state machine;
 - protocol DTOs are versioned and storage-neutral;
 - provider-specific behavior stays inside the object package;
 - no second implementation of namespace, publication, restore, references, or

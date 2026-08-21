@@ -13,6 +13,11 @@ It is a behavior oracle, not permission to restore the old metadata layout.
 It is not an inventory or qualification claim for every pre-#423 feature, and
 47/47 does not by itself qualify every phase of the wider recovery program.
 
+This ledger preserves historical MCP and LingTai evidence classes; it does not
+set current delivery priority. Current integrations use the native full CLI
+first, the direct Python SDK second, and the 18-tool endpoint only as an
+optional MCP sidecar. A sidecar-specific receipt qualifies only that boundary.
+
 Each stable item records:
 
 - class `A`, `B`, `C`, or `D` from the pre-test porting decision;

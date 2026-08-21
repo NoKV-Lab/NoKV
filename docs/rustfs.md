@@ -15,7 +15,7 @@ collection policy.
 ## Boundary
 
 ```text
-Workbench / SDK / CLI
+native full CLI / Python SDK / lower-level Rust SDK / optional Workbench MCP sidecar
   -> NoKV metadata and publication service
   -> S3-compatible object interface
   -> RustFS
