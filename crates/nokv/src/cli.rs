@@ -790,7 +790,7 @@ fn parse_request_id(value: String) -> Result<[u8; 16], CliError> {
         return Err(CliError::InvalidRequestId(value));
     }
     let mut decoded = [0_u8; 16];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         decoded[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
     }
     Ok(decoded)

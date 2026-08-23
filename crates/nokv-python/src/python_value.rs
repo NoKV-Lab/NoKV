@@ -34,7 +34,7 @@ pub(crate) fn parse_fixed_hex<const WIDTH: usize>(
         )));
     }
     let mut decoded = [0_u8; WIDTH];
-    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in encoded.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         decoded[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
     }
     Ok(decoded)
@@ -207,7 +207,9 @@ fn parse_variable_hex(field: &str, encoded: &str) -> PyResult<Vec<u8>> {
     }
     Ok(encoded
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
         .collect())
 }
