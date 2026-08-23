@@ -1283,9 +1283,7 @@ impl<'a> GcService<'a> {
             load_generic_index_gc_state(self.store, request.context, &request.expected_operation)?;
         let mut next_operation = request.expected_operation.clone();
         let mut next_generation = None;
-        let deletions: Vec<(Vec<u8>, Vec<u8>)>;
-
-        if !next_operation.rows_complete {
+        let deletions: Vec<(Vec<u8>, Vec<u8>)> = if !next_operation.rows_complete {
             let prefix =
                 generic_index_row_prefix(request.context.root_id, next_operation.generation_id);
             let start_after = next_operation.row_cursor.map(|sequence| {
@@ -1364,10 +1362,9 @@ impl<'a> GcService<'a> {
             next_operation.scanned_row_count = expected_sequence;
             next_operation.row_rolling_digest = rolling_digest;
             next_operation.rows_complete = rows_complete;
-            deletions = rows
-                .into_iter()
+            rows.into_iter()
                 .map(|item| (item.key, item.value))
-                .collect();
+                .collect()
         } else {
             let prefix = generic_index_append_receipt_prefix(
                 request.context.root_id,
@@ -1438,11 +1435,11 @@ impl<'a> GcService<'a> {
                 retired.state = GenericIndexGenerationState::Retired;
                 next_generation = Some(retired);
             }
-            deletions = receipts
+            receipts
                 .into_iter()
                 .map(|item| (item.key, item.value))
-                .collect();
-        }
+                .collect()
+        };
         next_operation.validate()?;
 
         let deterministic_result = encode_generic_index_gc_result(input_digest, &next_operation)?;
@@ -2334,7 +2331,7 @@ fn parse_sha256_digest_uri(value: &str) -> Result<[u8; SHA256_BYTES], GcError> {
         });
     }
     let mut digest = [0; SHA256_BYTES];
-    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         digest[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
     Ok(digest)
