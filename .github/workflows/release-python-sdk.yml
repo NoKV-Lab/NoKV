@@ -166,6 +166,7 @@ jobs:
       contents: write
     env:
       EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
+      GH_REPO: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ needs.validate.outputs.tag }}
       RELEASE_VERSION: ${{ needs.validate.outputs.version }}
