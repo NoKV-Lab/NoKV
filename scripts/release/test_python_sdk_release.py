@@ -215,6 +215,9 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("python_sdk_release.py write-assets", workflow)
         self.assertIn("python_sdk_release.py verify-install", workflow)
         self.assertIn("--verify-tag", workflow)
+        # The publish step runs outside the checkout (cd "$RELEASE_DIR"), so gh
+        # must learn the repository from the environment, not from git context.
+        self.assertIn("GH_REPO: ${{ github.repository }}", workflow)
         self.assertIn("Release tag moved", workflow)
         self.assertIn("release asset already exists with different bytes", workflow)
         self.assertNotIn("archive/refs/tags", workflow)
