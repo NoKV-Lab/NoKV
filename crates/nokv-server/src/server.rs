@@ -18,6 +18,7 @@ use nokv_protocol::{
     WORKSPACE_PROTOCOL_SCHEMA,
 };
 
+use crate::health::HealthState;
 use crate::legacy_rejection::{legacy_rejection_response, MAX_LEGACY_FIRST_FRAME_BYTES};
 use crate::{RootOwnerRegistry, ServerError, ShardOwner};
 
@@ -26,6 +27,7 @@ static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServerOptions {
     pub bind: SocketAddr,
+    pub health_bind: Option<SocketAddr>,
     pub handshake_timeout: Duration,
     pub read_timeout: Duration,
     pub write_timeout: Duration,
@@ -209,14 +211,57 @@ impl WorkspaceServer {
         listener: TcpListener,
         shutdown: &AtomicBool,
     ) -> Result<(), ServerError> {
-        serve_socket_loop(
+        let connections = Arc::new(
+            ConnectionLimiter::new(self.options.max_inflight_connections)
+                .expect("validated connection maximum is nonzero"),
+        );
+        let health = if let Some(health_bind) = self.options.health_bind {
+            let health_listener = TcpListener::bind(health_bind).map_err(ServerError::Bind)?;
+            let inflight = {
+                let connections = Arc::clone(&connections);
+                Arc::new(move || connections.in_flight()) as Arc<dyn Fn() -> usize + Send + Sync>
+            };
+            let installed_roots = {
+                let registry = Arc::clone(&self.registry);
+                Arc::new(move || registry.installed_root_count())
+                    as Arc<dyn Fn() -> Result<usize, ServerError> + Send + Sync>
+            };
+            let state = HealthState::new(
+                WORKSPACE_PROTOCOL_SCHEMA,
+                self.owner_loss.clone(),
+                inflight,
+                installed_roots,
+            );
+            let stop = Arc::new(AtomicBool::new(false));
+            let handle = thread::Builder::new()
+                .name("nokv-health".to_owned())
+                .spawn({
+                    let stop = Arc::clone(&stop);
+                    let worker_state = state.clone();
+                    move || crate::health::serve_health(health_listener, worker_state, stop)
+                })
+                .map_err(ServerError::Connection)?;
+            Some((stop, handle, state))
+        } else {
+            None
+        };
+        let result = serve_socket_loop(
             listener,
             self.options,
             Arc::clone(&self.registry),
             self.owner_loss.clone(),
             shutdown,
             || self.renew_ownership(),
-        )
+            ServeRuntime {
+                connections,
+                health: health.as_ref().map(|(_, _, state)| state.clone()),
+            },
+        );
+        if let Some((stop, handle, _)) = health {
+            stop.store(true, Ordering::Release);
+            let _ = handle.join();
+        }
+        result
     }
 
     pub fn dispatch_frame(&self, encoded: &[u8]) -> Result<Vec<u8>, ServerError> {
@@ -226,6 +271,11 @@ impl WorkspaceServer {
     }
 }
 
+struct ServeRuntime {
+    connections: Arc<ConnectionLimiter>,
+    health: Option<HealthState>,
+}
+
 fn serve_socket_loop(
     listener: TcpListener,
     options: ServerOptions,
@@ -233,19 +283,19 @@ fn serve_socket_loop(
     owner_loss: OwnerLossSignal,
     shutdown: &AtomicBool,
     mut renew_ownership: impl FnMut() -> Result<(), ServerError>,
+    runtime: ServeRuntime,
 ) -> Result<(), ServerError> {
     options.validate()?;
     listener
         .set_nonblocking(true)
         .map_err(ServerError::Connection)?;
     let mut next_renewal = Instant::now();
-    let connections = Arc::new(
-        ConnectionLimiter::new(options.max_inflight_connections)
-            .expect("validated connection maximum is nonzero"),
-    );
     loop {
         require_owner_retained(&owner_loss)?;
         if shutdown.load(Ordering::Acquire) {
+            if let Some(health) = &runtime.health {
+                health.set_draining();
+            }
             break;
         }
         let now = Instant::now();
@@ -260,19 +310,23 @@ fn serve_socket_loop(
                     drop(stream);
                     continue;
                 }
-                let Some(permit) = connections.try_acquire() else {
+                let Some(permit) = runtime.connections.try_acquire() else {
                     drop(stream);
                     continue;
                 };
+                if let Some(health) = &runtime.health {
+                    health.record_connection();
+                }
                 stream
                     .set_nonblocking(false)
                     .map_err(ServerError::Connection)?;
                 let registry = Arc::clone(&registry);
+                let health = runtime.health.clone();
                 thread::Builder::new()
                     .name("nokv-workspace-rpc".to_owned())
                     .spawn(move || {
                         let _permit = permit;
-                        let _ = serve_connection(stream, registry, options);
+                        let _ = serve_connection(stream, registry, options, health);
                     })
                     .map_err(ServerError::Connection)?;
             }
@@ -283,7 +337,7 @@ fn serve_socket_loop(
         }
     }
 
-    while connections.in_flight() != 0 {
+    while runtime.connections.in_flight() != 0 {
         require_owner_retained(&owner_loss)?;
         let now = Instant::now();
         if now >= next_renewal {
@@ -393,6 +447,7 @@ fn serve_connection(
     mut stream: TcpStream,
     registry: Arc<RootOwnerRegistry>,
     options: ServerOptions,
+    health: Option<HealthState>,
 ) -> Result<(), ServerError> {
     if !admit_current_protocol(&mut stream, options.handshake_timeout)? {
         return Ok(());
@@ -409,6 +464,9 @@ fn serve_connection(
         let encoded = encode_response_or_internal_failure(response.response())?;
         write_frame(&mut stream, &encoded)?;
         drop(response);
+        if let Some(health) = &health {
+            health.record_request();
+        }
         if registry.owner_loss_signal().is_lost() {
             return Err(ServerError::InvalidBootstrap(
                 "control-plane owner was lost".to_owned(),
@@ -668,6 +726,7 @@ mod tests {
     fn options() -> ServerOptions {
         ServerOptions {
             bind: "127.0.0.1:0".parse().unwrap(),
+            health_bind: None,
             handshake_timeout: Duration::from_millis(100),
             read_timeout: Duration::from_secs(1),
             write_timeout: Duration::from_secs(1),
@@ -795,7 +854,7 @@ mod tests {
     fn exact_handshake_preserves_multiple_operation_frames_on_one_connection() {
         let (mut client, server) = streams();
         let (registry, executor) = registry();
-        let serving = thread::spawn(move || serve_connection(server, registry, options()));
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
 
         let hello =
             WorkspaceHandshake::new(HandshakeKind::ClientHello, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
@@ -823,7 +882,7 @@ mod tests {
     fn operation_first_v3_gets_a_readable_rejection_with_zero_dispatch() {
         let (mut client, server) = streams();
         let (registry, executor) = registry();
-        let serving = thread::spawn(move || serve_connection(server, registry, options()));
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
 
         let mut legacy = encode_request(&request()).unwrap();
         let position = legacy
@@ -872,7 +931,7 @@ mod tests {
 
         let (mut client, server) = streams();
         let (registry, executor) = registry();
-        let serving = thread::spawn(move || serve_connection(server, registry, options()));
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
         let operation = request().operation;
         let encoded = rmp_serde::to_vec_named(&V2Frame {
             schema: crate::legacy_rejection::LEGACY_V2_SCHEMA,
@@ -905,7 +964,7 @@ mod tests {
     fn v7_hello_gets_v9_incompatible_and_zero_dispatch() {
         let (mut client, server) = streams();
         let (registry, executor) = registry();
-        let serving = thread::spawn(move || serve_connection(server, registry, options()));
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
 
         let hello =
             WorkspaceHandshake::new(HandshakeKind::ClientHello, "nokv.workspace.rpc.v7").unwrap();
@@ -926,7 +985,7 @@ mod tests {
     fn matched_but_corrupt_handshake_magic_never_enters_legacy_classification() {
         let (mut client, server) = streams();
         let (registry, executor) = registry();
-        let serving = thread::spawn(move || serve_connection(server, registry, options()));
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
 
         let mut corrupt = [0_u8; HANDSHAKE_PAYLOAD_BYTES];
         corrupt[..8].copy_from_slice(b"NOKVHS1\0");
@@ -950,7 +1009,7 @@ mod tests {
         let (registry, executor) = registry();
         let (completed_tx, completed_rx) = mpsc::channel();
         let serving = thread::spawn(move || {
-            let result = serve_connection(server, registry, options());
+            let result = serve_connection(server, registry, options(), None);
             completed_tx.send(()).unwrap();
             result
         });
@@ -981,10 +1040,25 @@ mod tests {
         let (registry, _) = registry();
         let renewals = AtomicUsize::new(0);
 
-        serve_socket_loop(listener, options(), registry, owner_loss, &shutdown, || {
-            renewals.fetch_add(1, AtomicOrdering::SeqCst);
-            Ok(())
-        })
+        let runtime = ServeRuntime {
+            connections: Arc::new(
+                ConnectionLimiter::new(options().max_inflight_connections)
+                    .expect("validated connection maximum is nonzero"),
+            ),
+            health: None,
+        };
+        serve_socket_loop(
+            listener,
+            options(),
+            registry,
+            owner_loss,
+            &shutdown,
+            || {
+                renewals.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            },
+            runtime,
+        )
         .unwrap();
 
         assert_eq!(renewals.load(AtomicOrdering::SeqCst), 0);
@@ -1006,6 +1080,13 @@ mod tests {
         let (completed_tx, completed_rx) = mpsc::channel();
         let (renewed_tx, renewed_rx) = mpsc::channel();
         let serving = thread::spawn(move || {
+            let runtime = ServeRuntime {
+                connections: Arc::new(
+                    ConnectionLimiter::new(runtime_options.max_inflight_connections)
+                        .expect("validated connection maximum is nonzero"),
+                ),
+                health: None,
+            };
             let result = serve_socket_loop(
                 listener,
                 runtime_options,
@@ -1017,6 +1098,7 @@ mod tests {
                     renewed_tx.send(count).unwrap();
                     Ok(())
                 },
+                runtime,
             );
             completed_tx.send(()).unwrap();
             result
@@ -1053,9 +1135,22 @@ mod tests {
         owner_loss.fail_closed();
         let (registry, _) = registry();
 
-        let error = serve_socket_loop(listener, options(), registry, owner_loss, &shutdown, || {
-            Ok(())
-        })
+        let runtime = ServeRuntime {
+            connections: Arc::new(
+                ConnectionLimiter::new(options().max_inflight_connections)
+                    .expect("validated connection maximum is nonzero"),
+            ),
+            health: None,
+        };
+        let error = serve_socket_loop(
+            listener,
+            options(),
+            registry,
+            owner_loss,
+            &shutdown,
+            || Ok(()),
+            runtime,
+        )
         .unwrap_err();
 
         assert!(error.to_string().contains("owner was lost"));
@@ -1065,7 +1160,7 @@ mod tests {
     fn oversized_legacy_first_frame_closes_before_reading_or_dispatching_its_body() {
         let (mut client, server) = streams();
         let (registry, executor) = registry();
-        let serving = thread::spawn(move || serve_connection(server, registry, options()));
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
 
         client
             .write_all(

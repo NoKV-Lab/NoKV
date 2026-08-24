@@ -12,6 +12,7 @@
 mod bootstrap;
 mod error;
 mod executor;
+mod health;
 mod legacy_rejection;
 mod lifecycle;
 mod recovery_installer;

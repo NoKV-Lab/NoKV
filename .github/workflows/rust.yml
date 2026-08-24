@@ -54,7 +54,8 @@ jobs:
             scripts/workbench/local_wal_recovery_gate.py \
             scripts/workbench/object_namespace_recovery_gate.py \
             scripts/workbench/restore_composition_gate.py \
-            scripts/workbench/fork_restore_recovery_gate.py
+            scripts/workbench/fork_restore_recovery_gate.py \
+            scripts/workbench/health_shutdown_gate.py
           python3 scripts/workbench/pre423_contract_ledger.py
           python3 scripts/workbench/pre423_contract_ledger_test.py
           python3 scripts/workbench/workbench_contract_test.py
@@ -63,6 +64,7 @@ jobs:
           python3 scripts/workbench/object_namespace_recovery_gate_test.py
           python3 scripts/workbench/restore_composition_gate_test.py
           python3 scripts/workbench/fork_restore_recovery_gate_test.py
+          python3 scripts/workbench/health_shutdown_gate_test.py
           bash -n scripts/workbench/start_rustfs.sh
 
       - name: Check Phase 1 qualification framework
@@ -560,6 +562,37 @@ jobs:
         with:
           name: restore-composition-${{ github.sha }}
           path: ${{ runner.temp }}/restore-composition/evidence
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Qualify owner health surface
+        id: health_shutdown
+        shell: bash
+        env:
+          HEALTH_SHUTDOWN_EVIDENCE_DIR: ${{ runner.temp }}/health-shutdown-evidence
+          AWS_ACCESS_KEY_ID: rustfsadmin
+          AWS_SECRET_ACCESS_KEY: rustfsadmin
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_EC2_METADATA_DISABLED: "true"
+        run: |
+          set -euo pipefail
+          python3 scripts/workbench/health_shutdown_gate.py \
+            --build \
+            --target-dir target \
+            --evidence-dir "$HEALTH_SHUTDOWN_EVIDENCE_DIR" \
+            --object-endpoint http://127.0.0.1:9000 \
+            --object-bucket nokv-local-wal-recovery-gate \
+            --seed "health-shutdown-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --timeout 60
+          jq -e '.overall_status == "PASS"' \
+            "$HEALTH_SHUTDOWN_EVIDENCE_DIR/qualification.json"
+
+      - name: Upload health/shutdown evidence
+        if: ${{ always() && steps.health_shutdown.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: health-shutdown-${{ github.sha }}
+          path: ${{ runner.temp }}/health-shutdown-evidence
           if-no-files-found: error
           retention-days: 7
 
