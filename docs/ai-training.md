@@ -5,12 +5,14 @@ SPDX-License-Identifier: Apache-2.0
 
 # AI Training
 
-Status: optional Agent SDK workload profile, not a separate product
+Status: optional Agent workload profile, not a separate product
 architecture or namespace.
 
 NoKV serves training data, checkpoints, experiment outputs, and provenance
-through the Agent SDK and explicit local adapters. Canonical identity remains a
-root, Workbench, and normalized path; a materialized local path is disposable.
+through the native full CLI first, the direct Python SDK for embedded jobs,
+lower-level Rust SDK calls where needed, and explicit local adapters. Canonical
+identity remains a root, Workbench, and normalized path; a materialized local
+path is disposable. The optional MCP sidecar is not required for this profile.
 
 ## Workloads
 
@@ -25,7 +27,7 @@ root, Workbench, and normalized path; a materialized local path is disposable.
 
 ```text
 training process
-  -> Rust or Python SDK
+  -> native CLI skill, Python SDK, or lower-level Rust SDK
   -> root router and fenced shard owner
   -> full-path Holt metadata
   -> immutable S3-compatible object blocks

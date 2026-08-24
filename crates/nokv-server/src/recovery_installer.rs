@@ -1092,7 +1092,7 @@ fn decode_digest(
         )));
     }
     let mut decoded = [0_u8; SHA256_BYTES];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         decoded[index] =
             (decode_hex_digit(pair[0], field)? << 4) | decode_hex_digit(pair[1], field)?;
     }

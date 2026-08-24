@@ -11,10 +11,14 @@ Status: normative workspace architecture.
 
 ```mermaid
 flowchart LR
-    Workbench["Workbench adapter"] --> SDK["Agent SDK"]
-    CLI["Custom CLI / MCP"] --> SDK
+    Skills["Downstream Agent skills"] --> CLI["Native full nokv CLI"]
+    CLI --> Agent["Transport-free Workbench facade"]
+    Sidecar["Optional MCP sidecar"] --> Agent
+    Agent --> SDK["Rust Agent SDK"]
+    CLI --> SDK
     Python["Python SDK"] --> SDK
-    Local["Materialize / collect"] --> Python
+    Local["Materialize / collect"] --> CLI
+    Local --> Python
 
     SDK --> Router["Root router"]
     Router --> Control["Control plane<br/>root placement + owner lease"]
@@ -40,7 +44,8 @@ FUSE, POSIX, CSI, and fsspec are not architecture layers.
 
 ```mermaid
 flowchart TD
-    CLI["nokv CLI / MCP"] --> Agent["nokv-agent"]
+    CLI["native full nokv CLI"] --> Agent["nokv-agent"]
+    Sidecar["optional MCP sidecar"] --> Agent
     CLI --> Client["nokv-client"]
     Python["nokv-python"] --> Client
     Agent --> Client
@@ -74,7 +79,9 @@ Key constraints:
 - object owns provider I/O, not reachability;
 - client uses protocol/routing and never imports meta/server;
 - Agent adapters shape tools over SDK traits and remain transport-free;
-- CLI and MCP are thin wiring.
+- the native full CLI is the primary integration surface;
+- the Python SDK is the secondary embedded surface;
+- the optional MCP sidecar is thin wiring over the same Agent facade.
 
 ## Identity And Namespace
 
@@ -413,7 +420,8 @@ experiments. The required evidence covers:
    amplification across the declared workload matrix;
 2. revision-owned publication, visibility, lifecycle, references, GC, and
    recovery;
-3. protocol, server, SDK, CLI, MCP, control routing, and lifecycle workers on
+3. protocol, server, native CLI, Python and Rust SDKs, optional MCP sidecar,
+   control routing, and lifecycle workers on
    the same schema and identity model;
 4. owner failover, checkpoint/log recovery, ambiguous provider outcomes, and
    live Workbench workflows;

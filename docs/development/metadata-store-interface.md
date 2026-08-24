@@ -35,8 +35,9 @@ shared-library ABIs.
 This decision changes internal metadata storage and shard bootstrap. It
 preserves these Agent and Workbench boundaries:
 
-- the 18-tool Workbench contract
-- CLI Workbench commands and MCP tool behavior
+- the 18-tool Workbench semantic contract
+- primary native CLI Workbench commands, secondary Python SDK behavior, and
+  optional MCP-sidecar tool behavior
 - the path-native `PathCurrent` namespace
 - immutable artifact storage
 - root placement in `nokv-control`

@@ -50,11 +50,14 @@ version. It does not follow Holt or either Homebrew build dependency. A Holt
 change is published only inside a new NoKV release after its exact pin and lock
 entry pass the release gates and the generated Formula is merged into the tap.
 
-Installing the executable does not create a NoKV deployment. A LingTai MCP
-configuration must still supply the selected NoKV control-plane endpoint,
-object-store configuration, root identity, and stable Agent presentation root.
-Its command is the Homebrew-installed `nokv` executable and its final argument
-is `mcp`.
+Installing the executable provides NoKV's primary native full CLI; downstream
+Agent systems should normally expose skills over that command. The direct
+Python SDK is the secondary embedded distribution. Neither installation creates
+a NoKV deployment: callers must still supply the selected control-plane
+endpoint, object-store configuration, root identity, and stable Agent
+presentation root. A LingTai or other MCP-compatible host may run the optional
+MCP sidecar through the Homebrew-installed `nokv` executable with final
+argument `mcp`; that transport is not required for CLI or Python SDK use.
 
 ## Release invariants
 

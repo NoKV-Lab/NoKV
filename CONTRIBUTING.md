@@ -14,9 +14,12 @@ Welcome, and thanks for your interest in NoKV. Whether this is your first open-s
 NoKV is a distributed workspace and artifact store built specifically for Agent
 infrastructure. Holt stores one canonical normalized full-path namespace per
 workspace, while immutable revision-owned blocks live in S3-compatible object
-storage. The supported product surfaces are the Rust and Python SDKs, the
-purpose-built `nokv` CLI, and the exact 18-tool Workbench/MCP contract. NoKV
-does not implement a POSIX filesystem, FUSE frontend, or inode/dentry model.
+storage. The primary product surface is the native full `nokv` CLI, followed
+by the direct Python SDK for embedded callers. The exact 18-tool Workbench
+endpoint is an optional MCP sidecar for hosts that need MCP transport; downstream
+Agent systems normally expose their own skills over the CLI or Python SDK.
+NoKV does not implement a POSIX filesystem, FUSE frontend, or inode/dentry
+model.
 
 ### New here? Read these first (in order)
 

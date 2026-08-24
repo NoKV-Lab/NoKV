@@ -6,9 +6,10 @@
 
 > Status: this page records the start of the collaboration. The active
 > integration uses the complete
-> [Workbench contract](../workbench-contract.md) over SDK, custom CLI, and MCP,
-> backed by NoKV's path-native workspace format. It does not use NoKV as a
-> FUSE/POSIX mount.
+> [Workbench contract](../workbench-contract.md) through the native full CLI
+> first, the direct Python SDK second, and an optional MCP sidecar when a host
+> requires it, backed by NoKV's path-native workspace format. It does not use
+> NoKV as a FUSE/POSIX mount.
 > See [Product Design](../product-design.md).
 
 This announcement marks the start of the design-partner collaboration between
@@ -20,7 +21,8 @@ This announcement marks the start of the design-partner collaboration between
 - **LingTai** is a local-first Agent runtime whose projects organize state,
   mailboxes, logs, and artifacts through path-shaped local files.
 - **NoKV** is a distributed Agent workspace and artifact store. It exposes
-  path-shaped identities through Workbench, SDK, custom CLI, and MCP while
+  path-shaped identities through its native CLI, direct SDKs, and an optional
+  Workbench MCP sidecar while
   storing canonical metadata in Holt and immutable bodies in S3-compatible
   storage.
 
@@ -48,10 +50,12 @@ that sandbox is not NoKV namespace truth.
 
 ## Current direction
 
-The stable boundary is the 18-tool Workbench contract. NoKV keeps path-shaped
-Agent semantics while storing canonical full-path metadata in Holt and
-immutable artifact revisions in S3-compatible storage. LingTai remains the
-active design partner and first-client integration.
+The stable boundary is the 18-tool Workbench semantic contract. Downstream
+skills use the native full CLI by default; embedded callers use the Python SDK;
+MCP remains an optional sidecar transport. NoKV keeps path-shaped Agent
+semantics while storing canonical full-path metadata in Holt and immutable
+artifact revisions in S3-compatible storage. LingTai remains the active design
+partner and first-client integration.
 
 If a stateful, snapshot-able, auditable Agent workspace is something you've
 wanted: star NoKV, follow [LingTai](https://github.com/Lingtai-AI/lingtai), and

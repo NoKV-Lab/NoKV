@@ -13,14 +13,20 @@ NoKV is a distributed workspace and artifact store for Agent infrastructure.
 It gives datasets, scripts, logs, outputs, checkpoints, reports, and provenance
 stable path-shaped addresses while keeping their bytes in object storage.
 
-The supported front doors are:
+The supported front doors, in delivery order, are:
 
-- Rust and Python Agent SDKs;
-- a purpose-built `nokv` CLI;
-- MCP and Agent tool adapters;
-- the complete 18-tool [Workbench contract](./workbench-contract.md);
-- explicit materialize/collect adapters for executables that require local
-  files.
+1. the native full `nokv` CLI, including all 18 Workbench operations;
+2. the direct Python SDK for embedded programmatic callers;
+3. the Rust SDK for lower-level native integrations; and
+4. the optional MCP sidecar for hosts that require MCP discovery and transport.
+
+The complete 18-tool [Workbench contract](./workbench-contract.md) fixes shared
+behavior across these surfaces. Downstream Agent systems normally provide
+skills that invoke the CLI, or call the Python SDK when an in-process boundary
+is preferable. MCP is not required to deploy or operate NoKV.
+
+NoKV also provides explicit materialize/collect adapters for executables that
+require local files.
 
 The Workbench experience stays independent of storage internals. Agents can
 list, stat, read, grep, search, aggregate, commit, snapshot, and restore. They
@@ -71,7 +77,7 @@ Workbench-specific result shaping stays above the storage core:
 - grep matching;
 - section projection;
 - the delta digest returned by append;
-- friendly errors and MCP envelopes;
+- friendly errors and optional MCP-sidecar envelopes;
 - stable `run_manifest.json` and `restore_manifest.json` projections.
 
 Workbench responses do not contain storage-specific node identities. Stable
@@ -238,7 +244,7 @@ upload input dataset
   -> execute
   -> collect declared outputs/logs/metadata
   -> commit each run with lineage to the same input
-  -> query, compare, snapshot, and restore through SDK/CLI/Workbench
+  -> query, compare, snapshot, and restore through CLI/Python SDK/Workbench
 ```
 
 Materialization verifies digests before execution. Collection publishes only
