@@ -16,6 +16,48 @@ SPDX-License-Identifier: Apache-2.0
   </p>
 
   <p>
+    <a href="https://github.com/NoKV-Lab/NoKV/actions/workflows/rust.yml">
+      <img alt="Rust CI" src="https://github.com/NoKV-Lab/NoKV/actions/workflows/rust.yml/badge.svg?branch=main" />
+    </a>
+    <a href="https://github.com/NoKV-Lab/NoKV/actions/workflows/python-sdk.yml">
+      <img alt="Python SDK" src="https://github.com/NoKV-Lab/NoKV/actions/workflows/python-sdk.yml/badge.svg?branch=main" />
+    </a>
+    <a href="https://github.com/NoKV-Lab/NoKV/actions/workflows/docker-image.yml">
+      <img alt="Multi-architecture container build" src="https://img.shields.io/github/actions/workflow/status/NoKV-Lab/NoKV/docker-image.yml?branch=main&amp;label=multi-arch%20build" />
+    </a>
+    <a href="https://github.com/NoKV-Lab/NoKV/actions/workflows/dco.yml">
+      <img alt="DCO" src="https://github.com/NoKV-Lab/NoKV/actions/workflows/dco.yml/badge.svg?branch=main" />
+    </a>
+    <a href="https://github.com/NoKV-Lab/NoKV/releases/latest">
+      <img alt="Latest release" src="https://img.shields.io/github/v/release/NoKV-Lab/NoKV?sort=date&amp;display_name=tag&amp;label=release" />
+    </a>
+    <a href="https://github.com/NoKV-Lab/homebrew-tap/blob/main/Formula/nokv.rb">
+      <img alt="Homebrew source release" src="https://img.shields.io/badge/Homebrew-source%20release-FBB040?logo=homebrew&amp;logoColor=black" />
+    </a>
+    <a href="./LICENSE">
+      <img alt="Apache-2.0 license" src="https://img.shields.io/github/license/NoKV-Lab/NoKV" />
+    </a>
+    <a href="./SECURITY.md">
+      <img alt="Security policy with private reporting" src="https://img.shields.io/badge/security-private%20reporting-2ea44f" />
+    </a>
+  </p>
+
+  <p>
+    <a href="https://landscape.cncf.io/?group=projects-and-products&amp;item=runtime--cloud-native-storage--nokv">
+      <img alt="Listed in the CNCF Landscape" src="https://img.shields.io/badge/CNCF%20Landscape-listed-0086FF" />
+    </a>
+    <a href="https://landscape.lfai.foundation/?group=projects-and-products&amp;item=data--store-format--nokv">
+      <img alt="Listed in the LF AI &amp; Data Landscape" src="https://img.shields.io/badge/LF%20AI%20%26%20Data%20Landscape-listed-003764" />
+    </a>
+    <a href="https://github.com/rust-unofficial/awesome-rust#database">
+      <img alt="Listed in Awesome Rust" src="https://img.shields.io/badge/Awesome%20Rust-listed-DEA584?logo=rust&amp;logoColor=white" />
+    </a>
+    <a href="https://dbdb.io/db/nokv">
+      <img alt="Historical DBDB.io profile" src="https://img.shields.io/badge/DBDB.io-historical%20profile-244A64" />
+    </a>
+  </p>
+
+  <p>
     <a href="https://nokv.io/"><strong>Website</strong></a> ·
     <a href="./docs/index.md"><strong>Documentation</strong></a> ·
     <a href="#quick-start"><strong>Quick Start</strong></a> ·
@@ -26,19 +68,44 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Our building partners include:
 
-| Partner | Project |
-| --- | --- |
-| **OpenViking** | [Website](https://openviking.ai/) · [GitHub](https://github.com/volcengine/OpenViking) · ![OpenViking stars](https://img.shields.io/github/stars/volcengine/OpenViking?style=flat&label=stars) |
-| **Hermes Agent** | [GitHub](https://github.com/NousResearch/hermes-agent) · ![Hermes Agent stars](https://img.shields.io/github/stars/NousResearch/hermes-agent?style=flat&label=stars) |
-| **LingTai** | [Website](https://lingtai.ai/en/) · [GitHub](https://github.com/Lingtai-AI/lingtai) · ![LingTai stars](https://img.shields.io/github/stars/Lingtai-AI/lingtai?style=flat&label=stars) |
-| **LoopX** | [GitHub](https://github.com/huangruiteng/loopx) · ![LoopX stars](https://img.shields.io/github/stars/huangruiteng/loopx?style=flat&label=stars) |
-| **heima** | [GitHub](https://github.com/litentry/heima) · ![heima stars](https://img.shields.io/github/stars/litentry/heima?style=flat&label=stars) |
+<table>
+  <tr>
+    <th align="left" width="190">Partner</th>
+    <th align="left" width="330">Project</th>
+    <th align="center" width="150">Stars</th>
+  </tr>
+  <tr>
+    <td><strong>LoopX</strong></td>
+    <td><a href="https://github.com/huangruiteng/loopx">GitHub</a></td>
+    <td align="center"><img alt="LoopX stars" src="https://img.shields.io/github/stars/huangruiteng/loopx?style=flat&amp;label=stars" /></td>
+  </tr>
+  <tr>
+    <td><strong>LingTai</strong></td>
+    <td><a href="https://lingtai.ai/en/">Website</a> · <a href="https://github.com/Lingtai-AI/lingtai">GitHub</a></td>
+    <td align="center"><img alt="LingTai stars" src="https://img.shields.io/github/stars/Lingtai-AI/lingtai?style=flat&amp;label=stars" /></td>
+  </tr>
+  <tr>
+    <td><strong>OpenViking</strong></td>
+    <td><a href="https://openviking.ai/">Website</a> · <a href="https://github.com/volcengine/OpenViking">GitHub</a></td>
+    <td align="center"><img alt="OpenViking stars" src="https://img.shields.io/github/stars/volcengine/OpenViking?style=flat&amp;label=stars" /></td>
+  </tr>
+  <tr>
+    <td><strong>Hermes Agent</strong></td>
+    <td><a href="https://github.com/NousResearch/hermes-agent">GitHub</a></td>
+    <td align="center"><img alt="Hermes Agent stars" src="https://img.shields.io/github/stars/NousResearch/hermes-agent?style=flat&amp;label=stars" /></td>
+  </tr>
+  <tr>
+    <td><strong>heima</strong></td>
+    <td><a href="https://github.com/litentry/heima">GitHub</a></td>
+    <td align="center"><img alt="heima stars" src="https://img.shields.io/github/stars/litentry/heima?style=flat&amp;label=stars" /></td>
+  </tr>
+</table>
 
 Building-partner status denotes an active collaboration. It does not by itself
 imply a production deployment, support SLA, or completed enterprise
 qualification.
 
-## Recognition
+## Third-party listings
 
 <table>
   <tr>
@@ -49,7 +116,30 @@ qualification.
     </td>
     <td>
       <strong>CNCF Landscape</strong><br/>
-      Listed in the CNCF Landscape.
+      Listed under Runtime / Cloud Native Storage, with AI Native Infra / Storage
+      as an additional path.
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="120">
+      <a href="https://landscape.lfai.foundation/?group=projects-and-products&item=data--store-format--nokv">
+        <img src="./docs/public/img/recognition/lfai.svg" width="56" alt="LF AI &amp; Data Landscape" />
+      </a>
+    </td>
+    <td>
+      <strong>LF AI &amp; Data Landscape</strong><br/>
+      Listed under Data / Store &amp; Format.
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="120">
+      <a href="https://github.com/rust-unofficial/awesome-rust#database">
+        <img src="https://awesome.re/mentioned-badge.svg" width="110" alt="Mentioned in Awesome Rust" />
+      </a>
+    </td>
+    <td>
+      <strong>Awesome Rust</strong><br/>
+      Listed under Applications / Database.
     </td>
   </tr>
   <tr>
@@ -60,10 +150,14 @@ qualification.
     </td>
     <td>
       <strong>DBDB.io</strong><br/>
-      NoKV system profile on DBDB.io.
+      Historical profile of NoKV's earlier Go storage-engine line.
     </td>
   </tr>
 </table>
+
+Landscape entries are third-party catalog listings, not foundation-hosted
+project status. The DBDB.io entry describes the earlier Go implementation and
+is preserved here with that scope made explicit.
 
 ## What NoKV Owns
 
