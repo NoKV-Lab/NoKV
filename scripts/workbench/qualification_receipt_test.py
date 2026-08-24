@@ -108,7 +108,7 @@ class QualificationReceiptTest(unittest.TestCase):
         self.producer_script.parent.mkdir(parents=True)
         self.producer_script.write_text(PRODUCER_FIXTURE, encoding="utf-8")
         self.live_producer_script = (
-            self.repo / "scripts" / "workbench" / "live_workbench.py"
+            self.repo / "scripts" / "workbench" / "native_cli_workbench.py"
         )
         self.live_producer_script.write_text(PRODUCER_FIXTURE, encoding="utf-8")
         self._git("add", ".")
@@ -266,7 +266,7 @@ class QualificationReceiptTest(unittest.TestCase):
                 "--evidence",
                 f"qualification={self.evidence_root / 'qualification.json'}",
                 "--evidence",
-                f"mcp-transcript={self.evidence_root / 'mcp-transcript.jsonl'}",
+                f"cli-transcript={self.evidence_root / 'cli-transcript.jsonl'}",
             ),
         )
         self.assertEqual(completed.returncode, 2)
@@ -276,7 +276,7 @@ class QualificationReceiptTest(unittest.TestCase):
 
     def test_product_binary_subject_must_match_producer_argv(self) -> None:
         qualification = self.evidence_root / "qualification.json"
-        transcript = self.evidence_root / "mcp-transcript.jsonl"
+        transcript = self.evidence_root / "cli-transcript.jsonl"
         completed = self._run(
             sys.executable,
             str(self.live_producer_script),
@@ -297,7 +297,7 @@ class QualificationReceiptTest(unittest.TestCase):
                 "--evidence",
                 f"qualification={qualification}",
                 "--evidence",
-                f"mcp-transcript={transcript}",
+                f"cli-transcript={transcript}",
             ),
         )
         self.assertEqual(completed.returncode, 2)
@@ -323,7 +323,7 @@ class QualificationReceiptTest(unittest.TestCase):
                 "--evidence",
                 f"qualification={self.evidence_root / 'qualification.json'}",
                 "--evidence",
-                f"mcp-transcript={self.evidence_root / 'mcp-transcript.jsonl'}",
+                f"cli-transcript={self.evidence_root / 'cli-transcript.jsonl'}",
             ),
         )
         self.assertEqual(completed.returncode, 2)

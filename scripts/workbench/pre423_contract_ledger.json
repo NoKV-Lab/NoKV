@@ -60,10 +60,10 @@
       "required_dependencies": {"lingtai-kernel": ["git", "sha256"], "etcd": ["sha256"], "object-store": ["oci"]}
     },
     "live-workbench": {
-      "description": "Shipping NoKV client and server across real metadata and object boundaries.",
+      "description": "Shipping NoKV client and server through the primary native CLI across real metadata and object boundaries.",
       "evidence_kinds": ["live"],
-      "command": {"kind": "python-script", "entrypoint": "scripts/workbench/live_workbench.py", "result_argument": "--qualification-result", "binary_argument": "--nokv-bin", "forbidden_arguments": ["--dry-run"]},
-      "required_evidence_roles": ["producer-result", "qualification", "mcp-transcript"],
+      "command": {"kind": "python-script", "entrypoint": "scripts/workbench/native_cli_workbench.py", "result_argument": "--qualification-result", "binary_argument": "--nokv-bin", "forbidden_arguments": ["--dry-run"]},
+      "required_evidence_roles": ["producer-result", "qualification", "cli-transcript"],
       "required_subjects": ["product_binary", "dependencies"],
       "required_dependencies": {"etcd": ["sha256"], "object-store": ["oci"]}
     },

@@ -45,13 +45,17 @@ throughput, and p50/p95/p99/maximum latency.
 
 The scientific reconstruction workflow must exercise the complete 18-tool
 Workbench semantics through the primary native CLI boundary. The direct Python
-SDK must independently exercise its supported programmatic path. The existing
-black-box runner,
-[`scripts/workbench/live_workbench.py`](../../scripts/workbench/live_workbench.py),
+SDK must independently exercise its supported programmatic path. The black-box
+native runner,
+[`scripts/workbench/native_cli_workbench.py`](../../scripts/workbench/native_cli_workbench.py),
+starts the same product owner and invokes every tool as
+`nokv workbench <tool> <canonical-json>` in a fresh CLI process, retaining the
+exact CLI transcript. The existing
+[`scripts/workbench/live_workbench.py`](../../scripts/workbench/live_workbench.py)
 qualifies the optional MCP sidecar only. Its dry-run proves only command
 construction and tool coverage; a live run retains exact sidecar and process
-evidence. It cannot substitute for native CLI or Python SDK evidence. Absent
-etcd, S3-compatible storage, or the requested binary is `NOT QUALIFIED`, never
+evidence. Neither runner substitutes for the Python SDK path. Absent etcd,
+S3-compatible storage, or the requested binary is `NOT QUALIFIED`, never
 `PASS`.
 
 Required evidence:

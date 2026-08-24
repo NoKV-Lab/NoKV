@@ -207,7 +207,7 @@
       "id": "live-workbench-nq",
       "producer": "live-workbench",
       "evidence_kind": "live",
-      "script": "scripts/workbench/live_workbench.py",
+      "script": "scripts/workbench/native_cli_workbench.py",
       "expected_outcome": "NQ",
       "expected_exit_code": 3,
       "uses_rust_target": false,
