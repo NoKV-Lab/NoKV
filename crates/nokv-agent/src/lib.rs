@@ -36,7 +36,7 @@ const TOOL_DESCRIPTIONS: [(&str, &str); WORKBENCH_TOOL_COUNT] = [
     ),
     (
         "workbench_put_file",
-        "Publish one artifact at a section-relative jailed path. replace=false is create-only; replace=true is replace-only. This tool is never an upsert.",
+        "Publish one artifact at a section-relative jailed path. replace=false is create-only; replace=true is replace-only, optionally pinned to the caller-observed expected_generation so a stale caller conflicts instead of overwriting. This tool is never an upsert.",
     ),
     (
         "workbench_append",

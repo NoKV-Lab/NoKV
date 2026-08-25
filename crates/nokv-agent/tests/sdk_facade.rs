@@ -4159,6 +4159,102 @@ fn path_jail_and_put_modes_fail_closed() {
 }
 
 #[test]
+fn put_file_expected_generation_is_a_caller_pinned_cas() {
+    let backend = FakeBackend::default();
+    let handler = test_handler(backend.clone());
+    run(&handler, "workbench_create", json!({"id": "wb-cas"})).unwrap();
+    run(
+        &handler,
+        "workbench_put_file",
+        json!({"id": "wb-cas", "section": "outputs", "path": "head.json", "text": "v1"}),
+    )
+    .unwrap();
+
+    // A competitor replaces the artifact after our caller observed generation 1.
+    let competitor = run(
+        &handler,
+        "workbench_put_file",
+        json!({
+            "id": "wb-cas", "section": "outputs", "path": "head.json",
+            "text": "v2-competitor", "replace": true, "expected_generation": 1
+        }),
+    )
+    .unwrap();
+    assert_eq!(competitor["generation"], 2);
+
+    // The stale caller pins the generation it observed and must conflict
+    // instead of overwriting the competitor's update.
+    let stale = run(
+        &handler,
+        "workbench_put_file",
+        json!({
+            "id": "wb-cas", "section": "outputs", "path": "head.json",
+            "text": "v3-stale", "replace": true, "expected_generation": 1
+        }),
+    )
+    .expect_err("stale expected_generation must conflict");
+    assert_eq!(stale.code, "Conflict");
+    assert_eq!(
+        backend.body("wb-cas", "outputs/head.json"),
+        b"v2-competitor"
+    );
+
+    // Refreshing the observation succeeds against the current generation.
+    let refreshed = run(
+        &handler,
+        "workbench_put_file",
+        json!({
+            "id": "wb-cas", "section": "outputs", "path": "head.json",
+            "text": "v3", "replace": true, "expected_generation": 2
+        }),
+    )
+    .unwrap();
+    assert_eq!(refreshed["generation"], 3);
+
+    // The pin is meaningless outside replace mode and for generation zero.
+    for arguments in [
+        json!({
+            "id": "wb-cas", "section": "outputs", "path": "head.json",
+            "text": "x", "expected_generation": 3
+        }),
+        json!({
+            "id": "wb-cas", "section": "outputs", "path": "head.json",
+            "text": "x", "replace": true, "expected_generation": 0
+        }),
+    ] {
+        let error = run(&handler, "workbench_put_file", arguments)
+            .expect_err("invalid expected_generation shapes must fail closed");
+        assert_eq!(error.code, "InvalidArguments");
+    }
+
+    // Legacy self-stat replace stays byte-for-byte unchanged.
+    let legacy = run(
+        &handler,
+        "workbench_put_file",
+        json!({
+            "id": "wb-cas", "section": "outputs", "path": "head.json",
+            "text": "v4", "replace": true
+        }),
+    )
+    .unwrap();
+    assert_eq!(legacy["generation"], 4);
+
+    // The schema rejects generation 0 first on validated routes; a direct
+    // handler call bypasses the schema, so the facade's own zero check is
+    // load-bearing there and gets pinned separately.
+    let direct_zero = handler
+        .execute(
+            "workbench_put_file",
+            &json!({
+                "id": "wb-cas", "section": "outputs", "path": "head.json",
+                "text": "x", "replace": true, "expected_generation": 0
+            }),
+        )
+        .expect_err("a zero pin must fail even without schema validation");
+    assert_eq!(direct_zero.code, "InvalidArguments");
+}
+
+#[test]
 fn append_is_one_backend_operation_and_edit_revalidates_generation_conflicts() {
     let backend = FakeBackend::default();
     let handler = test_handler_with_limits(backend.clone(), 1024, 2);

@@ -129,6 +129,7 @@ pub enum Command {
         source: PathBuf,
         path: String,
         replace: bool,
+        expected_generation: Option<u64>,
         content_type: Option<String>,
     },
     WorkspacePath(WorkspacePathCommand),
@@ -186,6 +187,7 @@ pub enum CliError {
     MixedRoutingOptions,
     MixedMetadataStoreOptions,
     LocalOnlyRecoverLog,
+    UnpinnedExpectedGeneration,
 }
 
 impl fmt::Display for CliError {
@@ -219,6 +221,9 @@ impl fmt::Display for CliError {
                 .write_str("--metadata-create, --metadata-reopen, and --metadata-recover-log are mutually exclusive"),
             Self::LocalOnlyRecoverLog => formatter.write_str(
                 "--metadata-recover-log installs a shared-log frontier and cannot be combined with --recovery-publication local-only",
+            ),
+            Self::UnpinnedExpectedGeneration => formatter.write_str(
+                "--expected-generation pins a replace-only publication and requires --replace",
             ),
         }
     }
@@ -734,10 +739,17 @@ fn parse_collect(arguments: &mut impl Iterator<Item = String>) -> Result<Command
         .next()
         .ok_or(CliError::MissingArgument("workspace path"))?;
     let mut replace = false;
+    let mut expected_generation = None;
     let mut content_type = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--replace" => replace = true,
+            "--expected-generation" => {
+                expected_generation = Some(parse_number(
+                    "--expected-generation",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
             "--content-type" => {
                 content_type = Some(next_value(arguments, &argument)?);
             }
@@ -745,12 +757,16 @@ fn parse_collect(arguments: &mut impl Iterator<Item = String>) -> Result<Command
             _ => return Err(CliError::UnexpectedArgument(argument)),
         }
     }
+    if expected_generation.is_some() && !replace {
+        return Err(CliError::UnpinnedExpectedGeneration);
+    }
     Ok(Command::Collect {
         workbench,
         section,
         source,
         path,
         replace,
+        expected_generation,
         content_type,
     })
 }
@@ -880,8 +896,58 @@ mod tests {
                 source: PathBuf::from("/tmp/result.bin"),
                 path: "result.bin".to_owned(),
                 replace: true,
+                expected_generation: None,
                 content_type: Some("application/octet-stream".to_owned()),
             }
+        );
+    }
+
+    #[test]
+    fn collect_expected_generation_pins_the_replace_cas() {
+        let parsed = parse(args(&[
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--workbench-root",
+            "/agents/test/wb",
+            "collect",
+            "run-1",
+            "outputs",
+            "/tmp/result.bin",
+            "result.bin",
+            "--replace",
+            "--expected-generation",
+            "7",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::Collect {
+                workbench: "run-1".to_owned(),
+                section: "outputs".to_owned(),
+                source: PathBuf::from("/tmp/result.bin"),
+                path: "result.bin".to_owned(),
+                replace: true,
+                expected_generation: Some(7),
+                content_type: None,
+            }
+        );
+
+        let unpinned = parse(args(&[
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--workbench-root",
+            "/agents/test/wb",
+            "collect",
+            "run-1",
+            "outputs",
+            "/tmp/result.bin",
+            "result.bin",
+            "--expected-generation",
+            "7",
+        ]));
+        assert!(
+            unpinned.is_err(),
+            "expected-generation without --replace must fail"
         );
     }
 
