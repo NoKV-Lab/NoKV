@@ -477,6 +477,10 @@
         "content_type": {
           "type": "string"
         },
+        "expected_generation": {
+          "minimum": 1,
+          "type": "integer"
+        },
         "id": {
           "type": "string"
         },

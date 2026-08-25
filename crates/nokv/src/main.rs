@@ -121,6 +121,7 @@ fn run() -> Result<(), String> {
             source,
             path,
             replace,
+            expected_generation,
             content_type,
         } => {
             let handler = build_handler(&invocation)?;
@@ -132,6 +133,7 @@ fn run() -> Result<(), String> {
                 source,
                 path,
                 *replace,
+                *expected_generation,
                 content_type.as_deref(),
             )
         }
@@ -477,6 +479,7 @@ fn collect(
     source: &Path,
     path: &str,
     replace: bool,
+    expected_generation: Option<u64>,
     content_type: Option<&str>,
 ) -> Result<(), String> {
     let bytes = transfer::read_collect_source(source, max_bytes)?;
@@ -487,6 +490,9 @@ fn collect(
         "base64": STANDARD.encode(bytes),
         "replace": replace,
     });
+    if let Some(expected_generation) = expected_generation {
+        arguments["expected_generation"] = Value::from(expected_generation);
+    }
     if let Some(content_type) = content_type {
         arguments["content_type"] = Value::String(content_type.to_owned());
     }
@@ -574,7 +580,7 @@ USAGE:
   nokv [connection/object options] workbench <tool> '<json arguments>'
   nokv [connection/object options] mcp [--profile workbench|agent]
   nokv [connection/object options] materialize <workbench> <section> <path> <destination>
-  nokv [connection/object options] collect <workbench> <section> <source> <path> [--replace] [--content-type TYPE]
+  nokv [connection/object options] collect <workbench> <section> <source> <path> [--replace] [--expected-generation N] [--content-type TYPE]
   nokv [route/agent options] workspace-path rename <workbench> <section> <source> <destination> --expected-generation N --request-id HEX32
   nokv [route/agent options] workspace-path remove <workbench> <section> <path> --expected-generation N --request-id HEX32
   nokv --root-id HEX32 --agent-id HEX32 --etcd-endpoint URL provision <logical-shard-id-hex32> [adoption options]

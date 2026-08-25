@@ -961,17 +961,41 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
             .unwrap_or(default_content_type)
             .to_owned();
         let replace = optional_bool(arguments, "replace")?.unwrap_or(false);
-        let condition = if replace {
-            let current = self
-                .backend
-                .stat(&path, &ReadView::Live)?
-                .ok_or_else(|| not_found(&path))?;
-            let artifact = current.artifact.ok_or_else(|| not_artifact(&path))?;
-            PublishCondition::ReplaceOnly {
-                expected_generation: artifact.generation,
+        let expected_generation = optional_u64(arguments, "expected_generation")?;
+        let condition = match (replace, expected_generation) {
+            (false, None) => PublishCondition::CreateOnly,
+            (false, Some(_)) => {
+                return Err(AgentError::invalid_arguments(
+                    "expected_generation requires replace=true; a create-only \
+                     publication has no generation to pin",
+                ));
             }
-        } else {
-            PublishCondition::CreateOnly
+            (true, Some(0)) => {
+                return Err(AgentError::invalid_arguments(
+                    "expected_generation must be at least 1; use replace=false \
+                     for a create-only publication",
+                ));
+            }
+            (true, Some(expected_generation)) => {
+                // The caller pins the generation it observed, so a competing
+                // replacement between the caller's own read and this publish
+                // surfaces as a typed Conflict instead of a lost update. The
+                // self-stat form below only protects the window inside this
+                // call, never the caller's read-modify-write span.
+                PublishCondition::ReplaceOnly {
+                    expected_generation,
+                }
+            }
+            (true, None) => {
+                let current = self
+                    .backend
+                    .stat(&path, &ReadView::Live)?
+                    .ok_or_else(|| not_found(&path))?;
+                let artifact = current.artifact.ok_or_else(|| not_artifact(&path))?;
+                PublishCondition::ReplaceOnly {
+                    expected_generation: artifact.generation,
+                }
+            }
         };
         let outcome = self.backend.publish(PublishRequest {
             path: path.clone(),
