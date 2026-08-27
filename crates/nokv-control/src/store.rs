@@ -29,6 +29,13 @@ pub const MAX_RECOVERY_LOG_SEGMENTS: usize = 4_096;
 /// Durable control-plane operations, split between immutable root placement
 /// and physical logical-shard ownership.
 pub trait ControlStore: Send + Sync {
+    /// Recommended cadence for keeping an acquired owner session alive.
+    ///
+    /// Stores without expiring owner sessions return `None`.
+    fn owner_lease_renew_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Create the immutable Agent authority for a root. An exact replay is
     /// idempotent; the root can never be rebound to another Agent.
     fn create_root_agent_binding(

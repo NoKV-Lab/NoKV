@@ -85,6 +85,108 @@ pub struct ShardBoot {
     pub roots: Vec<RootAttach>,
 }
 
+struct BootstrapLeaseKeepalive {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    failure: Arc<std::sync::Mutex<Option<String>>>,
+    worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl BootstrapLeaseKeepalive {
+    fn start(
+        control: Arc<dyn ControlStore>,
+        lease: LogicalShardLease,
+        interval: Option<std::time::Duration>,
+    ) -> Result<Self, ServerError> {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failure = Arc::new(std::sync::Mutex::new(None));
+
+        let worker = match interval {
+            None => None,
+            Some(interval) => {
+                if interval.is_zero() {
+                    return Err(ServerError::InvalidBootstrap(
+                        "owner lease renewal interval must be non-zero".to_owned(),
+                    ));
+                }
+
+                let worker_stop = Arc::clone(&stop);
+                let worker_failure = Arc::clone(&failure);
+
+                Some(
+                    std::thread::Builder::new()
+                        .name("nokv-bootstrap-owner-keepalive".to_owned())
+                        .spawn(move || loop {
+                            std::thread::park_timeout(interval);
+
+                            if worker_stop.load(std::sync::atomic::Ordering::Acquire) {
+                                break;
+                            }
+
+                            if let Err(error) = control.renew_owner(&lease) {
+                                if let Ok(mut failure) = worker_failure.lock() {
+                                    *failure = Some(error.to_string());
+                                }
+                                break;
+                            }
+                        })
+                        .map_err(ServerError::Connection)?,
+                )
+            }
+        };
+
+        Ok(Self {
+            stop,
+            failure,
+            worker: std::sync::Mutex::new(worker),
+        })
+    }
+
+    fn ensure_healthy(&self) -> Result<(), ServerError> {
+        let failure = self.failure.lock().map_err(|_| {
+            ServerError::InvalidBootstrap(
+                "bootstrap owner keepalive failure lock was poisoned".to_owned(),
+            )
+        })?;
+
+        match failure.as_ref() {
+            None => Ok(()),
+            Some(error) => Err(ServerError::InvalidBootstrap(format!(
+                "bootstrap owner lease keepalive failed: {error}"
+            ))),
+        }
+    }
+
+    fn stop(&self) -> Result<(), ServerError> {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+
+        let worker = {
+            let mut worker = self.worker.lock().map_err(|_| {
+                ServerError::InvalidBootstrap(
+                    "bootstrap owner keepalive worker lock was poisoned".to_owned(),
+                )
+            })?;
+            worker.take()
+        };
+
+        if let Some(worker) = worker {
+            worker.thread().unpark();
+            worker.join().map_err(|_| {
+                ServerError::InvalidBootstrap(
+                    "bootstrap owner keepalive worker panicked".to_owned(),
+                )
+            })?;
+        }
+
+        self.ensure_healthy()
+    }
+}
+
+impl Drop for BootstrapLeaseKeepalive {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
 /// One control-backed logical-shard owner retained by the serving runtime.
 ///
 /// A failed renewal removes every exact local route before exposing the lease
@@ -97,6 +199,7 @@ pub struct ShardOwner {
     meta: Arc<meta::MetaShard>,
     recovery: Arc<RecoveryPublisher>,
     routes: Vec<RootRoute>,
+    bootstrap_keepalive: BootstrapLeaseKeepalive,
 }
 
 impl ShardOwner {
@@ -130,19 +233,25 @@ impl ShardOwner {
 
     /// Renew the shard lease. Lease loss removes every route before returning.
     pub fn renew_or_uninstall(&self) -> Result<LogicalShardRecord, ServerError> {
-        match self.control.renew_owner(&self.lease) {
+        let renewal = self.bootstrap_keepalive.stop().and_then(|()| {
+            self.control
+                .renew_owner(&self.lease)
+                .map_err(ServerError::Control)
+        });
+
+        match renewal {
             Ok(record) => Ok(record),
-            Err(error) => {
-                let primary = ServerError::Control(error);
+            Err(primary) => {
                 let cleanup = self
                     .registry
                     .fail_closed_shard(LogicalShardIdentity::from(self.shard_id()))
                     .err();
+
                 match cleanup {
                     None => Err(primary),
                     Some(cleanup) => Err(ServerError::BootstrapRollback {
                         primary: primary.to_string(),
-                        rollback: format!("fail-close lease-lost logical shard: {}", cleanup),
+                        rollback: format!("fail-close lease-lost logical shard: {cleanup}"),
                     }),
                 }
             }
@@ -155,26 +264,52 @@ impl ShardOwner {
             .registry
             .fail_closed_shard(LogicalShardIdentity::from(self.shard_id()))
             .err();
+
         let publication = self.recovery.publish_current().map_err(ServerError::from);
+
         if let Err(publication) = publication {
-            return match cleanup {
-                None => Err(publication),
-                Some(cleanup) => Err(ServerError::BootstrapRollback {
+            let mut rollback = Vec::new();
+
+            if let Some(cleanup) = cleanup {
+                rollback.push(cleanup.to_string());
+            }
+
+            if let Err(error) = self.bootstrap_keepalive.stop() {
+                rollback.push(format!("stop bootstrap owner keepalive: {error}"));
+            }
+
+            return if rollback.is_empty() {
+                Err(publication)
+            } else {
+                Err(ServerError::BootstrapRollback {
                     primary: publication.to_string(),
-                    rollback: cleanup.to_string(),
-                }),
+                    rollback: rollback.join("; "),
+                })
             };
         }
-        match (self.control.release_owner(&self.lease), cleanup) {
-            (Ok(record), None) => Ok(record),
-            (Ok(_), Some(cleanup)) => Err(ServerError::BootstrapRollback {
+
+        let keepalive = self.bootstrap_keepalive.stop().err();
+        let release = self.control.release_owner(&self.lease);
+        let mut rollback = Vec::new();
+
+        if let Some(cleanup) = cleanup {
+            rollback.push(cleanup.to_string());
+        }
+
+        if let Some(error) = keepalive {
+            rollback.push(format!("stop bootstrap owner keepalive: {error}"));
+        }
+
+        match release {
+            Ok(record) if rollback.is_empty() => Ok(record),
+            Ok(_) => Err(ServerError::BootstrapRollback {
                 primary: "release logical-shard owner succeeded".to_owned(),
-                rollback: cleanup.to_string(),
+                rollback: rollback.join("; "),
             }),
-            (Err(control), None) => Err(ServerError::Control(control)),
-            (Err(control), Some(cleanup)) => Err(ServerError::BootstrapRollback {
+            Err(control) if rollback.is_empty() => Err(ServerError::Control(control)),
+            Err(control) => Err(ServerError::BootstrapRollback {
                 primary: format!("release logical-shard owner: {control}"),
-                rollback: cleanup.to_string(),
+                rollback: rollback.join("; "),
             }),
         }
     }
@@ -251,6 +386,25 @@ pub fn bootstrap_shard(
         }
         (Err(error), _) => return Err(error),
     };
+
+    let bootstrap_keepalive = match BootstrapLeaseKeepalive::start(
+        Arc::clone(&control),
+        lease.clone(),
+        control.owner_lease_renew_interval(),
+    ) {
+        Ok(keepalive) => keepalive,
+        Err(error) => {
+            return Err(rollback_bootstrap(
+                error,
+                control.as_ref(),
+                &registry,
+                &[],
+                &lease,
+                acquired,
+            ));
+        }
+    };
+
     let mut routes = Vec::with_capacity(placements.len());
 
     let meta = match prepared_meta {
@@ -259,7 +413,8 @@ pub fn bootstrap_shard(
             let meta = match open_meta(boot.open.clone(), boot.shard_id) {
                 Ok(meta) => meta,
                 Err(error) => {
-                    return Err(rollback_bootstrap(
+                    return Err(rollback_bootstrap_with_keepalive(
+                        &bootstrap_keepalive,
                         error,
                         control.as_ref(),
                         &registry,
@@ -270,7 +425,8 @@ pub fn bootstrap_shard(
                 }
             };
             if let Err(error) = validate_meta_shard(&meta, boot.shard_id) {
-                return Err(rollback_bootstrap(
+                return Err(rollback_bootstrap_with_keepalive(
+                    &bootstrap_keepalive,
                     error,
                     control.as_ref(),
                     &registry,
@@ -292,7 +448,8 @@ pub fn bootstrap_shard(
     ) {
         Ok(record) => record,
         Err(error) => {
-            return Err(rollback_bootstrap(
+            return Err(rollback_bootstrap_with_keepalive(
+                &bootstrap_keepalive,
                 error,
                 control.as_ref(),
                 &registry,
@@ -303,7 +460,8 @@ pub fn bootstrap_shard(
         }
     };
     if let Err(error) = activate_shard(&meta, &lease) {
-        return Err(rollback_bootstrap(
+        return Err(rollback_bootstrap_with_keepalive(
+            &bootstrap_keepalive,
             error,
             control.as_ref(),
             &registry,
@@ -322,7 +480,8 @@ pub fn bootstrap_shard(
     ) {
         Ok(recovery) => Arc::new(recovery),
         Err(error) => {
-            return Err(rollback_bootstrap(
+            return Err(rollback_bootstrap_with_keepalive(
+                &bootstrap_keepalive,
                 ServerError::from(error),
                 control.as_ref(),
                 &registry,
@@ -333,7 +492,8 @@ pub fn bootstrap_shard(
         }
     };
     if let Err(error) = recovery.publish_current() {
-        return Err(rollback_bootstrap(
+        return Err(rollback_bootstrap_with_keepalive(
+            &bootstrap_keepalive,
             ServerError::from(error),
             control.as_ref(),
             &registry,
@@ -342,6 +502,19 @@ pub fn bootstrap_shard(
             acquired,
         ));
     }
+
+    if let Err(error) = bootstrap_keepalive.ensure_healthy() {
+        return Err(rollback_bootstrap_with_keepalive(
+            &bootstrap_keepalive,
+            error,
+            control.as_ref(),
+            &registry,
+            &routes,
+            &lease,
+            acquired,
+        ));
+    }
+
     let metadata_executor: Arc<dyn WorkspaceRequestExecutor> =
         Arc::new(MetadataWorkspaceRequestExecutor::new(Arc::clone(&meta)));
     let executor: Arc<dyn WorkspaceRequestExecutor> = Arc::new(RecoveryPublishingExecutor::new(
@@ -354,7 +527,8 @@ pub fn bootstrap_shard(
         ) {
             Ok(route) => routes.push(route),
             Err(error) => {
-                return Err(rollback_bootstrap(
+                return Err(rollback_bootstrap_with_keepalive(
+                    &bootstrap_keepalive,
                     error,
                     control.as_ref(),
                     &registry,
@@ -366,7 +540,8 @@ pub fn bootstrap_shard(
         }
     }
     if let Err(error) = control.renew_owner(&lease) {
-        return Err(rollback_bootstrap(
+        return Err(rollback_bootstrap_with_keepalive(
+            &bootstrap_keepalive,
             ServerError::Control(error),
             control.as_ref(),
             &registry,
@@ -378,7 +553,8 @@ pub fn bootstrap_shard(
     let published = match recovery.publish_current() {
         Ok(record) => record,
         Err(error) => {
-            return Err(rollback_bootstrap(
+            return Err(rollback_bootstrap_with_keepalive(
+                &bootstrap_keepalive,
                 ServerError::from(error),
                 control.as_ref(),
                 &registry,
@@ -388,6 +564,19 @@ pub fn bootstrap_shard(
             ));
         }
     };
+
+    if let Err(error) = bootstrap_keepalive.ensure_healthy() {
+        return Err(rollback_bootstrap_with_keepalive(
+            &bootstrap_keepalive,
+            error,
+            control.as_ref(),
+            &registry,
+            &routes,
+            &lease,
+            acquired,
+        ));
+    }
+
     let serving = match control.mark_serving(
         &lease,
         RecoveryPublication {
@@ -398,7 +587,8 @@ pub fn bootstrap_shard(
     ) {
         Ok(record) => record,
         Err(error) => {
-            return Err(rollback_bootstrap(
+            return Err(rollback_bootstrap_with_keepalive(
+                &bootstrap_keepalive,
                 ServerError::Control(error),
                 control.as_ref(),
                 &registry,
@@ -416,6 +606,7 @@ pub fn bootstrap_shard(
         meta,
         recovery,
         routes,
+        bootstrap_keepalive,
     })
 }
 
@@ -1025,6 +1216,33 @@ fn display_epoch(epoch: Option<OwnerEpoch>) -> String {
     epoch.map_or_else(|| "epoch-zero".to_owned(), |epoch| epoch.get().to_string())
 }
 
+fn rollback_bootstrap_with_keepalive(
+    keepalive: &BootstrapLeaseKeepalive,
+    primary: ServerError,
+    control: &dyn ControlStore,
+    registry: &RootOwnerRegistry,
+    routes: &[RootRoute],
+    lease: &LogicalShardLease,
+    release_acquired_lease: bool,
+) -> ServerError {
+    let primary = match keepalive.stop() {
+        Ok(()) => primary,
+        Err(error) => ServerError::BootstrapRollback {
+            primary: primary.to_string(),
+            rollback: format!("stop bootstrap owner keepalive: {error}"),
+        },
+    };
+
+    rollback_bootstrap(
+        primary,
+        control,
+        registry,
+        routes,
+        lease,
+        release_acquired_lease,
+    )
+}
+
 fn rollback_bootstrap(
     primary: ServerError,
     control: &dyn ControlStore,
@@ -1071,7 +1289,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use nokv_control::{
         ControlError, InMemoryControlStore, LogRef, LogSegmentRef, LogicalShardState,
@@ -1236,12 +1454,90 @@ mod tests {
         }
     }
 
+    struct BootstrapLeaseProbe {
+        ttl: Duration,
+        post_acquisition_delay: Duration,
+        renew_interval: Duration,
+        last_renewal: Mutex<Option<Instant>>,
+        delay_active: AtomicBool,
+        renewals_during_delay: AtomicUsize,
+    }
+
+    impl BootstrapLeaseProbe {
+        fn new(ttl: Duration, post_acquisition_delay: Duration, renew_interval: Duration) -> Self {
+            Self {
+                ttl,
+                post_acquisition_delay,
+                renew_interval,
+                last_renewal: Mutex::new(None),
+                delay_active: AtomicBool::new(false),
+                renewals_during_delay: AtomicUsize::new(0),
+            }
+        }
+
+        fn note_acquired(&self) {
+            *self
+                .last_renewal
+                .lock()
+                .expect("test lease clock lock must remain available") = Some(Instant::now());
+        }
+
+        fn note_renewal(&self) -> Result<(), ControlError> {
+            let now = Instant::now();
+            let mut last = self
+                .last_renewal
+                .lock()
+                .expect("test lease clock lock must remain available");
+            let previous = last.as_ref().copied().ok_or_else(|| {
+                ControlError::Backend("simulated owner lease was not acquired".to_owned())
+            })?;
+            if now.duration_since(previous) >= self.ttl {
+                return Err(ControlError::Backend(format!(
+                    "simulated owner lease expired after {:?}",
+                    self.ttl
+                )));
+            }
+            *last = Some(now);
+            drop(last);
+
+            if self.delay_active.load(Ordering::SeqCst) {
+                self.renewals_during_delay.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+
+        fn delay_before_mark_serving(&self) -> Result<(), ControlError> {
+            self.delay_active.store(true, Ordering::SeqCst);
+            std::thread::sleep(self.post_acquisition_delay);
+            self.delay_active.store(false, Ordering::SeqCst);
+            self.require_fresh()
+        }
+
+        fn require_fresh(&self) -> Result<(), ControlError> {
+            let last = self
+                .last_renewal
+                .lock()
+                .expect("test lease clock lock must remain available");
+            let previous = last.as_ref().copied().ok_or_else(|| {
+                ControlError::Backend("simulated owner lease was not acquired".to_owned())
+            })?;
+            if previous.elapsed() >= self.ttl {
+                return Err(ControlError::Backend(format!(
+                    "simulated owner lease expired after {:?}",
+                    self.ttl
+                )));
+            }
+            Ok(())
+        }
+    }
+
     struct LoseFinalizeAckControlStore {
         inner: Arc<InMemoryControlStore>,
         lose_next_finalize_ack: AtomicBool,
         fail_next_finalize_before_apply: AtomicBool,
         logical_shard_override: Mutex<Option<LogicalShardRecord>>,
         advance_before_successor: Mutex<Option<(Arc<RecoveryPublisher>, LogicalShardLease)>>,
+        bootstrap_lease_probe: Option<Arc<BootstrapLeaseProbe>>,
     }
 
     impl LoseFinalizeAckControlStore {
@@ -1252,6 +1548,7 @@ mod tests {
                 fail_next_finalize_before_apply: AtomicBool::new(false),
                 logical_shard_override: Mutex::new(None),
                 advance_before_successor: Mutex::new(None),
+                bootstrap_lease_probe: None,
             }
         }
 
@@ -1265,6 +1562,7 @@ mod tests {
                 fail_next_finalize_before_apply: AtomicBool::new(false),
                 logical_shard_override: Mutex::new(Some(record)),
                 advance_before_successor: Mutex::new(None),
+                bootstrap_lease_probe: None,
             }
         }
 
@@ -1279,6 +1577,21 @@ mod tests {
                 fail_next_finalize_before_apply: AtomicBool::new(false),
                 logical_shard_override: Mutex::new(None),
                 advance_before_successor: Mutex::new(Some((publisher, lease))),
+                bootstrap_lease_probe: None,
+            }
+        }
+
+        fn with_bootstrap_lease_probe(
+            inner: Arc<InMemoryControlStore>,
+            bootstrap_lease_probe: Arc<BootstrapLeaseProbe>,
+        ) -> Self {
+            Self {
+                inner,
+                lose_next_finalize_ack: AtomicBool::new(false),
+                fail_next_finalize_before_apply: AtomicBool::new(false),
+                logical_shard_override: Mutex::new(None),
+                advance_before_successor: Mutex::new(None),
+                bootstrap_lease_probe: Some(bootstrap_lease_probe),
             }
         }
 
@@ -1289,11 +1602,18 @@ mod tests {
                 fail_next_finalize_before_apply: AtomicBool::new(true),
                 logical_shard_override: Mutex::new(None),
                 advance_before_successor: Mutex::new(None),
+                bootstrap_lease_probe: None,
             }
         }
     }
 
     impl ControlStore for LoseFinalizeAckControlStore {
+        fn owner_lease_renew_interval(&self) -> Option<std::time::Duration> {
+            self.bootstrap_lease_probe
+                .as_ref()
+                .map(|probe| probe.renew_interval)
+        }
+
         fn create_root_agent_binding(
             &self,
             binding: nokv_control::RootAgentBinding,
@@ -1402,8 +1722,16 @@ mod tests {
                     .map_err(|error| ControlError::Backend(error.to_string()))?;
                 self.inner.release_owner(&lease)?;
             }
-            self.inner
-                .acquire_successor(logical_shard_id, expected_owner_epoch, owner, endpoint)
+            let lease = self.inner.acquire_successor(
+                logical_shard_id,
+                expected_owner_epoch,
+                owner,
+                endpoint,
+            )?;
+            if let Some(probe) = &self.bootstrap_lease_probe {
+                probe.note_acquired();
+            }
+            Ok(lease)
         }
 
         fn reacquire_recovery(
@@ -1421,6 +1749,9 @@ mod tests {
             &self,
             lease: &LogicalShardLease,
         ) -> Result<LogicalShardRecord, ControlError> {
+            if let Some(probe) = &self.bootstrap_lease_probe {
+                probe.note_renewal()?;
+            }
             self.inner.renew_owner(lease)
         }
 
@@ -1429,6 +1760,9 @@ mod tests {
             lease: &LogicalShardLease,
             publication: RecoveryPublication,
         ) -> Result<LogicalShardRecord, ControlError> {
+            if let Some(probe) = &self.bootstrap_lease_probe {
+                probe.delay_before_mark_serving()?;
+            }
             self.inner.mark_serving(lease, publication)
         }
 
@@ -3771,5 +4105,65 @@ mod tests {
         for route in routes {
             assert!(!registry.contains_exact(route).unwrap());
         }
+    }
+
+    #[test]
+    fn successor_bootstrap_keeps_exact_lease_alive_during_post_acquisition_delay() {
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+
+        let first = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            acquire_boot(database.clone(), &[root_id]),
+        )
+        .unwrap();
+        let first_epoch = first.lease().owner_epoch;
+        first.release().unwrap();
+
+        let probe = Arc::new(BootstrapLeaseProbe::new(
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_millis(50),
+        ));
+        let delayed_control: Arc<dyn ControlStore> =
+            Arc::new(LoseFinalizeAckControlStore::with_bootstrap_lease_probe(
+                Arc::clone(&control),
+                Arc::clone(&probe),
+            ));
+        let registry = Arc::new(RootOwnerRegistry::new());
+        let boot = ShardBoot {
+            recovery_publication: RecoveryPublicationMode::Shared,
+            shard_id: shard(),
+            open: OpenMode::Existing(database),
+            lease: LeaseMode::Acquire {
+                owner: NodeId::new("node-b").unwrap(),
+                endpoint: "127.0.0.1:9020".to_owned(),
+                previous_epoch: Some(first_epoch),
+            },
+            recovery: current_recovery(&control),
+            roots: vec![root_attach(root_id, 61)],
+        };
+
+        let successor = bootstrap_shard(delayed_control, Arc::clone(&registry), boot).unwrap();
+
+        assert!(
+            probe.renewals_during_delay.load(Ordering::SeqCst) > 0,
+            "the acquired successor lease was not renewed during slow bootstrap"
+        );
+        assert_eq!(successor.lease().owner_epoch.get(), first_epoch.get() + 1);
+
+        let record = control.get_logical_shard(&shard()).unwrap().unwrap();
+        assert_eq!(record.state, LogicalShardState::Serving);
+        assert_eq!(record.owner_epoch, Some(successor.lease().owner_epoch));
+        assert_eq!(record.lease_id, successor.lease().lease_id);
+
+        let handoff = successor.renew_or_uninstall().unwrap();
+        assert_eq!(handoff.owner_epoch, Some(successor.lease().owner_epoch));
+        assert_eq!(handoff.lease_id, successor.lease().lease_id);
+
+        successor.release().unwrap();
     }
 }

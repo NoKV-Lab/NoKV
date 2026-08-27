@@ -616,6 +616,7 @@ OWNER:
   serve validates every active root's Agent binding; it does not require or compare one shard-wide AgentId
   --root-id HEX32 --etcd-endpoint URL --node-id ID
   --advertise-endpoint HOST:PORT --bind HOST:PORT
+  --etcd-lease-ttl-seconds N (default 10; owner keepalive runs every max(1, N/3) seconds)
   --handshake-timeout-millis N --max-inflight-connections N
   --metadata-create PATH starts the first standalone local-WAL owner
   --metadata-reopen PATH restarts the same exclusive local-WAL authority after lease loss

@@ -81,6 +81,10 @@ impl EtcdControlStore {
 }
 
 impl ControlStore for EtcdControlStore {
+    fn owner_lease_renew_interval(&self) -> Option<std::time::Duration> {
+        self.options.owner_lease_renew_interval()
+    }
+
     fn create_root_agent_binding(
         &self,
         binding: RootAgentBinding,
