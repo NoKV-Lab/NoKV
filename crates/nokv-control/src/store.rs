@@ -139,6 +139,10 @@ pub trait ControlStore: Send + Sync {
 
     /// End the live session for a boot that has not reached `Serving`, while
     /// retaining its durable recovery epoch for an exact retry.
+    ///
+    /// If the exact recorded recovery session has already expired, suspension
+    /// is an idempotent success. A different live or rebound session remains
+    /// fenced and must never be removed by this operation.
     fn suspend_recovery(
         &self,
         lease: &LogicalShardLease,
@@ -540,11 +544,16 @@ impl ControlStore for InMemoryControlStore {
             .get(&lease.logical_shard_id)
             .cloned()
             .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
-        validate_record_lease(&current, lease)?;
-        validate_in_memory_session(&state, lease)?;
         let retained = prepare_recovery_suspension(&current, lease)?;
-        state.owner_sessions.remove(&lease.logical_shard_id);
-        Ok(retained)
+
+        match state.owner_sessions.get(&lease.logical_shard_id).cloned() {
+            None => Ok(retained),
+            Some(session) if session == *lease => {
+                state.owner_sessions.remove(&lease.logical_shard_id);
+                Ok(retained)
+            }
+            Some(_) => Err(ControlError::StaleLease(lease.clone())),
+        }
     }
 
     fn release_owner(&self, lease: &LogicalShardLease) -> Result<LogicalShardRecord, ControlError> {
@@ -2050,6 +2059,113 @@ mod tests {
             )
             .unwrap();
         store.release_owner(&rebound).unwrap();
+    }
+
+    #[test]
+    fn expired_recovery_session_cleanup_is_idempotent_and_rebinds_same_epoch() {
+        let store = InMemoryControlStore::new();
+        let first = acquire_placed_shard(&store, 1, 1);
+
+        // Simulate backend lease expiry without calling suspend_recovery().
+        // The durable Recovering record remains, but its liveness session is gone.
+        let expired = store
+            .state
+            .lock()
+            .expect("control store mutex poisoned")
+            .owner_sessions
+            .remove(&first.logical_shard_id);
+
+        assert_eq!(expired, Some(first.clone()));
+        assert!(matches!(
+            store.renew_owner(&first),
+            Err(ControlError::StaleLease(_))
+        ));
+
+        // Current main fails here with StaleLease even though the exact durable
+        // record still identifies this recovery attempt and no live session exists.
+        let retained = store.suspend_recovery(&first).unwrap();
+
+        assert_eq!(retained.state, LogicalShardState::Recovering);
+        assert_eq!(retained.owner_epoch, Some(first.owner_epoch));
+        assert_eq!(retained.owner.as_ref(), Some(&first.owner));
+        assert_eq!(retained.lease_id, first.lease_id);
+
+        // Cleanup should remain idempotent while the exact record is unchanged
+        // and the session remains absent.
+        assert_eq!(
+            store.suspend_recovery(&first).unwrap(),
+            retained,
+            "suspending an already-expired exact recovery session is idempotent"
+        );
+
+        // The durable recovery epoch must be rebound, not incremented.
+        let rebound = store
+            .reacquire_recovery(
+                &first.logical_shard_id,
+                first.owner_epoch,
+                node("node-b"),
+                "node-b:7000".to_owned(),
+            )
+            .unwrap();
+
+        assert_eq!(rebound.owner_epoch, first.owner_epoch);
+        assert_ne!(rebound.lease_id, first.lease_id);
+
+        store
+            .mark_serving(
+                &rebound,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: None,
+                    durable_lsn: 0,
+                },
+            )
+            .unwrap();
+
+        store.release_owner(&rebound).unwrap();
+    }
+
+    #[test]
+    fn expired_recovery_cleanup_cannot_suspend_rebound_live_session() {
+        let store = InMemoryControlStore::new();
+        let first = acquire_placed_shard(&store, 1, 1);
+
+        let expired = store
+            .state
+            .lock()
+            .expect("control store mutex poisoned")
+            .owner_sessions
+            .remove(&first.logical_shard_id);
+
+        assert_eq!(expired, Some(first.clone()));
+
+        // Rebind using the same owner and epoch, but a different lease ID. This
+        // isolates the lease-ID fence rather than relying on an owner mismatch.
+        let rebound = store
+            .reacquire_recovery(
+                &first.logical_shard_id,
+                first.owner_epoch,
+                first.owner.clone(),
+                "node-a:7001".to_owned(),
+            )
+            .unwrap();
+
+        assert_eq!(rebound.owner, first.owner);
+        assert_eq!(rebound.owner_epoch, first.owner_epoch);
+        assert_ne!(rebound.lease_id, first.lease_id);
+
+        // The old lease must never be allowed to suspend the rebound session.
+        assert!(matches!(
+            store.suspend_recovery(&first),
+            Err(ControlError::StaleLease(_))
+        ));
+
+        // Prove that the rebound session is still live and was not removed.
+        let renewed = store.renew_owner(&rebound).unwrap();
+        assert_eq!(renewed.lease_id, rebound.lease_id);
+        assert_eq!(renewed.owner_epoch, Some(rebound.owner_epoch));
+
+        store.suspend_recovery(&rebound).unwrap();
     }
 
     #[test]

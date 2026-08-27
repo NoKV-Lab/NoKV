@@ -625,8 +625,20 @@ impl ControlStore for EtcdControlStore {
             let current = fetch_logical_shard(&mut client, &options, &lease.logical_shard_id)
                 .await?
                 .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
-            let session = validate_owner_session(&mut client, &options, &lease).await?;
             let retained = prepare_recovery_suspension(&current.record, &lease)?;
+
+            let Some(session) =
+                fetch_owner_session(&mut client, &options, &lease.logical_shard_id).await?
+            else {
+                revoke_lease_best_effort(&mut client, lease.lease_id).await;
+                return Ok(retained);
+            };
+
+            if session.lease != lease || session.attached_lease_id != lease_id_i64(lease.lease_id)?
+            {
+                return Err(ControlError::StaleLease(lease.clone()));
+            }
+
             let record_key = options.logical_shard_record_key(&lease.logical_shard_id);
             let session_key = options.logical_shard_session_key(&lease.logical_shard_id);
             let txn = Txn::new()
@@ -1335,7 +1347,7 @@ mod tests {
     use etcd_client::DeleteOptions;
 
     use super::*;
-    use crate::{AgentId, PlacementGeneration, RootPlacementLifecycle};
+    use crate::{AgentId, LogicalShardState, PlacementGeneration, RootPlacementLifecycle};
 
     fn root(fill: u8) -> RootId {
         RootId::from_bytes([fill; 16])
@@ -1775,6 +1787,133 @@ mod tests {
                     .await
                     .map_err(etcd_backend)?;
                 Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires NOKV_TEST_ETCD_ENDPOINT"]
+    fn etcd_expired_recovery_session_cleanup_rebinds_same_epoch() {
+        let endpoint = std::env::var("NOKV_TEST_ETCD_ENDPOINT")
+            .expect("NOKV_TEST_ETCD_ENDPOINT must name an isolated test etcd endpoint");
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let prefix = format!(
+            "/nokv/test/expired-recovery-session-{}-{nonce}",
+            std::process::id()
+        );
+
+        let options = EtcdControlStoreOptions::new([endpoint]).with_key_prefix(prefix.clone());
+        let store = EtcdControlStore::connect(options.clone()).unwrap();
+        let logical_shard_id = shard(9);
+
+        store.create_logical_shard(logical_shard_id).unwrap();
+
+        store
+            .create_root_placement(RootPlacement {
+                root_id: root(9),
+                logical_shard_id,
+                placement_generation: PlacementGeneration::new(1).unwrap(),
+                lifecycle: RootPlacementLifecycle::Provisioning,
+            })
+            .unwrap();
+
+        let first = store
+            .acquire_owner(
+                &logical_shard_id,
+                NodeId::new("node-a").unwrap(),
+                "node-a:7000".to_owned(),
+            )
+            .unwrap();
+
+        // Revoke the real etcd lease. etcd removes the attached session key,
+        // while the durable Recovering record intentionally remains.
+        let mut client = store.client.clone();
+
+        store
+            .block_on(async {
+                client
+                    .lease_revoke(lease_id_i64(first.lease_id)?)
+                    .await
+                    .map_err(etcd_backend)?;
+
+                Ok::<(), ControlError>(())
+            })
+            .unwrap();
+
+        assert!(
+            store
+                .block_on(fetch_owner_session(
+                    &mut client,
+                    &options,
+                    &logical_shard_id,
+                ))
+                .unwrap()
+                .is_none(),
+            "revoking the etcd lease must remove its attached owner session"
+        );
+
+        assert!(matches!(
+            store.renew_owner(&first),
+            Err(ControlError::StaleLease(_))
+        ));
+
+        // Before the fix this returns StaleLease.
+        let retained = store.suspend_recovery(&first).unwrap();
+
+        assert_eq!(retained.state, LogicalShardState::Recovering);
+        assert_eq!(retained.owner_epoch, Some(first.owner_epoch));
+        assert_eq!(retained.lease_id, first.lease_id);
+        assert_eq!(store.suspend_recovery(&first).unwrap(), retained);
+
+        let rebound = store
+            .reacquire_recovery(
+                &logical_shard_id,
+                first.owner_epoch,
+                NodeId::new("node-b").unwrap(),
+                "node-b:7000".to_owned(),
+            )
+            .unwrap();
+
+        assert_eq!(rebound.owner_epoch, first.owner_epoch);
+        assert_ne!(rebound.lease_id, first.lease_id);
+
+        // Cleanup using the expired lease must not affect the live replacement.
+        assert!(matches!(
+            store.suspend_recovery(&first),
+            Err(ControlError::NotOwner { .. }) | Err(ControlError::StaleLease(_))
+        ));
+
+        assert_eq!(
+            store.renew_owner(&rebound).unwrap().lease_id,
+            rebound.lease_id
+        );
+
+        store
+            .mark_serving(
+                &rebound,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: None,
+                    durable_lsn: 0,
+                },
+            )
+            .unwrap();
+
+        store.release_owner(&rebound).unwrap();
+
+        store
+            .block_on(async {
+                client
+                    .delete(prefix, Some(DeleteOptions::new().with_prefix()))
+                    .await
+                    .map_err(etcd_backend)?;
+
+                Ok::<(), ControlError>(())
             })
             .unwrap();
     }
