@@ -2589,6 +2589,57 @@ mod tests {
     }
 
     #[test]
+    fn shared_owner_fail_close_blocks_ready_provider_delete() {
+        let fixture = fixture();
+
+        let deleter = Arc::new(FakeDeleter {
+            ambiguous: false,
+            calls: AtomicUsize::new(0),
+            object_keys: Mutex::new(Vec::new()),
+        });
+
+        let owner_loss = fixture.registry.owner_loss_signal();
+
+        let runner = LifecycleRunner::new(
+            Arc::clone(&fixture.store),
+            Arc::clone(&fixture.registry),
+            fixture.route,
+            owner_loss.clone(),
+            deleter.clone(),
+            test_durability(),
+            LifecycleRunnerOptions {
+                scan_page_size: 8,
+                mutation_batch_size: 8,
+                ..LifecycleRunnerOptions::default()
+            },
+        )
+        .unwrap();
+
+        // Advance the real candidate to its destructive provider boundary.
+        runner.run_once(100_000).unwrap();
+        runner.run_once(100_000).unwrap();
+
+        fixture
+            .registry
+            .fail_closed_shard(fixture.route.logical_shard_id)
+            .unwrap();
+
+        assert!(owner_loss.is_lost());
+        assert!(!fixture.registry.contains_exact(fixture.route).unwrap());
+
+        assert!(matches!(
+            runner.run_once(100_000),
+            Err(LifecycleError::OwnerLost(_))
+        ));
+
+        assert_eq!(
+            deleter.calls.load(Ordering::SeqCst),
+            0,
+            "provider deletion must not run after shared owner fail-close"
+        );
+    }
+
+    #[test]
     fn owner_loss_blocks_delete_and_ambiguous_delete_quarantines() {
         let fixture = fixture();
         let deleter = Arc::new(FakeDeleter {

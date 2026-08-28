@@ -976,10 +976,10 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
 
-    let renew_seconds = u64::try_from(route.lease_ttl_seconds)
-        .map_err(|_| "etcd lease TTL must be positive".to_owned())?
-        .saturating_div(3)
-        .max(1);
+    let lease_renew_interval = owner.owner_lease_renew_interval().ok_or_else(|| {
+        "etcd-backed workspace server requires an expiring owner-lease renewal policy".to_owned()
+    })?;
+
     let meta = Arc::clone(owner.meta());
     let recovery = Arc::clone(owner.recovery_publisher());
     let owner_routes = owner.routes().to_vec();
@@ -989,7 +989,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
             handshake_timeout: Duration::from_millis(invocation.server.handshake_timeout_millis),
             read_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),
-            lease_renew_interval: Duration::from_secs(renew_seconds),
+            lease_renew_interval,
             max_inflight_connections: invocation.server.max_inflight_connections,
         },
         Arc::clone(&registry),

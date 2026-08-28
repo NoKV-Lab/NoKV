@@ -87,13 +87,14 @@ pub struct ShardBoot {
 
 struct BootstrapLeaseKeepalive {
     stop: Arc<std::sync::atomic::AtomicBool>,
-    failure: Arc<std::sync::Mutex<Option<String>>>,
+    failure: Arc<std::sync::Mutex<Option<nokv_control::ControlError>>>,
     worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl BootstrapLeaseKeepalive {
     fn start(
         control: Arc<dyn ControlStore>,
+        registry: Arc<RootOwnerRegistry>,
         lease: LogicalShardLease,
         interval: Option<std::time::Duration>,
     ) -> Result<Self, ServerError> {
@@ -124,8 +125,15 @@ impl BootstrapLeaseKeepalive {
 
                             if let Err(error) = control.renew_owner(&lease) {
                                 if let Ok(mut failure) = worker_failure.lock() {
-                                    *failure = Some(error.to_string());
+                                    *failure = Some(error.clone());
                                 }
+
+                                // Make terminal lease loss visible to every
+                                // owner-scoped RPC and lifecycle worker.
+                                let _ = registry.fail_closed_shard(LogicalShardIdentity::from(
+                                    lease.logical_shard_id,
+                                ));
+
                                 break;
                             }
                         })
@@ -150,9 +158,7 @@ impl BootstrapLeaseKeepalive {
 
         match failure.as_ref() {
             None => Ok(()),
-            Some(error) => Err(ServerError::InvalidBootstrap(format!(
-                "bootstrap owner lease keepalive failed: {error}"
-            ))),
+            Some(error) => Err(ServerError::Control(error.clone())),
         }
     }
 
@@ -187,6 +193,32 @@ impl Drop for BootstrapLeaseKeepalive {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_OWNER_ADMISSION_TEST_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn install_after_owner_admission_test_hook(hook: impl FnOnce() + 'static) {
+    AFTER_OWNER_ADMISSION_TEST_HOOK.with(|slot| {
+        assert!(
+            slot.borrow_mut().replace(Box::new(hook)).is_none(),
+            "after-owner-admission test hook is already installed"
+        );
+    });
+}
+
+#[cfg(test)]
+fn run_after_owner_admission_test_hook() {
+    let hook = AFTER_OWNER_ADMISSION_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// One control-backed logical-shard owner retained by the serving runtime.
 ///
 /// A failed renewal removes every exact local route before exposing the lease
@@ -199,6 +231,7 @@ pub struct ShardOwner {
     meta: Arc<meta::MetaShard>,
     recovery: Arc<RecoveryPublisher>,
     routes: Vec<RootRoute>,
+    owner_lease_renew_interval: Option<std::time::Duration>,
     bootstrap_keepalive: BootstrapLeaseKeepalive,
 }
 
@@ -225,6 +258,11 @@ impl ShardOwner {
 
     pub fn recovery_publisher(&self) -> &Arc<RecoveryPublisher> {
         &self.recovery
+    }
+
+    /// Exact control-store policy used during bootstrap and steady state.
+    pub fn owner_lease_renew_interval(&self) -> Option<std::time::Duration> {
+        self.owner_lease_renew_interval
     }
 
     pub(crate) fn is_for_registry(&self, registry: &Arc<RootOwnerRegistry>) -> bool {
@@ -387,10 +425,13 @@ pub fn bootstrap_shard(
         (Err(error), _) => return Err(error),
     };
 
+    let owner_lease_renew_interval = control.owner_lease_renew_interval();
+
     let bootstrap_keepalive = match BootstrapLeaseKeepalive::start(
         Arc::clone(&control),
+        Arc::clone(&registry),
         lease.clone(),
-        control.owner_lease_renew_interval(),
+        owner_lease_renew_interval,
     ) {
         Ok(keepalive) => keepalive,
         Err(error) => {
@@ -404,6 +445,9 @@ pub fn bootstrap_shard(
             ));
         }
     };
+
+    #[cfg(test)]
+    run_after_owner_admission_test_hook();
 
     let mut routes = Vec::with_capacity(placements.len());
 
@@ -606,6 +650,7 @@ pub fn bootstrap_shard(
         meta,
         recovery,
         routes,
+        owner_lease_renew_interval,
         bootstrap_keepalive,
     })
 }
@@ -1461,6 +1506,7 @@ mod tests {
         last_renewal: Mutex<Option<Instant>>,
         delay_active: AtomicBool,
         renewals_during_delay: AtomicUsize,
+        fail_renewals: AtomicBool,
     }
 
     impl BootstrapLeaseProbe {
@@ -1472,6 +1518,7 @@ mod tests {
                 last_renewal: Mutex::new(None),
                 delay_active: AtomicBool::new(false),
                 renewals_during_delay: AtomicUsize::new(0),
+                fail_renewals: AtomicBool::new(false),
             }
         }
 
@@ -1482,7 +1529,11 @@ mod tests {
                 .expect("test lease clock lock must remain available") = Some(Instant::now());
         }
 
-        fn note_renewal(&self) -> Result<(), ControlError> {
+        fn note_renewal(&self, lease: &LogicalShardLease) -> Result<(), ControlError> {
+            if self.fail_renewals.load(Ordering::SeqCst) {
+                return Err(ControlError::StaleLease(lease.clone()));
+            }
+
             let now = Instant::now();
             let mut last = self
                 .last_renewal
@@ -1511,6 +1562,20 @@ mod tests {
             std::thread::sleep(self.post_acquisition_delay);
             self.delay_active.store(false, Ordering::SeqCst);
             self.require_fresh()
+        }
+
+        fn delay_longer_than_ttl(&self) -> Result<(), ControlError> {
+            self.renewals_during_delay.store(0, Ordering::SeqCst);
+            self.delay_active.store(true, Ordering::SeqCst);
+
+            std::thread::sleep(self.ttl + Duration::from_millis(250));
+
+            self.delay_active.store(false, Ordering::SeqCst);
+            self.require_fresh()
+        }
+
+        fn arm_terminal_failure(&self) {
+            self.fail_renewals.store(true, Ordering::SeqCst);
         }
 
         fn require_fresh(&self) -> Result<(), ControlError> {
@@ -1612,6 +1677,7 @@ mod tests {
             self.bootstrap_lease_probe
                 .as_ref()
                 .map(|probe| probe.renew_interval)
+                .or_else(|| self.inner.owner_lease_renew_interval())
         }
 
         fn create_root_agent_binding(
@@ -1750,7 +1816,7 @@ mod tests {
             lease: &LogicalShardLease,
         ) -> Result<LogicalShardRecord, ControlError> {
             if let Some(probe) = &self.bootstrap_lease_probe {
-                probe.note_renewal()?;
+                probe.note_renewal(lease)?;
             }
             self.inner.renew_owner(lease)
         }
@@ -4105,6 +4171,208 @@ mod tests {
         for route in routes {
             assert!(!registry.contains_exact(route).unwrap());
         }
+    }
+
+    struct SuccessorProbeFixture {
+        _temporary: TempDir,
+        control: Arc<InMemoryControlStore>,
+        registry: Arc<RootOwnerRegistry>,
+        delayed_control: Arc<dyn ControlStore>,
+        boot: ShardBoot,
+        first_epoch: OwnerEpoch,
+    }
+
+    fn successor_probe_fixture(probe: Arc<BootstrapLeaseProbe>) -> SuccessorProbeFixture {
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+
+        let first = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            acquire_boot(database.clone(), &[root_id]),
+        )
+        .unwrap();
+
+        let first_epoch = first.lease().owner_epoch;
+        first.release().unwrap();
+
+        let delayed_control: Arc<dyn ControlStore> = Arc::new(
+            LoseFinalizeAckControlStore::with_bootstrap_lease_probe(Arc::clone(&control), probe),
+        );
+
+        let registry = Arc::new(RootOwnerRegistry::new());
+
+        let boot = ShardBoot {
+            recovery_publication: RecoveryPublicationMode::Shared,
+            shard_id: shard(),
+            open: OpenMode::Existing(database),
+            lease: LeaseMode::Acquire {
+                owner: NodeId::new("node-b").unwrap(),
+                endpoint: "127.0.0.1:9020".to_owned(),
+                previous_epoch: Some(first_epoch),
+            },
+            recovery: current_recovery(&control),
+            roots: vec![root_attach(root_id, 61)],
+        };
+
+        SuccessorProbeFixture {
+            _temporary: temporary,
+            control,
+            registry,
+            delayed_control,
+            boot,
+            first_epoch,
+        }
+    }
+
+    fn assert_exact_successor(
+        control: &InMemoryControlStore,
+        owner: &ShardOwner,
+        first_epoch: OwnerEpoch,
+    ) {
+        assert_eq!(owner.lease().owner_epoch.get(), first_epoch.get() + 1);
+
+        let record = control.get_logical_shard(&shard()).unwrap().unwrap();
+
+        assert_eq!(record.state, LogicalShardState::Serving);
+        assert_eq!(record.owner_epoch, Some(owner.lease().owner_epoch));
+        assert_eq!(record.lease_id, owner.lease().lease_id);
+    }
+
+    #[test]
+    fn successor_bootstrap_renews_between_admission_and_open_reconciliation() {
+        let probe = Arc::new(BootstrapLeaseProbe::new(
+            Duration::from_secs(1),
+            Duration::ZERO,
+            Duration::from_millis(50),
+        ));
+
+        let SuccessorProbeFixture {
+            _temporary,
+            control,
+            registry,
+            delayed_control,
+            boot,
+            first_epoch,
+        } = successor_probe_fixture(Arc::clone(&probe));
+
+        let hook_probe = Arc::clone(&probe);
+
+        install_after_owner_admission_test_hook(move || {
+            hook_probe.delay_longer_than_ttl().unwrap();
+        });
+
+        let successor = bootstrap_shard(delayed_control, Arc::clone(&registry), boot).unwrap();
+
+        assert!(
+            probe.renewals_during_delay.load(Ordering::SeqCst) > 0,
+            "the exact lease was not renewed between admission and open/reconciliation"
+        );
+
+        assert_eq!(
+            successor.owner_lease_renew_interval(),
+            Some(probe.renew_interval)
+        );
+
+        assert_exact_successor(control.as_ref(), &successor, first_epoch);
+
+        let lease = successor.lease().clone();
+        let handoff = successor.renew_or_uninstall().unwrap();
+
+        assert_eq!(handoff.owner_epoch, Some(lease.owner_epoch));
+        assert_eq!(handoff.lease_id, lease.lease_id);
+
+        successor.release().unwrap();
+    }
+
+    #[test]
+    fn successor_owner_renews_after_bootstrap_before_first_steady_state_renewal() {
+        let probe = Arc::new(BootstrapLeaseProbe::new(
+            Duration::from_secs(1),
+            Duration::ZERO,
+            Duration::from_millis(50),
+        ));
+
+        let SuccessorProbeFixture {
+            _temporary,
+            control,
+            registry,
+            delayed_control,
+            boot,
+            first_epoch,
+        } = successor_probe_fixture(Arc::clone(&probe));
+
+        let successor = bootstrap_shard(delayed_control, Arc::clone(&registry), boot).unwrap();
+
+        let lease = successor.lease().clone();
+
+        // Simulate CLI and lifecycle setup before WorkspaceServer performs
+        // its first steady-state renew_or_uninstall handoff.
+        probe.delay_longer_than_ttl().unwrap();
+
+        assert!(
+            probe.renewals_during_delay.load(Ordering::SeqCst) > 0,
+            "the exact lease was not renewed after bootstrap returned"
+        );
+
+        assert_exact_successor(control.as_ref(), &successor, first_epoch);
+
+        let handoff = successor.renew_or_uninstall().unwrap();
+
+        assert_eq!(handoff.owner_epoch, Some(lease.owner_epoch));
+        assert_eq!(handoff.lease_id, lease.lease_id);
+
+        successor.release().unwrap();
+    }
+
+    #[test]
+    fn terminal_bootstrap_renewal_failure_fail_closes_owner_scope_and_stays_typed() {
+        let probe = Arc::new(BootstrapLeaseProbe::new(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Duration::from_millis(25),
+        ));
+
+        let SuccessorProbeFixture {
+            _temporary,
+            control,
+            registry,
+            delayed_control,
+            boot,
+            first_epoch: _,
+        } = successor_probe_fixture(Arc::clone(&probe));
+
+        let successor = bootstrap_shard(delayed_control, Arc::clone(&registry), boot).unwrap();
+
+        let lease = successor.lease().clone();
+        let route = successor.routes()[0];
+        let owner_loss = registry.owner_loss_signal();
+
+        probe.arm_terminal_failure();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        while !owner_loss.is_lost() || registry.contains_exact(route).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "terminal keepalive failure did not reach the shared owner-loss/route boundary"
+            );
+
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        match successor.renew_or_uninstall().unwrap_err() {
+            ServerError::Control(ControlError::StaleLease(stale)) => {
+                assert_eq!(stale, lease);
+            }
+            other => panic!("typed stale-lease failure was not preserved: {other:?}"),
+        }
+
+        // The probe returns StaleLease before calling the in-memory backend,
+        // so the test removes the retained backend session explicitly.
+        control.release_owner(&lease).unwrap();
     }
 
     #[test]
