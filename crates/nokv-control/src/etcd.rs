@@ -48,6 +48,81 @@ struct StoredOwnerSession {
     attached_lease_id: i64,
 }
 
+#[cfg(test)]
+type SuspendRecoveryMissingSessionHook =
+    Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(test)]
+static SUSPEND_RECOVERY_MISSING_SESSION_HOOK:
+    std::sync::OnceLock<
+        std::sync::Mutex<
+            Option<(
+                LogicalShardId,
+                SuspendRecoveryMissingSessionHook,
+            )>,
+        >,
+    > = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_suspend_recovery_missing_session_hook(
+    logical_shard_id: LogicalShardId,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    let slot =
+        SUSPEND_RECOVERY_MISSING_SESSION_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None));
+
+    let mut guard = slot
+        .lock()
+        .expect(
+            "suspend-recovery test-hook mutex must remain available",
+        );
+
+    assert!(
+        guard.is_none(),
+        "suspend-recovery missing-session hook is already installed"
+    );
+
+    *guard = Some((
+        logical_shard_id,
+        Box::new(hook),
+    ));
+}
+
+#[cfg(test)]
+fn run_suspend_recovery_missing_session_hook(
+    logical_shard_id: &LogicalShardId,
+) {
+    let slot =
+        SUSPEND_RECOVERY_MISSING_SESSION_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None));
+
+    let hook = {
+        let mut guard = slot
+            .lock()
+            .expect(
+                "suspend-recovery test-hook mutex must remain available",
+            );
+
+        let should_run = guard
+            .as_ref()
+            .map(|(expected, _)| {
+                expected == logical_shard_id
+            })
+            .unwrap_or(false);
+
+        if should_run {
+            guard.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    };
+
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 impl EtcdControlStore {
     pub fn connect(options: EtcdControlStoreOptions) -> Result<Self, ControlError> {
         options.validate()?;
@@ -621,47 +696,124 @@ impl ControlStore for EtcdControlStore {
         let mut client = self.client.clone();
         let options = self.options.clone();
         let lease = lease.clone();
+
         self.block_on(async move {
-            let current = fetch_logical_shard(&mut client, &options, &lease.logical_shard_id)
+            let current =
+                fetch_logical_shard(
+                    &mut client,
+                    &options,
+                    &lease.logical_shard_id,
+                )
                 .await?
-                .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
-            let retained = prepare_recovery_suspension(&current.record, &lease)?;
+                .ok_or(ControlError::LogicalShardNotFound(
+                    lease.logical_shard_id,
+                ))?;
 
-            let Some(session) =
-                fetch_owner_session(&mut client, &options, &lease.logical_shard_id).await?
-            else {
-                revoke_lease_best_effort(&mut client, lease.lease_id).await;
-                return Ok(retained);
-            };
+            let retained =
+                prepare_recovery_suspension(&current.record, &lease)?;
 
-            if session.lease != lease || session.attached_lease_id != lease_id_i64(lease.lease_id)?
-            {
-                return Err(ControlError::StaleLease(lease.clone()));
-            }
+            let session =
+                fetch_owner_session(
+                    &mut client,
+                    &options,
+                    &lease.logical_shard_id,
+                )
+                .await?;
 
-            let record_key = options.logical_shard_record_key(&lease.logical_shard_id);
-            let session_key = options.logical_shard_session_key(&lease.logical_shard_id);
-            let txn = Txn::new()
-                .when(vec![
-                    Compare::mod_revision(record_key, CompareOp::Equal, current.mod_revision),
-                    Compare::value(session_key.clone(), CompareOp::Equal, session.encoded),
-                    Compare::lease(
-                        session_key.clone(),
-                        CompareOp::Equal,
-                        lease_id_i64(lease.lease_id)?,
-                    ),
-                ])
-                .and_then(vec![TxnOp::delete(session_key, None)]);
-            let result = match client.txn(txn).await {
-                Ok(response) if response.succeeded() => Ok(retained),
-                Ok(_) | Err(_) => {
-                    classify_suspend_recovery_failure(&mut client, &options, &lease, &retained)
+            let result = match session {
+                None => {
+                    #[cfg(test)]
+                    run_suspend_recovery_missing_session_hook(
+                        &lease.logical_shard_id,
+                    );
+
+                    if exact_recovery_record_is_sessionless(
+                        &mut client,
+                        &options,
+                        &current,
+                    )
+                    .await?
+                    {
+                        Ok(retained.clone())
+                    } else {
+                        classify_suspend_recovery_failure(
+                            &mut client,
+                            &options,
+                            &lease,
+                            &current,
+                            &retained,
+                        )
                         .await
+                    }
+                }
+                Some(session) => {
+                    if session.lease != lease
+                        || session.attached_lease_id
+                            != lease_id_i64(lease.lease_id)?
+                    {
+                        return Err(ControlError::StaleLease(
+                            lease.clone(),
+                        ));
+                    }
+
+                    let record_key = options
+                        .logical_shard_record_key(
+                            &lease.logical_shard_id,
+                        );
+
+                    let session_key = options
+                        .logical_shard_session_key(
+                            &lease.logical_shard_id,
+                        );
+
+                    let txn = Txn::new()
+                        .when(vec![
+                            Compare::mod_revision(
+                                record_key,
+                                CompareOp::Equal,
+                                current.mod_revision,
+                            ),
+                            Compare::value(
+                                session_key.clone(),
+                                CompareOp::Equal,
+                                session.encoded,
+                            ),
+                            Compare::lease(
+                                session_key.clone(),
+                                CompareOp::Equal,
+                                lease_id_i64(lease.lease_id)?,
+                            ),
+                        ])
+                        .and_then(vec![
+                            TxnOp::delete(session_key, None),
+                        ]);
+
+                    match client.txn(txn).await {
+                        Ok(response) if response.succeeded() => {
+                            Ok(retained.clone())
+                        }
+                        Ok(_) | Err(_) => {
+                            classify_suspend_recovery_failure(
+                                &mut client,
+                                &options,
+                                &lease,
+                                &current,
+                                &retained,
+                            )
+                            .await
+                        }
+                    }
                 }
             };
+
             if result.is_ok() {
-                revoke_lease_best_effort(&mut client, lease.lease_id).await;
+                revoke_lease_best_effort(
+                    &mut client,
+                    lease.lease_id,
+                )
+                .await;
             }
+
             result
         })
     }
@@ -1254,26 +1406,82 @@ async fn classify_owner_record_mutation_failure(
     ))
 }
 
+async fn exact_recovery_record_is_sessionless(
+    client: &mut Client,
+    options: &EtcdControlStoreOptions,
+    expected: &StoredLogicalShard,
+) -> Result<bool, ControlError> {
+    let logical_shard_id = expected.record.logical_shard_id;
+
+    let record_key =
+        options.logical_shard_record_key(&logical_shard_id);
+
+    let session_key =
+        options.logical_shard_session_key(&logical_shard_id);
+
+    // This transaction is the linearization point for sessionless recovery
+    // suspension. The validated record revision and session absence must both
+    // still be true at the same etcd revision.
+    let txn = Txn::new()
+        .when(vec![
+            Compare::mod_revision(
+                record_key.clone(),
+                CompareOp::Equal,
+                expected.mod_revision,
+            ),
+            Compare::version(
+                session_key,
+                CompareOp::Equal,
+                0,
+            ),
+        ])
+        .and_then(vec![
+            TxnOp::get(record_key, None),
+        ]);
+
+    Ok(
+        client
+            .txn(txn)
+            .await
+            .map_err(etcd_backend)?
+            .succeeded(),
+    )
+}
+
 async fn classify_suspend_recovery_failure(
     client: &mut Client,
     options: &EtcdControlStoreOptions,
     lease: &LogicalShardLease,
+    expected: &StoredLogicalShard,
     retained: &LogicalShardRecord,
 ) -> Result<LogicalShardRecord, ControlError> {
-    let latest = fetch_logical_shard(client, options, &lease.logical_shard_id)
-        .await?
-        .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
-    if latest.record == *retained
-        && fetch_owner_session(client, options, &lease.logical_shard_id)
-            .await?
-            .is_none()
+    if exact_recovery_record_is_sessionless(
+        client,
+        options,
+        expected,
+    )
+    .await?
     {
         return Ok(retained.clone());
     }
+
+    let latest =
+        fetch_logical_shard(
+            client,
+            options,
+            &lease.logical_shard_id,
+        )
+        .await?
+        .ok_or(ControlError::LogicalShardNotFound(
+            lease.logical_shard_id,
+        ))?;
+
     validate_record_lease(&latest.record, lease)?;
     validate_owner_session(client, options, lease).await?;
+
     Err(ControlError::Backend(
-        "recovery suspension CAS failed while the exact owner session remained current".to_owned(),
+        "recovery suspension CAS failed while the exact owner session remained current"
+            .to_owned(),
     ))
 }
 
@@ -1342,7 +1550,9 @@ fn etcd_backend(error: etcd_client::Error) -> ControlError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use etcd_client::DeleteOptions;
 
@@ -1917,4 +2127,390 @@ mod tests {
             })
             .unwrap();
     }
+
+    #[test]
+    #[ignore = "requires NOKV_TEST_ETCD_ENDPOINT"]
+    fn etcd_missing_session_fast_path_is_linearizable_against_rebind_and_mark_serving() {
+        let endpoint =
+            std::env::var("NOKV_TEST_ETCD_ENDPOINT")
+                .expect(
+                    "NOKV_TEST_ETCD_ENDPOINT must name an isolated test etcd endpoint",
+                );
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let prefix = format!(
+            "/nokv/test/suspend-linearizability-{}-{nonce}",
+            std::process::id(),
+        );
+
+        let options =
+            EtcdControlStoreOptions::new([endpoint])
+                .with_key_prefix(prefix.clone());
+
+        let setup_store =
+            EtcdControlStore::connect(options.clone()).unwrap();
+
+        let logical_shard_id = shard(10);
+
+        setup_store
+            .create_logical_shard(logical_shard_id)
+            .unwrap();
+
+        setup_store
+            .create_root_placement(RootPlacement {
+                root_id: root(10),
+                logical_shard_id,
+                placement_generation:
+                    PlacementGeneration::new(1).unwrap(),
+                lifecycle:
+                    RootPlacementLifecycle::Provisioning,
+            })
+            .unwrap();
+
+        let first = setup_store
+            .acquire_owner(
+                &logical_shard_id,
+                NodeId::new("node-a").unwrap(),
+                "node-a:7000".to_owned(),
+            )
+            .unwrap();
+
+        let mut setup_client =
+            setup_store.client.clone();
+
+        setup_store
+            .block_on(async {
+                setup_client
+                    .lease_revoke(
+                        lease_id_i64(first.lease_id)?,
+                    )
+                    .await
+                    .map_err(etcd_backend)?;
+
+                Ok::<(), ControlError>(())
+            })
+            .unwrap();
+
+        assert!(
+            setup_store
+                .block_on(fetch_owner_session(
+                    &mut setup_client,
+                    &options,
+                    &logical_shard_id,
+                ))
+                .unwrap()
+                .is_none(),
+        );
+
+        let cleanup_store =
+            EtcdControlStore::connect(options.clone()).unwrap();
+
+        let contender_store =
+            EtcdControlStore::connect(options.clone()).unwrap();
+
+        let (reached_tx, reached_rx) =
+            mpsc::channel();
+
+        let (resume_tx, resume_rx) =
+            mpsc::channel();
+
+        install_suspend_recovery_missing_session_hook(
+            logical_shard_id,
+            move || {
+                reached_tx
+                    .send(())
+                    .expect(
+                        "test must signal the missing-session boundary",
+                    );
+
+                resume_rx
+                    .recv()
+                    .expect(
+                        "test must resume missing-session cleanup",
+                    );
+            },
+        );
+
+        let first_for_cleanup = first.clone();
+
+        let cleanup_thread = thread::spawn(move || {
+            cleanup_store
+                .suspend_recovery(&first_for_cleanup)
+        });
+
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect(
+                "cleanup did not reach the missing-session boundary",
+            );
+
+        let rebound = contender_store
+            .reacquire_recovery(
+                &logical_shard_id,
+                first.owner_epoch,
+                first.owner.clone(),
+                "node-a:7001".to_owned(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            rebound.owner_epoch,
+            first.owner_epoch,
+        );
+
+        assert_ne!(
+            rebound.lease_id,
+            first.lease_id,
+        );
+
+        contender_store
+            .mark_serving(
+                &rebound,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: None,
+                    durable_lsn: 0,
+                },
+            )
+            .unwrap();
+
+        resume_tx
+            .send(())
+            .expect(
+                "test must release the cleanup thread",
+            );
+
+        let cleanup_result = cleanup_thread
+            .join()
+            .expect(
+                "cleanup thread must not panic",
+            );
+
+        assert!(matches!(
+            cleanup_result,
+            Err(ControlError::StaleLease(_))
+                | Err(ControlError::NotOwner { .. })
+                | Err(
+                    ControlError::RecoveryStateConflict { .. }
+                )
+        ));
+
+        let latest = contender_store
+            .get_logical_shard(&logical_shard_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            latest.state,
+            LogicalShardState::Serving,
+        );
+
+        assert_eq!(
+            latest.owner_epoch,
+            Some(rebound.owner_epoch),
+        );
+
+        assert_eq!(
+            latest.lease_id,
+            rebound.lease_id,
+        );
+
+        contender_store
+            .release_owner(&rebound)
+            .unwrap();
+
+        let mut cleanup_client =
+            contender_store.client.clone();
+
+        contender_store
+            .block_on(async {
+                cleanup_client
+                    .delete(
+                        prefix,
+                        Some(
+                            DeleteOptions::new()
+                                .with_prefix(),
+                        ),
+                    )
+                    .await
+                    .map_err(etcd_backend)?;
+
+                Ok::<(), ControlError>(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires NOKV_TEST_ETCD_ENDPOINT"]
+    fn etcd_double_expiry_cleanup_requires_exact_rebound_lease() {
+        let endpoint =
+            std::env::var("NOKV_TEST_ETCD_ENDPOINT")
+                .expect(
+                    "NOKV_TEST_ETCD_ENDPOINT must name an isolated test etcd endpoint",
+                );
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let prefix = format!(
+            "/nokv/test/double-expiry-{}-{nonce}",
+            std::process::id(),
+        );
+
+        let options =
+            EtcdControlStoreOptions::new([endpoint])
+                .with_key_prefix(prefix.clone());
+
+        let store =
+            EtcdControlStore::connect(options.clone()).unwrap();
+
+        let logical_shard_id = shard(11);
+
+        store
+            .create_logical_shard(logical_shard_id)
+            .unwrap();
+
+        store
+            .create_root_placement(RootPlacement {
+                root_id: root(11),
+                logical_shard_id,
+                placement_generation:
+                    PlacementGeneration::new(1).unwrap(),
+                lifecycle:
+                    RootPlacementLifecycle::Provisioning,
+            })
+            .unwrap();
+
+        let first = store
+            .acquire_owner(
+                &logical_shard_id,
+                NodeId::new("node-a").unwrap(),
+                "node-a:7000".to_owned(),
+            )
+            .unwrap();
+
+        let mut client = store.client.clone();
+
+        store
+            .block_on(async {
+                client
+                    .lease_revoke(
+                        lease_id_i64(first.lease_id)?,
+                    )
+                    .await
+                    .map_err(etcd_backend)?;
+
+                Ok::<(), ControlError>(())
+            })
+            .unwrap();
+
+        assert!(
+            store
+                .block_on(fetch_owner_session(
+                    &mut client,
+                    &options,
+                    &logical_shard_id,
+                ))
+                .unwrap()
+                .is_none(),
+        );
+
+        let rebound = store
+            .reacquire_recovery(
+                &logical_shard_id,
+                first.owner_epoch,
+                first.owner.clone(),
+                "node-a:7001".to_owned(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            &rebound.owner,
+            &first.owner,
+        );
+
+        assert_eq!(
+            rebound.owner_epoch,
+            first.owner_epoch,
+        );
+
+        assert_ne!(
+            rebound.lease_id,
+            first.lease_id,
+        );
+
+        store
+            .block_on(async {
+                client
+                    .lease_revoke(
+                        lease_id_i64(rebound.lease_id)?,
+                    )
+                    .await
+                    .map_err(etcd_backend)?;
+
+                Ok::<(), ControlError>(())
+            })
+            .unwrap();
+
+        assert!(
+            store
+                .block_on(fetch_owner_session(
+                    &mut client,
+                    &options,
+                    &logical_shard_id,
+                ))
+                .unwrap()
+                .is_none(),
+        );
+
+        // Both sessions are absent. Cleanup for L1 must still be rejected
+        // because the durable Recovering record now identifies L2.
+        assert!(matches!(
+            store.suspend_recovery(&first),
+            Err(ControlError::StaleLease(_))
+                | Err(ControlError::NotOwner { .. })
+        ));
+
+        let retained =
+            store.suspend_recovery(&rebound).unwrap();
+
+        assert_eq!(
+            retained.state,
+            LogicalShardState::Recovering,
+        );
+
+        assert_eq!(
+            retained.owner_epoch,
+            Some(rebound.owner_epoch),
+        );
+
+        assert_eq!(
+            retained.lease_id,
+            rebound.lease_id,
+        );
+
+        store
+            .block_on(async {
+                client
+                    .delete(
+                        prefix,
+                        Some(
+                            DeleteOptions::new()
+                                .with_prefix(),
+                        ),
+                    )
+                    .await
+                    .map_err(etcd_backend)?;
+
+                Ok::<(), ControlError>(())
+            })
+            .unwrap();
+    }
+
 }

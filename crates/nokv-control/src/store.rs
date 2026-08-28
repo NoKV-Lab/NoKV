@@ -141,8 +141,9 @@ pub trait ControlStore: Send + Sync {
     /// retaining its durable recovery epoch for an exact retry.
     ///
     /// If the exact recorded recovery session has already expired, suspension
-    /// is an idempotent success. A different live or rebound session remains
-    /// fenced and must never be removed by this operation.
+    /// is an idempotent success only while the durable `Recovering` record still
+    /// identifies that exact lease. Backends must linearize record identity and
+    /// session absence. A different live or rebound lease remains fenced.
     fn suspend_recovery(
         &self,
         lease: &LogicalShardLease,
@@ -2166,6 +2167,85 @@ mod tests {
         assert_eq!(renewed.owner_epoch, Some(rebound.owner_epoch));
 
         store.suspend_recovery(&rebound).unwrap();
+    }
+
+    #[test]
+    fn double_expiry_cleanup_requires_exact_rebound_lease() {
+        let store = InMemoryControlStore::new();
+        let first = acquire_placed_shard(&store, 1, 1);
+
+        let expired_first = store
+            .state
+            .lock()
+            .expect("control store mutex poisoned")
+            .owner_sessions
+            .remove(&first.logical_shard_id);
+
+        assert_eq!(
+            expired_first,
+            Some(first.clone()),
+        );
+
+        let rebound = store
+            .reacquire_recovery(
+                &first.logical_shard_id,
+                first.owner_epoch,
+                first.owner.clone(),
+                "node-a:7001".to_owned(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            &rebound.owner,
+            &first.owner,
+        );
+
+        assert_eq!(
+            rebound.owner_epoch,
+            first.owner_epoch,
+        );
+
+        assert_ne!(
+            rebound.lease_id,
+            first.lease_id,
+        );
+
+        let expired_rebound = store
+            .state
+            .lock()
+            .expect("control store mutex poisoned")
+            .owner_sessions
+            .remove(&rebound.logical_shard_id);
+
+        assert_eq!(
+            expired_rebound,
+            Some(rebound.clone()),
+        );
+
+        // Both sessions are absent. Only the durable record's exact lease ID
+        // can distinguish stale L1 cleanup from current L2 cleanup.
+        assert!(matches!(
+            store.suspend_recovery(&first),
+            Err(ControlError::StaleLease(_))
+        ));
+
+        let retained =
+            store.suspend_recovery(&rebound).unwrap();
+
+        assert_eq!(
+            retained.state,
+            LogicalShardState::Recovering,
+        );
+
+        assert_eq!(
+            retained.owner_epoch,
+            Some(rebound.owner_epoch),
+        );
+
+        assert_eq!(
+            retained.lease_id,
+            rebound.lease_id,
+        );
     }
 
     #[test]
