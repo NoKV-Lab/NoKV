@@ -22,11 +22,19 @@ The checked-in integration assets are deliberately small:
   exact Rust-owned schema at
   `crates/nokv-agent/workbench_contract_schema.json`.
 - `workbench_contract_test.py` tests normalization and exact surface matching.
-- `live_workbench.py` provisions one root, starts one explicit metadata
-  owner and the flat `nokv mcp` command, then records a real
-  scientific reconstruction workflow through all 18 tools.
-- `live_workbench_test.py` checks exact coverage/order, flat commands,
-  secret redaction, dry-run evidence, and fail-closed qualification.
+- `native_cli_workbench.py` provisions one root, starts one explicit metadata
+  owner, and records the scientific reconstruction workflow by invoking every
+  tool through the primary `nokv workbench <tool> <canonical-json>` CLI
+  boundary in a fresh process.
+- `native_cli_workbench_test.py` freezes direct-CLI argv construction, exact
+  tool coverage, transcript/error parsing, secret redaction, dry-run evidence,
+  and the required CI artifact.
+- `live_workbench.py` provisions one root, starts one explicit metadata owner
+  and the flat optional `nokv mcp` command, then records the same workflow
+  through the sidecar transport.
+- `live_workbench_test.py` checks the sidecar runner's exact coverage/order,
+  flat commands, secret redaction, dry-run evidence, and fail-closed
+  qualification.
 - `local_wal_recovery_gate.py` starts an isolated real etcd process and proves
   that a killed `Recovering(2)` owner is retried at epoch 2 both before and
   after the local Holt fence advances. It separately sends `SIGTERM` to a
@@ -65,7 +73,7 @@ The checked-in integration assets are deliberately small:
 
 The source-bound qualification manifest covers every producer declared by the
 pre-#423 ledger. Live producers bind the exact product binary, pinned dependency
-identities, and their required `qualification` and MCP-transcript evidence
+identities, and their required `qualification` and transport-transcript evidence
 roles. Missing LingTai and installed-Python live runners emit typed `NQ`
 receipts with a concrete gap reason. The native Workbench and object-namespace
 entrypoints also refuse to claim scenarios their bounded harnesses do not run.
@@ -83,6 +91,7 @@ python3 scripts/workbench/pre423_contract_ledger.py
 python3 scripts/workbench/pre423_contract_ledger_test.py
 python3 scripts/workbench/workbench_contract_test.py
 python3 scripts/workbench/live_workbench_test.py
+python3 scripts/workbench/native_cli_workbench_test.py
 python3 scripts/workbench/local_wal_recovery_gate_test.py
 python3 scripts/workbench/object_namespace_recovery_gate_test.py
 python3 scripts/workbench/restore_composition_gate_test.py
@@ -109,8 +118,41 @@ metadata schemas are rejected; the sole marker is `nokv_workspace`.
 
 ## Live Workbench evidence
 
-Dry-run validates the redacted command graph and exact 18-tool coverage without
-claiming that any dependency ran:
+### Primary native CLI
+
+Dry-run validates the redacted direct-CLI command graph and exact 18-tool
+coverage without claiming that any dependency ran:
+
+```bash
+python3 scripts/workbench/native_cli_workbench.py \
+  --dry-run \
+  --evidence-dir target/native-cli-workbench/evidence/dry-run
+```
+
+A live run consumes already-running etcd and S3-compatible services. Each
+Workbench call is a separate invocation of `nokv workbench`; the evidence
+records exact redacted argv, canonical JSON input, stdout, stderr, exit code,
+and the decoded public result in `cli-transcript.jsonl`.
+
+```bash
+python3 scripts/workbench/native_cli_workbench.py \
+  --build \
+  --root-id 11111111111111111111111111111111 \
+  --agent-id 44444444444444444444444444444444 \
+  --agent-name research-agent \
+  --logical-shard-id 22222222222222222222222222222222 \
+  --etcd-endpoint http://127.0.0.1:2379 \
+  --object-endpoint http://127.0.0.1:9000 \
+  --object-bucket nokv-workbench-live \
+  --metadata-mode create \
+  --metadata-dir target/native-cli-workbench/metadata/live-01 \
+  --evidence-dir target/native-cli-workbench/evidence/live-01
+```
+
+### Optional MCP sidecar
+
+The sidecar runner remains separate. Its dry-run validates the redacted command
+graph and exact 18-tool coverage without claiming that any dependency ran:
 
 ```bash
 python3 scripts/workbench/live_workbench.py \
@@ -118,7 +160,7 @@ python3 scripts/workbench/live_workbench.py \
   --evidence-dir target/workbench-live/evidence/dry-run
 ```
 
-A live run consumes already-running etcd and S3-compatible services.
+A live sidecar run consumes already-running etcd and S3-compatible services.
 Credentials may be supplied with `NOKV_LIVE_S3_ACCESS_KEY_ID` and
 `NOKV_LIVE_S3_SECRET_ACCESS_KEY`; evidence records only their presence and
 redacts secret values without retaining a digest verifier.
@@ -163,10 +205,12 @@ record size, so a long-lived deployment such as a partner pre-pilot should run
 recovery authority, nothing is published, and `--metadata-recover-log` is not
 available for that shard.
 
-The deterministic evidence directory contains `plan.json`, exact paired
-requests/responses in `mcp-transcript.jsonl`, `processes.jsonl` and process
-logs, build/config facts in `environment.json`, validated schema evidence in
-`contract.json`, and explicit statuses in `qualification.json`.
+The native deterministic evidence directory contains `plan.json`, exact direct
+CLI invocations in `cli-transcript.jsonl`, `processes.jsonl` and process logs,
+build/config facts in `environment.json`, the binary-exported 18-tool schema
+check in `contract.json`, and explicit statuses in `qualification.json`. The
+sidecar runner separately retains paired JSON-RPC requests/responses in
+`mcp-transcript.jsonl` and its MCP schema evidence.
 
 Exit status `3` means a required live dependency is absent and the workflow is
 `NOT QUALIFIED`, never a pass. Exit status `2` means a configured live boundary

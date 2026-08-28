@@ -39,6 +39,7 @@ workbench-test:
 	python3 scripts/workbench/pre423_contract_ledger_test.py
 	python3 scripts/workbench/workbench_contract_test.py
 	python3 scripts/workbench/live_workbench_test.py
+	python3 scripts/workbench/native_cli_workbench_test.py
 
 governance-test:
 	python3 scripts/ci/pr_change_governance_test.py
@@ -58,6 +59,7 @@ verify:
 	python3 scripts/workbench/pre423_contract_ledger_test.py
 	python3 scripts/workbench/workbench_contract_test.py
 	python3 scripts/workbench/live_workbench_test.py
+	python3 scripts/workbench/native_cli_workbench_test.py
 	python3 scripts/ci/pr_change_governance_test.py
 	python3 scripts/release/test_homebrew_source_release.py
 	python3 scripts/release/test_python_sdk_release.py

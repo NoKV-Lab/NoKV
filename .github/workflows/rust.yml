@@ -51,6 +51,7 @@ jobs:
             scripts/workbench/pre423_contract_ledger.py \
             scripts/workbench/workbench_contract.py \
             scripts/workbench/live_workbench.py \
+            scripts/workbench/native_cli_workbench.py \
             scripts/workbench/local_wal_recovery_gate.py \
             scripts/workbench/object_namespace_recovery_gate.py \
             scripts/workbench/restore_composition_gate.py \
@@ -59,6 +60,7 @@ jobs:
           python3 scripts/workbench/pre423_contract_ledger_test.py
           python3 scripts/workbench/workbench_contract_test.py
           python3 scripts/workbench/live_workbench_test.py
+          python3 scripts/workbench/native_cli_workbench_test.py
           python3 scripts/workbench/local_wal_recovery_gate_test.py
           python3 scripts/workbench/object_namespace_recovery_gate_test.py
           python3 scripts/workbench/restore_composition_gate_test.py
@@ -188,7 +190,7 @@ jobs:
                   --dependency "etcd=sha256:e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9"
                   --dependency "object-store=oci:rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
                   --evidence "qualification=$evidence_root/qualification.json"
-                  --evidence "mcp-transcript=$evidence_root/mcp-transcript.jsonl"
+                  --evidence "cli-transcript=$evidence_root/cli-transcript.jsonl"
                 )
                 producer_args+=(
                   --nokv-bin "$product_binary"
@@ -529,6 +531,78 @@ jobs:
         with:
           name: live-workbench-${{ github.sha }}
           path: ${{ runner.temp }}/live-workbench
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Qualify primary native CLI Workbench contracts
+        id: native_cli_workbench
+        shell: bash
+        env:
+          NATIVE_CLI_WORKBENCH_ROOT: ${{ runner.temp }}/native-cli-workbench
+        run: |
+          set -euo pipefail
+          endpoint=http://127.0.0.1:22381
+          peer=http://127.0.0.1:22382
+          mkdir -p "$NATIVE_CLI_WORKBENCH_ROOT"
+          etcd \
+            --name nokv-native-cli-workbench \
+            --data-dir "$NATIVE_CLI_WORKBENCH_ROOT/etcd-data" \
+            --listen-client-urls "$endpoint" \
+            --advertise-client-urls "$endpoint" \
+            --listen-peer-urls "$peer" \
+            --initial-advertise-peer-urls "$peer" \
+            --initial-cluster "nokv-native-cli-workbench=$peer" \
+            --initial-cluster-state new \
+            --log-level warn \
+            >"$NATIVE_CLI_WORKBENCH_ROOT/etcd.log" 2>&1 &
+          etcd_pid=$!
+          trap 'kill "$etcd_pid" >/dev/null 2>&1 || true; wait "$etcd_pid" >/dev/null 2>&1 || true' EXIT
+          ready=false
+          for _ in $(seq 1 60); do
+            if etcdctl --endpoints "$endpoint" endpoint health >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$etcd_pid" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.25
+          done
+          if [[ "$ready" != true ]]; then
+            cat "$NATIVE_CLI_WORKBENCH_ROOT/etcd.log"
+            exit 1
+          fi
+          python3 scripts/workbench/native_cli_workbench.py \
+            --nokv-bin target/debug/nokv \
+            --evidence-dir "$NATIVE_CLI_WORKBENCH_ROOT/evidence" \
+            --metadata-dir "$NATIVE_CLI_WORKBENCH_ROOT/metadata" \
+            --root-id 55555555555555555555555555555555 \
+            --agent-id 88888888888888888888888888888888 \
+            --agent-name ci-native-cli-agent \
+            --logical-shard-id 66666666666666666666666666666666 \
+            --etcd-endpoint "$endpoint" \
+            --etcd-key-prefix "/nokv/control/native-cli-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --server-bind 127.0.0.1:17751 \
+            --advertise-endpoint 127.0.0.1:17751 \
+            --object-endpoint http://127.0.0.1:9000 \
+            --object-bucket nokv-local-wal-recovery-gate \
+            --object-root "native-cli-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --object-access-key-id rustfsadmin \
+            --object-secret-access-key rustfsadmin \
+            --command-timeout-seconds 45
+          jq -e '.workbench_workflow.status == "PASS"' \
+            "$NATIVE_CLI_WORKBENCH_ROOT/evidence/qualification.json"
+          jq -e '.workbench_workflow.transport == "native-cli"' \
+            "$NATIVE_CLI_WORKBENCH_ROOT/evidence/qualification.json"
+          jq -e '.acceptance_gates["0"].status == "NOT QUALIFIED"' \
+            "$NATIVE_CLI_WORKBENCH_ROOT/evidence/qualification.json"
+
+      - name: Upload native CLI Workbench evidence
+        if: ${{ always() && steps.native_cli_workbench.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-cli-workbench-${{ github.sha }}
+          path: ${{ runner.temp }}/native-cli-workbench
           if-no-files-found: error
           retention-days: 7
 

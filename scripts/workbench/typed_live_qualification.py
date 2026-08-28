@@ -24,7 +24,10 @@ from source_bound_producer import (
 
 
 QUALIFICATION_ROLE = "qualification"
-TRANSCRIPT_ROLE = "mcp-transcript"
+TRANSCRIPT_FILES = {
+    "mcp-transcript": "mcp-transcript.jsonl",
+    "cli-transcript": "cli-transcript.jsonl",
+}
 
 
 def load_live_context(
@@ -74,8 +77,12 @@ def publish_live_result(
         raise ProducerError(
             "live evidence roles must be unique and start with producer-result"
         )
-    if TRANSCRIPT_ROLE in roles and transcript is None and outcome == "PASS":
-        raise ProducerError("a live PASS requires the real MCP transcript")
+    transcript_roles = tuple(role for role in roles if role in TRANSCRIPT_FILES)
+    if len(transcript_roles) > 1:
+        raise ProducerError("a live producer may retain only one transport transcript")
+    if transcript_roles and transcript is None and outcome == "PASS":
+        label = "MCP" if transcript_roles[0] == "mcp-transcript" else "native CLI"
+        raise ProducerError(f"a live PASS requires the real {label} transcript")
     result_path = result_path.resolve()
     if QUALIFICATION_ROLE in roles:
         payload = (
@@ -87,12 +94,12 @@ def publish_live_result(
             operation_id=context.operation_id,
             label="typed live qualification evidence",
         )
-    if TRANSCRIPT_ROLE in roles:
+    for role in transcript_roles:
         if transcript is None:
             transcript = (
                 json.dumps(
                     {
-                        "schema": "nokv.pre423.mcp_transcript_gap.v1",
+                        "schema": f"nokv.pre423.{role.replace('-', '_')}_gap.v1",
                         "outcome": outcome,
                         "reason": qualification.get(
                             "reason", "live transcript unavailable"
@@ -104,10 +111,10 @@ def publish_live_result(
                 + b"\n"
             )
         write_create_new_evidence(
-            result_path.parent / "mcp-transcript.jsonl",
+            result_path.parent / TRANSCRIPT_FILES[role],
             transcript,
             operation_id=context.operation_id,
-            label="typed live transcript evidence",
+            label=f"typed live {role} evidence",
         )
     write_producer_result(
         result_path,

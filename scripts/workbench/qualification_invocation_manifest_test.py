@@ -17,7 +17,7 @@ import api_decision_qualification
 import commit_replay_qualification
 import cursor_differential_qualification
 import lingtai_mcp_qualification
-import live_workbench
+import native_cli_workbench
 import nokv_agent_qualification
 import object_namespace_recovery_gate
 import pre423_contract_ledger
@@ -37,7 +37,7 @@ PRODUCER_MODULES = {
     "cursor-differential": cursor_differential_qualification,
     "nokv-agent-unit": nokv_agent_qualification,
     "lingtai-mcp": lingtai_mcp_qualification,
-    "live-workbench": live_workbench,
+    "live-workbench": native_cli_workbench,
     "object-namespace-recovery": object_namespace_recovery_gate,
     "python-sdk": python_sdk_qualification,
     "restore-composition": restore_composition_gate,
@@ -282,6 +282,7 @@ class QualificationInvocationManifestTests(unittest.TestCase):
             "cargo build --locked -p nokv --bin nokv --target-dir target/phase1-qualification",
             '--evidence "qualification=$evidence_root/qualification.json"',
             '--evidence "mcp-transcript=$evidence_root/mcp-transcript.jsonl"',
+            '--evidence "cli-transcript=$evidence_root/cli-transcript.jsonl"',
             "lingtai-kernel=git:834274df1304488d3e6b5b2cde4a3b481a81e38b",
             "python_sdk_sha256=$(git ls-files -s crates/nokv-python | sha256sum",
             "python3 scripts/workbench/qualification_aggregate.py",

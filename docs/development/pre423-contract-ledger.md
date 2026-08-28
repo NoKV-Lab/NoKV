@@ -195,7 +195,7 @@ typed producers pass.
 | `pre423_contract_ledger.py`, `workbench_contract_test.py`, and every `*_gate_test.py` | Validate policy, checker, or harness shape only. They sign no product stable ID by themselves. |
 | `cargo test -p nokv-agent` | Candidate `nokv-agent-unit` source for schema-surface `T01`-`T04`, `C01`, `C02`, `C07`, and `L01`. |
 | `cargo test -p nokv-agent --test sdk_facade` | Candidate `nokv-agent-unit` source for the ledger's facade-contract and output-golden scenarios. Each claim still needs a direct assertion-to-scenario mapping; the broad command is not one receipt for all IDs. |
-| `live_workbench.py` | Its explicit stable checks can back native scenarios for `T08`, `C04`, `C05`, and `C15`. Its `C06` probe proves same-name read/write isolation, reconnect, and wrong-agent admission, but does not yet cover every operation required by the `C06` root-authority scenario. It is raw MCP evidence, not LingTai evidence. |
+| `native_cli_workbench.py` | Its explicit direct-CLI checks can back native scenarios for `T08`, `C04`, `C05`, and `C15`. Its `C06` probe proves same-name read/write isolation, reconnect, and wrong-agent admission, but does not yet cover every operation required by the `C06` root-authority scenario. It is raw native CLI evidence, not LingTai evidence. |
 | `restore_composition_gate.py` | Can back restore-composition scenarios for `T14`, `T18`, `C20`, and `C21` where its exact A to snapshot A to B to snapshot B to C oracle asserts the scenario. It does not satisfy their independent provider, native, commit, output, or LingTai gates. |
 | `object_namespace_recovery_gate.py` | Can back the provider restart binding scenario in `C06` and the explicit object-outage read scenario in `C12`. Its commit replay, wrong-prefix, and exact-byte observations are partial evidence only for the remaining provider scenarios. |
 | `local_wal_recovery_gate.py` | Qualifies owner-epoch/local-WAL recovery, which is not one of the 47 pre-#423 stable IDs. It signs none of this ledger's scenarios. |
@@ -209,11 +209,11 @@ Workbench ledger qualification result.
 
 The five source-bound static or exact-test producers are implemented and have
 their own fail-closed policy tests. They still need to be executed as part of
-the complete protected producer graph. Three existing live harnesses need
-typed scenario/result/evidence integration without weakening their current
-oracles: `live-workbench`, `object-namespace-recovery`, and
-`restore-composition`. Three behavior boundaries still require dedicated
-commands before the ledger can reach `PASS`:
+the complete protected producer graph. The direct native CLI `live-workbench`
+producer now retains `cli-transcript` evidence; the object-namespace and
+restore-composition live harnesses still need typed scenario/result/evidence
+integration without weakening their current oracles. Three behavior boundaries
+still require dedicated commands before the ledger can reach `PASS`:
 
 1. `snapshot-lifecycle` integration must deterministically cover committed-only
    minting, frozen reads after live mutation, renew by id and alias, terminal

@@ -24,7 +24,15 @@ def canonical_sha256(value: object) -> str:
 
 
 class TypedLiveQualificationTests(unittest.TestCase):
-    def context_environment(self, binary: Path) -> dict[str, str]:
+    def context_environment(
+        self,
+        binary: Path,
+        roles: tuple[str, ...] = (
+            "producer-result",
+            "qualification",
+            "mcp-transcript",
+        ),
+    ) -> dict[str, str]:
         subjects = {
             "dependencies": [
                 {"name": "etcd", "identity": "sha256:" + "11" * 32},
@@ -57,8 +65,7 @@ class TypedLiveQualificationTests(unittest.TestCase):
                 sort_keys=True,
             ),
             "NOKV_QUALIFICATION_REQUIRED_EVIDENCE_ROLES": json.dumps(
-                ["producer-result", "qualification", "mcp-transcript"],
-                separators=(",", ":"),
+                list(roles), separators=(",", ":")
             ),
         }
 
@@ -125,6 +132,46 @@ class TypedLiveQualificationTests(unittest.TestCase):
             )
             self.assertTrue((evidence / "qualification.json").is_file())
             self.assertTrue((evidence / "mcp-transcript.jsonl").is_file())
+
+    def test_native_cli_result_publishes_a_cli_transcript(self) -> None:
+        roles = ("producer-result", "qualification", "cli-transcript")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "nokv"
+            binary.write_bytes(b"release identity")
+            context = load_live_context(
+                producer_id="live-workbench",
+                scenarios={
+                    "t01.create-live": ScenarioContract("T01", "native-workbench-e2e")
+                },
+                dependency_names=("etcd", "object-store"),
+                product_binary=binary,
+                evidence_roles=roles,
+                environ=self.context_environment(binary, roles),
+            )
+            evidence = root / "evidence"
+            evidence.mkdir()
+            publish_live_result(
+                result_path=evidence / "producer-result.json",
+                context=context,
+                outcome="NQ",
+                qualification={"status": "NOT QUALIFIED", "reason": "no service"},
+                evidence_roles=roles,
+            )
+            value = json.loads(
+                (evidence / "producer-result.json").read_text(encoding="utf-8")
+            )
+            transcript = evidence / "cli-transcript.jsonl"
+
+            self.assertTrue(transcript.is_file())
+            self.assertEqual(
+                value["scenarios"]["t01.create-live"]["evidence_roles"],
+                list(roles),
+            )
+            self.assertEqual(
+                json.loads(transcript.read_text(encoding="utf-8"))["schema"],
+                "nokv.pre423.cli_transcript_gap.v1",
+            )
 
     def test_live_context_rejects_a_different_binary_argument(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
