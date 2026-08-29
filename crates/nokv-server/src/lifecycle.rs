@@ -324,6 +324,8 @@ pub struct LifecycleRunner {
     durability: Arc<dyn LifecycleDurabilityBarrier>,
     options: LifecycleRunnerOptions,
     cursors: Mutex<LifecycleCursors>,
+    #[cfg(test)]
+    before_provider_delete_test_hook: Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
 }
 
 impl LifecycleRunner {
@@ -348,9 +350,46 @@ impl LifecycleRunner {
             durability,
             options: options.validate()?,
             cursors: Mutex::new(LifecycleCursors::default()),
+            #[cfg(test)]
+            before_provider_delete_test_hook: Mutex::new(None),
         };
+
         runner.require_current_owner()?;
         Ok(runner)
+    }
+
+    #[cfg(test)]
+    fn install_before_provider_delete_test_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        let mut current = self
+            .before_provider_delete_test_hook
+            .lock()
+            .expect("provider-delete test-hook lock must remain available");
+
+        assert!(
+            current.replace(Box::new(hook)).is_none(),
+            "provider-delete test hook is already installed"
+        );
+    }
+
+    #[cfg(test)]
+    fn run_before_provider_delete_test_hook(&self) {
+        let hook = self
+            .before_provider_delete_test_hook
+            .lock()
+            .expect("provider-delete test-hook lock must remain available")
+            .take();
+
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn enter_destructive_operation(
+        &self,
+    ) -> Result<crate::registry::ShardOperationPermit, LifecycleError> {
+        self.registry
+            .enter_shard_operation(self.route)
+            .map_err(|error| LifecycleError::OwnerLost(error.to_string()))
     }
 
     /// Execute one bounded recovery pass over every lifecycle family.
@@ -656,6 +695,9 @@ impl LifecycleRunner {
                 ) {
                     self.require_current_owner()?;
                     self.publish_current()?;
+                    #[cfg(test)]
+                    self.run_before_provider_delete_test_hook();
+                    let _operation_permit = self.enter_destructive_operation()?;
                     let request = LifecycleDeleteRequest {
                         purpose: LifecycleDeletePurpose::AbortedPublication,
                         object_key: expected.object_key.clone(),
@@ -1356,6 +1398,9 @@ impl LifecycleRunner {
             let absence_digest = if entry.delete_required {
                 self.require_current_owner()?;
                 self.publish_current()?;
+                #[cfg(test)]
+                self.run_before_provider_delete_test_hook();
+                let _operation_permit = self.enter_destructive_operation()?;
                 let request = LifecycleDeleteRequest {
                     purpose: LifecycleDeletePurpose::RevisionGarbageCollection,
                     object_key: entry.row.object_key.clone(),
@@ -1696,6 +1741,7 @@ fn gc_concurrent(error: &meta::GcError) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
 
     use nokv_object::{
         ArtifactStoreCapabilities, ImmutableCreateOutcome, ObjectError, ObjectInfo, ObjectRange,
@@ -2588,8 +2634,50 @@ mod tests {
         assert_eq!(operation(&fixture).phase, GcPhase::Deleted);
     }
 
+    struct BlockingDeleter {
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        resume: Mutex<mpsc::Receiver<()>>,
+        calls: AtomicUsize,
+    }
+
+    impl LifecycleObjectDeleter for BlockingDeleter {
+        fn delete(
+            &self,
+            request: &LifecycleDeleteRequest,
+        ) -> Result<LifecycleAbsenceProof, LifecycleDeleteError> {
+            assert_eq!(
+                request.purpose,
+                LifecycleDeletePurpose::RevisionGarbageCollection,
+            );
+
+            if let Some(entered) = self
+                .entered
+                .lock()
+                .expect("blocking-deleter entered lock must remain available")
+                .take()
+            {
+                entered
+                    .send(())
+                    .expect("blocking deleter must signal entry");
+            }
+
+            self.resume
+                .lock()
+                .expect("blocking-deleter resume lock must remain available")
+                .recv()
+                .expect("blocking deleter must be released");
+
+            self.calls.fetch_add(1, Ordering::SeqCst);
+
+            Ok(LifecycleAbsenceProof::from_delete_request(
+                request,
+                LifecycleDeleteDisposition::Deleted,
+            ))
+        }
+    }
+
     #[test]
-    fn shared_owner_fail_close_blocks_ready_provider_delete() {
+    fn shared_fail_close_wins_check_to_provider_dispatch_race() {
         let fixture = fixture();
 
         let deleter = Arc::new(FakeDeleter {
@@ -2600,42 +2688,160 @@ mod tests {
 
         let owner_loss = fixture.registry.owner_loss_signal();
 
-        let runner = LifecycleRunner::new(
-            Arc::clone(&fixture.store),
-            Arc::clone(&fixture.registry),
-            fixture.route,
-            owner_loss.clone(),
-            deleter.clone(),
-            test_durability(),
-            LifecycleRunnerOptions {
-                scan_page_size: 8,
-                mutation_batch_size: 8,
-                ..LifecycleRunnerOptions::default()
-            },
-        )
-        .unwrap();
+        let runner = Arc::new(
+            LifecycleRunner::new(
+                Arc::clone(&fixture.store),
+                Arc::clone(&fixture.registry),
+                fixture.route,
+                owner_loss.clone(),
+                deleter.clone(),
+                test_durability(),
+                LifecycleRunnerOptions {
+                    scan_page_size: 8,
+                    mutation_batch_size: 8,
+                    ..LifecycleRunnerOptions::default()
+                },
+            )
+            .unwrap(),
+        );
 
-        // Advance the real candidate to its destructive provider boundary.
+        // Advance the real candidate to provider deletion.
         runner.run_once(100_000).unwrap();
         runner.run_once(100_000).unwrap();
 
+        let (reached_tx, reached_rx) = mpsc::channel();
+
+        let (resume_tx, resume_rx) = mpsc::channel();
+
+        runner.install_before_provider_delete_test_hook(move || {
+            reached_tx
+                .send(())
+                .expect("test must signal the pre-dispatch boundary");
+
+            resume_rx
+                .recv()
+                .expect("test must release provider dispatch");
+        });
+
+        let worker_runner = Arc::clone(&runner);
+
+        let worker = thread::spawn(move || worker_runner.run_once(100_000));
+
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("lifecycle worker did not reach the provider boundary");
+
+        // No operation permit has been admitted yet. Fail-close must return
+        // and make subsequent provider dispatch impossible.
         fixture
             .registry
             .fail_closed_shard(fixture.route.logical_shard_id)
             .unwrap();
 
         assert!(owner_loss.is_lost());
-        assert!(!fixture.registry.contains_exact(fixture.route).unwrap());
+
+        resume_tx
+            .send(())
+            .expect("test must resume the lifecycle worker");
+
+        let result = worker.join().expect("lifecycle worker must not panic");
+
+        assert!(matches!(result, Err(LifecycleError::OwnerLost(_)),));
+
+        assert_eq!(
+            deleter.calls.load(Ordering::SeqCst),
+            0,
+            "provider deletion crossed the shared fail-close fence",
+        );
+    }
+
+    #[test]
+    fn shared_fail_close_waits_for_admitted_provider_delete() {
+        let fixture = fixture();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+
+        let (resume_tx, resume_rx) = mpsc::channel();
+
+        let deleter = Arc::new(BlockingDeleter {
+            entered: Mutex::new(Some(entered_tx)),
+            resume: Mutex::new(resume_rx),
+            calls: AtomicUsize::new(0),
+        });
+
+        let owner_loss = fixture.registry.owner_loss_signal();
+
+        let runner = Arc::new(
+            LifecycleRunner::new(
+                Arc::clone(&fixture.store),
+                Arc::clone(&fixture.registry),
+                fixture.route,
+                owner_loss.clone(),
+                deleter.clone(),
+                test_durability(),
+                LifecycleRunnerOptions {
+                    scan_page_size: 8,
+                    mutation_batch_size: 8,
+                    ..LifecycleRunnerOptions::default()
+                },
+            )
+            .unwrap(),
+        );
+
+        runner.run_once(100_000).unwrap();
+        runner.run_once(100_000).unwrap();
+
+        let worker_runner = Arc::clone(&runner);
+
+        let worker = thread::spawn(move || worker_runner.run_once(100_000));
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("provider delete was not entered");
+
+        let registry = Arc::clone(&fixture.registry);
+
+        let logical_shard_id = fixture.route.logical_shard_id;
+
+        let (closed_tx, closed_rx) = mpsc::channel();
+
+        let closer = thread::spawn(move || {
+            registry.fail_closed_shard(logical_shard_id).unwrap();
+
+            closed_tx
+                .send(())
+                .expect("test must signal completed fail-close");
+        });
 
         assert!(matches!(
-            runner.run_once(100_000),
-            Err(LifecycleError::OwnerLost(_))
+            closed_rx.recv_timeout(Duration::from_millis(200),),
+            Err(mpsc::RecvTimeoutError::Timeout),
         ));
 
         assert_eq!(
             deleter.calls.load(Ordering::SeqCst),
             0,
-            "provider deletion must not run after shared owner fail-close"
+            "blocked provider operation completed before release",
+        );
+
+        resume_tx
+            .send(())
+            .expect("test must release provider deletion");
+
+        closed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("fail-close did not drain the admitted operation");
+
+        closer.join().expect("fail-close thread must not panic");
+
+        let _cycle_result = worker.join().expect("lifecycle worker must not panic");
+
+        assert!(owner_loss.is_lost());
+
+        assert_eq!(
+            deleter.calls.load(Ordering::SeqCst),
+            1,
+            "the operation admitted before the fence must drain exactly once",
         );
     }
 
