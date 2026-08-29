@@ -7,10 +7,15 @@ SPDX-License-Identifier: Apache-2.0
 
 These assets validate the same 18-tool Workbench semantics exported by
 `crates/nokv-agent`. The native full CLI is the primary integration surface,
-and the direct Python SDK is second for embedded callers. The MCP-focused
-assets here qualify the optional `nokv mcp` sidecar; they do not make MCP a
-required deployment component or define a runtime-specific metadata layout,
-capability alias, migration helper, or filesystem frontend.
+and the direct Python SDK is second for embedded callers.
+
+Several runners here still reach the 18 tools through a `nokv mcp` child
+process. That sidecar is deprecated and is not a supported NoKV integration
+surface: it survives only as this harness's transport, evidence produced over
+it qualifies that transport alone, and nothing here makes MCP a deployment
+component or defines a runtime-specific metadata layout, capability alias,
+migration helper, or filesystem frontend. Re-pointing these runners at
+`nokv workbench <tool>` is tracked work, not a documentation change.
 
 The checked-in integration assets are deliberately small:
 
@@ -95,12 +100,8 @@ PYTHONPATH=scripts/workbench python3 -m unittest \
 python3 scripts/workbench/fork_restore_recovery_gate_test.py
 ```
 
-To qualify the optional sidecar, register the built binary in an MCP-compatible
-Agent runtime as a stdio MCP command:
-
-```text
-/absolute/path/to/nokv <root, route, object, and workbench options> mcp
-```
+The runners below invoke the built binary directly; do not register it in an
+Agent runtime as an MCP command.
 
 The deployment must provide one persisted `RootId` placement, its
 `LogicalShardId`, current placement generation and owner epoch, a reachable

@@ -3,13 +3,12 @@ Copyright 2024-2026 The NoKV Authors.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Workbench MCP Sidecar Preflight
+# Live Deployment Preflight
 
-This guide qualifies the optional `nokv mcp` stdio sidecar for an
-MCP-compatible Agent runtime. It is not the default NoKV integration guide:
-downstream systems should normally provide skills over the native full CLI,
-and embedded callers should use the Python SDK. The sidecar uses the same
-workspace format and grants no additional authority or compatibility route.
+This guide covers bringing up a live NoKV deployment and qualifying it before
+a production handoff. Downstream systems provide skills over the native full
+CLI; embedded callers use the Python SDK. Every surface uses the same workspace
+format and grants no additional authority or compatibility route.
 
 ## Required Inputs
 
@@ -65,18 +64,12 @@ recovery path itself. It is switched on implicitly by
 The corresponding invariant for operators: back up the Holt directory. In the
 default shape it is the only copy of the metadata.
 
-## Live Sidecar Contract Check
-
-If the host requires MCP, start the optional `nokv mcp` sidecar with the same
-root, route, owner, and object configuration that its CLI or SDK path would
-use. Send `initialize`, then `tools/list`, and validate the response with
-`workbench_contract.validate_tool_contract`.
+## Live Contract Check
 
 For the complete live Workbench path, run
 `scripts/workbench/live_workbench.py`. It calls `nokv provision`,
-starts `nokv serve` with explicit metadata create/reopen intent, starts
-`nokv ... --agent-id {stable-id} --workbench-root /agents/{name}/wb mcp`,
-exercises all 18 tools, and
+starts `nokv serve` with explicit metadata create/reopen intent, exercises all
+18 tools, and
 retains exact requests/responses plus materialize/collect evidence. Run
 `--dry-run` first to inspect the redacted command and normalized-input plan.
 In the local-WAL profile, `reopen` qualifies only a restart of the same
@@ -90,6 +83,10 @@ The release-level epoch proof is the real-etcd fence-before/fence-after
 `SIGKILL` runner in
 [`scripts/workbench/local_wal_recovery_gate.py`](../scripts/workbench/local_wal_recovery_gate.py);
 a normal reopen alone does not cover interrupted `Recovering` retries.
+`live_workbench.py` currently drives the 18 tools through a `nokv mcp` child
+process. That sidecar is deprecated and is not a supported NoKV integration
+surface; it remains only as this harness's transport, and evidence produced
+over it qualifies neither the CLI nor the Python SDK path.
 The selected `--workbench-root` is durable presentation configuration because
 canonical v1 manifests contain its projected paths. Keep it identical across
 restart/replay; it never replaces `RootId` as the storage or routing identity.
@@ -99,11 +96,11 @@ tool advertisement. This is a fail-closed deployment identity check, not
 authentication. A legacy root without a binding requires a one-time,
 operator-verified provision with `--adopt-legacy-agent-binding`; NoKV never
 infers identity from the presentation path.
-Before reading MCP stdin or advertising tools, the flat CLI performs the typed
-workspace RPC preflight for every capability required by this 18-tool profile;
-a missing capability or route mismatch stops startup.
+Before serving any Agent-facing command, the CLI performs the typed workspace
+RPC preflight for every capability required by the 18-tool profile; a missing
+capability or route mismatch stops startup.
 
-Registration must stop if:
+Bring-up must stop if:
 
 - the tool set is not exactly 18 tools;
 - any normalized input schema differs;

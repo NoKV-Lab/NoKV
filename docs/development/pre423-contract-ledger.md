@@ -15,8 +15,10 @@ It is not an inventory or qualification claim for every pre-#423 feature, and
 
 This ledger preserves historical MCP and LingTai evidence classes; it does not
 set current delivery priority. Current integrations use the native full CLI
-first, the direct Python SDK second, and the 18-tool endpoint only as an
-optional MCP sidecar. A sidecar-specific receipt qualifies only that boundary.
+first and the direct Python SDK second. The `nokv mcp` sidecar is deprecated
+and is not a supported integration surface; the MCP and LingTai rows below are
+retained evidence history, and a transport-specific receipt qualifies only that
+transport.
 
 Each stable item records:
 

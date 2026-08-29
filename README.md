@@ -169,7 +169,7 @@ commit, restore, retain, and collect it.
 ```text
 Downstream skills -> native full nokv CLI
 Embedded callers  -> direct Python SDK
-MCP hosts         -> optional 18-tool sidecar
+Native callers    -> lower-level Rust SDK
                              |
                              v
           NoKV workspace service
@@ -212,8 +212,8 @@ general NAS replacement are outside the product architecture.
 - **Safe restore.** A restore reuses immutable revisions in a fresh hidden
   same-root incarnation, then publishes visibility atomically.
 - **Deterministic Agent surface.** The same exact 18-tool Workbench semantics
-  are available through the primary native CLI, the direct Python SDK, and an
-  optional MCP sidecar.
+  are available through the primary native CLI, the direct Python SDK, and the
+  lower-level Rust SDK.
 
 These guarantees are shard-local. NoKV does not provide cross-shard
 transactions. Snapshot protection is leased, and root or Workbench scoping is
@@ -254,7 +254,7 @@ the evidence itself — files, manifests, lineage, and the bytes they attest
 
 | Status | Capabilities and limits |
 | --- | --- |
-| **Current product** | Persisted `RootId -> LogicalShardId` affinity; one epoch-fenced active owner per shard; canonical full-path metadata keys; immutable S3-compatible bodies; native full CLI; direct Python and Rust SDKs; optional MCP sidecar; exact 18-tool Workbench semantics; snapshots, commits, restore, queries, and reference-fenced GC |
+| **Current product** | Persisted `RootId -> LogicalShardId` affinity; one epoch-fenced active owner per shard; canonical full-path metadata keys; immutable S3-compatible bodies; native full CLI; direct Python and Rust SDKs; exact 18-tool Workbench semantics; snapshots, commits, restore, queries, and reference-fenced GC |
 | **Current durability profile** | Acknowledged metadata writes are synchronously durable in the owning shard's local Holt WAL. Each mutation also appends canonical hash-chained replay material in the same store. First-owner acquisition accepts a new or prepared epoch-zero store. Exact current-lease resume is also admitted. Unknown, mixed, or unverified successor stores fail closed. |
 | **Not qualified** | Remote checkpoint/log recovery, shared metadata durability, multi-machine failover, production metadata HA, tenant identity/RBAC, cross-shard transactions, and complete provider fault-injection qualification |
 
@@ -278,15 +278,13 @@ the exact contracts and qualification gates.
   materialize/collect adapters for local executables.
 - **Rust Agent SDK.** [`nokv-client`](crates/nokv-client) is the lower-level
   native integration and shared implementation boundary.
-- **Optional MCP sidecar.** `nokv mcp` exposes the exact 18 Workbench tools
-  over stdio only for hosts that require MCP discovery and JSON-RPC transport.
 - **Transport-free Agent contracts** in
   [`nokv-agent`](crates/nokv-agent), shared by every adapter.
 
 Downstream Agent systems should normally write skills that invoke the native
-CLI. Use the Python SDK when an in-process boundary is preferable. The MCP
-sidecar delegates to the same facade; it is not required to deploy NoKV and is
-not a separate metadata or lifecycle authority.
+CLI. Use the Python SDK when an in-process boundary is preferable. Every
+surface delegates to the same transport-free facade; none of them is a separate
+metadata or lifecycle authority.
 
 RootId is the only storage and routing identity. A Workbench presentation root
 shapes Agent-facing paths and manifests but never enters canonical metadata
@@ -294,8 +292,7 @@ keys.
 
 ## Stable Workbench
 
-The native CLI accepts exactly these 18 Workbench operation names; the
-optional MCP sidecar exposes the same names as tools:
+The native CLI accepts exactly these 18 Workbench operation names:
 
 ```text
 workbench_create
@@ -323,17 +320,15 @@ digest relationships, commit identity, snapshot lifecycle, and restore
 idempotency form the stable contract. Workbench result shaping remains an
 adapter concern and does not dictate durable metadata families.
 
-The 18 names define behavior, not a required transport. The native CLI exposes
-them directly, the Python SDK provides the underlying programmatic operations,
-and the MCP sidecar is an optional projection for compatible hosts.
+The 18 names define behavior, not a transport. The native CLI exposes them
+directly, and the Python SDK provides the underlying programmatic operations.
 
 See the [Workbench Contract](docs/workbench-contract.md).
 
 ## Integration Model
 
-The Workbench contract is runtime-neutral. A downstream Agent runtime should
-normally expose skills over the native CLI, or embed the Python SDK. A runtime
-that specifically requires MCP can opt into the sidecar and exercise the same
+The Workbench contract is runtime-neutral. A downstream Agent runtime exposes
+skills over the native CLI, or embeds the Python SDK, and exercises the same
 scientific reconstruction workflow:
 
 ```text
@@ -363,23 +358,13 @@ The default integration is a downstream skill that calls the native CLI. It
 can invoke the same 18 operations with `nokv workbench <tool> '<json
 arguments>'`; an embedded host can instead call the Python SDK directly.
 
-For a host that specifically requires MCP, one optional registry entry spawns
-the `nokv` binary as a stdio sidecar:
-
-```text
-nokv ... --agent-id {stable_agent_id_hex32} \
-  --workbench-root /agents/{agent_name}/wb mcp
-```
-
 In every integration shape, the runtime persists a stable `AgentId` and a
 distinct `RootId` for each
 isolation boundary. Provisioning immutably binds that root to the AgentId;
 `--workbench-root` remains only the human-facing path projection and cannot
 grant isolation by itself. The binding prevents accidental root reuse, but is
 not an authentication credential. The 18 `workbench_*` tools land next to the
-agent's local file tools instead of replacing them. The sidecar does not grant
-new authority; the runtime supplies the same persisted identities, route,
-presentation root, and object configuration used by the CLI or SDK.
+agent's local file tools instead of replacing them, and grant no new authority.
 
 A research run then follows the fixed section layout — `input`, `scripts`,
 `outputs`, `logs`, `metadata`:
@@ -419,6 +404,12 @@ cargo build --release -p nokv --bin nokv
 ./target/release/nokv --help
 ./target/release/nokv schema
 ```
+
+`nokv schema` reports the frozen contract marker
+`nokv.workbench.mcp_input_schemas.v1`, and `nokv --help` still lists an `mcp`
+subcommand. Both are retained wire identity for the qualification harness. The
+MCP sidecar is deprecated and is not a supported NoKV integration surface; use
+the native CLI or the Python SDK.
 
 Anyone can instead install the current stable source release from NoKV's public
 Homebrew tap. The fully qualified command adds the tap and trusts only the
@@ -467,10 +458,8 @@ python3 scripts/workbench/workbench_contract_test.py
 
 A live deployment additionally needs a root id, persisted logical-shard
 placement, one admitted shard owner, and S3-compatible object coordinates. The
-[Workbench MCP sidecar preflight](docs/workbench-preflight.md) gives the
-optional sidecar-specific registration and acceptance flow. Native CLI and
-Python SDK users use the same provision, serve, materialize, collect, and
-recovery contracts without running MCP.
+[live deployment preflight](docs/workbench-preflight.md) gives the provision,
+serve, admission, and acceptance flow.
 
 ## Documentation
 
@@ -486,7 +475,7 @@ recovery contracts without running MCP.
 - [Agent Contributor Handbook](docs/development/nokv-agent.md)
 - [Code Contract](docs/development/code_contract.md)
 - [PR Review Checklist](docs/development/pr_review_checklist.md)
-- [Workbench MCP Sidecar Preflight](docs/workbench-preflight.md)
+- [Live Deployment Preflight](docs/workbench-preflight.md)
 - [Source-only Homebrew Release](scripts/release/README.md)
 
 ## Contributing
@@ -524,7 +513,7 @@ git diff --check
 | [`nokv-agent`](crates/nokv-agent) | Transport-free 18-tool Workbench facade and stable result shaping |
 | [`nokv-python`](crates/nokv-python) | Direct Python SDK and explicit materialize/collect adapters |
 | [`nokv-server`](crates/nokv-server) | Logical-shard owner, metadata adapter composition, RPC server, and root-affine lifecycle workers |
-| [`nokv`](crates/nokv) | Thin native full CLI and optional MCP sidecar wiring |
+| [`nokv`](crates/nokv) | Thin native full CLI wiring |
 | [`nokv-bench`](bench) | Non-product contract, recovery, and performance workloads |
 
 ## License

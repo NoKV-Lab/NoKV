@@ -23,7 +23,7 @@ The normative qualification gates are in
 | Holt engine | Named trees, point/range reads, atomic batches | Engine throughput, conflicts, WAL cost, checkpoint behavior |
 | Metadata domain | Workspace marker, paths, commands, operations | Namespace amplification, visibility, replay, lifecycle cost |
 | Service | Protocol through shard owner and object provider | Routing, serialization, fencing, provider latency, recovery |
-| Product | Primary native CLI, secondary Python SDK, Rust SDK, optional MCP sidecar, or transport-free Workbench facade | User-visible latency, results, errors, retries, and end-to-end throughput |
+| Product | Primary native CLI, secondary Python SDK, Rust SDK, or transport-free Workbench facade | User-visible latency, results, errors, retries, and end-to-end throughput |
 
 A report names its level. Results from different levels are not interchangeable.
 
