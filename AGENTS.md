@@ -42,7 +42,7 @@ Before reviewing or editing a PR:
 Check for:
 
 - Scope drift across `nokv-types`, `nokv-meta`, `nokv-object`, `nokv-agent`,
-  `nokv-client`, `nokv-fuse`, docs, and example files.
+  `nokv-client`, `nokv-server`, `nokv-control`, docs, and example files.
 - Missing DCO `Signed-off-by` trailers.
 - Package-boundary violations.
 - New helpers that reimplement standard library or existing repository helpers.

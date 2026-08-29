@@ -155,13 +155,16 @@ is not a NoKV namespace. Keep the configured Workbench root stable across
 restarts because canonical v1 manifest presentation paths are replay-bound;
 `RootId`, not this display root, remains the storage/routing identity.
 
-`nokv serve` publishes shared recovery segments by default
-(`--recovery-publication shared`), which is what the recovery gates qualify.
-Until shared checkpoint compaction exists that chain is bounded by the Control
-record size, so a long-lived deployment such as a partner pre-pilot should run
-`--recovery-publication local-only`: the exclusive Holt WAL is then the only
-recovery authority, nothing is published, and `--metadata-recover-log` is not
-available for that shard.
+`nokv serve` defaults to `--recovery-publication local-only`: the exclusive
+local Holt WAL is the only recovery authority, nothing is published to Control,
+and `--metadata-recover-log` is not available for that shard. Every gate in
+this directory runs on that default, so the recovery gates qualify local-WAL
+recovery only.
+
+Shared publication (`--recovery-publication shared`) is an unqualified opt-in
+and no gate exercises it. Until shared checkpoint compaction exists the segment
+chain is bounded by the Control record size, and a shard that reaches that
+bound loses its owner fence and stops accepting writes.
 
 The deterministic evidence directory contains `plan.json`, exact paired
 requests/responses in `mcp-transcript.jsonl`, `processes.jsonl` and process
