@@ -2181,10 +2181,7 @@ mod tests {
             .owner_sessions
             .remove(&first.logical_shard_id);
 
-        assert_eq!(
-            expired_first,
-            Some(first.clone()),
-        );
+        assert_eq!(expired_first, Some(first.clone()),);
 
         let rebound = store
             .reacquire_recovery(
@@ -2195,20 +2192,11 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            &rebound.owner,
-            &first.owner,
-        );
+        assert_eq!(&rebound.owner, &first.owner,);
 
-        assert_eq!(
-            rebound.owner_epoch,
-            first.owner_epoch,
-        );
+        assert_eq!(rebound.owner_epoch, first.owner_epoch,);
 
-        assert_ne!(
-            rebound.lease_id,
-            first.lease_id,
-        );
+        assert_ne!(rebound.lease_id, first.lease_id,);
 
         let expired_rebound = store
             .state
@@ -2217,10 +2205,7 @@ mod tests {
             .owner_sessions
             .remove(&rebound.logical_shard_id);
 
-        assert_eq!(
-            expired_rebound,
-            Some(rebound.clone()),
-        );
+        assert_eq!(expired_rebound, Some(rebound.clone()),);
 
         // Both sessions are absent. Only the durable record's exact lease ID
         // can distinguish stale L1 cleanup from current L2 cleanup.
@@ -2229,23 +2214,13 @@ mod tests {
             Err(ControlError::StaleLease(_))
         ));
 
-        let retained =
-            store.suspend_recovery(&rebound).unwrap();
+        let retained = store.suspend_recovery(&rebound).unwrap();
 
-        assert_eq!(
-            retained.state,
-            LogicalShardState::Recovering,
-        );
+        assert_eq!(retained.state, LogicalShardState::Recovering,);
 
-        assert_eq!(
-            retained.owner_epoch,
-            Some(rebound.owner_epoch),
-        );
+        assert_eq!(retained.owner_epoch, Some(rebound.owner_epoch),);
 
-        assert_eq!(
-            retained.lease_id,
-            rebound.lease_id,
-        );
+        assert_eq!(retained.lease_id, rebound.lease_id,);
     }
 
     #[test]
