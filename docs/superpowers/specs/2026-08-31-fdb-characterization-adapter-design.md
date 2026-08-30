@@ -7,8 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 **Decision date:** 2026-08-31
 
-**Status:** Approved design; implementation remains gated on review of this
-written specification.
+**Status:** Implemented as a non-default characterization adapter.
 
 **Qualification:** `NOT QUALIFIED` for NoKV serving.
 

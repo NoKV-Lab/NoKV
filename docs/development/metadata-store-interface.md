@@ -5,9 +5,11 @@ SPDX-License-Identifier: Apache-2.0
 
 # Metadata Store Interface
 
-Implemented: the storage-neutral interface, local Holt adapter, and `MetaShard`
-cutover. The serving local profile uses Holt through `TxnStore`. Pending:
-FoundationDB, replicated Holt, provider-neutral runtime admission, and
+Implemented: the storage-neutral interface, local Holt adapter, `MetaShard`
+cutover, and a non-default FoundationDB characterization adapter. The serving
+local profile still uses Holt through `TxnStore`; FoundationDB is **NOT
+QUALIFIED** and is not wired into `nokv-server`. Pending: FoundationDB serving
+qualification, replicated Holt, provider-neutral runtime admission, and
 owner-safe response delivery.
 
 The [code contract](./code_contract.md), [architecture](../architecture.md),
@@ -58,6 +60,9 @@ responsibilities:
   acknowledgement boundaries, recovery authority, and physical errors.
 - `nokv-meta-holt` maps the neutral requests to Holt trees, views, atomic
   batches, WAL acknowledgement, reopen, poison handling, and diagnostics.
+- `nokv-meta-fdb` maps the neutral requests to one explicit FoundationDB
+  cluster file and binary namespace. Its dependency and live tests are feature
+  gated, and its synchronous bridge is characterization-only.
 
 `bootstrap_shard` opens one `MetaShard` for a logical-shard owner and attaches
 all Active roots found at startup. The server constructs the Holt adapter and
@@ -95,7 +100,7 @@ Implemented and reserved names are:
 | One logical metadata shard | `MetaShard` | Implemented |
 | Ordered transaction store interface | `TxnStore` | Implemented |
 | Embedded Holt implementation | `HoltStore` | Implemented |
-| FoundationDB implementation | `FdbStore` | Reserved |
+| FoundationDB implementation | `FdbStore` | Characterization only; `NOT QUALIFIED` |
 | Replicated Holt implementation | `HoltClusterStore` | Reserved |
 | Workspace metadata error | `MetaError` | Implemented |
 | Physical store error | `StoreError` | Implemented |
@@ -286,9 +291,10 @@ A later root-scoped clock can reduce unrelated conflicts. Removing that clock
 requires a separate range-conflict contract before the change lands.
 
 The Holt adapter translates exact byte checks to internal `RecordVersion`
-assertions and `EmptyPrefix` to `assert_prefix_empty`. A FoundationDB adapter
-will repeat the checks in one transaction and register the required conflict
-ranges. These mechanisms remain adapter details.
+assertions and `EmptyPrefix` to `assert_prefix_empty`. The FoundationDB
+characterization adapter repeats the checks with non-snapshot reads in one
+transaction so FoundationDB registers the required conflict ranges. These
+mechanisms remain adapter details.
 
 ## Receipt Boundary
 
@@ -346,9 +352,9 @@ result.
 Route removal cannot replace these checks because it can race an in-flight
 request. Reading dedupe from the uncertain instance is not durability evidence.
 
-The proposed FoundationDB adapter would map a settled
-`commit_unknown_result` to `Settled`. It maps an error that permits a late
-commit to `MayCommit`. The Holt adapter maps `DefinitelyNotApplied` through
+The FoundationDB characterization adapter maps `commit_unknown_result` and
+every other maybe-committed error to `MayCommit`; it never retries the raw
+transaction. The Holt adapter maps `DefinitelyNotApplied` through
 normal physical error classification. When that classification is
 `Unavailable`, the server exposes a retryable request-local failure without
 fencing the shard; a classified corruption remains non-retryable. It poisons
@@ -647,6 +653,15 @@ Every store implementation must run the shared interface tests for:
 - limit rejection
 - empty initialization and exact reopen
 
+The FoundationDB adapter uses the following evidence gates:
+
+| Gate | Command or environment | Qualification |
+| --- | --- | --- |
+| Pure options, encoding, limit, and error tests | `cargo test -p nokv-meta-fdb` | Required in the default workspace; does not load `libfdb_c` |
+| Binding API compile | `cargo check -p nokv-meta-fdb --features fdb --all-targets` | Required for the selected 7.3 API |
+| Shared conformance, binary scans, conflict, reopen, and namespace isolation | `NOKV_TEST_FDB_CLUSTER_FILE=/absolute/path cargo test -p nokv-meta-fdb --features fdb --test fdb_conformance -- --ignored --nocapture` | Environment-gated; `NOT QUALIFIED` unless the run and output are retained |
+| Unknown outcome, process/network loss, failover, and representative performance | Dedicated fault and benchmark environments | `NOT QUALIFIED` |
+
 ### Adapter Fault Tests
 
 The shared runner does not inject commit faults.
@@ -683,8 +698,9 @@ Remaining work:
 1. Add provider-neutral configuration, persistent runtime binding, admission,
    and metadata-transaction unknown-outcome recovery orchestration.
 2. Replace the synchronous store and server path with one async path.
-3. Add a non-default `nokv-meta-fdb` adapter and keep it `NOT QUALIFIED` until
-   its workspace, failure, failover, and benchmark gates pass.
+3. Qualify the non-default `nokv-meta-fdb` characterization adapter only after
+   its async, large-transaction, provider-admission, workspace, failure,
+   failover, and benchmark gates pass.
 4. Add `HoltClusterStore` only after its replicated transaction format exists.
 
 The cutover retains no forwarding constructors, aliases, fallback stores, or
