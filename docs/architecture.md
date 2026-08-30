@@ -13,7 +13,6 @@ Status: normative workspace architecture.
 flowchart LR
     Skills["Downstream Agent skills"] --> CLI["Native full nokv CLI"]
     CLI --> Agent["Transport-free Workbench facade"]
-    Sidecar["Optional MCP sidecar"] --> Agent
     Agent --> SDK["Rust Agent SDK"]
     CLI --> SDK
     Python["Python SDK"] --> SDK
@@ -45,7 +44,6 @@ FUSE, POSIX, CSI, and fsspec are not architecture layers.
 ```mermaid
 flowchart TD
     CLI["native full nokv CLI"] --> Agent["nokv-agent"]
-    Sidecar["optional MCP sidecar"] --> Agent
     CLI --> Client["nokv-client"]
     Python["nokv-python"] --> Client
     Agent --> Client
@@ -80,8 +78,7 @@ Key constraints:
 - client uses protocol/routing and never imports meta/server;
 - Agent adapters shape tools over SDK traits and remain transport-free;
 - the native full CLI is the primary integration surface;
-- the Python SDK is the secondary embedded surface;
-- the optional MCP sidecar is thin wiring over the same Agent facade.
+- the Python SDK is the secondary embedded surface.
 
 ## Identity And Namespace
 
@@ -420,7 +417,7 @@ experiments. The required evidence covers:
    amplification across the declared workload matrix;
 2. revision-owned publication, visibility, lifecycle, references, GC, and
    recovery;
-3. protocol, server, native CLI, Python and Rust SDKs, optional MCP sidecar,
+3. protocol, server, native CLI, Python and Rust SDKs,
    control routing, and lifecycle workers on
    the same schema and identity model;
 4. owner failover, checkpoint/log recovery, ambiguous provider outcomes, and

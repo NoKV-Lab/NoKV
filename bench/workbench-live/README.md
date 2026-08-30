@@ -6,10 +6,12 @@ SPDX-License-Identifier: Apache-2.0
 # Live Workbench evidence
 
 The executable product-boundary workload lives at
-`scripts/workbench/live_workbench.py`. It exercises the flat `nokv`
-CLI-backed optional MCP sidecar against real root routing, Holt metadata
-ownership, and an S3-compatible object provider. It is sidecar qualification,
-not evidence that MCP is NoKV's primary integration surface. Its deterministic
+`scripts/workbench/live_workbench.py`. It exercises the flat `nokv` binary
+against real root routing, Holt metadata ownership, and an S3-compatible object
+provider. It currently reaches the 18 tools through a `nokv mcp` child process:
+that sidecar is deprecated and is not a supported NoKV integration surface, so
+this run qualifies that transport only and is not evidence for the CLI or
+Python SDK path. Its deterministic
 runtime evidence directory is under `target/workbench-live/evidence/` by
 default; evidence is not checked into this source directory.
 

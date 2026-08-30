@@ -12,7 +12,7 @@ NoKV serves training data, checkpoints, experiment outputs, and provenance
 through the native full CLI first, the direct Python SDK for embedded jobs,
 lower-level Rust SDK calls where needed, and explicit local adapters. Canonical
 identity remains a root, Workbench, and normalized path; a materialized local
-path is disposable. The optional MCP sidecar is not required for this profile.
+path is disposable.
 
 ## Workloads
 

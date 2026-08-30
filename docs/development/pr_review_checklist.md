@@ -152,9 +152,8 @@ boundaries, or Workbench behavior.
 ## Workbench Contract
 
 - Do public docs and examples present the native full CLI first, the Python SDK
-  second, and the exact 18-tool MCP endpoint only as an optional sidecar?
-- Does the MCP sidecar remain thin over the transport-free facade instead of
-  becoming a required deployment component or a second state machine?
+  second, and the Rust SDK third, without presenting the deprecated `nokv mcp`
+  sidecar as a supported integration surface?
 - Do all 18 tool names and normalized input schemas remain stable?
 - Does golden-transcript validation cover observable result and error behavior,
   rather than treating input-schema validation as equivalent?

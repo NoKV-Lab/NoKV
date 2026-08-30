@@ -62,6 +62,14 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let invocation = cli::parse(std::env::args().skip(1)).map_err(|error| error.to_string())?;
+    if matches!(invocation.command, Command::Mcp { .. }) {
+        // stderr only: stdout carries the line-delimited JSON-RPC stream.
+        eprintln!(
+            "warning: `nokv mcp` is deprecated and is not a supported NoKV integration \
+             surface. Use `nokv workbench <tool>` or the direct Python SDK. The sidecar is \
+             retained only as the live qualification harness transport."
+        );
+    }
     match &invocation.command {
         Command::Help => {
             print_help();
@@ -578,7 +586,7 @@ NoKV Agent-workspace CLI
 
 USAGE:
   nokv [connection/object options] workbench <tool> '<json arguments>'
-  nokv [connection/object options] mcp [--profile workbench|agent]
+  nokv [connection/object options] mcp [--profile workbench|agent]   (DEPRECATED)
   nokv [connection/object options] materialize <workbench> <section> <path> <destination>
   nokv [connection/object options] collect <workbench> <section> <source> <path> [--replace] [--expected-generation N] [--content-type TYPE]
   nokv [route/agent options] workspace-path rename <workbench> <section> <source> <destination> --expected-generation N --request-id HEX32
@@ -605,6 +613,8 @@ AGENT PRESENTATION:
   --workbench-root /agents/AGENT_NAME/wb is required by workbench, collect, and mcp
   keep this presentation root stable: it shapes responses and canonical v1 manifest paths
   RootId remains the only storage/routing identity; the presentation root never enters Holt keys
+  mcp is DEPRECATED and is not a supported NoKV integration surface: use `nokv workbench <tool>`
+  or the direct Python SDK; it is retained only as the live qualification harness transport
   mcp defaults to the 18-tool Workbench profile; --profile agent selects the seven path tools
   workspace-path is a custom CLI surface; it does not add to the fixed 18 Workbench tools
   workspace-path requires an explicit lowercase HEX32 request id for exact cross-process replay
@@ -631,7 +641,7 @@ OBJECT DATA:
   --object-bucket NAME [--object-endpoint URL] [--object-root PREFIX]
   [--hot-cache-dir PATH --hot-cache-bytes BYTES]
 
-NoKV exposes SDK, CLI, and MCP operations. It does not expose FUSE or POSIX."
+NoKV exposes SDK and CLI operations. It does not expose FUSE or POSIX."
     );
 }
 
