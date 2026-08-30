@@ -4,7 +4,7 @@ layout: home
 hero:
   name: NoKV
   text: Agent-native distributed workspace and artifact storage.
-  tagline: A native full CLI and direct Python SDK over path-primary ordered metadata, with an optional Workbench MCP sidecar.
+  tagline: A native full CLI and direct Python SDK over path-primary ordered metadata.
   image:
     src: /img/logo.png
     alt: NoKV
@@ -23,7 +23,7 @@ hero:
       link: /development/workspace-acceptance
 features:
   - title: Stable Agent surface
-    details: Use the native full CLI first, the direct Python SDK for embedded callers, and the exact 18-tool MCP endpoint only as an optional sidecar.
+    details: Use the native full CLI first, the direct Python SDK for embedded callers, and the lower-level Rust SDK for native integrations. One 18-tool Workbench contract fixes behavior across all three.
   - title: Path-primary metadata
     details: One normalized full path is namespace truth. Exact artifacts use point reads; child listing uses component-safe delimiter scans.
   - title: Immutable revisions
@@ -48,9 +48,10 @@ SPDX-License-Identifier: Apache-2.0
   <div class="nokv-grid-3">
     <div class="nokv-card">
       <div class="nokv-card-kicker">Application surface</div>
-      <h3>CLI · Python SDK · MCP sidecar</h3>
+      <h3>CLI · Python SDK · Rust SDK</h3>
       <p>Downstream skills use the native CLI by default; embedded callers use
-      the Python SDK, and MCP hosts can opt into the same 18-tool semantics.</p>
+      the Python SDK, and native integrations use the Rust SDK. All three share
+      the same 18-tool semantics.</p>
     </div>
     <div class="nokv-card">
       <div class="nokv-card-kicker">Metadata layer</div>
@@ -94,7 +95,7 @@ SPDX-License-Identifier: Apache-2.0
   [RustFS Provider Profile](./rustfs.md).
 - Workloads and evidence: [AI Training Workload](./ai-training.md),
   [Benchmarks](./benchmarks.md),
-  [Workbench MCP Sidecar Preflight](./workbench-preflight.md), and
+  [Live Deployment Preflight](./workbench-preflight.md), and
   [Workspace Acceptance](./development/workspace-acceptance.md).
 - Development: [Code Contract](./development/code_contract.md),
   [`nokv-agent` Handbook](./development/nokv-agent.md),

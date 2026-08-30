@@ -8,10 +8,14 @@ SPDX-License-Identifier: Apache-2.0
 Status: normative qualification gates for the supported NoKV workspace.
 
 NoKV is qualified as one Agent-facing system: Workbench semantics, the primary
-native full CLI, the secondary direct Python SDK, the optional MCP sidecar,
-metadata semantics, object publication, root routing, recovery, and garbage
-collection must run against the same workspace format. An MCP-only result does
-not qualify the CLI or Python SDK paths.
+native full CLI, the secondary direct Python SDK, metadata semantics, object
+publication, root routing, recovery, and garbage collection must run against
+the same workspace format.
+
+The `nokv mcp` sidecar is a deprecated transport, not a qualified surface. It
+is named in this document only because several live runners still drive the
+product through it. Evidence produced over that transport qualifies neither the
+CLI nor the Python SDK path.
 Passing a codec or Holt microbenchmark alone does not qualify the product.
 
 Every applicable gate reports exactly one status:
@@ -48,9 +52,10 @@ Workbench semantics through the primary native CLI boundary. The direct Python
 SDK must independently exercise its supported programmatic path. The existing
 black-box runner,
 [`scripts/workbench/live_workbench.py`](../../scripts/workbench/live_workbench.py),
-qualifies the optional MCP sidecar only. Its dry-run proves only command
-construction and tool coverage; a live run retains exact sidecar and process
-evidence. It cannot substitute for native CLI or Python SDK evidence. Absent
+reaches the 18 tools through a `nokv mcp` child process and therefore qualifies
+that deprecated transport only. Its dry-run proves only command construction
+and tool coverage; a live run retains exact transport and process evidence. It
+cannot substitute for native CLI or Python SDK evidence. Absent
 etcd, S3-compatible storage, or the requested binary is `NOT QUALIFIED`, never
 `PASS`.
 
@@ -73,6 +78,14 @@ Required evidence:
 The bounded live Workbench runner uses a minimum one-day snapshot lease. Even
 when its 18-tool workflow passes, Gate 0 remains `NOT QUALIFIED` until separate
 retained evidence observes expiry and the terminal `reaped` state.
+
+A second, independent reason Gate 0 cannot report `PASS` today: the frozen
+pre-#423 ledger's `native-workbench-e2e` expectation profile admits only the
+`live-workbench` producer, whose required evidence roles include
+`mcp-transcript`. That producer's transport is the deprecated sidecar, so the
+gate is unsatisfiable as specified. Admitting a CLI-driven producer is a
+ledger-policy change, not a documentation change, and the ledger is digest
+pinned.
 
 Workbench responses must not expose storage keys, owner addresses, internal
 incarnations, or host-filesystem identities.
@@ -225,7 +238,8 @@ same Holt authority; the production CLI contains no fault-only admission path.
 The independent object-provider runner is
 [`scripts/workbench/object_namespace_recovery_gate.py`](../../scripts/workbench/object_namespace_recovery_gate.py).
 It owns real etcd and digest-pinned RustFS instances and retains its raw process
-and MCP evidence separately from the epoch-boundary runner.
+and transport evidence separately from the epoch-boundary runner. It also drives
+the product through the deprecated `nokv mcp` child process.
 
 Required evidence:
 
@@ -277,7 +291,7 @@ Required evidence:
   CLI builds contain no fault hook, flag, environment branch, or arbitrary
   executor injection surface.
 
-## Gate 7: CLI, Python SDK, MCP Sidecar, And Package Boundaries
+## Gate 7: CLI, Python SDK, And Package Boundaries
 
 Required evidence:
 
@@ -290,8 +304,9 @@ Required evidence:
   explicit materialize/collect adapters;
 - `nokv-agent` remains transport-free and shapes the stable 18 tools over SDK
   traits;
-- the optional MCP sidecar is a thin consumer of the same Agent facade and is
-  neither a required deployment component nor a second state machine;
+- the deprecated `nokv mcp` sidecar remains a thin consumer of the same Agent
+  facade, is presented in no document as a supported integration surface, and
+  gains no new behavior;
 - protocol DTOs are versioned and storage-neutral;
 - provider-specific behavior stays inside the object package;
 - no second implementation of namespace, publication, restore, references, or
