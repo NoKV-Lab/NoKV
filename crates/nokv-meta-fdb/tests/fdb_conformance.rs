@@ -31,6 +31,9 @@ const TRANSACTION_TIMEOUT_MILLIS: i32 = 4_000;
 #[test]
 #[ignore = "requires NOKV_TEST_FDB_CLUSTER_FILE, a compatible libfdb_c, and a disposable cluster"]
 fn fdb_live_conformance_and_isolation() {
+    // SAFETY: this integration-test binary boots the FoundationDB client once,
+    // and `network` is dropped only after every database and store handle.
+    let network = unsafe { foundationdb::boot() };
     let cluster_file = cluster_file();
     let first_namespace = unique_namespace();
     let second_namespace = unique_namespace();
@@ -50,6 +53,7 @@ fn fdb_live_conformance_and_isolation() {
 
     drop(second_guard);
     drop(first_guard);
+    drop(network);
 }
 
 fn cluster_file() -> PathBuf {
