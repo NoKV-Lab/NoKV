@@ -8,3 +8,4 @@
 #[cfg(feature = "metadata-read-stats")]
 pub mod metadata;
 pub mod report;
+pub mod seed_qualification;

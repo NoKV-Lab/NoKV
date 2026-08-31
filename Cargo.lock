@@ -1319,6 +1319,7 @@ dependencies = [
 name = "nokv-bench"
 version = "0.1.0"
 dependencies = [
+ "nokv-client",
  "nokv-meta",
  "nokv-meta-holt",
  "nokv-meta-store",
@@ -1327,6 +1328,9 @@ dependencies = [
  "nokv-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "url",
 ]
 
 [[package]]

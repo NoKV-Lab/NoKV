@@ -14,6 +14,7 @@ homepage.workspace = true
 metadata-read-stats = ["nokv-meta/metadata-read-stats", "nokv-meta-holt/read-stats"]
 
 [dependencies]
+nokv-client.workspace = true
 nokv-meta.workspace = true
 nokv-meta-holt = { workspace = true, features = ["test-support"] }
 nokv-meta-store.workspace = true
@@ -22,6 +23,11 @@ nokv-server.workspace = true
 nokv-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [[bin]]
 name = "nokv-workspace-bench"
@@ -31,3 +37,7 @@ path = "src/bin/nokv-workspace-bench.rs"
 name = "nokv-bench"
 path = "src/bin/nokv-bench.rs"
 required-features = ["metadata-read-stats"]
+
+[[bin]]
+name = "nokv-fdb-seed-qualification"
+path = "src/bin/nokv-fdb-seed-qualification.rs"
