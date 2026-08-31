@@ -147,7 +147,13 @@ replay. Unknown versions fail closed. Keys do not repeat a version because the
 store-level schema marker gates their codec.
 SecondaryIndexV2 values use version `2` and contain only `path_digest` plus
 `PathIndexGenerationId`; `PathIndexLocator` values use version `1` and contain
-the locator state plus the one canonical normalized path.
+the locator state plus the one canonical normalized path. A publication's
+secondary-index staging `CommandDedupe` result uses version `2`: its intent
+digest binds the root and operation identities, stable operation/workspace/path
+keys, staged locator key and payload, and ordered secondary-index rows. It does
+not bind mutable operation, workspace, or current-path payload bytes. The first
+stage transaction still asserts those exact payloads before writing any staged
+row.
 Generic index current, generation, row, reference, append-receipt,
 registration-operation, and commit-member payloads use value version `1`.
 Row binding is explicit: `Directory` cannot later decorate an artifact,

@@ -60,7 +60,7 @@ use super::restore_records::{
 };
 
 const MAX_COMMAND_ITEMS: usize = 256;
-const SECONDARY_INDEX_STAGE_RESULT_VERSION: u8 = 1;
+const SECONDARY_INDEX_STAGE_RESULT_VERSION: u8 = 2;
 /// Maximum rows admitted by one recoverable publication batch.
 pub const MAX_PUBLICATION_BATCH_ROWS: usize = 192;
 const _: () = assert!(MAX_PUBLICATION_BATCH_ROWS + 2 <= MAX_COMMAND_ITEMS);
@@ -878,38 +878,22 @@ fn secondary_index_stage_request_id(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn secondary_index_stage_input_digest(
+fn secondary_index_stage_intent_digest(
     root_id: RootId,
     operation_id: OperationId,
     operation_key: &[u8],
-    operation_payload: &[u8],
     workspace_key: &[u8],
-    workspace_payload: &[u8],
     path_key: &[u8],
-    current_path_payload: Option<&[u8]>,
     locator_key: &[u8],
     locator_payload: &[u8],
     index_rows: &BTreeMap<Vec<u8>, Vec<u8>>,
 ) -> [u8; SHA256_BYTES] {
     let mut digest = Sha256::new();
-    digest.update(b"nokv.metadata.secondary-index-stage-input.v1\0");
+    digest.update(b"nokv.metadata.secondary-index-stage-intent.v2\0");
     digest.update(root_id.as_bytes());
     digest.update(operation_id.as_bytes());
-    for value in [
-        operation_key,
-        operation_payload,
-        workspace_key,
-        workspace_payload,
-        path_key,
-    ] {
+    for value in [operation_key, workspace_key, path_key] {
         update_stage_digest_bytes(&mut digest, value);
-    }
-    match current_path_payload {
-        None => digest.update([0]),
-        Some(payload) => {
-            digest.update([1]);
-            update_stage_digest_bytes(&mut digest, payload);
-        }
     }
     update_stage_digest_bytes(&mut digest, locator_key);
     update_stage_digest_bytes(&mut digest, locator_payload);
@@ -3387,15 +3371,12 @@ impl PublicationService<'_> {
         locator_payload: &[u8],
         index_rows: &BTreeMap<Vec<u8>, Vec<u8>>,
     ) -> Result<MetadataCommandResult, PublicationError> {
-        let input_digest = secondary_index_stage_input_digest(
+        let input_digest = secondary_index_stage_intent_digest(
             context.root_id,
             operation_id,
             operation_key,
-            operation_payload,
             workspace_key,
-            workspace_payload,
             path_key,
-            current_path_payload,
             locator_key,
             locator_payload,
             index_rows,
@@ -7570,7 +7551,65 @@ mod tests {
     }
 
     #[test]
-    fn finalize_resumes_a_durable_index_stage_after_the_clock_advances() {
+    fn secondary_index_stage_v2_replay_binds_immutable_write_intent() {
+        let rows = BTreeMap::from([(b"row-a".to_vec(), b"value-a".to_vec())]);
+        let expected = secondary_index_stage_intent_digest(
+            root(),
+            operation_id(229),
+            b"operation-key",
+            b"workspace-key",
+            b"path-key",
+            b"locator-key",
+            b"locator-payload",
+            &rows,
+        );
+        let encoded = encode_secondary_index_stage_result(expected);
+        assert_eq!(
+            validate_secondary_index_stage_result(&encoded, expected),
+            Ok(())
+        );
+
+        let changed_locator = secondary_index_stage_intent_digest(
+            root(),
+            operation_id(229),
+            b"operation-key",
+            b"workspace-key",
+            b"path-key",
+            b"locator-key",
+            b"different-locator-payload",
+            &rows,
+        );
+        assert_eq!(
+            validate_secondary_index_stage_result(&encoded, changed_locator),
+            Err(PublicationError::OperationInputMismatch)
+        );
+
+        let changed_rows = BTreeMap::from([(b"row-b".to_vec(), b"value-b".to_vec())]);
+        let changed_rows_digest = secondary_index_stage_intent_digest(
+            root(),
+            operation_id(229),
+            b"operation-key",
+            b"workspace-key",
+            b"path-key",
+            b"locator-key",
+            b"locator-payload",
+            &changed_rows,
+        );
+        assert_eq!(
+            validate_secondary_index_stage_result(&encoded, changed_rows_digest),
+            Err(PublicationError::OperationInputMismatch)
+        );
+
+        let mut old_version = encoded;
+        old_version[0] = 1;
+        assert_eq!(
+            validate_secondary_index_stage_result(&old_version, expected),
+            Err(PublicationError::ReplayResultMismatch)
+        );
+    }
+
+    #[test]
+    fn finalize_resumes_a_durable_index_stage_after_workspace_and_heartbeat_updates() {
         let inner = crate::workspace::test_support::memory_txn_store().unwrap();
         let failing = Arc::new(FailSecondArmedCommitStore::new(inner));
         let mut counter = 1;
@@ -7641,13 +7680,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(staged_locator.state, PathIndexLocatorState::Staged);
-        store
-            .execute(&fence_command(
-                &store,
-                next_request(&mut counter),
-                RootFenceAction::RequireActive,
-            ))
-            .unwrap();
+        publish_full(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(231),
+            revision(231),
+            path("outputs/unrelated.bin"),
+            PublishClaim::CreateOnly,
+            1,
+        );
+        let heartbeated = service
+            .heartbeat_publish(HeartbeatPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: request.expected_operation.clone(),
+                activity_deadline_ms: 2_000_000,
+            })
+            .unwrap()
+            .operation;
 
         let resumed = service
             .finalize_publish(FinalizePublishRequest {
@@ -7655,6 +7705,7 @@ mod tests {
                     read_version: store.current_read_version().unwrap(),
                     ..first_context
                 },
+                expected_operation: heartbeated,
                 ..request
             })
             .unwrap();
