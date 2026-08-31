@@ -151,34 +151,17 @@ endpoint, bucket, prefix, or physical object keys. Immutable create and delete
 operations with ambiguous completion remain reconciliation cases rather than
 blind retries.
 
-## Existing Roots
+## Provisioned namespaces
 
-Roots created before object-namespace binding have no durable evidence from
-which NoKV could infer the historical bucket/prefix. Automatic adoption would
-therefore make a typo authoritative. Upgrade them only while all owners are
-stopped and after an operator verifies the exact existing object profile:
+`provision` derives or loads the root's immutable object namespace from the
+selected formatted metadata store, creates the provider marker, and verifies
+the exact namespace before making the root Ready. It does not infer or adopt a
+namespace from bucket listing.
 
-```bash
-nokv \
-  --root-id ROOT_HEX32 \
-  --etcd-endpoint ETCD_URL \
-  --object-bucket BUCKET \
-  --object-endpoint S3_URL \
-  --object-root PREFIX \
-  provision LOGICAL_SHARD_HEX32 \
-  --adopt-legacy-object-namespace
-```
-
-Without the explicit flag, provisioning an existing unbound root fails before
-creating a marker or control binding. The next `--metadata-reopen` validates
-the control binding and upgrades the legacy Holt root fence through the normal
-owner-fenced metadata command and recovery outbox. Existing v1 root-fence and
-v2 recovery bytes remain readable and re-encode canonically.
-
-The legacy `None` decode and explicit adoption path may be removed only after
-every supported deployment proves that all root control bindings and Holt root
-fences contain an `ObjectNamespaceId`, and the documented upgrade window has
-ended. It must never be replaced by implicit adoption.
+There is no implicit legacy-adoption mode. An unbound historical deployment
+must be migrated by a separately reviewed offline procedure; changing the
+runtime's bucket, endpoint, or prefix cannot silently redefine its object
+authority.
 
 ## Qualification
 

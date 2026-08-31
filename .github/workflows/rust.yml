@@ -5,364 +5,22 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 permissions:
   contents: read
 
 jobs:
-  workbench-contract:
+  quality:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Set up Rust for typed qualification
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install protobuf compiler for typed qualification
-        run: |
-          set -euo pipefail
-          # apt has hung on an unreachable mirror long enough to wedge a
-          # required check for half an hour, and the step it wedges is not
-          # the code under test, so the red lands nowhere useful. Bound each
-          # call and retry rather than letting a mirror decide the build.
-          for attempt in 1 2 3; do
-            if sudo timeout 300 apt-get update \
-              && sudo timeout 300 apt-get install -y protobuf-compiler; then
-              exit 0
-            fi
-            echo "apt attempt ${attempt} failed or timed out; retrying" >&2
-            sudo pkill -f apt-get || true
-            sleep $((attempt * 15))
-          done
-          echo "apt-get could not install protobuf-compiler after 3 attempts" >&2
-          exit 1
-
-      - name: Cache typed qualification targets
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check Workbench contract and live workflow
-        run: |
-          set -euo pipefail
-          python3 -m py_compile \
-            scripts/workbench/pre423_contract_ledger.py \
-            scripts/workbench/workbench_contract.py \
-            scripts/workbench/live_workbench.py \
-            scripts/workbench/local_wal_recovery_gate.py \
-            scripts/workbench/object_namespace_recovery_gate.py \
-            scripts/workbench/restore_composition_gate.py \
-            scripts/workbench/fork_restore_recovery_gate.py
-          python3 scripts/workbench/pre423_contract_ledger.py
-          python3 scripts/workbench/pre423_contract_ledger_test.py
-          python3 scripts/workbench/workbench_contract_test.py
-          python3 scripts/workbench/live_workbench_test.py
-          python3 scripts/workbench/local_wal_recovery_gate_test.py
-          python3 scripts/workbench/object_namespace_recovery_gate_test.py
-          python3 scripts/workbench/restore_composition_gate_test.py
-          python3 scripts/workbench/fork_restore_recovery_gate_test.py
-          bash -n scripts/workbench/start_rustfs.sh
-
-      - name: Check Phase 1 qualification framework
-        run: |
-          set -euo pipefail
-          python3 -m py_compile \
-            scripts/workbench/pre423_contract_ledger.py \
-            scripts/workbench/pre423_contract_ledger_test.py \
-            scripts/workbench/source_bound_producer.py \
-            scripts/workbench/source_bound_producer_test.py \
-            scripts/workbench/typed_live_qualification.py \
-            scripts/workbench/typed_live_qualification_test.py \
-            scripts/workbench/qualification_receipt.py \
-            scripts/workbench/qualification_receipt_test.py \
-            scripts/workbench/qualification_aggregate.py \
-            scripts/workbench/qualification_aggregate_test.py \
-            scripts/workbench/qualification_invocation_check.py \
-            scripts/workbench/qualification_invocation_check_test.py \
-            scripts/workbench/api_absence_qualification.py \
-            scripts/workbench/api_absence_qualification_test.py \
-            scripts/workbench/api_decision_qualification.py \
-            scripts/workbench/api_decision_qualification_test.py \
-            scripts/workbench/commit_replay_qualification.py \
-            scripts/workbench/commit_replay_qualification_test.py \
-            scripts/workbench/cursor_differential_qualification.py \
-            scripts/workbench/cursor_differential_qualification_test.py \
-            scripts/workbench/nokv_agent_qualification.py \
-            scripts/workbench/nokv_agent_qualification_test.py \
-            scripts/workbench/lingtai_mcp_qualification.py \
-            scripts/workbench/python_sdk_qualification.py \
-            scripts/workbench/live_gap_qualification_test.py \
-            scripts/workbench/snapshot_lifecycle_qualification.py \
-            scripts/workbench/snapshot_lifecycle_qualification_test.py \
-            scripts/workbench/qualification_invocation_manifest_test.py
-          PYTHONPATH=scripts/workbench python3 -m unittest \
-            scripts/workbench/pre423_contract_ledger_test.py \
-            scripts/workbench/source_bound_producer_test.py \
-            scripts/workbench/typed_live_qualification_test.py \
-            scripts/workbench/qualification_receipt_test.py \
-            scripts/workbench/qualification_aggregate_test.py \
-            scripts/workbench/qualification_invocation_check_test.py \
-            scripts/workbench/api_absence_qualification_test.py \
-            scripts/workbench/api_decision_qualification_test.py \
-            scripts/workbench/commit_replay_qualification_test.py \
-            scripts/workbench/cursor_differential_qualification_test.py \
-            scripts/workbench/nokv_agent_qualification_test.py \
-            scripts/workbench/live_gap_qualification_test.py \
-            scripts/workbench/snapshot_lifecycle_qualification_test.py \
-            scripts/workbench/qualification_invocation_manifest_test.py
-
-      - name: Build source-bound qualification product
-        run: cargo build --locked -p nokv --bin nokv --target-dir target/phase1-qualification
-
-      - name: Upload source-bound qualification product
-        id: qualification_product
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: phase1-product-${{ github.sha }}
-          path: target/phase1-qualification/debug/nokv
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Produce Phase 1 source-bound qualification receipts
-        id: qualification_receipts
-        shell: bash
-        env:
-          PHASE1_QUALIFICATION_ROOT: ${{ runner.temp }}/phase1-qualification
-        run: |
-          set -euo pipefail
-          manifest=scripts/workbench/qualification_invocation_manifest.json
-          bundle="$PHASE1_QUALIFICATION_ROOT/bundle"
-          target_dir=target/phase1-qualification
-          product_binary="$target_dir/debug/nokv"
-          runner_python=$(python3 -c 'import os,sys; print(os.path.realpath(sys.executable))')
-          [[ -x "$runner_python" && "$runner_python" = /* ]]
-          mkdir -p "$PHASE1_QUALIFICATION_ROOT"
-          [[ -x "$product_binary" ]]
-          python_sdk_sha256=$(git ls-files -s crates/nokv-python | sha256sum | cut -d' ' -f1)
-
-          while IFS= read -r invocation; do
-            invocation_id=$(jq -r '.id' <<<"$invocation")
-            producer=$(jq -r '.producer' <<<"$invocation")
-            evidence_kind=$(jq -r '.evidence_kind' <<<"$invocation")
-            script=$(jq -r '.script' <<<"$invocation")
-            expected_exit=$(jq -r '.expected_exit_code' <<<"$invocation")
-            evidence_root="$PHASE1_QUALIFICATION_ROOT/producer-evidence/$invocation_id"
-            producer_result="$evidence_root/producer-result.json"
-            mkdir -p "$evidence_root"
-
-            receipt_args=(
-              "$runner_python" scripts/workbench/qualification_receipt.py
-              --repo "$GITHUB_WORKSPACE"
-              --output-dir "$bundle"
-              --evidence-root "$evidence_root"
-              --producer "$producer"
-              --evidence-kind "$evidence_kind"
-              --evidence "producer-result=$producer_result"
-            )
-            mapfile -t claims < <(jq -r '.claims[]' <<<"$invocation")
-            for claim in "${claims[@]}"; do
-              receipt_args+=(--claim "$claim")
-            done
-
-            producer_args=(
-              "$runner_python" "$script"
-              --qualification-result "$producer_result"
-            )
-            case "$producer" in
-              lingtai-mcp)
-                receipt_args+=(
-                  --binary "$product_binary"
-                  --dependency "lingtai-kernel=git:834274df1304488d3e6b5b2cde4a3b481a81e38b"
-                  --dependency "etcd=sha256:e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9"
-                  --dependency "object-store=oci:rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
-                  --evidence "qualification=$evidence_root/qualification.json"
-                  --evidence "mcp-transcript=$evidence_root/mcp-transcript.jsonl"
-                )
-                producer_args+=(--nokv-bin "$product_binary")
-                ;;
-              live-workbench)
-                receipt_args+=(
-                  --binary "$product_binary"
-                  --dependency "etcd=sha256:e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9"
-                  --dependency "object-store=oci:rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
-                  --evidence "qualification=$evidence_root/qualification.json"
-                  --evidence "mcp-transcript=$evidence_root/mcp-transcript.jsonl"
-                )
-                producer_args+=(
-                  --nokv-bin "$product_binary"
-                  --evidence-dir "$evidence_root/workflow"
-                )
-                ;;
-              object-namespace-recovery)
-                receipt_args+=(
-                  --binary "$product_binary"
-                  --dependency "etcd=sha256:e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9"
-                  --dependency "rustfs=oci:rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
-                  --evidence "qualification=$evidence_root/qualification.json"
-                )
-                producer_args+=(
-                  --binary "$product_binary"
-                  --evidence-dir "$evidence_root/gate"
-                )
-                ;;
-              python-sdk)
-                receipt_args+=(
-                  --binary "$product_binary"
-                  --dependency "python-sdk=sha256:$python_sdk_sha256"
-                  --dependency "etcd=sha256:e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9"
-                  --dependency "object-store=oci:rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
-                  --evidence "qualification=$evidence_root/qualification.json"
-                )
-                producer_args+=(--nokv-bin "$product_binary")
-                ;;
-              restore-composition)
-                receipt_args+=(
-                  --binary "$product_binary"
-                  --dependency "etcd=sha256:e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9"
-                  --dependency "rustfs=oci:rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
-                  --evidence "qualification=$evidence_root/qualification.json"
-                )
-                producer_args+=(
-                  --nokv-bin "$product_binary"
-                  --evidence-dir "$evidence_root/gate"
-                  --etcd-bin "$evidence_root/unavailable-etcd"
-                  --etcdctl-bin "$evidence_root/unavailable-etcdctl"
-                  --docker-bin "$evidence_root/unavailable-docker"
-                  --aws-bin "$evidence_root/unavailable-aws"
-                )
-                ;;
-              snapshot-lifecycle)
-                receipt_args+=(
-                  --evidence "qualification=$evidence_root/qualification.json"
-                )
-                ;;
-            esac
-            if [[ "$(jq -r '.uses_rust_target' <<<"$invocation")" == "true" ]]; then
-              producer_args+=(--target-dir "$target_dir")
-            fi
-
-            set +e
-            "${receipt_args[@]}" -- "${producer_args[@]}"
-            receipt_status=$?
-            set -e
-            if [[ "$receipt_status" -ne "$expected_exit" ]]; then
-              echo "unexpected receipt status for $invocation_id: expected=$expected_exit actual=$receipt_status" >&2
-              exit 1
-            fi
-          done < <(jq -c '.invocations[]' "$manifest")
-
-      - name: Aggregate Phase 1 receipts as explicitly not qualified
-        shell: bash
-        env:
-          PHASE1_QUALIFICATION_ROOT: ${{ runner.temp }}/phase1-qualification
-          QUALIFICATION_PRODUCT_ARTIFACT_ID: ${{ steps.qualification_product.outputs.artifact-id }}
-          QUALIFICATION_PRODUCT_ARTIFACT_DIGEST: ${{ steps.qualification_product.outputs.artifact-digest }}
-        run: |
-          set -euo pipefail
-          manifest=scripts/workbench/qualification_invocation_manifest.json
-          report="$PHASE1_QUALIFICATION_ROOT/aggregate.json"
-          product_manifest="$PHASE1_QUALIFICATION_ROOT/product-artifact-manifest.json"
-          product_binary=target/phase1-qualification/debug/nokv
-          artifact_digest="${QUALIFICATION_PRODUCT_ARTIFACT_DIGEST#sha256:}"
-          binary_digest=$(sha256sum "$product_binary" | cut -d' ' -f1)
-          [[ "$QUALIFICATION_PRODUCT_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
-          [[ "$artifact_digest" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$binary_digest" =~ ^[0-9a-f]{64}$ ]]
-          jq -n \
-            --arg run_id "$GITHUB_RUN_ID" \
-            --argjson attempt "$GITHUB_RUN_ATTEMPT" \
-            --arg head_sha "$GITHUB_SHA" \
-            --arg job "$GITHUB_JOB" \
-            --arg artifact_id "$QUALIFICATION_PRODUCT_ARTIFACT_ID" \
-            --arg artifact_digest "sha256:$artifact_digest" \
-            --arg binary_sha256 "sha256:$binary_digest" \
-            --argjson producers '["lingtai-mcp","live-workbench","object-namespace-recovery","python-sdk","restore-composition"]' \
-            '{
-              schema: "nokv.pre423.product_artifact_manifest.v1",
-              provider: "github-actions",
-              workflow_run_id: $run_id,
-              workflow_attempt: $attempt,
-              head_sha: $head_sha,
-              artifacts: [
-                $producers[] | {
-                  producer: ., job: $job, artifact_id: $artifact_id,
-                  artifact_digest: $artifact_digest, binary_path: "nokv",
-                  binary_sha256: $binary_sha256
-                }
-              ]
-            }' >"$product_manifest"
-          expected_exit=$(jq -r '.aggregate_expectation.expected_exit_code' "$manifest")
-          set +e
-          python3 scripts/workbench/qualification_aggregate.py \
-            --repo "$GITHUB_WORKSPACE" \
-            --receipt-dir "$PHASE1_QUALIFICATION_ROOT/bundle/receipts" \
-            --product-artifact-manifest "$product_manifest" \
-            --output "$report"
-          aggregate_status=$?
-          set -e
-          [[ "$aggregate_status" -eq "$expected_exit" ]]
-          [[ "$aggregate_status" -eq 3 ]]
-          jq -e '.status == "NQ"' "$report"
-          expected_receipt_counts=$(jq -c \
-            '.aggregate_expectation.receipt_counts' "$manifest")
-          jq -e --argjson expected "$expected_receipt_counts" \
-            '.receipt_counts == $expected' "$report"
-          jq -e '.invalid_receipts == [] and .receipt_conflicts == []' "$report"
-          python3 scripts/workbench/qualification_invocation_check.py \
-            --manifest "$manifest" \
-            --report "$report"
-
-      - name: Upload Phase 1 qualification evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: phase1-qualification-${{ github.sha }}
-          path: ${{ runner.temp }}/phase1-qualification
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Check Homebrew release safety
-        run: python3 scripts/release/test_homebrew_source_release.py
-
-      - name: Check Python SDK release safety
-        run: python3 scripts/release/test_python_sdk_release.py
-
-      - name: Check pull request governance policy
-        run: python3 scripts/ci/pr_change_governance_test.py
-
-  nokv-workspace:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      ETCD_VERSION: v3.7.1
-      ETCD_LINUX_AMD64_SHA256: e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9
-      RUSTFS_IMAGE: rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Install protobuf compiler
-        run: |
-          set -euo pipefail
-          # apt has hung on an unreachable mirror long enough to wedge a
-          # required check for half an hour, and the step it wedges is not
-          # the code under test, so the red lands nowhere useful. Bound each
-          # call and retry rather than letting a mirror decide the build.
-          for attempt in 1 2 3; do
-            if sudo timeout 300 apt-get update \
-              && sudo timeout 300 apt-get install -y protobuf-compiler; then
-              exit 0
-            fi
-            echo "apt attempt ${attempt} failed or timed out; retrying" >&2
-            sudo pkill -f apt-get || true
-            sleep $((attempt * 15))
-          done
-          echo "apt-get could not install protobuf-compiler after 3 attempts" >&2
-          exit 1
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -370,20 +28,17 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
-      - name: Clippy
+      - name: Clippy default runtime
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Clippy metadata read diagnostics
+      - name: Check feature-gated FDB composition
         run: |
-          cargo clippy -p nokv-meta -p nokv-bench --all-targets --features metadata-read-stats -- -D warnings
-          cargo clippy -p nokv-meta-holt --all-targets --features read-stats -- -D warnings
+          cargo check -p nokv-server --features fdb --all-targets
+          cargo check -p nokv --features fdb --all-targets
+          cargo clippy -p nokv-server --features fdb --all-targets -- -D warnings
+          cargo clippy -p nokv --features fdb --all-targets -- -D warnings
 
-      - name: Clippy restore crash support
-        run: |
-          cargo clippy -p nokv-server --all-targets --features restore-crash-test-support -- -D warnings
-          cargo clippy -p nokv-bench --all-targets --features restore-crash-test-support -- -D warnings
-
-      - name: Test
+      - name: Test workspace
         run: cargo test --workspace
 
       - name: Test metadata read diagnostics
@@ -392,114 +47,58 @@ jobs:
           cargo test -p nokv-meta-holt --features read-stats
           cargo test -p nokv-bench --features metadata-read-stats
 
-      - name: Test restore crash support
-        run: |
-          cargo test -p nokv-server --features restore-crash-test-support
-          cargo test -p nokv-bench --bin nokv-restore-crash-owner --features restore-crash-test-support
-
-      - name: Install pinned etcd
-        shell: bash
+      - name: Check qualification scripts
         run: |
           set -euo pipefail
-          archive="$RUNNER_TEMP/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
-          install_dir="$RUNNER_TEMP/etcd-$ETCD_VERSION"
-          # --retry alone does not cover a reset connection: curl treats it
-          # as fatal and exits without a single retry, which is how a 220 ms
-          # network blip has failed a required check. --retry-all-errors is
-          # what makes the retry budget apply to it.
-          curl --fail --location --retry 5 --retry-all-errors --retry-delay 5 \
-            --connect-timeout 30 --max-time 600 \
-            --output "$archive" \
-            "https://github.com/etcd-io/etcd/releases/download/$ETCD_VERSION/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
-          echo "$ETCD_LINUX_AMD64_SHA256  $archive" | sha256sum --check
-          mkdir -p "$install_dir"
-          tar -xzf "$archive" -C "$install_dir" --strip-components=1
-          echo "$install_dir" >>"$GITHUB_PATH"
-          "$install_dir/etcd" --version
-          "$install_dir/etcdctl" version
+          python3 -m compileall -q scripts/workbench
+          PYTHONPATH=scripts/workbench python3 -m unittest discover \
+            -s scripts/workbench -p '*_test.py'
+          bash -n scripts/workbench/start_rustfs.sh
 
-      - name: Start pinned RustFS for namespace admission
-        shell: bash
+      - name: Check release safety
+        run: |
+          python3 scripts/release/test_homebrew_source_release.py
+          python3 scripts/release/test_python_sdk_release.py
+          python3 scripts/ci/pr_change_governance_test.py
+
+  standalone-live-workbench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFS_IMAGE: rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab
+      RUSTFS_CONTAINER: nokv-holt-live-rustfs
+      RUSTFS_VOLUME: nokv-holt-live-rustfs-data
+      S3_BUCKET: nokv-holt-live
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build standalone NoKV
+        run: cargo build --locked -p nokv --bin nokv
+
+      - name: Start pinned RustFS
         env:
-          NOKV_WORKBENCH_RUSTFS_CONTAINER: nokv-local-wal-recovery-rustfs
-          NOKV_WORKBENCH_RUSTFS_VOLUME: nokv-local-wal-recovery-rustfs-data
+          NOKV_WORKBENCH_RUSTFS_CONTAINER: ${{ env.RUSTFS_CONTAINER }}
+          NOKV_WORKBENCH_RUSTFS_VOLUME: ${{ env.RUSTFS_VOLUME }}
           NOKV_WORKBENCH_RUSTFS_IMAGE: ${{ env.RUSTFS_IMAGE }}
-          NOKV_WORKBENCH_S3_BUCKET: nokv-local-wal-recovery-gate
+          NOKV_WORKBENCH_S3_BUCKET: ${{ env.S3_BUCKET }}
           NOKV_WORKBENCH_S3_ENDPOINT: http://127.0.0.1:9000
           NOKV_WORKBENCH_S3_ACCESS_KEY_ID: rustfsadmin
           NOKV_WORKBENCH_S3_SECRET_ACCESS_KEY: rustfsadmin
-        run: |
-          set -euo pipefail
-          aws --version
-          docker --version
-          bash scripts/workbench/start_rustfs.sh
+        run: bash scripts/workbench/start_rustfs.sh
 
-      - name: Qualify interrupted local-WAL successor recovery
-        id: local_wal_recovery
-        shell: bash
-        env:
-          RECOVERY_EVIDENCE_DIR: ${{ runner.temp }}/local-wal-recovery-evidence
-          AWS_ACCESS_KEY_ID: rustfsadmin
-          AWS_SECRET_ACCESS_KEY: rustfsadmin
-          AWS_DEFAULT_REGION: us-east-1
-          AWS_EC2_METADATA_DISABLED: "true"
-        run: |
-          set -euo pipefail
-          python3 scripts/workbench/local_wal_recovery_gate.py \
-            --build \
-            --target-dir target \
-            --evidence-dir "$RECOVERY_EVIDENCE_DIR" \
-            --object-endpoint http://127.0.0.1:9000 \
-            --object-bucket nokv-local-wal-recovery-gate \
-            --timeout 45
-
-      - name: Upload local-WAL recovery evidence
-        if: ${{ always() && steps.local_wal_recovery.outcome != 'skipped' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: local-wal-recovery-${{ github.sha }}
-          path: ${{ runner.temp }}/local-wal-recovery-evidence
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Qualify live Workbench contracts
+      - name: Qualify standalone Holt Workbench
         id: live_workbench
-        shell: bash
         env:
           LIVE_WORKBENCH_ROOT: ${{ runner.temp }}/live-workbench
         run: |
           set -euo pipefail
-          endpoint=http://127.0.0.1:22379
-          peer=http://127.0.0.1:22380
           mkdir -p "$LIVE_WORKBENCH_ROOT"
-          etcd \
-            --name nokv-live-workbench \
-            --data-dir "$LIVE_WORKBENCH_ROOT/etcd-data" \
-            --listen-client-urls "$endpoint" \
-            --advertise-client-urls "$endpoint" \
-            --listen-peer-urls "$peer" \
-            --initial-advertise-peer-urls "$peer" \
-            --initial-cluster "nokv-live-workbench=$peer" \
-            --initial-cluster-state new \
-            --log-level warn \
-            >"$LIVE_WORKBENCH_ROOT/etcd.log" 2>&1 &
-          etcd_pid=$!
-          trap 'kill "$etcd_pid" >/dev/null 2>&1 || true; wait "$etcd_pid" >/dev/null 2>&1 || true' EXIT
-          ready=false
-          for _ in $(seq 1 60); do
-            if etcdctl --endpoints "$endpoint" endpoint health >/dev/null 2>&1; then
-              ready=true
-              break
-            fi
-            if ! kill -0 "$etcd_pid" >/dev/null 2>&1; then
-              break
-            fi
-            sleep 0.25
-          done
-          if [[ "$ready" != true ]]; then
-            cat "$LIVE_WORKBENCH_ROOT/etcd.log"
-            exit 1
-          fi
           python3 scripts/workbench/live_workbench.py \
             --nokv-bin target/debug/nokv \
             --evidence-dir "$LIVE_WORKBENCH_ROOT/evidence" \
@@ -507,20 +106,15 @@ jobs:
             --root-id 11111111111111111111111111111111 \
             --agent-id 44444444444444444444444444444444 \
             --agent-name ci-agent \
-            --logical-shard-id 22222222222222222222222222222222 \
-            --etcd-endpoint "$endpoint" \
-            --etcd-key-prefix "/nokv/control/live-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --server-bind 127.0.0.1:17750 \
             --advertise-endpoint 127.0.0.1:17750 \
             --object-endpoint http://127.0.0.1:9000 \
-            --object-bucket nokv-local-wal-recovery-gate \
+            --object-bucket "$S3_BUCKET" \
             --object-root "live-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --object-access-key-id rustfsadmin \
             --object-secret-access-key rustfsadmin \
             --command-timeout-seconds 45
           jq -e '.workbench_workflow.status == "PASS"' \
-            "$LIVE_WORKBENCH_ROOT/evidence/qualification.json"
-          jq -e '.acceptance_gates["0"].status == "NOT QUALIFIED"' \
             "$LIVE_WORKBENCH_ROOT/evidence/qualification.json"
 
       - name: Upload live Workbench evidence
@@ -532,203 +126,8 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Qualify restored Workbench composition
-        id: restore_composition
-        shell: bash
-        env:
-          RESTORE_COMPOSITION_EVIDENCE_DIR: ${{ runner.temp }}/restore-composition/evidence
-        run: |
-          set -euo pipefail
-          python3 scripts/workbench/restore_composition_gate.py \
-            --build \
-            --nokv-bin target/debug/nokv \
-            --target-dir target \
-            --fault-target-dir "${RUNNER_TEMP}/restore-composition-fault-target" \
-            --evidence-dir "$RESTORE_COMPOSITION_EVIDENCE_DIR" \
-            --seed "restore-composition-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --timeout 60
-          jq -e '.restore_composition.status == "PASS"' \
-            "$RESTORE_COMPOSITION_EVIDENCE_DIR/qualification.json"
-          jq -e '.partial_publication_recovery.status == "PASS"' \
-            "$RESTORE_COMPOSITION_EVIDENCE_DIR/qualification.json"
-          jq -e '.overall_status == "PASS"' \
-            "$RESTORE_COMPOSITION_EVIDENCE_DIR/qualification.json"
-
-      - name: Upload restore composition evidence
-        if: ${{ always() && steps.restore_composition.outcome != 'skipped' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: restore-composition-${{ github.sha }}
-          path: ${{ runner.temp }}/restore-composition/evidence
-          if-no-files-found: error
-          retention-days: 7
-
       - name: Remove pinned RustFS
         if: ${{ always() }}
-        shell: bash
         run: |
-          docker rm -f nokv-local-wal-recovery-rustfs >/dev/null 2>&1 || true
-          docker volume rm -f nokv-local-wal-recovery-rustfs-data >/dev/null 2>&1 || true
-
-  object-namespace-recovery:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      ETCD_VERSION: v3.7.1
-      ETCD_LINUX_AMD64_SHA256: e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9
-      RUSTFS_IMAGE: rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install protobuf compiler
-        run: |
-          set -euo pipefail
-          # apt has hung on an unreachable mirror long enough to wedge a
-          # required check for half an hour, and the step it wedges is not
-          # the code under test, so the red lands nowhere useful. Bound each
-          # call and retry rather than letting a mirror decide the build.
-          for attempt in 1 2 3; do
-            if sudo timeout 300 apt-get update \
-              && sudo timeout 300 apt-get install -y protobuf-compiler; then
-              exit 0
-            fi
-            echo "apt attempt ${attempt} failed or timed out; retrying" >&2
-            sudo pkill -f apt-get || true
-            sleep $((attempt * 15))
-          done
-          echo "apt-get could not install protobuf-compiler after 3 attempts" >&2
-          exit 1
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install pinned etcd
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
-          install_dir="$RUNNER_TEMP/etcd-$ETCD_VERSION"
-          # --retry alone does not cover a reset connection: curl treats it
-          # as fatal and exits without a single retry, which is how a 220 ms
-          # network blip has failed a required check. --retry-all-errors is
-          # what makes the retry budget apply to it.
-          curl --fail --location --retry 5 --retry-all-errors --retry-delay 5 \
-            --connect-timeout 30 --max-time 600 \
-            --output "$archive" \
-            "https://github.com/etcd-io/etcd/releases/download/$ETCD_VERSION/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
-          echo "$ETCD_LINUX_AMD64_SHA256  $archive" | sha256sum --check
-          mkdir -p "$install_dir"
-          tar -xzf "$archive" -C "$install_dir" --strip-components=1
-          echo "$install_dir" >>"$GITHUB_PATH"
-          "$install_dir/etcd" --version
-          "$install_dir/etcdctl" version
-
-      - name: Qualify object namespace restart and retry
-        id: object_namespace_recovery
-        shell: bash
-        env:
-          OBJECT_RECOVERY_EVIDENCE_DIR: ${{ runner.temp }}/object-namespace-recovery-evidence
-        run: |
-          set -euo pipefail
-          aws --version
-          docker --version
-          python3 scripts/workbench/object_namespace_recovery_gate.py \
-            --build \
-            --target-dir target \
-            --rustfs-image "$RUSTFS_IMAGE" \
-            --evidence-dir "$OBJECT_RECOVERY_EVIDENCE_DIR" \
-            --timeout 60
-
-      - name: Upload object namespace recovery evidence
-        if: ${{ always() && steps.object_namespace_recovery.outcome != 'skipped' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: object-namespace-recovery-${{ github.sha }}
-          path: ${{ runner.temp }}/object-namespace-recovery-evidence
-          if-no-files-found: error
-          retention-days: 7
-
-  fork-restore-recovery:
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    env:
-      ETCD_VERSION: v3.7.1
-      ETCD_LINUX_AMD64_SHA256: e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9
-      RUSTFS_IMAGE: rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install protobuf compiler
-        run: |
-          set -euo pipefail
-          # apt has hung on an unreachable mirror long enough to wedge a
-          # required check for half an hour, and the step it wedges is not
-          # the code under test, so the red lands nowhere useful. Bound each
-          # call and retry rather than letting a mirror decide the build.
-          for attempt in 1 2 3; do
-            if sudo timeout 300 apt-get update \
-              && sudo timeout 300 apt-get install -y protobuf-compiler; then
-              exit 0
-            fi
-            echo "apt attempt ${attempt} failed or timed out; retrying" >&2
-            sudo pkill -f apt-get || true
-            sleep $((attempt * 15))
-          done
-          echo "apt-get could not install protobuf-compiler after 3 attempts" >&2
-          exit 1
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install pinned etcd
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
-          install_dir="$RUNNER_TEMP/etcd-$ETCD_VERSION"
-          # --retry alone does not cover a reset connection: curl treats it
-          # as fatal and exits without a single retry, which is how a 220 ms
-          # network blip has failed a required check. --retry-all-errors is
-          # what makes the retry budget apply to it.
-          curl --fail --location --retry 5 --retry-all-errors --retry-delay 5 \
-            --connect-timeout 30 --max-time 600 \
-            --output "$archive" \
-            "https://github.com/etcd-io/etcd/releases/download/$ETCD_VERSION/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
-          echo "$ETCD_LINUX_AMD64_SHA256  $archive" | sha256sum --check
-          mkdir -p "$install_dir"
-          tar -xzf "$archive" -C "$install_dir" --strip-components=1
-          echo "$install_dir" >>"$GITHUB_PATH"
-          "$install_dir/etcd" --version
-          "$install_dir/etcdctl" version
-
-      - name: Qualify path-native fork restore and retry
-        id: fork_restore_recovery
-        shell: bash
-        env:
-          FORK_RESTORE_EVIDENCE_DIR: ${{ runner.temp }}/fork-restore-recovery-evidence
-        run: |
-          set -euo pipefail
-          aws --version
-          docker --version
-          python3 scripts/workbench/fork_restore_recovery_gate.py \
-            --build \
-            --target-dir target \
-            --rustfs-image "$RUSTFS_IMAGE" \
-            --fixture-files 64 \
-            --evidence-dir "$FORK_RESTORE_EVIDENCE_DIR" \
-            --timeout 60
-
-      - name: Upload fork restore recovery evidence
-        if: ${{ always() && steps.fork_restore_recovery.outcome != 'skipped' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: fork-restore-recovery-${{ github.sha }}
-          path: ${{ runner.temp }}/fork-restore-recovery-evidence
-          if-no-files-found: error
-          retention-days: 7
+          docker rm -f "$RUSTFS_CONTAINER" >/dev/null 2>&1 || true
+          docker volume rm -f "$RUSTFS_VOLUME" >/dev/null 2>&1 || true

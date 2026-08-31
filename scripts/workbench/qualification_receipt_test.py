@@ -260,8 +260,6 @@ class QualificationReceiptTest(unittest.TestCase):
                 "--binary",
                 "/usr/bin/true",
                 "--dependency",
-                f"etcd=sha256:{'1' * 64}",
-                "--dependency",
                 f"object-store=oci:rustfs/rustfs@sha256:{'2' * 64}",
                 "--evidence",
                 f"qualification={self.evidence_root / 'qualification.json'}",
@@ -290,8 +288,6 @@ class QualificationReceiptTest(unittest.TestCase):
             extra=(
                 "--binary",
                 "/usr/bin/true",
-                "--dependency",
-                f"etcd=sha256:{'1' * 64}",
                 "--dependency",
                 f"object-store=oci:rustfs/rustfs@sha256:{'2' * 64}",
                 "--evidence",

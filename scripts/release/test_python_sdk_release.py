@@ -210,7 +210,9 @@ class WorkflowTest(unittest.TestCase):
             with self.subTest(runner=runner):
                 self.assertIn(runner, workflow)
         self.assertIn('manylinux: "2_28"', workflow)
-        self.assertIn("before-script-linux", workflow)
+        self.assertNotIn("before-script-linux", workflow)
+        self.assertNotIn("protobuf", workflow.lower())
+        self.assertNotIn("protoc", workflow.lower())
         self.assertIn("python_sdk_release.py validate-version", workflow)
         self.assertIn("python_sdk_release.py write-assets", workflow)
         self.assertIn("python_sdk_release.py verify-install", workflow)

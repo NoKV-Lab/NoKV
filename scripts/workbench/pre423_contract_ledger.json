@@ -57,7 +57,7 @@
       "command": {"kind": "python-script", "entrypoint": "scripts/workbench/lingtai_mcp_qualification.py", "result_argument": "--qualification-result", "binary_argument": "--nokv-bin", "forbidden_arguments": ["--dry-run"]},
       "required_evidence_roles": ["producer-result", "qualification", "mcp-transcript"],
       "required_subjects": ["product_binary", "dependencies"],
-      "required_dependencies": {"lingtai-kernel": ["git", "sha256"], "etcd": ["sha256"], "object-store": ["oci"]}
+      "required_dependencies": {"lingtai-kernel": ["git", "sha256"], "nokv-seed": ["sha256"], "object-store": ["oci"]}
     },
     "live-workbench": {
       "description": "Shipping NoKV client and server across real metadata and object boundaries.",
@@ -65,7 +65,7 @@
       "command": {"kind": "python-script", "entrypoint": "scripts/workbench/live_workbench.py", "result_argument": "--qualification-result", "binary_argument": "--nokv-bin", "forbidden_arguments": ["--dry-run"]},
       "required_evidence_roles": ["producer-result", "qualification", "mcp-transcript"],
       "required_subjects": ["product_binary", "dependencies"],
-      "required_dependencies": {"etcd": ["sha256"], "object-store": ["oci"]}
+      "required_dependencies": {"object-store": ["oci"]}
     },
     "nokv-agent-unit": {
       "description": "Transport-free nokv-agent schema, facade, and golden-output tests.",
@@ -81,7 +81,7 @@
       "command": {"kind": "python-script", "entrypoint": "scripts/workbench/object_namespace_recovery_gate.py", "result_argument": "--qualification-result", "binary_argument": "--binary", "forbidden_arguments": ["--dry-run"]},
       "required_evidence_roles": ["producer-result", "qualification"],
       "required_subjects": ["product_binary", "dependencies"],
-      "required_dependencies": {"etcd": ["sha256"], "rustfs": ["oci"]}
+      "required_dependencies": {"metadata-store": ["sha256"], "rustfs": ["oci"]}
     },
     "python-sdk": {
       "description": "Installed supported Python SDK or adapter against real NoKV services.",
@@ -89,7 +89,7 @@
       "command": {"kind": "python-script", "entrypoint": "scripts/workbench/python_sdk_qualification.py", "result_argument": "--qualification-result", "binary_argument": "--nokv-bin", "forbidden_arguments": ["--dry-run"]},
       "required_evidence_roles": ["producer-result", "qualification"],
       "required_subjects": ["product_binary", "dependencies"],
-      "required_dependencies": {"python-sdk": ["sha256"], "etcd": ["sha256"], "object-store": ["oci"]}
+      "required_dependencies": {"python-sdk": ["sha256"], "nokv-seed": ["sha256"], "object-store": ["oci"]}
     },
     "restore-composition": {
       "description": "Real committed-source snapshot and repeated restore composition tests.",
@@ -97,7 +97,7 @@
       "command": {"kind": "python-script", "entrypoint": "scripts/workbench/restore_composition_gate.py", "result_argument": "--qualification-result", "binary_argument": "--nokv-bin", "forbidden_arguments": ["--dry-run"]},
       "required_evidence_roles": ["producer-result", "qualification"],
       "required_subjects": ["product_binary", "dependencies"],
-      "required_dependencies": {"etcd": ["sha256"], "rustfs": ["oci"]}
+      "required_dependencies": {"metadata-store": ["sha256"], "rustfs": ["oci"]}
     },
     "snapshot-lifecycle": {
       "description": "Typed cross-package snapshot lifecycle and retention integration tests.",

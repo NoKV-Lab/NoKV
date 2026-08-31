@@ -27,7 +27,7 @@ class TypedLiveQualificationTests(unittest.TestCase):
     def context_environment(self, binary: Path) -> dict[str, str]:
         subjects = {
             "dependencies": [
-                {"name": "etcd", "identity": "sha256:" + "11" * 32},
+                {"name": "metadata-store", "identity": "sha256:" + "11" * 32},
                 {"name": "object-store", "identity": "oci:example@sha256:" + "22" * 32},
             ],
             "product_binary": {
@@ -72,7 +72,7 @@ class TypedLiveQualificationTests(unittest.TestCase):
                 scenarios={
                     "t01.create-live": ScenarioContract("T01", "native-workbench-e2e")
                 },
-                dependency_names=("etcd", "object-store"),
+                dependency_names=("metadata-store", "object-store"),
                 product_binary=binary,
                 evidence_roles=(
                     "producer-result",
@@ -94,7 +94,7 @@ class TypedLiveQualificationTests(unittest.TestCase):
                 scenarios={
                     "t01.create-live": ScenarioContract("T01", "native-workbench-e2e")
                 },
-                dependency_names=("etcd", "object-store"),
+                dependency_names=("metadata-store", "object-store"),
                 product_binary=binary,
                 evidence_roles=(
                     "producer-result",
@@ -141,7 +141,7 @@ class TypedLiveQualificationTests(unittest.TestCase):
                             "T01", "native-workbench-e2e"
                         )
                     },
-                    dependency_names=("etcd", "object-store"),
+                    dependency_names=("metadata-store", "object-store"),
                     product_binary=other,
                     evidence_roles=(
                         "producer-result",
@@ -161,7 +161,7 @@ class TypedLiveQualificationTests(unittest.TestCase):
                 scenarios={
                     "t01.create-live": ScenarioContract("T01", "native-workbench-e2e")
                 },
-                dependency_names=("etcd", "object-store"),
+                dependency_names=("metadata-store", "object-store"),
                 product_binary=binary,
                 evidence_roles=(
                     "producer-result",

@@ -92,7 +92,6 @@ class LiveWorkbenchTest(unittest.TestCase):
             "--nokv-bin target/debug/nokv",
             "--agent-id 44444444444444444444444444444444",
             "jq -e '.workbench_workflow.status == \"PASS\"'",
-            'jq -e \'.acceptance_gates["0"].status == "NOT QUALIFIED"\'',
             "live-workbench-${{ github.sha }}",
             "if: ${{ always() && steps.live_workbench.outcome != 'skipped' }}",
             "if-no-files-found: error",
@@ -139,14 +138,15 @@ class LiveWorkbenchTest(unittest.TestCase):
         self.assertEqual(current.agent_name, "display-only")
         self.assertEqual(current.agent_id, "aa" * 16)
         self.assertEqual(current.workbench_root, "/agents/display-only/wb")
+        provision = harness.provision_command(current)
+        self.assertEqual(provision[provision.index("--agent-id") + 1], "aa" * 16)
         for command in (
-            harness.provision_command(current),
             harness.mcp_command(current),
             harness.materialize_command(current, Path(directory) / "input.json"),
             harness.collect_command(current, Path(directory) / "output.json"),
+            harness.server_command(current),
         ):
-            self.assertEqual(command[command.index("--agent-id") + 1], "aa" * 16)
-        self.assertNotIn("--agent-id", harness.server_command(current))
+            self.assertNotIn("--agent-id", command)
 
     def test_agent_identity_must_be_canonical_fixed_hex(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -159,31 +159,21 @@ class LiveWorkbenchTest(unittest.TestCase):
                         live=False,
                     )
 
-    def test_authority_probe_uses_distinct_durable_identities_on_one_shard(
+    def test_authority_probe_uses_distinct_durable_identities_in_one_store(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             current = config(Path(directory) / "evidence")
-        peer, mismatch = harness.authority_configs(current)
+        peer = harness.authority_config(current)
 
         self.assertNotEqual(peer.root_id, current.root_id)
         self.assertNotEqual(peer.agent_id, current.agent_id)
-        self.assertEqual(peer.shard_id, current.shard_id)
         self.assertEqual(peer.object_root, current.object_root)
         self.assertEqual(peer.bucket, current.bucket)
         self.assertEqual(peer.workbench, current.workbench)
-        self.assertEqual(mismatch.root_id, current.root_id)
-        self.assertEqual(mismatch.agent_id, peer.agent_id)
-        self.assertNotEqual(mismatch.agent_id, current.agent_id)
-        self.assertNotEqual(mismatch.workbench_root, current.workbench_root)
-
         harness.validate(peer, live=False)
-        for command in (
-            harness.provision_command(peer),
-            harness.mcp_command(peer),
-            harness.mcp_command(mismatch),
-        ):
-            self.assertIn("--agent-id", command)
+        self.assertIn("--agent-id", harness.provision_command(peer))
+        self.assertNotIn("--agent-id", harness.mcp_command(peer))
 
     def test_plan_covers_exact_eighteen_tools_in_dependency_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -367,12 +357,11 @@ class LiveWorkbenchTest(unittest.TestCase):
         with self.assertRaisesRegex(harness.WorkflowFailure, "grep continuation"):
             harness.assert_phase_one_results(results, current)
 
-    def test_authority_assertions_require_isolation_reconnect_and_early_rejection(
+    def test_authority_assertions_require_root_isolation_and_reconnect(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             current = config(Path(directory) / "evidence")
-        peer, _ = harness.authority_configs(current)
         results = {
             "peer-read-before-create": {"code": "NotFound"},
             "peer-put": {
@@ -397,23 +386,16 @@ class LiveWorkbenchTest(unittest.TestCase):
                 "items": [{"value": {"state": "post-snapshot"}}],
             },
         }
-        mismatch = subprocess.CompletedProcess(
-            harness.mcp_command(harness.authority_configs(current)[1]),
-            1,
-            stdout="",
-            stderr="root is already bound to another Agent\n",
-        )
-        evidence = harness.assert_authority_results(results, mismatch, current, peer)
+        evidence = harness.assert_authority_results(results, current)
         self.assertEqual(evidence["status"], "PASS")
         self.assertEqual(evidence["workbench_id"], current.workbench)
         self.assertNotIn(current.agent_id, harness.canonical_json(evidence))
-        self.assertNotIn(peer.agent_id, harness.canonical_json(evidence))
 
         results["primary-read-after-peer-write"]["items"][0]["value"] = {
             "authority": "peer"
         }
         with self.assertRaisesRegex(harness.WorkflowFailure, "RootId isolation"):
-            harness.assert_authority_results(results, mismatch, current, peer)
+            harness.assert_authority_results(results, current)
 
     def test_flat_commands_and_plan_have_no_superseded_surface(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -507,8 +489,6 @@ class LiveWorkbenchTest(unittest.TestCase):
                     str(evidence),
                     "--metadata-dir",
                     str(root / "metadata"),
-                    "--etcd-endpoint",
-                    "http://127.0.0.1:1",
                     "--object-bucket",
                     "test",
                     "--object-endpoint",

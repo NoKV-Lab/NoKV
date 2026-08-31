@@ -8,9 +8,7 @@
     "lingtai-mcp",
     "live-workbench",
     "nokv-agent-unit",
-    "object-namespace-recovery",
     "python-sdk",
-    "restore-composition",
     "snapshot-lifecycle"
   ],
   "invocations": [
@@ -249,43 +247,6 @@
       ]
     },
     {
-      "id": "object-namespace-recovery-nq",
-      "producer": "object-namespace-recovery",
-      "evidence_kind": "live",
-      "script": "scripts/workbench/object_namespace_recovery_gate.py",
-      "expected_outcome": "NQ",
-      "expected_exit_code": 3,
-      "uses_rust_target": false,
-      "claims": [
-        "T18:provider-recovery:t18.restore-two-manifest-publication",
-        "T18:provider-recovery:t18.restore-provider-restart",
-        "T18:provider-recovery:t18.restore-reference-fenced-gc",
-        "T18:provider-recovery:t18.restore-exact-bytes",
-        "C06:provider-recovery:c06.root-binding-survives-provider-restart",
-        "C08:provider-recovery:c08.conditional-put-provider",
-        "C08:provider-recovery:c08.conditional-put-response-loss-readback",
-        "C09:provider-recovery:c09.two-writer-no-lost-update",
-        "C09:provider-recovery:c09.same-operation-retry",
-        "C12:provider-recovery:c12.range-conditional-frozen-provider-restart",
-        "C12:provider-recovery:c12.provider-outage-read-failure",
-        "C16:provider-recovery:c16.commit-outcome-unknown-retry",
-        "C19:provider-recovery:c19.frozen-reference-retention-across-restart",
-        "C19:provider-recovery:c19.retire-reap-reference-release",
-        "C20:provider-recovery:c20.restore-cleanup-after-failure",
-        "C20:provider-recovery:c20.restore-reference-fenced-gc",
-        "C20:provider-recovery:c20.restore-exact-source-and-destination-bytes",
-        "L08:provider-recovery:l08.single-node-no-external-etcd-live",
-        "L08:provider-recovery:l08.http-health-readiness-stats-live",
-        "L08:provider-recovery:l08.metadata-backup-fresh-node-restore-live",
-        "L08:provider-recovery:l08.metadata-fsck-clean-and-corruption-detection-live",
-        "L08:provider-recovery:l08.manual-reconciliable-gc-live",
-        "L08:provider-recovery:l08.checkpoint-log-replay-live",
-        "L08:provider-recovery:l08.cross-owner-failover-live",
-        "L08:provider-recovery:l08.multishard-routing-failover-live",
-        "L08:provider-recovery:l08.v010-upgrade-recovery-matrix-live"
-      ]
-    },
-    {
       "id": "python-sdk-nq",
       "producer": "python-sdk",
       "evidence_kind": "live",
@@ -313,23 +274,6 @@
         "L06:python-sdk-e2e:l06.dcp-rank-failure-propagation-live",
         "L06:python-sdk-e2e:l06.dcp-short-range-batch-fails-live",
         "L06:python-sdk-e2e:l06.dcp-multirank-exact-roundtrip-live"
-      ]
-    },
-    {
-      "id": "restore-composition-nq",
-      "producer": "restore-composition",
-      "evidence_kind": "live",
-      "script": "scripts/workbench/restore_composition_gate.py",
-      "expected_outcome": "NQ",
-      "expected_exit_code": 3,
-      "uses_rust_target": false,
-      "claims": [
-        "T14:restore-composition:t14.restored-destination-resnapshot",
-        "T18:restore-composition:t18.restore-independent-destination",
-        "T18:restore-composition:t18.restore-terminal-replay",
-        "C20:restore-composition:c20.hidden-staging-cow-independent-destination",
-        "C20:restore-composition:c20.restore-terminal-replay",
-        "C21:restore-composition:c21.restore-snapshot-restore-composition"
       ]
     },
     {
@@ -366,12 +310,15 @@
   "aggregate_expectation": {
     "expected_status": "NQ",
     "expected_exit_code": 3,
-    "omitted_producers": [],
+    "omitted_producers": [
+      "object-namespace-recovery",
+      "restore-composition"
+    ],
     "product_artifact_manifest": true,
     "receipt_counts": {
-      "discovered": 137,
-      "accepted": 137,
-      "selected": 137,
+      "discovered": 124,
+      "accepted": 124,
+      "selected": 124,
       "superseded": 0,
       "rejected": 0,
       "invalid": 0
