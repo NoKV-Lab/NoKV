@@ -91,6 +91,43 @@ struct BootstrapLeaseKeepalive {
     worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+/// Unwind sentinel for the keepalive worker: a panic anywhere in the renewal
+/// loop records a typed cause and fail-closes the owner scope, exactly like a
+/// typed renewal failure. Without it a panicked worker dies silently and the
+/// owner keeps serving on a lease nobody renews.
+struct KeepalivePanicFailClose {
+    failure: Arc<std::sync::Mutex<Option<nokv_control::ControlError>>>,
+    registry: Arc<RootOwnerRegistry>,
+    shard: LogicalShardIdentity,
+}
+
+impl Drop for KeepalivePanicFailClose {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+
+        let error = nokv_control::ControlError::Backend(
+            "bootstrap owner keepalive worker panicked; owner scope fail-closed".to_owned(),
+        );
+
+        // Recover a poisoned failure slot: the typed cause must land even when
+        // the panic interrupted a failure-recording critical section.
+        let mut failure = match self.failure.lock() {
+            Ok(failure) => failure,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if failure.is_none() {
+            *failure = Some(error.clone());
+        }
+        drop(failure);
+
+        let _ = self
+            .registry
+            .fail_closed_shard_with_control(self.shard, error);
+    }
+}
+
 impl BootstrapLeaseKeepalive {
     fn start(
         control: Arc<dyn ControlStore>,
@@ -116,27 +153,41 @@ impl BootstrapLeaseKeepalive {
                 Some(
                     std::thread::Builder::new()
                         .name("nokv-bootstrap-owner-keepalive".to_owned())
-                        .spawn(move || loop {
-                            std::thread::park_timeout(interval);
+                        .spawn(move || {
+                            // An unwinding worker is as terminal as a typed
+                            // renewal failure: publish a typed cause and
+                            // fail-close the owner scope before the thread
+                            // dies, so routing never outlives a dead guard.
+                            let panic_guard = KeepalivePanicFailClose {
+                                failure: Arc::clone(&worker_failure),
+                                registry: Arc::clone(&registry),
+                                shard: LogicalShardIdentity::from(lease.logical_shard_id),
+                            };
 
-                            if worker_stop.load(std::sync::atomic::Ordering::Acquire) {
-                                break;
-                            }
+                            loop {
+                                std::thread::park_timeout(interval);
 
-                            if let Err(error) = control.renew_owner(&lease) {
-                                if let Ok(mut failure) = worker_failure.lock() {
-                                    *failure = Some(error.clone());
+                                if worker_stop.load(std::sync::atomic::Ordering::Acquire) {
+                                    break;
                                 }
 
-                                // Make terminal lease loss visible to every
-                                // owner-scoped RPC and lifecycle worker.
-                                let _ = registry.fail_closed_shard_with_control(
-                                    LogicalShardIdentity::from(lease.logical_shard_id),
-                                    error.clone(),
-                                );
+                                if let Err(error) = control.renew_owner(&lease) {
+                                    if let Ok(mut failure) = worker_failure.lock() {
+                                        *failure = Some(error.clone());
+                                    }
 
-                                break;
+                                    // Make terminal lease loss visible to every
+                                    // owner-scoped RPC and lifecycle worker.
+                                    let _ = registry.fail_closed_shard_with_control(
+                                        LogicalShardIdentity::from(lease.logical_shard_id),
+                                        error.clone(),
+                                    );
+
+                                    break;
+                                }
                             }
+
+                            drop(panic_guard);
                         })
                         .map_err(ServerError::Connection)?,
                 )
@@ -157,10 +208,29 @@ impl BootstrapLeaseKeepalive {
             )
         })?;
 
-        match failure.as_ref() {
-            None => Ok(()),
-            Some(error) => Err(ServerError::Control(error.clone())),
+        if let Some(error) = failure.as_ref() {
+            return Err(ServerError::Control(error.clone()));
         }
+        drop(failure);
+
+        // Belt and suspenders behind the unwind sentinel: a worker that exited
+        // without a stop request and without recording a cause is a dead guard,
+        // never a healthy one.
+        let worker = self.worker.lock().map_err(|_| {
+            ServerError::InvalidBootstrap(
+                "bootstrap owner keepalive worker lock was poisoned".to_owned(),
+            )
+        })?;
+        if let Some(handle) = worker.as_ref() {
+            if handle.is_finished() && !self.stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(ServerError::InvalidBootstrap(
+                    "bootstrap owner keepalive worker exited without recording a failure"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     fn stop(&self) -> Result<(), ServerError> {
@@ -297,16 +367,12 @@ impl ShardOwner {
                         .err(),
                 };
 
-                if cleanup.is_none() || typed_control {
-                    Err(primary)
-                } else {
-                    Err(ServerError::BootstrapRollback {
+                match cleanup {
+                    Some(cleanup) if !typed_control => Err(ServerError::BootstrapRollback {
                         primary: primary.to_string(),
-                        rollback: format!(
-                            "fail-close lease-lost logical shard: {}",
-                            cleanup.expect("checked as present"),
-                        ),
-                    })
+                        rollback: format!("fail-close lease-lost logical shard: {cleanup}"),
+                    }),
+                    _ => Err(primary),
                 }
             }
         }
@@ -1529,6 +1595,7 @@ mod tests {
         delay_active: AtomicBool,
         renewals_during_delay: AtomicUsize,
         fail_renewals: AtomicBool,
+        panic_one_renewal: AtomicBool,
     }
 
     impl BootstrapLeaseProbe {
@@ -1541,6 +1608,7 @@ mod tests {
                 delay_active: AtomicBool::new(false),
                 renewals_during_delay: AtomicUsize::new(0),
                 fail_renewals: AtomicBool::new(false),
+                panic_one_renewal: AtomicBool::new(false),
             }
         }
 
@@ -1552,6 +1620,9 @@ mod tests {
         }
 
         fn note_renewal(&self, lease: &LogicalShardLease) -> Result<(), ControlError> {
+            if self.panic_one_renewal.swap(false, Ordering::SeqCst) {
+                panic!("injected keepalive worker panic");
+            }
             if self.fail_renewals.load(Ordering::SeqCst) {
                 return Err(ControlError::StaleLease(lease.clone()));
             }
@@ -4307,6 +4378,75 @@ mod tests {
         assert_eq!(handoff.lease_id, lease.lease_id);
 
         successor.release().unwrap();
+    }
+
+    #[test]
+    fn keepalive_worker_panic_fail_closes_owner_scope_and_fails_bootstrap() {
+        // A worker that PANICS (instead of returning a typed error) must be
+        // just as terminal as a typed renewal failure: the owner-loss signal
+        // trips with a typed cause and bootstrap refuses to hand out an
+        // unguarded owner.
+        let probe = Arc::new(BootstrapLeaseProbe::new(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Duration::from_millis(25),
+        ));
+
+        let SuccessorProbeFixture {
+            _temporary,
+            control: _,
+            registry,
+            delayed_control,
+            boot,
+            first_epoch: _,
+        } = successor_probe_fixture(Arc::clone(&probe));
+
+        let owner_loss = registry.owner_loss_signal();
+        let hook_probe = Arc::clone(&probe);
+        let hook_owner_loss = owner_loss.clone();
+
+        install_after_owner_admission_test_hook(move || {
+            hook_probe.panic_one_renewal.store(true, Ordering::SeqCst);
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !hook_owner_loss.is_lost() {
+                assert!(
+                    Instant::now() < deadline,
+                    "worker panic was not published to the owner-loss signal"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            match hook_owner_loss.control_error() {
+                Some(ControlError::Backend(message)) => {
+                    assert!(
+                        message.contains("panicked"),
+                        "owner-loss cause does not name the panic: {message}"
+                    );
+                }
+                other => panic!("worker panic lost its typed cause: {other:?}"),
+            }
+        });
+
+        let error = match bootstrap_shard(delayed_control, Arc::clone(&registry), boot) {
+            Ok(owner) => {
+                let _ = owner.release();
+                panic!("bootstrap unexpectedly succeeded after a worker panic");
+            }
+            Err(error) => error,
+        };
+
+        match error {
+            ServerError::Control(ControlError::Backend(message)) => {
+                assert!(
+                    message.contains("panicked"),
+                    "bootstrap error does not name the panic: {message}"
+                );
+            }
+            other => panic!("worker panic was not surfaced as a typed control loss: {other:?}"),
+        }
+
+        assert!(owner_loss.is_lost());
     }
 
     #[test]
