@@ -2,7 +2,7 @@ use std::fmt;
 
 use nokv_types::{
     CommandDigest, CommitVersion, LogicalShardId, ObjectNamespaceId, PlacementGeneration,
-    RootActivationState,
+    RootActivationState, SHA256_BYTES,
 };
 
 /// Initial value format for every durable workspace record.
@@ -42,9 +42,19 @@ pub struct HistoryValue {
 pub struct CommandDedupeRecord {
     pub command_digest: CommandDigest,
     pub commit_version: CommitVersion,
-    /// Recovery outbox position committed atomically with this result.
-    pub recovery_lsn: u64,
+    /// Local recovery evidence committed atomically with this result.
+    ///
+    /// Shared and replicated authorities store `None` because their atomic
+    /// transaction store is itself the successor recovery authority.
+    pub recovery_receipt: Option<LocalRecoveryReceipt>,
     pub deterministic_result: Vec<u8>,
+}
+
+/// Exact local recovery position bound to one metadata command result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalRecoveryReceipt {
+    pub recovery_lsn: u64,
+    pub chain_digest: [u8; SHA256_BYTES],
 }
 
 /// Strict durable-record decode or encode failure.
@@ -315,28 +325,49 @@ impl HistoryValue {
 
 impl CommandDedupeRecord {
     pub fn encode(&self) -> Result<Vec<u8>, RecordCodecError> {
-        const COMMAND_DEDUPE_VALUE_FORMAT_VERSION: u8 = 2;
-        if self.recovery_lsn == 0 {
+        const COMMAND_DEDUPE_VALUE_FORMAT_VERSION: u8 = 3;
+        if matches!(
+            self.recovery_receipt,
+            Some(LocalRecoveryReceipt {
+                recovery_lsn: 0,
+                ..
+            })
+        ) {
             return Err(RecordCodecError::ZeroScalar {
                 field: "recovery_lsn",
             });
         }
         let result_length =
             checked_u32_length("deterministic_result", self.deterministic_result.len())?;
+        let receipt_bytes = self
+            .recovery_receipt
+            .map_or(0, |_| std::mem::size_of::<u64>() + SHA256_BYTES);
         let mut encoded = Vec::with_capacity(
-            1 + CommandDigest::BYTE_WIDTH + 8 + 8 + 4 + self.deterministic_result.len(),
+            1 + CommandDigest::BYTE_WIDTH
+                + 8
+                + 1
+                + receipt_bytes
+                + 4
+                + self.deterministic_result.len(),
         );
         encoded.push(COMMAND_DEDUPE_VALUE_FORMAT_VERSION);
         encoded.extend_from_slice(self.command_digest.as_bytes());
         encoded.extend_from_slice(&self.commit_version.get().to_be_bytes());
-        encoded.extend_from_slice(&self.recovery_lsn.to_be_bytes());
+        match self.recovery_receipt {
+            None => encoded.push(0),
+            Some(receipt) => {
+                encoded.push(1);
+                encoded.extend_from_slice(&receipt.recovery_lsn.to_be_bytes());
+                encoded.extend_from_slice(&receipt.chain_digest);
+            }
+        }
         encoded.extend_from_slice(&result_length.to_be_bytes());
         encoded.extend_from_slice(&self.deterministic_result);
         Ok(encoded)
     }
 
     pub fn decode(encoded: &[u8]) -> Result<Self, RecordCodecError> {
-        const COMMAND_DEDUPE_VALUE_FORMAT_VERSION: u8 = 2;
+        const COMMAND_DEDUPE_VALUE_FORMAT_VERSION: u8 = 3;
         let mut decoder = Decoder::new(encoded);
         let actual = decoder.u8("value_format_version")?;
         if actual != COMMAND_DEDUPE_VALUE_FORMAT_VERSION {
@@ -347,18 +378,33 @@ impl CommandDedupeRecord {
         }
         let command_digest = CommandDigest::from_bytes(decoder.fixed("command_digest")?);
         let commit_version = decoder.commit_version("commit_version")?;
-        let recovery_lsn = decoder.u64("recovery_lsn")?;
-        if recovery_lsn == 0 {
-            return Err(RecordCodecError::ZeroScalar {
-                field: "recovery_lsn",
-            });
-        }
+        let recovery_receipt = match decoder.u8("recovery_receipt tag")? {
+            0 => None,
+            1 => {
+                let recovery_lsn = decoder.u64("recovery_lsn")?;
+                if recovery_lsn == 0 {
+                    return Err(RecordCodecError::ZeroScalar {
+                        field: "recovery_lsn",
+                    });
+                }
+                Some(LocalRecoveryReceipt {
+                    recovery_lsn,
+                    chain_digest: decoder.fixed("recovery_chain_digest")?,
+                })
+            }
+            value => {
+                return Err(RecordCodecError::InvalidOptionalTag {
+                    field: "recovery_receipt",
+                    value,
+                })
+            }
+        };
         let deterministic_result = decoder.length_prefixed_bytes("deterministic_result")?;
         decoder.finish()?;
         Ok(Self {
             command_digest,
             commit_version,
-            recovery_lsn,
+            recovery_receipt,
             deterministic_result,
         })
     }
@@ -581,16 +627,45 @@ mod tests {
         let record = CommandDedupeRecord {
             command_digest: CommandDigest::from_bytes([0xaa; 32]),
             commit_version: commit_version(11),
-            recovery_lsn: 17,
+            recovery_receipt: Some(LocalRecoveryReceipt {
+                recovery_lsn: 17,
+                chain_digest: [0xbb; SHA256_BYTES],
+            }),
             deterministic_result: b"ok".to_vec(),
         };
         let expected = [
-            &[2][..],
+            &[3][..],
             &[0xaa; 32],
             &11_u64.to_be_bytes(),
+            &[1],
             &17_u64.to_be_bytes(),
+            &[0xbb; SHA256_BYTES],
             &2_u32.to_be_bytes(),
             b"ok",
+        ]
+        .concat();
+
+        assert_eq!(record.encode().unwrap(), expected);
+        assert_eq!(CommandDedupeRecord::decode(&expected).unwrap(), record);
+        assert_every_proper_prefix_is_truncated(&expected, CommandDedupeRecord::decode);
+        assert_trailing_byte_is_rejected(expected, CommandDedupeRecord::decode);
+    }
+
+    #[test]
+    fn command_dedupe_codec_freezes_shared_authority_without_a_local_receipt() {
+        let record = CommandDedupeRecord {
+            command_digest: CommandDigest::from_bytes([0xcc; 32]),
+            commit_version: commit_version(12),
+            recovery_receipt: None,
+            deterministic_result: b"shared".to_vec(),
+        };
+        let expected = [
+            &[3][..],
+            &[0xcc; 32],
+            &12_u64.to_be_bytes(),
+            &[0],
+            &6_u32.to_be_bytes(),
+            b"shared",
         ]
         .concat();
 
@@ -622,7 +697,10 @@ mod tests {
         let dedupe = CommandDedupeRecord {
             command_digest: CommandDigest::from_bytes([2; 32]),
             commit_version: commit_version(1),
-            recovery_lsn: 1,
+            recovery_receipt: Some(LocalRecoveryReceipt {
+                recovery_lsn: 1,
+                chain_digest: [3; SHA256_BYTES],
+            }),
             deterministic_result: Vec::new(),
         };
 
@@ -636,7 +714,7 @@ mod tests {
         for value in &mut values[1..] {
             value[0] = VALUE_FORMAT_VERSION + 1;
         }
-        values[3][0] = 3;
+        values[3][0] = 4;
         assert!(matches!(
             RootFence::decode(&values[0]),
             Err(RecordCodecError::UnsupportedValueVersion { .. })
@@ -655,12 +733,12 @@ mod tests {
         ));
 
         let mut legacy_dedupe = dedupe.encode().unwrap();
-        legacy_dedupe[0] = 1;
+        legacy_dedupe[0] = 2;
         assert_eq!(
             CommandDedupeRecord::decode(&legacy_dedupe),
             Err(RecordCodecError::UnsupportedValueVersion {
-                actual: 1,
-                expected: 2,
+                actual: 2,
+                expected: 3,
             })
         );
     }
@@ -707,6 +785,56 @@ mod tests {
             Err(RecordCodecError::InvalidOptionalTag {
                 field: "previous_payload",
                 value: 2,
+            })
+        );
+
+        let dedupe = CommandDedupeRecord {
+            command_digest: CommandDigest::from_bytes([2; 32]),
+            commit_version: commit_version(1),
+            recovery_receipt: None,
+            deterministic_result: Vec::new(),
+        };
+        let mut invalid_receipt_tag = dedupe.encode().unwrap();
+        invalid_receipt_tag[1 + CommandDigest::BYTE_WIDTH + 8] = 2;
+        assert_eq!(
+            CommandDedupeRecord::decode(&invalid_receipt_tag),
+            Err(RecordCodecError::InvalidOptionalTag {
+                field: "recovery_receipt",
+                value: 2,
+            })
+        );
+
+        let zero_receipt = CommandDedupeRecord {
+            command_digest: CommandDigest::from_bytes([2; 32]),
+            commit_version: commit_version(1),
+            recovery_receipt: Some(LocalRecoveryReceipt {
+                recovery_lsn: 0,
+                chain_digest: [3; SHA256_BYTES],
+            }),
+            deterministic_result: Vec::new(),
+        };
+        assert_eq!(
+            zero_receipt.encode(),
+            Err(RecordCodecError::ZeroScalar {
+                field: "recovery_lsn",
+            })
+        );
+
+        let mut zero_receipt_bytes = CommandDedupeRecord {
+            recovery_receipt: Some(LocalRecoveryReceipt {
+                recovery_lsn: 1,
+                chain_digest: [3; SHA256_BYTES],
+            }),
+            ..dedupe
+        }
+        .encode()
+        .unwrap();
+        let recovery_lsn_offset = 1 + CommandDigest::BYTE_WIDTH + 8 + 1;
+        zero_receipt_bytes[recovery_lsn_offset..recovery_lsn_offset + 8].fill(0);
+        assert_eq!(
+            CommandDedupeRecord::decode(&zero_receipt_bytes),
+            Err(RecordCodecError::ZeroScalar {
+                field: "recovery_lsn",
             })
         );
 

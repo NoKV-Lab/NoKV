@@ -925,7 +925,13 @@ mod tests {
             .unwrap()
             .unwrap();
         store
-            .replace_recovery_header_for_test(dedupe.recovery_lsn, None)
+            .replace_recovery_header_for_test(
+                dedupe
+                    .recovery_receipt
+                    .expect("local dedupe must carry a recovery receipt")
+                    .recovery_lsn,
+                None,
+            )
             .unwrap();
 
         assert!(matches!(

@@ -298,12 +298,15 @@ mechanisms remain adapter details.
 
 ## Receipt Boundary
 
-`TxnStore` does not define a second provider receipt format. A successful
+`TxnStore` does not define a second provider receipt format. Every successful
 workspace command writes its `CommandDedupe` result, domain commit clock,
-history, events, and `RecoveryOutbox` material in the same `WriteTxn` as the
-authoritative mutation. That checked domain record is the replay and
-reconciliation receipt. `Commit::Applied` states only that the physical store
-reached its advertised acknowledgement boundary.
+history, and events in the same `WriteTxn` as the authoritative mutation.
+`RecoveryMode::LocalJournal` also writes the typed local receipt and
+`RecoveryOutbox` material in that transaction. `RecoveryMode::StoreAuthority`
+writes neither local artifact; the checked dedupe row in the shared or
+replicated transaction store is the replay and reconciliation receipt.
+`Commit::Applied` states only that the physical store reached its advertised
+acknowledgement boundary.
 
 An adapter can keep a physical transaction or log identifier for diagnostics
 and recovery, but it cannot expose that identifier as a NoKV receipt or
@@ -413,8 +416,8 @@ create/reopen/replace/remove for both a short path with a 61,203-byte typed
 projection and a maximum-length path with 64 dependencies and a 57,243-byte
 projection. A separate successful replacement changes all 60 index fields at
 once: the before/after event is 61,323 bytes and the fully derived transaction
-is 9,859,091 bytes. The short-path replace-to-empty and remove transactions are
-also pinned at 11,797,794 and 11,791,459 bytes. These are characterized storage
+is 9,859,124 bytes. The short-path replace-to-empty and remove transactions are
+also pinned at 11,797,827 and 11,791,492 bytes. These are characterized storage
 and metadata-engine compatibility results, not a universal domain-size proof.
 The local-WAL server qualifies restart of the same exclusive namespace with an
 empty shared recovery frontier. It does not qualify rolling upgrade onto
@@ -631,7 +634,6 @@ serialization without combining that work with the interface cutover.
 FoundationDB production work must address:
 
 - a root-scoped logical commit clock
-- removal of local recovery-chain writes from its hot commit path
 - physical affected-byte sizing and representative transaction qualification
 - bounded publication and secondary-index maintenance for states whose fully
   derived transaction is larger than FoundationDB's hard budget

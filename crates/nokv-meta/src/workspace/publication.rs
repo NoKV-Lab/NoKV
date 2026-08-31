@@ -6731,7 +6731,7 @@ mod tests {
         assert_eq!(replaced.result.path_generation, Generation::new(2).unwrap());
         let replace_bytes =
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
-        assert_eq!(replace_bytes, 11_799_434);
+        assert_eq!(replace_bytes, 11_799_467);
 
         let removed = remove_path(
             &store,
@@ -6755,7 +6755,7 @@ mod tests {
         assert_eq!(removed.removed_artifact_revision_id, revision(216));
         let remove_bytes =
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
-        assert_eq!(remove_bytes, 11_793_075);
+        assert_eq!(remove_bytes, 11_793_108);
     }
 
     #[test]
@@ -6910,7 +6910,7 @@ mod tests {
 
         assert_eq!(
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes),
-            9_860_707
+            9_860_740
         );
     }
 

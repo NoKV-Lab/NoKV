@@ -84,9 +84,9 @@ fallback, or provider conversion tool.
   deployment security boundary as the existing NoKV RPC endpoint.
 - No FUSE, POSIX, inode, dentry, or generic filesystem behavior.
 
-## Current Baseline And Required Break
+## Baseline At Design Approval And Required Break
 
-The current tree has these relevant properties:
+The tree captured when this design was approved had these relevant properties:
 
 - `nokv` enables etcd by default and exposes static or etcd routing.
 - `nokv-control` contains a provider-neutral control contract plus an etcd
@@ -519,7 +519,7 @@ Format 11 replaces the mandatory local recovery binding in the dedupe record
 with a provider-neutral optional receipt:
 
 ```text
-DedupeRecordV2 {
+CommandDedupeRecordV3 {
     request_id,
     command_digest,
     result,

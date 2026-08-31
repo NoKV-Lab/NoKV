@@ -188,7 +188,10 @@ pub use query_records::{
 };
 #[cfg(feature = "metadata-read-stats")]
 pub use read_stats::{MetadataReadStats, MetadataReadStatsSessionError};
-pub use records::{CommandDedupeRecord, CurrentValue, HistoryValue, RecordCodecError, RootFence};
+pub use records::{
+    CommandDedupeRecord, CurrentValue, HistoryValue, LocalRecoveryReceipt, RecordCodecError,
+    RootFence,
+};
 pub use recovery::{
     RecoveryCodecError, RecoveryMutationV1, RecoveryOutboxRecord, RecoveryOutboxSegment,
     RecoveryResultV1, RecoveryState, MAX_RECOVERY_SEGMENT_BYTES, MAX_RECOVERY_SEGMENT_RECORDS,

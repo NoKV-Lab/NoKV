@@ -19,15 +19,16 @@ Every logical-shard store has one authoritative marker:
 System("schema")
   -> value_format_version = 1
      schema_id = "nokv_workspace"
-     format_version = 10
+     format_version = 11
 ```
 
 Startup is fail-closed:
 
 - an empty store is initialized with the exact supported marker and logical
   keyspace catalog;
-- format-9 and older stores are rejected without writes; there is no marker-only
-  upgrade because format 10 adds authoritative Generic index families;
+- format-10 and older stores are rejected without writes; there is no
+  marker-only upgrade because format 11 changes command-dedupe recovery
+  authority and its durable codec;
 - a nonempty current store opens only when its marker, value format, and
   configured adapter catalog match this contract;
 - a missing, malformed, unknown-version, or inconsistent store is rejected.
@@ -105,26 +106,32 @@ float, timestamp, bytes, and string values.
 
 ## Durable Format Registry
 
-`System.format_version` is `10`. Version 10 retains the format-9 RecoveryOutbox
-LSN encoding as
-canonical fixed-width decimal keys. Numeric ordering is unchanged, while the
-sequential key shape avoids pathological underfilled Holt frames. Logical
-recovery records, deterministic results, and hash-chain bytes are unchanged.
+`System.format_version` is `11`. Version 11 retains the format-10 keyspace
+catalog and fixed-width decimal RecoveryOutbox LSN keys. It changes
+`CommandDedupe` so one result contains an optional typed local recovery
+receipt. `RecoveryMode::LocalJournal` writes that receipt and the hash-chained
+RecoveryOutbox in the same transaction. `RecoveryMode::StoreAuthority` writes
+neither; its atomic dedupe result in the shared or replicated store is the
+recovery evidence. The system recovery tail remains at LSN zero and the
+logical-shard genesis digest in store-authority mode, and RecoveryOutbox must
+remain empty.
 
-Ordinary open does not migrate a format-9 marker, even when its old catalog is
-otherwise internally consistent. Format 9 lacks the three authoritative
-Generic index families, so marker-only upgrade would advertise records and
-lifecycle invariants that were never installed. Migration remains not
-qualified; every older or unknown marker is fail-closed and unchanged.
+Ordinary open does not migrate a format-10 marker, even when its catalog is
+otherwise internally consistent. Format 10 requires a local recovery LSN in
+every command dedupe record and cannot be reinterpreted as shared-authority
+evidence. Migration remains not qualified; every older or unknown marker is
+fail-closed and unchanged.
 
 Durable codecs are independently versioned:
 publication-owned workspace/path/revision records use value version `2`;
 `CommitRecord` uses version `3` and dual-decodes version `2`, while its member,
-consumer, head, and tag records remain version `2`; `ChangeEvent` and the
-logical recovery-outbox record use value version `2`; other ordinary workspace
+consumer, head, and tag records remain version `2`; `ChangeEvent` uses value
+version `2`, and the logical recovery-outbox record uses version `3` with
+strict legacy-version-2 decoding; other ordinary workspace
 records and the recovery storage header/chunk records currently use value
-version `1`; `CommandDedupe` uses version `2` to bind its exact result to a
-recovery LSN. `BuildCommitOperation` and `CommitRetireOperation` use version `6`
+version `1`; `CommandDedupe` uses version `3` to bind its exact result to an
+optional local recovery receipt. `BuildCommitOperation` and
+`CommitRetireOperation` use version `6`
 and dual-decode version `5`; the build record retains the complete exact commit
 request, opaque Agent projection-input digest, first owner-observed commit time,
 run-manifest publication condition, immutable staged-manifest binding, and the
@@ -181,9 +188,10 @@ System keyspaces use IDs `0x0101` through `0x0106`. Domain keyspaces use
 `0x0200 | format_tag`. The `MetadataFamily` format tags remain one byte and keep
 their existing recovery and history encoding. Reserved format tags do not name
 caller-mutable metadata families. Tags `0x10`, `0x14`, and `0x18` are
-permanently reserved and cannot be reassigned. `MetaShard` appends
-`recovery_outbox` rows in
-the same transaction as each authoritative mutation.
+permanently reserved and cannot be reassigned. Under a local-journal store
+profile, `MetaShard` appends `recovery_outbox` rows in the same transaction as
+each authoritative mutation. A store-authority profile never writes this
+keyspace.
 
 Initial durable enum discriminants:
 
@@ -436,7 +444,8 @@ StagedObject
 
 CommandDedupe
   key: root_id | request_id
-  val: command digest, deterministic result, commit_version, recovery_lsn
+  val: command digest, deterministic result, commit_version,
+       optional local recovery LSN and chain digest
 
 GcCandidate
   key: root_id | artifact_revision_id | reference_epoch
