@@ -12,6 +12,7 @@
 mod bootstrap;
 mod error;
 mod executor;
+mod holt_runtime;
 mod legacy_rejection;
 mod lifecycle;
 mod metadata_url;
@@ -32,9 +33,13 @@ pub use executor::{
     RestoreInitializationBarrierPhase, RestoreManifestBindingEvidence,
     RestoreManifestPublicationEvidence,
 };
+pub use holt_runtime::{
+    format_holt, provision_holt, serve_holt, HoltFormatOutcome, HoltFormatState,
+    HoltProvisionOutcome, HoltRootCatalogEntry, HoltServingRuntime,
+};
 pub use lifecycle::{
-    ArtifactLifecycleDeleter, LifecycleAbsenceProof, LifecycleCycleReport,
-    LifecycleDeleteDisposition, LifecycleDeleteError, LifecycleDeletePurpose,
+    ArtifactLifecycleDeleter, CommittedMetadataDurability, LifecycleAbsenceProof,
+    LifecycleCycleReport, LifecycleDeleteDisposition, LifecycleDeleteError, LifecycleDeletePurpose,
     LifecycleDeleteRequest, LifecycleDurabilityBarrier, LifecycleError, LifecycleObjectDeleter,
     LifecycleRunner, LifecycleRunnerOptions,
 };

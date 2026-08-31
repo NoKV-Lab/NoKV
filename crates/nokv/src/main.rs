@@ -17,7 +17,6 @@ mod workbench_mcp;
 use std::io::{self, BufReader};
 use std::path::Path;
 use std::process::ExitCode;
-#[cfg(feature = "etcd")]
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD;
@@ -32,7 +31,6 @@ use serde_json::{json, Value};
 
 use backend::CliWorkbenchBackend;
 use cli::{Command, Invocation, McpProfile, WorkspacePathCommand};
-#[cfg(feature = "etcd")]
 use object_store::CliObjectStore;
 
 type CliHandler = SdkWorkbenchToolHandler<CliWorkbenchBackend>;
@@ -77,6 +75,7 @@ fn run() -> Result<(), String> {
         }
         Command::Schema => print_schema(),
         Command::Version { json } => print_version(*json),
+        Command::Format => run_format(&invocation),
         Command::Provision {
             logical_shard_id,
             adopt_legacy_object_namespace,
@@ -591,8 +590,9 @@ USAGE:
   nokv [connection/object options] collect <workbench> <section> <source> <path> [--replace] [--expected-generation N] [--content-type TYPE]
   nokv [route/agent options] workspace-path rename <workbench> <section> <source> <destination> --expected-generation N --request-id HEX32
   nokv [route/agent options] workspace-path remove <workbench> <section> <path> --expected-generation N --request-id HEX32
-  nokv --root-id HEX32 --agent-id HEX32 --etcd-endpoint URL provision <logical-shard-id-hex32> [adoption options]
-  nokv [owner options] serve
+  nokv format --meta-url holt:///absolute/path
+  nokv --root-id HEX32 --agent-id HEX32 provision --meta-url holt:///absolute/path
+  nokv [owner options] serve --meta-url holt:///absolute/path
   nokv schema
   nokv version [--json]
   nokv --version
@@ -620,6 +620,8 @@ AGENT PRESENTATION:
   workspace-path requires an explicit lowercase HEX32 request id for exact cross-process replay
 
 OWNER:
+  --meta-url holt:///absolute/path selects one exclusive standalone Holt store
+  format creates format 11 explicitly; provision and serve only reopen that exact store
   provision first binds RootId to an explicit AgentId, then creates namespace, shard, and affinity
   --adopt-legacy-agent-binding is a one-time explicit migration for a verified legacy root
   --adopt-legacy-object-namespace is a one-time explicit migration after verifying bucket/prefix
@@ -657,8 +659,114 @@ fn connect_control(
     ))
 }
 
-#[cfg(feature = "etcd")]
+fn configured_metadata_url(
+    invocation: &Invocation,
+) -> Result<Option<nokv_server::MetadataUrl>, String> {
+    invocation
+        .server
+        .metadata_url
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|error: nokv_server::MetadataUrlError| error.to_string())
+}
+
+fn run_format(invocation: &Invocation) -> Result<(), String> {
+    let metadata = configured_metadata_url(invocation)?
+        .ok_or_else(|| "format requires --meta-url".to_owned())?;
+    match metadata {
+        nokv_server::MetadataUrl::Holt(url) => {
+            let outcome = nokv_server::format_holt(&url, build_info::VERSION)
+                .map_err(|error| error.to_string())?;
+            print_json(&json!({
+                "status": "success",
+                "operation": "format",
+                "provider": "holt",
+                "created": outcome.state == nokv_server::HoltFormatState::Created,
+                "store_id": encode_lowercase_hex(outcome.manifest.store_id().as_bytes()),
+                "logical_shard_id": encode_lowercase_hex(outcome.logical_shard_id.as_bytes()),
+                "workspace_format_version": outcome.manifest.workspace_format_version(),
+                "physical_encoding_version": outcome.manifest.physical_encoding_version(),
+            }))
+        }
+        nokv_server::MetadataUrl::FoundationDb(_) => Err(
+            "this binary has no FoundationDB runtime composition; use the feature-enabled nokv-fdb binary"
+                .to_owned(),
+        ),
+    }
+}
+
 fn run_provision(
+    invocation: &Invocation,
+    logical_shard_id: &Option<String>,
+    adopt_legacy_object_namespace: bool,
+    adopt_legacy_agent_binding: bool,
+) -> Result<(), String> {
+    if let Some(metadata) = configured_metadata_url(invocation)? {
+        if logical_shard_id.is_some() || adopt_legacy_object_namespace || adopt_legacy_agent_binding
+        {
+            return Err(
+                "metadata-URL provisioning allocates provider identities and does not accept legacy shard or adoption arguments"
+                    .to_owned(),
+            );
+        }
+        return run_metadata_provision(invocation, metadata);
+    }
+    let logical_shard_id = logical_shard_id
+        .as_deref()
+        .ok_or_else(|| "legacy etcd provision requires a logical shard id".to_owned())?;
+    run_etcd_provision(
+        invocation,
+        logical_shard_id,
+        adopt_legacy_object_namespace,
+        adopt_legacy_agent_binding,
+    )
+}
+
+fn run_metadata_provision(
+    invocation: &Invocation,
+    metadata: nokv_server::MetadataUrl,
+) -> Result<(), String> {
+    let root_id = nokv_control::RootId::from(
+        connection::configured_root_id(&invocation.client).map_err(|error| error.to_string())?,
+    );
+    let agent_id = connection::parse_agent_id(
+        invocation
+            .agent_id
+            .as_deref()
+            .ok_or_else(|| "provision requires --agent-id".to_owned())?,
+    )
+    .map_err(|error| error.to_string())?;
+    match metadata {
+        nokv_server::MetadataUrl::Holt(url) => {
+            let outcome = nokv_server::provision_holt(&url, root_id, agent_id)
+                .map_err(|error| error.to_string())?;
+            let objects = CliObjectStore::build(&invocation.client.object)?;
+            objects.ensure_namespace(outcome.root.object_namespace_id)?;
+            let objects = objects.bind(outcome.root.object_namespace_id)?;
+            objects.validate_agent_capabilities()?;
+            print_json(&json!({
+                "status": "success",
+                "operation": "provision",
+                "provider": "holt",
+                "preexisting": outcome.preexisting,
+                "root_id": encode_lowercase_hex(outcome.root.root_id.as_bytes()),
+                "agent_id": encode_lowercase_hex(outcome.root.agent_id.as_bytes()),
+                "logical_shard_id": encode_lowercase_hex(outcome.logical_shard_id.as_bytes()),
+                "object_namespace_id": encode_lowercase_hex(outcome.root.object_namespace_id.as_bytes()),
+                "placement_generation": outcome.root.placement_generation.get(),
+                "lifecycle": "ready",
+            }))
+        }
+        nokv_server::MetadataUrl::FoundationDb(_) => Err(
+            "this binary has no FoundationDB runtime composition; use the feature-enabled nokv-fdb binary"
+                .to_owned(),
+        ),
+    }
+}
+
+#[cfg(feature = "etcd")]
+fn run_etcd_provision(
     invocation: &Invocation,
     logical_shard_id: &str,
     adopt_legacy_object_namespace: bool,
@@ -752,7 +860,7 @@ fn run_provision(
 }
 
 #[cfg(not(feature = "etcd"))]
-fn run_provision(
+fn run_etcd_provision(
     _invocation: &Invocation,
     _logical_shard_id: &str,
     _adopt_legacy_object_namespace: bool,
@@ -796,7 +904,6 @@ fn validate_served_root_agent_bindings(
     Ok(())
 }
 
-#[cfg(feature = "etcd")]
 fn join_lifecycle_workers(
     workers: Vec<std::thread::JoinHandle<Result<(), nokv_server::LifecycleError>>>,
     failures: &mut Vec<String>,
@@ -810,9 +917,166 @@ fn join_lifecycle_workers(
     }
 }
 
-#[cfg(feature = "etcd")]
+fn install_shutdown_signal() -> Result<Arc<std::sync::atomic::AtomicBool>, String> {
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for (name, signal) in [
+        ("SIGINT", signal_hook::consts::SIGINT),
+        ("SIGTERM", signal_hook::consts::SIGTERM),
+    ] {
+        signal_hook::flag::register(signal, Arc::clone(&shutdown))
+            .map_err(|error| format!("cannot install {name} shutdown handler: {error}"))?;
+    }
+    Ok(shutdown)
+}
+
 fn run_server(invocation: &Invocation) -> Result<(), String> {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    match configured_metadata_url(invocation)? {
+        Some(nokv_server::MetadataUrl::Holt(url)) => run_holt_server(invocation, &url),
+        Some(nokv_server::MetadataUrl::FoundationDb(_)) => Err(
+            "this binary has no FoundationDB runtime composition; use the feature-enabled nokv-fdb binary"
+                .to_owned(),
+        ),
+        None => run_etcd_server(invocation),
+    }
+}
+
+fn run_holt_server(
+    invocation: &Invocation,
+    metadata: &nokv_server::HoltMetadataUrl,
+) -> Result<(), String> {
+    use std::time::Duration;
+
+    use nokv_protocol::{LogicalShardIdentity, ObjectNamespaceIdentity, RootIdentity, RootRoute};
+    use nokv_server::{
+        ArtifactLifecycleDeleter, CommittedMetadataDurability, LifecycleObjectDeleter,
+        LifecycleRunner, LifecycleRunnerOptions, ServerOptions,
+    };
+
+    if invocation.server.lifecycle_interval_millis == 0
+        || invocation.server.lifecycle_interval_millis > 60_000
+    {
+        return Err("--lifecycle-interval-millis must be within 1..=60000".to_owned());
+    }
+    if invocation.server.handshake_timeout_millis == 0
+        || invocation.server.handshake_timeout_millis > 60_000
+    {
+        return Err("--handshake-timeout-millis must be within 1..=60000".to_owned());
+    }
+    if invocation.server.max_inflight_connections == 0
+        || invocation.server.max_inflight_connections > 4_096
+    {
+        return Err("--max-inflight-connections must be within 1..=4096".to_owned());
+    }
+    let endpoint = invocation
+        .server
+        .advertise_endpoint
+        .as_deref()
+        .ok_or_else(|| "serve requires --advertise-endpoint".to_owned())?
+        .parse::<std::net::SocketAddr>()
+        .map_err(|error| format!("invalid --advertise-endpoint: {error}"))?;
+    let shutdown = install_shutdown_signal()?;
+    let runtime = nokv_server::serve_holt(metadata, endpoint).map_err(|error| error.to_string())?;
+    let namespace = runtime
+        .roots()
+        .first()
+        .expect("serve_holt requires at least one Ready root")
+        .object_namespace_id;
+    if runtime
+        .roots()
+        .iter()
+        .any(|root| root.object_namespace_id != namespace)
+    {
+        return Err("standalone Holt roots do not share one object namespace".to_owned());
+    }
+    let objects = Arc::new(CliObjectStore::build(&invocation.client.object)?.bind(namespace)?);
+    objects.validate_agent_capabilities()?;
+    let server = runtime
+        .workspace_server(ServerOptions {
+            bind: invocation.server.bind,
+            handshake_timeout: Duration::from_millis(invocation.server.handshake_timeout_millis),
+            read_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
+            lease_renew_interval: Duration::from_secs(30),
+            max_inflight_connections: invocation.server.max_inflight_connections,
+        })
+        .map_err(|error| error.to_string())?;
+    let owner_loss = server.owner_loss_signal();
+    let lifecycle_objects: Arc<dyn LifecycleObjectDeleter> =
+        Arc::new(ArtifactLifecycleDeleter::new(objects));
+    let durability = Arc::new(CommittedMetadataDurability);
+    let mut lifecycles = Vec::with_capacity(runtime.roots().len());
+    for root in runtime.roots() {
+        let route = RootRoute {
+            root_id: RootIdentity::from(root.root_id),
+            logical_shard_id: LogicalShardIdentity::from(runtime.logical_shard_id()),
+            object_namespace_id: ObjectNamespaceIdentity::from(root.object_namespace_id),
+            placement_generation: root.placement_generation.get(),
+            owner_epoch: runtime.owner_epoch().get(),
+        };
+        let lifecycle = LifecycleRunner::new(
+            Arc::clone(runtime.meta()),
+            Arc::clone(runtime.registry()),
+            route,
+            owner_loss.clone(),
+            Arc::clone(&lifecycle_objects),
+            durability.clone(),
+            LifecycleRunnerOptions {
+                poll_interval: Duration::from_millis(invocation.server.lifecycle_interval_millis),
+                ..LifecycleRunnerOptions::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        lifecycles.push(lifecycle);
+    }
+    let mut lifecycle_workers = Vec::with_capacity(lifecycles.len());
+    for (index, lifecycle) in lifecycles.into_iter().enumerate() {
+        let worker_owner_loss = owner_loss.clone();
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = std::thread::Builder::new()
+            .name(format!("nokv-holt-lifecycle-{index}"))
+            .spawn(move || {
+                let result = lifecycle.run_until_owner_loss_or_shutdown(worker_shutdown.as_ref());
+                if result.is_err() {
+                    worker_owner_loss.fail_closed();
+                }
+                result
+            });
+        match worker {
+            Ok(worker) => lifecycle_workers.push(worker),
+            Err(error) => {
+                owner_loss.fail_closed();
+                let mut failures = vec![format!("cannot start lifecycle worker: {error}")];
+                join_lifecycle_workers(lifecycle_workers, &mut failures);
+                if let Err(error) = server.release_ownership() {
+                    failures.push(format!("standalone owner release failed: {error}"));
+                }
+                return Err(failures.join("; "));
+            }
+        }
+    }
+
+    let server_result = server.run_until_shutdown(shutdown.as_ref());
+    if server_result.is_err() {
+        owner_loss.fail_closed();
+    }
+    let mut failures = Vec::new();
+    join_lifecycle_workers(lifecycle_workers, &mut failures);
+    if let Err(error) = server.release_ownership() {
+        failures.push(format!("standalone owner release failed: {error}"));
+    }
+    if let Err(error) = server_result {
+        failures.push(format!("RPC server stopped: {error}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+#[cfg(feature = "etcd")]
+fn run_etcd_server(invocation: &Invocation) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use nokv_control::{NodeId, RecoveryPublication, RootId};
@@ -825,18 +1089,6 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     use sha2::{Digest, Sha256};
 
     static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-    fn install_shutdown_signal() -> Result<Arc<AtomicBool>, String> {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        for (name, signal) in [
-            ("SIGINT", signal_hook::consts::SIGINT),
-            ("SIGTERM", signal_hook::consts::SIGTERM),
-        ] {
-            signal_hook::flag::register(signal, Arc::clone(&shutdown))
-                .map_err(|error| format!("cannot install {name} shutdown handler: {error}"))?;
-        }
-        Ok(shutdown)
-    }
 
     fn request_id(domain: &[u8], root: RootId) -> RequestId {
         let mut hasher = Sha256::new();
@@ -1082,7 +1334,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
 }
 
 #[cfg(not(feature = "etcd"))]
-fn run_server(_invocation: &Invocation) -> Result<(), String> {
+fn run_etcd_server(_invocation: &Invocation) -> Result<(), String> {
     Err("serve requires the nokv etcd feature".to_owned())
 }
 

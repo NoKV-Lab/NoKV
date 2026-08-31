@@ -122,6 +122,19 @@ pub trait LifecycleDurabilityBarrier: Send + Sync {
     fn publish_current(&self) -> Result<(), RecoveryPublisherError>;
 }
 
+/// Durability barrier for metadata stores whose commit acknowledgement is the
+/// serving authority. Holt has already synced its local journal, while FDB has
+/// committed to the shared database; neither mode publishes a distributed
+/// recovery outbox from the server process.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CommittedMetadataDurability;
+
+impl LifecycleDurabilityBarrier for CommittedMetadataDurability {
+    fn publish_current(&self) -> Result<(), RecoveryPublisherError> {
+        Ok(())
+    }
+}
+
 impl LifecycleDurabilityBarrier for RecoveryPublisher {
     fn publish_current(&self) -> Result<(), RecoveryPublisherError> {
         RecoveryPublisher::publish_current(self).map(|_| ())

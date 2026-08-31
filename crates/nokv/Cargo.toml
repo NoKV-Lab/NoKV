@@ -11,7 +11,7 @@ homepage.workspace = true
 
 [features]
 default = ["etcd"]
-etcd = ["nokv-client/etcd", "nokv-control/etcd", "nokv-server/etcd", "dep:signal-hook"]
+etcd = ["nokv-client/etcd", "nokv-control/etcd", "nokv-server/etcd"]
 
 [dependencies]
 base64.workspace = true
@@ -24,7 +24,7 @@ nokv-agent.workspace = true
 nokv-workbench-projection.workspace = true
 nokv-types.workspace = true
 sha2.workspace = true
-signal-hook = { workspace = true, optional = true }
+signal-hook.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

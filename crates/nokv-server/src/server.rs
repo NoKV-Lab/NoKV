@@ -193,6 +193,27 @@ impl WorkspaceServer {
         })
     }
 
+    /// Construct a standalone owner whose physical Holt lock is its ownership
+    /// authority. The registry must already contain at least one exact route.
+    pub fn new_local(
+        options: ServerOptions,
+        registry: Arc<RootOwnerRegistry>,
+    ) -> Result<Self, ServerError> {
+        options.validate()?;
+        if registry.installed_root_count()? == 0 {
+            return Err(ServerError::InvalidOptions(
+                "standalone serving requires at least one installed root route".to_owned(),
+            ));
+        }
+        Ok(Self {
+            options,
+            owner_loss: registry.owner_loss_signal(),
+            registry,
+            ownership: Vec::new(),
+            discovery: Arc::new(UnavailableRouteDiscovery),
+        })
+    }
+
     /// Install the seed-visible route source for this server process.
     pub fn with_discovery_source(mut self, source: Arc<dyn RouteDiscoverySource>) -> Self {
         self.discovery = source;

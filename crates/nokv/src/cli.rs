@@ -72,6 +72,7 @@ pub struct ServerConfig {
     pub max_inflight_connections: usize,
     pub advertise_endpoint: Option<String>,
     pub node_id: Option<String>,
+    pub metadata_url: Option<String>,
     pub metadata_store: Option<MetadataStoreConfig>,
     pub lifecycle_interval_millis: u64,
     pub recovery_publication: RecoveryPublicationConfig,
@@ -133,8 +134,9 @@ pub enum Command {
         content_type: Option<String>,
     },
     WorkspacePath(WorkspacePathCommand),
+    Format,
     Provision {
-        logical_shard_id: String,
+        logical_shard_id: Option<String>,
         adopt_legacy_object_namespace: bool,
         adopt_legacy_agent_binding: bool,
     },
@@ -295,6 +297,7 @@ impl Default for ServerConfig {
             max_inflight_connections: DEFAULT_MAX_INFLIGHT_CONNECTIONS,
             advertise_endpoint: None,
             node_id: None,
+            metadata_url: None,
             metadata_store: None,
             lifecycle_interval_millis: DEFAULT_LIFECYCLE_INTERVAL_MILLIS,
             recovery_publication: RecoveryPublicationConfig::LocalOnly,
@@ -317,7 +320,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             break Command::Help;
         };
         if !argument.starts_with("--") {
-            break parse_command(argument, &mut arguments)?;
+            break parse_command(argument, &mut arguments, &mut server)?;
         }
         match argument.as_str() {
             "--metadata-address" => {
@@ -425,6 +428,10 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
                 server.advertise_endpoint = Some(next_value(&mut arguments, &argument)?);
             }
             "--node-id" => server.node_id = Some(next_value(&mut arguments, &argument)?),
+            "--meta-url" => select_metadata_url(
+                &mut server.metadata_url,
+                next_value(&mut arguments, &argument)?,
+            )?,
             "--metadata-create" => {
                 select_metadata_store(
                     &mut server.metadata_store,
@@ -558,9 +565,18 @@ fn select_metadata_store(
     Ok(())
 }
 
+fn select_metadata_url(selected: &mut Option<String>, requested: String) -> Result<(), CliError> {
+    if selected.is_some() {
+        return Err(CliError::UnexpectedArgument("--meta-url".to_owned()));
+    }
+    *selected = Some(requested);
+    Ok(())
+}
+
 fn parse_command(
     command: String,
     arguments: &mut impl Iterator<Item = String>,
+    server: &mut ServerConfig,
 ) -> Result<Command, CliError> {
     match command.as_str() {
         "workbench" => Ok(Command::Workbench {
@@ -588,8 +604,9 @@ fn parse_command(
         }),
         "collect" => parse_collect(arguments),
         "workspace-path" => parse_workspace_path(arguments),
-        "provision" => parse_provision(arguments),
-        "serve" => Ok(Command::Serve),
+        "format" => parse_runtime_options(arguments, server).map(|()| Command::Format),
+        "provision" => parse_provision(arguments, server),
+        "serve" => parse_runtime_options(arguments, server).map(|()| Command::Serve),
         "schema" => Ok(Command::Schema),
         "version" => parse_version(arguments),
         "help" => Ok(Command::Help),
@@ -693,17 +710,38 @@ fn parse_workspace_path(arguments: &mut impl Iterator<Item = String>) -> Result<
     }))
 }
 
-fn parse_provision(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
-    let logical_shard_id = arguments
-        .next()
-        .ok_or(CliError::MissingArgument("logical shard id"))?;
+fn parse_runtime_options(
+    arguments: &mut impl Iterator<Item = String>,
+    server: &mut ServerConfig,
+) -> Result<(), CliError> {
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--meta-url" => {
+                select_metadata_url(&mut server.metadata_url, next_value(arguments, &argument)?)?
+            }
+            _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    Ok(())
+}
+
+fn parse_provision(
+    arguments: &mut impl Iterator<Item = String>,
+    server: &mut ServerConfig,
+) -> Result<Command, CliError> {
+    let mut logical_shard_id = None;
     let mut adopt_legacy_object_namespace = false;
     let mut adopt_legacy_agent_binding = false;
-    for argument in arguments.by_ref() {
+    while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--adopt-legacy-object-namespace" => adopt_legacy_object_namespace = true,
             "--adopt-legacy-agent-binding" => adopt_legacy_agent_binding = true,
+            "--meta-url" => {
+                select_metadata_url(&mut server.metadata_url, next_value(arguments, &argument)?)?
+            }
             _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ if logical_shard_id.is_none() => logical_shard_id = Some(argument),
             _ => return Err(CliError::UnexpectedArgument(argument)),
         }
     }
@@ -1048,6 +1086,66 @@ mod tests {
     }
 
     #[test]
+    fn metadata_runtime_commands_accept_one_explicit_url_after_the_command() {
+        let formatted = parse(args(&[
+            "format",
+            "--meta-url",
+            "holt:///var/lib/nokv/metadata",
+        ]))
+        .unwrap();
+        assert_eq!(formatted.command, Command::Format);
+        assert_eq!(
+            formatted.server.metadata_url.as_deref(),
+            Some("holt:///var/lib/nokv/metadata")
+        );
+
+        let provisioned = parse(args(&[
+            "--root-id",
+            "11111111111111111111111111111111",
+            "--agent-id",
+            "22222222222222222222222222222222",
+            "provision",
+            "--meta-url",
+            "holt:///var/lib/nokv/metadata",
+        ]))
+        .unwrap();
+        assert_eq!(
+            provisioned.command,
+            Command::Provision {
+                logical_shard_id: None,
+                adopt_legacy_object_namespace: false,
+                adopt_legacy_agent_binding: false,
+            }
+        );
+
+        let served = parse(args(&[
+            "serve",
+            "--meta-url",
+            "holt:///var/lib/nokv/metadata",
+        ]))
+        .unwrap();
+        assert_eq!(served.command, Command::Serve);
+        assert_eq!(
+            served.server.metadata_url.as_deref(),
+            Some("holt:///var/lib/nokv/metadata")
+        );
+    }
+
+    #[test]
+    fn metadata_runtime_url_is_single_assignment() {
+        assert_eq!(
+            parse(args(&[
+                "--meta-url",
+                "holt:///var/lib/nokv/a",
+                "serve",
+                "--meta-url",
+                "holt:///var/lib/nokv/b",
+            ])),
+            Err(CliError::UnexpectedArgument("--meta-url".to_owned()))
+        );
+    }
+
+    #[test]
     fn parses_human_and_machine_readable_version_commands() {
         assert_eq!(
             parse(args(&["--version"])).unwrap().command,
@@ -1161,7 +1259,7 @@ mod tests {
         assert_eq!(
             parsed.command,
             Command::Provision {
-                logical_shard_id: "22222222222222222222222222222222".to_owned(),
+                logical_shard_id: Some("22222222222222222222222222222222".to_owned()),
                 adopt_legacy_object_namespace: false,
                 adopt_legacy_agent_binding: false,
             }

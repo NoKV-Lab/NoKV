@@ -30,3 +30,10 @@ pub use checkpoint::{
     HoltFreshCheckpointInstaller, HoltRecoveryStagingAdoptionAuthority,
     HoltRecoveryStagingIdentity, HOLT_CHECKPOINT_FORMAT_ID,
 };
+
+/// Physical Holt adapter encoding selected by the format-11 server manifest.
+///
+/// This is independent of Holt's internal file-format versions. It identifies
+/// the exact NoKV keyspace-to-tree binding and serving options admitted by this
+/// adapter.
+pub const HOLT_PHYSICAL_ENCODING_VERSION: u8 = 1;
