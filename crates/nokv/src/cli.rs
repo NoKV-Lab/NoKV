@@ -10,11 +10,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-pub const DEFAULT_METADATA_ADDRESS: &str = "127.0.0.1:7750";
 pub const DEFAULT_SERVER_BIND: &str = "127.0.0.1:7750";
 pub const DEFAULT_MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
-pub const DEFAULT_ETCD_KEY_PREFIX: &str = "/nokv/control";
-pub const DEFAULT_ETCD_LEASE_TTL_SECONDS: i64 = 10;
 pub const DEFAULT_LIFECYCLE_INTERVAL_MILLIS: u64 = 1_000;
 pub const DEFAULT_HANDSHAKE_TIMEOUT_MILLIS: u64 = 5_000;
 pub const DEFAULT_MAX_INFLIGHT_CONNECTIONS: usize = 256;
@@ -22,32 +19,10 @@ pub const DEFAULT_MAX_INFLIGHT_CONNECTIONS: usize = 256;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientConfig {
     pub root_id: Option<String>,
-    pub routing: RoutingConfig,
+    pub seeds: Vec<SocketAddr>,
     pub max_attempts: u32,
     pub max_artifact_bytes: usize,
     pub object: ObjectConfig,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RoutingConfig {
-    Static(StaticRoutingConfig),
-    Etcd(EtcdRoutingConfig),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StaticRoutingConfig {
-    pub metadata_address: SocketAddr,
-    pub logical_shard_id: Option<String>,
-    pub object_namespace_id: Option<String>,
-    pub placement_generation: Option<u64>,
-    pub owner_epoch: Option<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EtcdRoutingConfig {
-    pub endpoints: Vec<String>,
-    pub key_prefix: String,
-    pub lease_ttl_seconds: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,31 +48,7 @@ pub struct ServerConfig {
     pub advertise_endpoint: Option<String>,
     pub node_id: Option<String>,
     pub metadata_url: Option<String>,
-    pub metadata_store: Option<MetadataStoreConfig>,
     pub lifecycle_interval_millis: u64,
-    pub recovery_publication: RecoveryPublicationConfig,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MetadataStoreConfig {
-    Create(PathBuf),
-    Reopen(PathBuf),
-    RecoverLog(PathBuf),
-}
-
-/// `serve --recovery-publication` selection.
-///
-/// `LocalOnly` is the resting state: the exclusive local Holt WAL is the only
-/// recovery authority and nothing is published to Control. `Shared` uploads
-/// every applied outbox tail as immutable log segments plus control
-/// references before a response leaves the shard; until shared checkpoint
-/// compaction bounds that segment chain it is an opt-in, and it is implied by
-/// `--metadata-recover-log`, which can only resume from a shared frontier.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RecoveryPublicationConfig {
-    Shared,
-    #[default]
-    LocalOnly,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,11 +86,7 @@ pub enum Command {
     },
     WorkspacePath(WorkspacePathCommand),
     Format,
-    Provision {
-        logical_shard_id: Option<String>,
-        adopt_legacy_object_namespace: bool,
-        adopt_legacy_agent_binding: bool,
-    },
+    Provision,
     Serve,
     Schema,
     Version {
@@ -186,9 +133,6 @@ pub enum CliError {
     InvalidAddress { option: &'static str, value: String },
     InvalidOption { option: &'static str, value: String },
     InvalidRequestId(String),
-    MixedRoutingOptions,
-    MixedMetadataStoreOptions,
-    LocalOnlyRecoverLog,
     UnpinnedExpectedGeneration,
 }
 
@@ -216,14 +160,6 @@ impl fmt::Display for CliError {
                 formatter,
                 "--request-id must be exactly 32 lowercase hexadecimal characters, got {value:?}"
             ),
-            Self::MixedRoutingOptions => formatter.write_str(
-                "static metadata routing options and etcd routing options cannot be combined",
-            ),
-            Self::MixedMetadataStoreOptions => formatter
-                .write_str("--metadata-create, --metadata-reopen, and --metadata-recover-log are mutually exclusive"),
-            Self::LocalOnlyRecoverLog => formatter.write_str(
-                "--metadata-recover-log installs a shared-log frontier and cannot be combined with --recovery-publication local-only",
-            ),
             Self::UnpinnedExpectedGeneration => formatter.write_str(
                 "--expected-generation pins a replace-only publication and requires --replace",
             ),
@@ -237,34 +173,10 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             root_id: None,
-            routing: RoutingConfig::Static(StaticRoutingConfig::default()),
+            seeds: Vec::new(),
             max_attempts: 3,
             max_artifact_bytes: DEFAULT_MAX_ARTIFACT_BYTES,
             object: ObjectConfig::default(),
-        }
-    }
-}
-
-impl Default for StaticRoutingConfig {
-    fn default() -> Self {
-        Self {
-            metadata_address: DEFAULT_METADATA_ADDRESS
-                .parse()
-                .expect("default metadata address is valid"),
-            logical_shard_id: None,
-            object_namespace_id: None,
-            placement_generation: None,
-            owner_epoch: None,
-        }
-    }
-}
-
-impl Default for EtcdRoutingConfig {
-    fn default() -> Self {
-        Self {
-            endpoints: Vec::new(),
-            key_prefix: DEFAULT_ETCD_KEY_PREFIX.to_owned(),
-            lease_ttl_seconds: DEFAULT_ETCD_LEASE_TTL_SECONDS,
         }
     }
 }
@@ -298,9 +210,7 @@ impl Default for ServerConfig {
             advertise_endpoint: None,
             node_id: None,
             metadata_url: None,
-            metadata_store: None,
             lifecycle_interval_millis: DEFAULT_LIFECYCLE_INTERVAL_MILLIS,
-            recovery_publication: RecoveryPublicationConfig::LocalOnly,
         }
     }
 }
@@ -309,10 +219,6 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     let mut arguments = arguments.into_iter();
     let mut client = ClientConfig::default();
     let mut server = ServerConfig::default();
-    let mut recovery_publication_explicit = false;
-    let mut static_routing = StaticRoutingConfig::default();
-    let mut etcd_routing = EtcdRoutingConfig::default();
-    let mut routing_kind = None;
     let mut agent_id = None;
     let mut workbench_root = None;
     let command = loop {
@@ -323,54 +229,14 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             break parse_command(argument, &mut arguments, &mut server)?;
         }
         match argument.as_str() {
-            "--metadata-address" => {
-                select_routing(&mut routing_kind, RoutingKind::Static)?;
-                static_routing.metadata_address =
-                    parse_address("--metadata-address", next_value(&mut arguments, &argument)?)?;
-            }
+            "--seed" => client.seeds.push(parse_address(
+                "--seed",
+                next_value(&mut arguments, &argument)?,
+            )?),
             "--root-id" => client.root_id = Some(next_value(&mut arguments, &argument)?),
             "--agent-id" => agent_id = Some(next_value(&mut arguments, &argument)?),
             "--workbench-root" => {
                 workbench_root = Some(next_value(&mut arguments, &argument)?);
-            }
-            "--logical-shard-id" => {
-                select_routing(&mut routing_kind, RoutingKind::Static)?;
-                static_routing.logical_shard_id = Some(next_value(&mut arguments, &argument)?);
-            }
-            "--object-namespace-id" => {
-                select_routing(&mut routing_kind, RoutingKind::Static)?;
-                static_routing.object_namespace_id = Some(next_value(&mut arguments, &argument)?);
-            }
-            "--placement-generation" => {
-                select_routing(&mut routing_kind, RoutingKind::Static)?;
-                static_routing.placement_generation = Some(parse_number(
-                    "--placement-generation",
-                    next_value(&mut arguments, &argument)?,
-                )?);
-            }
-            "--owner-epoch" => {
-                select_routing(&mut routing_kind, RoutingKind::Static)?;
-                static_routing.owner_epoch = Some(parse_number(
-                    "--owner-epoch",
-                    next_value(&mut arguments, &argument)?,
-                )?);
-            }
-            "--etcd-endpoint" => {
-                select_routing(&mut routing_kind, RoutingKind::Etcd)?;
-                etcd_routing
-                    .endpoints
-                    .push(next_value(&mut arguments, &argument)?);
-            }
-            "--etcd-key-prefix" => {
-                select_routing(&mut routing_kind, RoutingKind::Etcd)?;
-                etcd_routing.key_prefix = next_value(&mut arguments, &argument)?;
-            }
-            "--etcd-lease-ttl-seconds" => {
-                select_routing(&mut routing_kind, RoutingKind::Etcd)?;
-                etcd_routing.lease_ttl_seconds = parse_number(
-                    "--etcd-lease-ttl-seconds",
-                    next_value(&mut arguments, &argument)?,
-                )?;
             }
             "--max-attempts" => {
                 client.max_attempts =
@@ -432,76 +298,16 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
                 &mut server.metadata_url,
                 next_value(&mut arguments, &argument)?,
             )?,
-            "--metadata-create" => {
-                select_metadata_store(
-                    &mut server.metadata_store,
-                    MetadataStoreConfig::Create(PathBuf::from(next_value(
-                        &mut arguments,
-                        &argument,
-                    )?)),
-                )?;
-            }
-            "--metadata-reopen" => {
-                select_metadata_store(
-                    &mut server.metadata_store,
-                    MetadataStoreConfig::Reopen(PathBuf::from(next_value(
-                        &mut arguments,
-                        &argument,
-                    )?)),
-                )?;
-            }
-            "--metadata-recover-log" => {
-                select_metadata_store(
-                    &mut server.metadata_store,
-                    MetadataStoreConfig::RecoverLog(PathBuf::from(next_value(
-                        &mut arguments,
-                        &argument,
-                    )?)),
-                )?;
-            }
             "--lifecycle-interval-millis" => {
                 server.lifecycle_interval_millis = parse_number(
                     "--lifecycle-interval-millis",
                     next_value(&mut arguments, &argument)?,
                 )?;
             }
-            "--recovery-publication" => {
-                let value = next_value(&mut arguments, &argument)?;
-                recovery_publication_explicit = true;
-                server.recovery_publication = match value.as_str() {
-                    "shared" => RecoveryPublicationConfig::Shared,
-                    "local-only" => RecoveryPublicationConfig::LocalOnly,
-                    _ => {
-                        return Err(CliError::InvalidOption {
-                            option: "--recovery-publication",
-                            value,
-                        })
-                    }
-                };
-            }
             "--help" => break Command::Help,
             "--version" => break Command::Version { json: false },
             _ => return Err(CliError::UnknownOption(argument)),
         }
-    };
-    if matches!(
-        server.metadata_store,
-        Some(MetadataStoreConfig::RecoverLog(_))
-    ) {
-        // A shared-log successor resumes from a shared frontier, so shared
-        // publication is the only coherent choice: imply it when the caller
-        // said nothing, refuse it when the caller asked for local-only.
-        match (recovery_publication_explicit, server.recovery_publication) {
-            (false, _) => server.recovery_publication = RecoveryPublicationConfig::Shared,
-            (true, RecoveryPublicationConfig::LocalOnly) => {
-                return Err(CliError::LocalOnlyRecoverLog);
-            }
-            (true, RecoveryPublicationConfig::Shared) => {}
-        }
-    }
-    client.routing = match routing_kind.unwrap_or(RoutingKind::Static) {
-        RoutingKind::Static => RoutingConfig::Static(static_routing),
-        RoutingKind::Etcd => RoutingConfig::Etcd(etcd_routing),
     };
     if let Some(argument) = arguments.next() {
         return Err(CliError::UnexpectedArgument(argument));
@@ -520,9 +326,11 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             | Command::Materialize { .. }
             | Command::Collect { .. }
             | Command::WorkspacePath(_)
-            | Command::Provision { .. }
-    ) && agent_id.is_none()
+    ) && client.seeds.is_empty()
     {
+        return Err(CliError::MissingOption("--seed"));
+    }
+    if matches!(&command, Command::Provision) && agent_id.is_none() {
         return Err(CliError::MissingOption("--agent-id"));
     }
     Ok(Invocation {
@@ -532,37 +340,6 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
         workbench_root,
         command,
     })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RoutingKind {
-    Static,
-    Etcd,
-}
-
-fn select_routing(
-    selected: &mut Option<RoutingKind>,
-    requested: RoutingKind,
-) -> Result<(), CliError> {
-    match *selected {
-        Some(current) if current != requested => Err(CliError::MixedRoutingOptions),
-        Some(_) => Ok(()),
-        None => {
-            *selected = Some(requested);
-            Ok(())
-        }
-    }
-}
-
-fn select_metadata_store(
-    selected: &mut Option<MetadataStoreConfig>,
-    requested: MetadataStoreConfig,
-) -> Result<(), CliError> {
-    if selected.is_some() {
-        return Err(CliError::MixedMetadataStoreOptions);
-    }
-    *selected = Some(requested);
-    Ok(())
 }
 
 fn select_metadata_url(selected: &mut Option<String>, requested: String) -> Result<(), CliError> {
@@ -730,26 +507,16 @@ fn parse_provision(
     arguments: &mut impl Iterator<Item = String>,
     server: &mut ServerConfig,
 ) -> Result<Command, CliError> {
-    let mut logical_shard_id = None;
-    let mut adopt_legacy_object_namespace = false;
-    let mut adopt_legacy_agent_binding = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "--adopt-legacy-object-namespace" => adopt_legacy_object_namespace = true,
-            "--adopt-legacy-agent-binding" => adopt_legacy_agent_binding = true,
             "--meta-url" => {
                 select_metadata_url(&mut server.metadata_url, next_value(arguments, &argument)?)?
             }
             _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
-            _ if logical_shard_id.is_none() => logical_shard_id = Some(argument),
             _ => return Err(CliError::UnexpectedArgument(argument)),
         }
     }
-    Ok(Command::Provision {
-        logical_shard_id,
-        adopt_legacy_object_namespace,
-        adopt_legacy_agent_binding,
-    })
+    Ok(Command::Provision)
 }
 
 fn parse_version(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
@@ -867,766 +634,172 @@ mod tests {
     }
 
     #[test]
-    fn parses_root_routed_workbench_call() {
+    fn client_commands_accept_repeatable_seeds() {
         let parsed = parse(args(&[
             "--root-id",
-            "01",
-            "--agent-id",
-            "44444444444444444444444444444444",
+            "11111111111111111111111111111111",
+            "--seed",
+            "127.0.0.1:7750",
+            "--seed",
+            "127.0.0.1:7751",
             "--workbench-root",
             "/agents/test/wb",
-            "--logical-shard-id",
-            "02",
-            "--placement-generation",
-            "7",
-            "--owner-epoch",
-            "9",
-            "--object-bucket",
-            "artifacts",
             "workbench",
             "workbench_create",
             r#"{"id":"run-1"}"#,
         ]))
         .unwrap();
-        assert_eq!(parsed.client.root_id.as_deref(), Some("01"));
         assert_eq!(
-            parsed.agent_id.as_deref(),
-            Some("44444444444444444444444444444444")
+            parsed.client.seeds,
+            [
+                "127.0.0.1:7750".parse::<SocketAddr>().unwrap(),
+                "127.0.0.1:7751".parse::<SocketAddr>().unwrap(),
+            ]
         );
-        assert_eq!(parsed.workbench_root.as_deref(), Some("/agents/test/wb"));
-        let RoutingConfig::Static(route) = parsed.client.routing else {
-            panic!("static route expected");
-        };
-        assert_eq!(route.logical_shard_id.as_deref(), Some("02"));
-        assert_eq!(route.placement_generation, Some(7));
-        assert_eq!(route.owner_epoch, Some(9));
-        assert_eq!(
-            parsed.command,
-            Command::Workbench {
-                tool: "workbench_create".to_owned(),
-                arguments: r#"{"id":"run-1"}"#.to_owned(),
-            }
-        );
+        assert_eq!(parsed.agent_id, None);
     }
 
     #[test]
-    fn collect_is_explicit_local_transfer() {
-        let parsed = parse(args(&[
-            "--agent-id",
-            "44444444444444444444444444444444",
+    fn client_commands_require_a_seed() {
+        let error = parse(args(&[
             "--workbench-root",
             "/agents/test/wb",
-            "collect",
-            "run-1",
-            "outputs",
-            "/tmp/result.bin",
-            "result.bin",
-            "--replace",
-            "--content-type",
-            "application/octet-stream",
+            "workbench",
+            "workbench_create",
         ]))
-        .unwrap();
-        assert_eq!(
-            parsed.command,
-            Command::Collect {
-                workbench: "run-1".to_owned(),
-                section: "outputs".to_owned(),
-                source: PathBuf::from("/tmp/result.bin"),
-                path: "result.bin".to_owned(),
-                replace: true,
-                expected_generation: None,
-                content_type: Some("application/octet-stream".to_owned()),
-            }
-        );
+        .unwrap_err();
+        assert_eq!(error, CliError::MissingOption("--seed"));
     }
 
     #[test]
-    fn collect_expected_generation_pins_the_replace_cas() {
-        let parsed = parse(args(&[
-            "--agent-id",
-            "44444444444444444444444444444444",
-            "--workbench-root",
-            "/agents/test/wb",
-            "collect",
-            "run-1",
-            "outputs",
-            "/tmp/result.bin",
-            "result.bin",
-            "--replace",
-            "--expected-generation",
-            "7",
+    fn metadata_runtime_commands_accept_one_explicit_url() {
+        for (command, expected) in [("format", Command::Format), ("serve", Command::Serve)] {
+            let parsed = parse(args(&[
+                command,
+                "--meta-url",
+                "holt:///var/lib/nokv/metadata",
+            ]))
+            .unwrap();
+            assert_eq!(parsed.command, expected);
+            assert_eq!(
+                parsed.server.metadata_url.as_deref(),
+                Some("holt:///var/lib/nokv/metadata")
+            );
+        }
+        assert!(parse(args(&[
+            "format",
+            "--meta-url",
+            "holt:///one",
+            "--meta-url",
+            "holt:///two",
         ]))
-        .unwrap();
-        assert_eq!(
-            parsed.command,
-            Command::Collect {
-                workbench: "run-1".to_owned(),
-                section: "outputs".to_owned(),
-                source: PathBuf::from("/tmp/result.bin"),
-                path: "result.bin".to_owned(),
-                replace: true,
-                expected_generation: Some(7),
-                content_type: None,
-            }
-        );
-
-        let unpinned = parse(args(&[
-            "--agent-id",
-            "44444444444444444444444444444444",
-            "--workbench-root",
-            "/agents/test/wb",
-            "collect",
-            "run-1",
-            "outputs",
-            "/tmp/result.bin",
-            "result.bin",
-            "--expected-generation",
-            "7",
-        ]));
-        assert!(
-            unpinned.is_err(),
-            "expected-generation without --replace must fail"
-        );
+        .is_err());
     }
 
     #[test]
-    fn workspace_path_mutations_require_exact_replay_inputs() {
+    fn provision_requires_agent_and_rejects_legacy_arguments() {
         let parsed = parse(args(&[
             "--root-id",
             "11111111111111111111111111111111",
             "--agent-id",
             "44444444444444444444444444444444",
-            "--etcd-endpoint",
-            "http://127.0.0.1:2379",
-            "workspace-path",
-            "rename",
-            "run-42",
-            "outputs",
-            "a.bin",
-            "b.bin",
-            "--expected-generation",
-            "7",
-            "--request-id",
-            "abababababababababababababababab",
+            "provision",
+            "--meta-url",
+            "holt:///var/lib/nokv/metadata",
         ]))
         .unwrap();
-        assert_eq!(
-            parsed.command,
-            Command::WorkspacePath(WorkspacePathCommand::Rename {
-                workbench: "run-42".to_owned(),
-                section: "outputs".to_owned(),
-                source: "a.bin".to_owned(),
-                destination: "b.bin".to_owned(),
-                expected_generation: 7,
-                request_id: [0xab; 16],
-            })
-        );
+        assert_eq!(parsed.command, Command::Provision);
 
-        let removed = parse(args(&[
-            "--root-id",
-            "11111111111111111111111111111111",
-            "--agent-id",
-            "44444444444444444444444444444444",
-            "--etcd-endpoint",
-            "http://127.0.0.1:2379",
-            "workspace-path",
-            "remove",
-            "run-42",
-            "logs",
-            "run.log",
-            "--request-id",
-            "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
-            "--expected-generation",
-            "3",
-        ]))
-        .unwrap();
+        assert_eq!(
+            parse(args(&[
+                "--root-id",
+                "11111111111111111111111111111111",
+                "provision",
+                "--meta-url",
+                "holt:///var/lib/nokv/metadata",
+            ])),
+            Err(CliError::MissingOption("--agent-id"))
+        );
         assert!(matches!(
-            removed.command,
-            Command::WorkspacePath(WorkspacePathCommand::Remove {
-                expected_generation: 3,
-                request_id,
-                ..
-            }) if request_id == [0xcd; 16]
+            parse(args(&[
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "provision",
+                "22222222222222222222222222222222",
+            ])),
+            Err(CliError::UnexpectedArgument(_))
         ));
     }
 
     #[test]
-    fn workspace_path_rejects_missing_or_malformed_request_identity() {
-        let prefix = [
-            "--root-id",
-            "11111111111111111111111111111111",
-            "--agent-id",
-            "44444444444444444444444444444444",
+    fn removed_control_and_local_wal_options_are_unknown() {
+        for option in [
             "--etcd-endpoint",
-            "http://127.0.0.1:2379",
+            "--metadata-address",
+            "--logical-shard-id",
+            "--object-namespace-id",
+            "--placement-generation",
+            "--owner-epoch",
+            "--metadata-create",
+            "--metadata-reopen",
+            "--metadata-recover-log",
+            "--recovery-publication",
+        ] {
+            assert!(matches!(
+                parse(args(&[option, "value", "help"])),
+                Err(CliError::UnknownOption(actual)) if actual == option
+            ));
+        }
+    }
+
+    #[test]
+    fn workspace_path_requires_exact_replay_inputs() {
+        let parsed = parse(args(&[
+            "--seed",
+            "127.0.0.1:7750",
             "workspace-path",
             "remove",
-            "run-42",
+            "run-1",
             "outputs",
-            "a.bin",
+            "result.bin",
+            "--expected-generation",
+            "7",
+            "--request-id",
+            "0123456789abcdef0123456789abcdef",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::WorkspacePath(WorkspacePathCommand::Remove {
+                expected_generation: 7,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn collect_expected_generation_requires_replace() {
+        let base = [
+            "--seed",
+            "127.0.0.1:7750",
+            "--workbench-root",
+            "/agents/test/wb",
+            "collect",
+            "run-1",
+            "outputs",
+            "/tmp/result.bin",
+            "result.bin",
             "--expected-generation",
             "7",
         ];
         assert_eq!(
-            parse(args(&prefix)),
-            Err(CliError::MissingOption("--request-id"))
-        );
-
-        let mut malformed = prefix.to_vec();
-        malformed.extend(["--request-id", "ABC"]);
-        assert_eq!(
-            parse(args(&malformed)),
-            Err(CliError::InvalidRequestId("ABC".to_owned()))
+            parse(args(&base)),
+            Err(CliError::UnpinnedExpectedGeneration)
         );
     }
 
     #[test]
     fn absent_command_is_help() {
         assert_eq!(parse(Vec::new()).unwrap().command, Command::Help);
-    }
-
-    #[test]
-    fn metadata_runtime_commands_accept_one_explicit_url_after_the_command() {
-        let formatted = parse(args(&[
-            "format",
-            "--meta-url",
-            "holt:///var/lib/nokv/metadata",
-        ]))
-        .unwrap();
-        assert_eq!(formatted.command, Command::Format);
-        assert_eq!(
-            formatted.server.metadata_url.as_deref(),
-            Some("holt:///var/lib/nokv/metadata")
-        );
-
-        let provisioned = parse(args(&[
-            "--root-id",
-            "11111111111111111111111111111111",
-            "--agent-id",
-            "22222222222222222222222222222222",
-            "provision",
-            "--meta-url",
-            "holt:///var/lib/nokv/metadata",
-        ]))
-        .unwrap();
-        assert_eq!(
-            provisioned.command,
-            Command::Provision {
-                logical_shard_id: None,
-                adopt_legacy_object_namespace: false,
-                adopt_legacy_agent_binding: false,
-            }
-        );
-
-        let served = parse(args(&[
-            "serve",
-            "--meta-url",
-            "holt:///var/lib/nokv/metadata",
-        ]))
-        .unwrap();
-        assert_eq!(served.command, Command::Serve);
-        assert_eq!(
-            served.server.metadata_url.as_deref(),
-            Some("holt:///var/lib/nokv/metadata")
-        );
-    }
-
-    #[test]
-    fn metadata_runtime_url_is_single_assignment() {
-        assert_eq!(
-            parse(args(&[
-                "--meta-url",
-                "holt:///var/lib/nokv/a",
-                "serve",
-                "--meta-url",
-                "holt:///var/lib/nokv/b",
-            ])),
-            Err(CliError::UnexpectedArgument("--meta-url".to_owned()))
-        );
-    }
-
-    #[test]
-    fn parses_human_and_machine_readable_version_commands() {
-        assert_eq!(
-            parse(args(&["--version"])).unwrap().command,
-            Command::Version { json: false }
-        );
-        assert_eq!(
-            parse(args(&["version"])).unwrap().command,
-            Command::Version { json: false }
-        );
-        assert_eq!(
-            parse(args(&["version", "--json"])).unwrap().command,
-            Command::Version { json: true }
-        );
-    }
-
-    #[test]
-    fn parses_control_plane_routing_without_static_fences() {
-        let parsed = parse(args(&[
-            "--root-id",
-            "01",
-            "--agent-id",
-            "44444444444444444444444444444444",
-            "--workbench-root",
-            "/agents/test/wb",
-            "--etcd-endpoint",
-            "http://127.0.0.1:2379",
-            "--etcd-endpoint",
-            "http://127.0.0.1:22379",
-            "--etcd-key-prefix",
-            "/nokv/production",
-            "mcp",
-        ]))
-        .unwrap();
-        let RoutingConfig::Etcd(route) = parsed.client.routing else {
-            panic!("etcd route expected");
-        };
-        assert_eq!(
-            route.endpoints,
-            ["http://127.0.0.1:2379", "http://127.0.0.1:22379"]
-        );
-        assert_eq!(route.key_prefix, "/nokv/production");
-        assert_eq!(route.lease_ttl_seconds, 10);
-        assert_eq!(
-            parsed.command,
-            Command::Mcp {
-                profile: McpProfile::Workbench
-            }
-        );
-    }
-
-    #[test]
-    fn mcp_profile_is_explicit_and_defaults_to_workbench() {
-        let prefix = [
-            "--agent-id",
-            "44444444444444444444444444444444",
-            "--workbench-root",
-            "/agents/test/wb",
-        ];
-        for (suffix, expected) in [
-            (&["mcp"][..], McpProfile::Workbench),
-            (
-                &["mcp", "--profile", "workbench"][..],
-                McpProfile::Workbench,
-            ),
-            (&["mcp", "--profile", "agent"][..], McpProfile::Agent),
-        ] {
-            let parsed = parse(args(&prefix).into_iter().chain(args(suffix))).unwrap();
-            assert_eq!(parsed.command, Command::Mcp { profile: expected });
-        }
-
-        let invalid = parse(
-            args(&prefix)
-                .into_iter()
-                .chain(args(&["mcp", "--profile", "legacy"])),
-        )
-        .unwrap_err();
-        assert_eq!(
-            invalid,
-            CliError::InvalidOption {
-                option: "--profile",
-                value: "legacy".to_owned(),
-            }
-        );
-        let duplicate = parse(args(&prefix).into_iter().chain(args(&[
-            "mcp",
-            "--profile",
-            "agent",
-            "--profile",
-            "workbench",
-        ])))
-        .unwrap_err();
-        assert_eq!(
-            duplicate,
-            CliError::UnexpectedArgument("--profile".to_owned())
-        );
-    }
-
-    #[test]
-    fn parses_explicit_root_provisioning() {
-        let parsed = parse(args(&[
-            "--root-id",
-            "11",
-            "--agent-id",
-            "44444444444444444444444444444444",
-            "--etcd-endpoint",
-            "http://127.0.0.1:2379",
-            "provision",
-            "22222222222222222222222222222222",
-        ]))
-        .unwrap();
-        assert_eq!(
-            parsed.command,
-            Command::Provision {
-                logical_shard_id: Some("22222222222222222222222222222222".to_owned()),
-                adopt_legacy_object_namespace: false,
-                adopt_legacy_agent_binding: false,
-            }
-        );
-        assert!(matches!(parsed.client.routing, RoutingConfig::Etcd(_)));
-    }
-
-    #[test]
-    fn legacy_namespace_adoption_requires_an_explicit_provision_flag() {
-        let parsed = parse(args(&[
-            "--root-id",
-            "11",
-            "--agent-id",
-            "44444444444444444444444444444444",
-            "--etcd-endpoint",
-            "http://127.0.0.1:2379",
-            "provision",
-            "22222222222222222222222222222222",
-            "--adopt-legacy-object-namespace",
-        ]))
-        .unwrap();
-        assert!(matches!(
-            parsed.command,
-            Command::Provision {
-                adopt_legacy_object_namespace: true,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn legacy_namespace_adoption_rejects_unparsed_trailing_arguments() {
-        let error = parse(args(&[
-            "--root-id",
-            "11",
-            "--agent-id",
-            "44444444444444444444444444444444",
-            "--etcd-endpoint",
-            "http://127.0.0.1:2379",
-            "provision",
-            "22222222222222222222222222222222",
-            "--adopt-legacy-object-namespace",
-            "unexpected",
-        ]))
-        .unwrap_err();
-
-        assert_eq!(error, CliError::UnexpectedArgument("unexpected".to_owned()));
-    }
-
-    #[test]
-    fn mixed_static_and_control_routing_fails_closed() {
-        assert_eq!(
-            parse(args(&[
-                "--metadata-address",
-                "127.0.0.1:7750",
-                "--workbench-root",
-                "/agents/test/wb",
-                "--etcd-endpoint",
-                "http://127.0.0.1:2379",
-                "mcp",
-            ])),
-            Err(CliError::MixedRoutingOptions)
-        );
-    }
-
-    #[test]
-    fn server_recovery_publication_defaults_to_local_only_and_shared_is_explicit() {
-        // A fresh or reopened owner runs on its exclusive Holt WAL alone unless
-        // shared publication is asked for. Publishing to Control is a switch,
-        // not the resting state.
-        for open in ["--metadata-create", "--metadata-reopen"] {
-            let parsed = parse(args(&[open, "/var/lib/nokv/shard.holt", "serve"])).unwrap();
-            assert_eq!(
-                parsed.server.recovery_publication,
-                RecoveryPublicationConfig::LocalOnly,
-                "{open} without --recovery-publication must be local-only"
-            );
-        }
-
-        let shared = parse(args(&[
-            "--metadata-reopen",
-            "/var/lib/nokv/shard.holt",
-            "--recovery-publication",
-            "shared",
-            "serve",
-        ]))
-        .unwrap();
-        assert_eq!(
-            shared.server.recovery_publication,
-            RecoveryPublicationConfig::Shared
-        );
-
-        let local_only = parse(args(&[
-            "--metadata-reopen",
-            "/var/lib/nokv/shard.holt",
-            "--recovery-publication",
-            "local-only",
-            "serve",
-        ]))
-        .unwrap();
-        assert_eq!(
-            local_only.server.recovery_publication,
-            RecoveryPublicationConfig::LocalOnly
-        );
-
-        assert_eq!(
-            parse(args(&[
-                "--metadata-reopen",
-                "/var/lib/nokv/shard.holt",
-                "--recovery-publication",
-                "sometimes",
-                "serve",
-            ])),
-            Err(CliError::InvalidOption {
-                option: "--recovery-publication",
-                value: "sometimes".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn recover_log_implies_shared_publication_unless_contradicted() {
-        // Recovering from the shared log installs a shared frontier, so the
-        // only coherent publication mode is shared. Leaving the option out
-        // must select it rather than trip over the local-only default.
-        let recovered = parse(args(&[
-            "--metadata-recover-log",
-            "/var/lib/nokv/recovered.holt",
-            "serve",
-        ]))
-        .unwrap();
-        assert_eq!(
-            recovered.server.recovery_publication,
-            RecoveryPublicationConfig::Shared
-        );
-
-        // Saying so explicitly is fine.
-        let explicit = parse(args(&[
-            "--metadata-recover-log",
-            "/var/lib/nokv/recovered.holt",
-            "--recovery-publication",
-            "shared",
-            "serve",
-        ]))
-        .unwrap();
-        assert_eq!(
-            explicit.server.recovery_publication,
-            RecoveryPublicationConfig::Shared
-        );
-
-        // A shared-log successor cannot be a local-only owner.
-        assert_eq!(
-            parse(args(&[
-                "--metadata-recover-log",
-                "/var/lib/nokv/recovered.holt",
-                "--recovery-publication",
-                "local-only",
-                "serve",
-            ])),
-            Err(CliError::LocalOnlyRecoverLog)
-        );
-    }
-
-    #[test]
-    fn server_metadata_open_mode_is_explicit_and_unique() {
-        let parsed = parse(args(&[
-            "--metadata-reopen",
-            "/var/lib/nokv/shard.holt",
-            "--node-id",
-            "owner-a",
-            "--advertise-endpoint",
-            "metadata-a.internal:7750",
-            "serve",
-        ]))
-        .unwrap();
-        assert_eq!(
-            parsed.server.metadata_store,
-            Some(MetadataStoreConfig::Reopen(PathBuf::from(
-                "/var/lib/nokv/shard.holt"
-            )))
-        );
-        assert_eq!(parsed.server.node_id.as_deref(), Some("owner-a"));
-        assert_eq!(
-            parsed.server.advertise_endpoint.as_deref(),
-            Some("metadata-a.internal:7750")
-        );
-
-        assert_eq!(
-            parse(args(&[
-                "--metadata-create",
-                "/tmp/new.holt",
-                "--metadata-reopen",
-                "/tmp/existing.holt",
-                "serve",
-            ])),
-            Err(CliError::MixedMetadataStoreOptions)
-        );
-
-        let recovered = parse(args(&[
-            "--metadata-recover-log",
-            "/var/lib/nokv/recovered-shard.holt",
-            "serve",
-        ]))
-        .unwrap();
-        assert_eq!(
-            recovered.server.metadata_store,
-            Some(MetadataStoreConfig::RecoverLog(PathBuf::from(
-                "/var/lib/nokv/recovered-shard.holt"
-            )))
-        );
-        assert_eq!(
-            parse(args(&[
-                "--metadata-reopen",
-                "/tmp/existing.holt",
-                "--metadata-recover-log",
-                "/tmp/recovered.holt",
-                "serve",
-            ])),
-            Err(CliError::MixedMetadataStoreOptions)
-        );
-    }
-
-    #[test]
-    fn parses_server_handshake_resource_limits() {
-        let parsed = parse(args(&[
-            "--handshake-timeout-millis",
-            "750",
-            "--max-inflight-connections",
-            "64",
-            "serve",
-        ]))
-        .unwrap();
-        assert_eq!(parsed.server.handshake_timeout_millis, 750);
-        assert_eq!(parsed.server.max_inflight_connections, 64);
-    }
-
-    #[test]
-    fn unknown_options_fail_closed() {
-        assert!(matches!(
-            parse(args(&["--mount", "3", "mcp"])),
-            Err(CliError::UnknownOption(option)) if option == "--mount"
-        ));
-    }
-
-    #[test]
-    fn agent_commands_require_an_explicit_presentation_root() {
-        assert_eq!(
-            parse(args(&[
-                "--agent-id",
-                "44444444444444444444444444444444",
-                "mcp",
-            ])),
-            Err(CliError::MissingOption("--workbench-root"))
-        );
-        assert_eq!(
-            parse(args(&[
-                "--agent-id",
-                "44444444444444444444444444444444",
-                "workbench",
-                "workbench_create",
-                r#"{"id":"run-1"}"#,
-            ])),
-            Err(CliError::MissingOption("--workbench-root"))
-        );
-    }
-
-    #[test]
-    fn agent_commands_and_provision_require_an_explicit_agent_id() {
-        for arguments in [
-            args(&["--workbench-root", "/agents/test/wb", "mcp"]),
-            args(&[
-                "--workbench-root",
-                "/agents/test/wb",
-                "workbench",
-                "workbench_create",
-                r#"{"id":"run-1"}"#,
-            ]),
-            args(&[
-                "materialize",
-                "run-1",
-                "outputs",
-                "result.bin",
-                "/tmp/result.bin",
-            ]),
-            args(&[
-                "--workbench-root",
-                "/agents/test/wb",
-                "collect",
-                "run-1",
-                "outputs",
-                "/tmp/result.bin",
-                "result.bin",
-            ]),
-            args(&[
-                "--root-id",
-                "11111111111111111111111111111111",
-                "--etcd-endpoint",
-                "http://127.0.0.1:2379",
-                "workspace-path",
-                "remove",
-                "run-1",
-                "outputs",
-                "result.bin",
-                "--expected-generation",
-                "1",
-                "--request-id",
-                "abababababababababababababababab",
-            ]),
-            args(&[
-                "--root-id",
-                "11111111111111111111111111111111",
-                "--etcd-endpoint",
-                "http://127.0.0.1:2379",
-                "provision",
-                "22222222222222222222222222222222",
-            ]),
-        ] {
-            assert_eq!(parse(arguments), Err(CliError::MissingOption("--agent-id")));
-        }
-    }
-
-    #[test]
-    fn schema_version_help_and_serve_do_not_require_an_agent_id() {
-        assert_eq!(parse(args(&["schema"])).unwrap().command, Command::Schema);
-        assert!(matches!(
-            parse(args(&["version"])).unwrap().command,
-            Command::Version { .. }
-        ));
-        assert_eq!(parse(args(&["help"])).unwrap().command, Command::Help);
-        assert_eq!(parse(args(&["serve"])).unwrap().command, Command::Serve);
-    }
-
-    #[test]
-    fn legacy_agent_binding_adoption_is_explicit_and_provision_only() {
-        let parsed = parse(args(&[
-            "--root-id",
-            "11111111111111111111111111111111",
-            "--agent-id",
-            "44444444444444444444444444444444",
-            "--etcd-endpoint",
-            "http://127.0.0.1:2379",
-            "provision",
-            "22222222222222222222222222222222",
-            "--adopt-legacy-agent-binding",
-            "--adopt-legacy-object-namespace",
-        ]))
-        .unwrap();
-        assert!(matches!(
-            parsed.command,
-            Command::Provision {
-                adopt_legacy_agent_binding: true,
-                adopt_legacy_object_namespace: true,
-                ..
-            }
-        ));
-
-        assert!(matches!(
-            parse(args(&[
-                "--agent-id",
-                "44444444444444444444444444444444",
-                "--workbench-root",
-                "/agents/test/wb",
-                "mcp",
-                "--adopt-legacy-agent-binding",
-            ])),
-            Err(CliError::UnexpectedArgument(argument))
-                if argument == "--adopt-legacy-agent-binding"
-        ));
     }
 }

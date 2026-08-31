@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -20,7 +19,7 @@ use nokv_protocol::{
 };
 
 use crate::legacy_rejection::{legacy_rejection_response, MAX_LEGACY_FIRST_FRAME_BYTES};
-use crate::{RootOwnerRegistry, ServerError, ShardOwner};
+use crate::{RootOwnerRegistry, ServerError};
 
 static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -178,31 +177,12 @@ pub struct ServerHealth {
 pub struct WorkspaceServer {
     options: ServerOptions,
     registry: Arc<RootOwnerRegistry>,
-    ownership: Vec<ShardOwner>,
     maintenance: Option<Arc<dyn OwnershipMaintenance>>,
     owner_loss: OwnerLossSignal,
     discovery: Arc<dyn RouteDiscoverySource>,
 }
 
 impl WorkspaceServer {
-    pub fn new(
-        options: ServerOptions,
-        registry: Arc<RootOwnerRegistry>,
-        ownership: Vec<ShardOwner>,
-    ) -> Result<Self, ServerError> {
-        if let Err(error) = validate_ownership(options, &registry, &ownership) {
-            return Err(release_rejected_ownership(ownership, error));
-        }
-        Ok(Self {
-            options,
-            owner_loss: registry.owner_loss_signal(),
-            registry,
-            ownership,
-            maintenance: None,
-            discovery: Arc::new(UnavailableRouteDiscovery),
-        })
-    }
-
     /// Construct a standalone owner whose physical Holt lock is its ownership
     /// authority. The registry must already contain at least one exact route.
     pub fn new_local(
@@ -219,7 +199,6 @@ impl WorkspaceServer {
             options,
             owner_loss: registry.owner_loss_signal(),
             registry,
-            ownership: Vec::new(),
             maintenance: None,
             discovery: Arc::new(UnavailableRouteDiscovery),
         })
@@ -253,7 +232,6 @@ impl WorkspaceServer {
             options,
             owner_loss: registry.owner_loss_signal(),
             registry,
-            ownership: Vec::new(),
             maintenance: Some(maintenance),
             discovery: Arc::new(UnavailableRouteDiscovery),
         })
@@ -275,12 +253,6 @@ impl WorkspaceServer {
     /// Runtime lease-renewal hook. A failed renewal uninstalls that owner's
     /// complete root-route set before the error is returned.
     pub fn renew_ownership(&self) -> Result<(), ServerError> {
-        for owner in &self.ownership {
-            if let Err(error) = owner.renew_or_uninstall() {
-                self.owner_loss.mark_lost();
-                return Err(error);
-            }
-        }
         if let Some(maintenance) = &self.maintenance {
             if let Err(error) = maintenance.renew() {
                 self.owner_loss.mark_lost();
@@ -292,20 +264,11 @@ impl WorkspaceServer {
 
     /// Remove all routes and release every logical-shard lease once.
     pub fn release_ownership(self) -> Result<(), ServerError> {
-        let maintenance = self
-            .maintenance
+        self.maintenance
             .as_ref()
             .map(|maintenance| maintenance.release())
-            .transpose();
-        let legacy = release_ownership(self.ownership);
-        match (maintenance, legacy) {
-            (Ok(_), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-            (Err(primary), Err(cleanup)) => Err(ServerError::BootstrapRollback {
-                primary: primary.to_string(),
-                rollback: cleanup.to_string(),
-            }),
-        }
+            .transpose()
+            .map(|_| ())
     }
 
     pub fn owner_loss_signal(&self) -> OwnerLossSignal {
@@ -445,85 +408,6 @@ fn require_owner_retained(owner_loss: &OwnerLossSignal) -> Result<(), ServerErro
 fn sleep_until_runtime_event(next_renewal: Instant) {
     let until_renewal = next_renewal.saturating_duration_since(Instant::now());
     thread::sleep(until_renewal.min(Duration::from_millis(10)));
-}
-
-fn validate_ownership(
-    options: ServerOptions,
-    registry: &Arc<RootOwnerRegistry>,
-    ownership: &[ShardOwner],
-) -> Result<(), ServerError> {
-    options.validate()?;
-    if ownership.is_empty() {
-        return Err(ServerError::InvalidOptions(
-            "serving requires at least one logical-shard owner".to_owned(),
-        ));
-    }
-    let mut shards = BTreeSet::new();
-    let mut roots = BTreeSet::new();
-    for (index, owner) in ownership.iter().enumerate() {
-        if !owner.is_for_registry(registry) {
-            return Err(ServerError::InvalidOptions(format!(
-                "ownership entry {index} belongs to another registry"
-            )));
-        }
-        if !shards.insert(owner.shard_id()) {
-            return Err(ServerError::InvalidOptions(format!(
-                "ownership entry {index} duplicates logical shard {:?}",
-                owner.shard_id()
-            )));
-        }
-        if owner.routes().is_empty() {
-            return Err(ServerError::InvalidOptions(format!(
-                "ownership entry {index} has no root routes"
-            )));
-        }
-        for route in owner.routes() {
-            if route.logical_shard_id != nokv_protocol::LogicalShardIdentity::from(owner.shard_id())
-            {
-                return Err(ServerError::InvalidOptions(format!(
-                    "ownership entry {index} contains a route for another logical shard"
-                )));
-            }
-            if !roots.insert(route.root_id) {
-                return Err(ServerError::InvalidOptions(format!(
-                    "ownership entry {index} duplicates root route {:?}",
-                    route.root_id
-                )));
-            }
-            if !registry.contains_exact(*route)? {
-                return Err(ServerError::InvalidOptions(format!(
-                    "ownership entry {index} has no exact installed route for root {:?}",
-                    route.root_id
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn release_rejected_ownership(ownership: Vec<ShardOwner>, primary: ServerError) -> ServerError {
-    match release_ownership(ownership) {
-        Ok(()) => primary,
-        Err(cleanup) => ServerError::BootstrapRollback {
-            primary: primary.to_string(),
-            rollback: cleanup.to_string(),
-        },
-    }
-}
-
-fn release_ownership(ownership: Vec<ShardOwner>) -> Result<(), ServerError> {
-    let failures = ownership
-        .into_iter()
-        .filter_map(|owner| owner.release().err().map(|error| error.to_string()))
-        .collect::<Vec<_>>();
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(ServerError::BootstrapRollback {
-            primary: "release logical-shard ownership".to_owned(),
-            rollback: failures.join("; "),
-        })
-    }
 }
 
 fn serve_connection(

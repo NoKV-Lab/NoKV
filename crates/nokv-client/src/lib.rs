@@ -30,10 +30,6 @@ pub use error::{ArtifactPublishStage, ClientError, TransportError};
 pub use generic_index::{
     GenericIndexAbortOutcome, GenericIndexRegistrationOutcome, GenericIndexRegistrationPlan,
 };
-#[cfg(feature = "control")]
-pub use route::ControlRouteResolver;
-#[cfg(feature = "etcd")]
-pub use route::EtcdRouteOptions;
 pub use route::{
     ResolvedRoute, RouteRefreshMode, RouteResolver, SeedRouteOptions, SeedRouteResolver,
     StaticRouteResolver,

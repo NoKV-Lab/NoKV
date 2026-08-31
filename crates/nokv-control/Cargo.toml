@@ -1,7 +1,7 @@
 [package]
 name = "nokv-control"
 version = "0.1.0"
-description = "NoKV control plane shard ownership, epoch fencing, and recovery coordination."
+description = "Provider-neutral NoKV metadata catalog and distributed ownership contracts."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,13 +13,5 @@ homepage.workspace = true
 name = "nokv_control"
 path = "src/lib.rs"
 
-[features]
-default = []
-etcd = ["dep:etcd-client", "dep:tokio"]
-
 [dependencies]
-etcd-client = { workspace = true, optional = true }
 nokv-types.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tokio = { workspace = true, optional = true }

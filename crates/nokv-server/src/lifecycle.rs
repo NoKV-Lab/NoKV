@@ -27,7 +27,7 @@ use nokv_types::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{OwnerLossSignal, RecoveryPublisher, RecoveryPublisherError, RootOwnerRegistry};
+use crate::{OwnerLossSignal, RootOwnerRegistry};
 
 const OWNER_LOSS_POLL_SLICE: Duration = Duration::from_millis(10);
 static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -115,12 +115,33 @@ pub trait LifecycleObjectDeleter: Send + Sync {
     ) -> Result<LifecycleAbsenceProof, LifecycleDeleteError>;
 }
 
-/// Required recovery barrier for background metadata mutations. A lifecycle
-/// transition is not externally durable until its outbox tail is published to
-/// immutable objects and committed by the control plane.
+/// Commit-authority barrier for background metadata mutations.
 pub trait LifecycleDurabilityBarrier: Send + Sync {
-    fn publish_current(&self) -> Result<(), RecoveryPublisherError>;
+    fn publish_current(&self) -> Result<(), LifecycleDurabilityError>;
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LifecycleDurabilityError {
+    Retryable(String),
+    Terminal(String),
+}
+
+impl LifecycleDurabilityError {
+    fn retryable(&self) -> bool {
+        matches!(self, Self::Retryable(_))
+    }
+}
+
+impl fmt::Display for LifecycleDurabilityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Retryable(detail) => write!(formatter, "retryable durability failure: {detail}"),
+            Self::Terminal(detail) => write!(formatter, "terminal durability failure: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for LifecycleDurabilityError {}
 
 /// Durability barrier for metadata stores whose commit acknowledgement is the
 /// serving authority. Holt has already synced its local journal, while FDB has
@@ -130,14 +151,8 @@ pub trait LifecycleDurabilityBarrier: Send + Sync {
 pub struct CommittedMetadataDurability;
 
 impl LifecycleDurabilityBarrier for CommittedMetadataDurability {
-    fn publish_current(&self) -> Result<(), RecoveryPublisherError> {
+    fn publish_current(&self) -> Result<(), LifecycleDurabilityError> {
         Ok(())
-    }
-}
-
-impl LifecycleDurabilityBarrier for RecoveryPublisher {
-    fn publish_current(&self) -> Result<(), RecoveryPublisherError> {
-        RecoveryPublisher::publish_current(self).map(|_| ())
     }
 }
 
@@ -263,9 +278,9 @@ pub enum LifecycleError {
         detail: String,
     },
     Clock(String),
-    RecoveryPublication {
+    DurabilityBarrier {
         primary: Option<String>,
-        source: RecoveryPublisherError,
+        source: LifecycleDurabilityError,
     },
     WorkerLockPoisoned,
 }
@@ -285,12 +300,12 @@ impl fmt::Display for LifecycleError {
                 write!(formatter, "lifecycle {action} failed: {detail}")
             }
             Self::Clock(detail) => write!(formatter, "lifecycle clock failed: {detail}"),
-            Self::RecoveryPublication { primary, source } => match primary {
+            Self::DurabilityBarrier { primary, source } => match primary {
                 Some(primary) => write!(
                     formatter,
-                    "lifecycle failed before recovery publication: {primary}; recovery publication also failed: {source}"
+                    "lifecycle failed before its durability barrier: {primary}; durability barrier also failed: {source}"
                 ),
-                None => write!(formatter, "lifecycle recovery publication failed: {source}"),
+                None => write!(formatter, "lifecycle durability barrier failed: {source}"),
             },
             Self::WorkerLockPoisoned => formatter.write_str("lifecycle worker lock is poisoned"),
         }
@@ -301,7 +316,7 @@ impl std::error::Error for LifecycleError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Meta(error) => Some(error),
-            Self::RecoveryPublication { source, .. } => Some(source),
+            Self::DurabilityBarrier { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -389,7 +404,7 @@ impl LifecycleRunner {
     fn publish_current(&self) -> Result<(), LifecycleError> {
         self.durability
             .publish_current()
-            .map_err(|source| LifecycleError::RecoveryPublication {
+            .map_err(|source| LifecycleError::DurabilityBarrier {
                 primary: None,
                 source,
             })
@@ -401,11 +416,11 @@ impl LifecycleRunner {
     ) -> Result<LifecycleCycleReport, LifecycleError> {
         match (result, self.durability.publish_current()) {
             (result, Ok(())) => result,
-            (Ok(_), Err(source)) => Err(LifecycleError::RecoveryPublication {
+            (Ok(_), Err(source)) => Err(LifecycleError::DurabilityBarrier {
                 primary: None,
                 source,
             }),
-            (Err(primary), Err(source)) => Err(LifecycleError::RecoveryPublication {
+            (Err(primary), Err(source)) => Err(LifecycleError::DurabilityBarrier {
                 primary: Some(primary.to_string()),
                 source,
             }),
@@ -1673,7 +1688,7 @@ fn retryable_lifecycle(error: &LifecycleError) -> bool {
         LifecycleError::Meta(meta::MetaError::ReadStabilityExhausted { .. })
     ) || matches!(
         error,
-        LifecycleError::RecoveryPublication {
+        LifecycleError::DurabilityBarrier {
             primary: None,
             source,
         } if source.retryable()
@@ -1736,7 +1751,7 @@ mod tests {
     }
 
     impl LifecycleDurabilityBarrier for TestDurabilityBarrier {
-        fn publish_current(&self) -> Result<(), RecoveryPublisherError> {
+        fn publish_current(&self) -> Result<(), LifecycleDurabilityError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1751,10 +1766,10 @@ mod tests {
     struct FailingDurabilityBarrier;
 
     impl LifecycleDurabilityBarrier for FailingDurabilityBarrier {
-        fn publish_current(&self) -> Result<(), RecoveryPublisherError> {
-            Err(RecoveryPublisherError::Backlog {
-                remaining_after_lsn: 7,
-            })
+        fn publish_current(&self) -> Result<(), LifecycleDurabilityError> {
+            Err(LifecycleDurabilityError::Retryable(
+                "metadata commit is not yet durable".to_owned(),
+            ))
         }
     }
 
@@ -1766,7 +1781,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_cycle_cannot_succeed_before_its_recovery_tail_is_published() {
+    fn lifecycle_cycle_cannot_succeed_before_its_durability_barrier_commits() {
         let fixture = fixture();
         let runner = LifecycleRunner::new(
             Arc::clone(&fixture.store),
@@ -1790,7 +1805,7 @@ mod tests {
         let error = runner.run_once(100).unwrap_err();
         assert!(matches!(
             &error,
-            LifecycleError::RecoveryPublication { primary: None, .. }
+            LifecycleError::DurabilityBarrier { primary: None, .. }
         ));
         assert!(retryable_lifecycle(&error));
     }

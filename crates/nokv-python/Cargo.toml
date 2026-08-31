@@ -22,7 +22,7 @@ extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 nokv-agent.workspace = true
-nokv-client = { workspace = true, features = ["etcd"] }
+nokv-client.workspace = true
 nokv-workbench-projection.workspace = true
 nokv-object.workspace = true
 nokv-protocol.workspace = true

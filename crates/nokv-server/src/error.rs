@@ -13,14 +13,8 @@ pub enum ServerError {
     InvalidBootstrap(String),
     RouteRollback(String),
     Control(nokv_control::ControlError),
-    PreparedOwnerAdmission {
-        path: PathBuf,
-        source: nokv_control::ControlError,
-    },
     Store(nokv_meta_store::StoreError),
     Meta(nokv_meta::workspace::MetaError),
-    RecoveryInstallation(crate::RecoveryInstallerError),
-    RecoveryPublication(crate::RecoveryPublisherError),
     RecoveryPath {
         path: PathBuf,
         source: std::io::Error,
@@ -56,38 +50,8 @@ impl fmt::Display for ServerError {
             }
             Self::RouteRollback(message) => write!(formatter, "root route rollback: {message}"),
             Self::Control(error) => write!(formatter, "control plane failed: {error}"),
-            Self::PreparedOwnerAdmission { path, source } => {
-                if matches!(source, nokv_control::ControlError::Backend(_)) {
-                    write!(
-                        formatter,
-                        "control-plane owner acquisition outcome is unknown after preparing the \
-                         epoch-zero metadata store at {}: {source}; preserve the store and \
-                         retry with --metadata-reopen {} after the prior owner session settles; \
-                         startup will acquire epoch one if the transaction did not apply, or \
-                         rebind the durable Recovering epoch one if it did; do not delete the \
-                         prepared store while acquisition may have succeeded",
-                        path.display(),
-                        path.display()
-                    )
-                } else {
-                    write!(
-                        formatter,
-                        "control plane failed after preparing the epoch-zero metadata store at \
-                         {}: {source}; retry the corrected first-owner command with \
-                         --metadata-reopen {}",
-                        path.display(),
-                        path.display()
-                    )
-                }
-            }
             Self::Store(error) => write!(formatter, "metadata store failed: {error}"),
             Self::Meta(error) => write!(formatter, "metadata failed: {error}"),
-            Self::RecoveryInstallation(error) => {
-                write!(formatter, "recovery installation failed: {error}")
-            }
-            Self::RecoveryPublication(error) => {
-                write!(formatter, "recovery publication failed: {error}")
-            }
             Self::RecoveryPath { path, source } => write!(
                 formatter,
                 "recovery metadata path {} cannot be inspected: {source}",
@@ -126,18 +90,6 @@ impl From<nokv_meta_store::StoreError> for ServerError {
 impl From<nokv_meta::workspace::MetaError> for ServerError {
     fn from(error: nokv_meta::workspace::MetaError) -> Self {
         Self::Meta(error)
-    }
-}
-
-impl From<crate::RecoveryInstallerError> for ServerError {
-    fn from(error: crate::RecoveryInstallerError) -> Self {
-        Self::RecoveryInstallation(error)
-    }
-}
-
-impl From<crate::RecoveryPublisherError> for ServerError {
-    fn from(error: crate::RecoveryPublisherError) -> Self {
-        Self::RecoveryPublication(error)
     }
 }
 

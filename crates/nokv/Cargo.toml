@@ -10,8 +10,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["etcd"]
-etcd = ["nokv-client/etcd", "nokv-control/etcd", "nokv-server/etcd"]
+default = []
 fdb = ["nokv-server/fdb"]
 
 [dependencies]

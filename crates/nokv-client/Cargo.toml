@@ -9,13 +9,7 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
-[features]
-default = []
-control = ["dep:nokv-control"]
-etcd = ["control", "nokv-control/etcd"]
-
 [dependencies]
-nokv-control = { workspace = true, optional = true }
 nokv-object.workspace = true
 nokv-protocol.workspace = true
 nokv-types.workspace = true

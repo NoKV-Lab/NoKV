@@ -8,12 +8,12 @@
 use std::sync::{Arc, OnceLock};
 
 use nokv_object::{
-    admit_artifact_provider, ensure_object_namespace, load_object_namespace,
-    verify_object_namespace, ArtifactObjectStore, ArtifactStoreCapabilities,
-    ImmutableCreateOutcome, LocalHotTier, LocalHotTierOptions, ObjectDeleteOutcome, ObjectError,
-    ObjectInfo, ObjectKey, ObjectRange, ProviderAdmissionError, ProviderAdmissionProfile,
-    ProviderAdmissionReceipt, ProviderHandleIdentity, S3ArtifactStore, S3ArtifactStoreOptions,
-    TieredArtifactStore, TieredArtifactStoreOptions, DEFAULT_ARTIFACT_BLOCK_SIZE,
+    admit_artifact_provider, ensure_object_namespace, verify_object_namespace, ArtifactObjectStore,
+    ArtifactStoreCapabilities, ImmutableCreateOutcome, LocalHotTier, LocalHotTierOptions,
+    ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectKey, ObjectRange, ProviderAdmissionError,
+    ProviderAdmissionProfile, ProviderAdmissionReceipt, ProviderHandleIdentity, S3ArtifactStore,
+    S3ArtifactStoreOptions, TieredArtifactStore, TieredArtifactStoreOptions,
+    DEFAULT_ARTIFACT_BLOCK_SIZE,
 };
 use nokv_types::ObjectNamespaceId;
 
@@ -120,10 +120,6 @@ impl CliObjectStore {
         verify_object_namespace(self.durable(), expected).map_err(|error| error.to_string())?;
         self.namespace_id = Some(expected);
         Ok(self)
-    }
-
-    pub fn load_namespace(&self) -> Result<Option<ObjectNamespaceId>, String> {
-        load_object_namespace(self.durable()).map_err(|error| error.to_string())
     }
 
     pub fn ensure_namespace(&self, namespace_id: ObjectNamespaceId) -> Result<(), String> {
