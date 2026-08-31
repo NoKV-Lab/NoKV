@@ -2117,6 +2117,10 @@ mod tests {
     fn artifact_entry(index: usize) -> PathEntry {
         PathEntry {
             generation: Generation::new(1).unwrap(),
+            index_generation: nokv_types::PathIndexGenerationId::from_bytes(
+                [index as u8; FIXED_ID_BYTES],
+            ),
+            path_digest: [index as u8; SHA256_BYTES],
             artifact_revision_id: revision(index + 1),
             body_digest_uri: format!("sha256:{:064x}", index + 1),
             manifest_digest_uri: format!("sha256:{:064x}", index + 2),

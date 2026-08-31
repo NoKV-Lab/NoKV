@@ -16,19 +16,40 @@ use super::{keyspaces, store_limits, MetaError, MetaShard};
 
 pub(crate) struct CommitCaptureStore {
     inner: Arc<dyn TxnStore>,
-    last_commit: Mutex<Option<WriteTxn>>,
+    commits: Mutex<Vec<WriteTxn>>,
+}
+
+pub(crate) struct TransactionTargetStore {
+    inner: Arc<dyn TxnStore>,
+    transaction_target_bytes: usize,
 }
 
 impl CommitCaptureStore {
     pub(crate) fn with_last_commit<T>(&self, inspect: impl FnOnce(&WriteTxn) -> T) -> T {
-        let last_commit = self
-            .last_commit
+        let commits = self
+            .commits
             .lock()
             .expect("capture commit lock must be available");
-        let transaction = last_commit
-            .as_ref()
+        let transaction = commits
+            .last()
             .expect("captured store must contain one commit");
         inspect(transaction)
+    }
+
+    pub(crate) fn with_last_commits<T>(
+        &self,
+        count: usize,
+        inspect: impl FnOnce(&[WriteTxn]) -> T,
+    ) -> T {
+        let commits = self
+            .commits
+            .lock()
+            .expect("capture commit lock must be available");
+        assert!(
+            commits.len() >= count,
+            "captured store contains fewer commits than requested"
+        );
+        inspect(&commits[commits.len() - count..])
     }
 }
 
@@ -42,10 +63,31 @@ impl TxnStore for CommitCaptureStore {
     }
 
     fn commit(&self, transaction: WriteTxn) -> Result<Commit, StoreError> {
-        *self
-            .last_commit
+        self.commits
             .lock()
-            .expect("capture commit lock must be available") = Some(transaction.clone());
+            .expect("capture commit lock must be available")
+            .push(transaction.clone());
+        self.inner.commit(transaction)
+    }
+
+    fn ready(&self) -> Result<(), StoreError> {
+        self.inner.ready()
+    }
+}
+
+impl TxnStore for TransactionTargetStore {
+    fn profile(&self) -> StoreProfile {
+        StoreProfile {
+            transaction_target_bytes: self.transaction_target_bytes,
+            ..self.inner.profile()
+        }
+    }
+
+    fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+        self.inner.read(batch)
+    }
+
+    fn commit(&self, transaction: WriteTxn) -> Result<Commit, StoreError> {
         self.inner.commit(transaction)
     }
 
@@ -59,9 +101,19 @@ pub(crate) fn capture_txn_store(
 ) -> (Arc<dyn TxnStore>, Arc<CommitCaptureStore>) {
     let capture = Arc::new(CommitCaptureStore {
         inner,
-        last_commit: Mutex::new(None),
+        commits: Mutex::new(Vec::new()),
     });
     (capture.clone(), capture)
+}
+
+pub(crate) fn with_transaction_target(
+    inner: Arc<dyn TxnStore>,
+    transaction_target_bytes: usize,
+) -> Arc<dyn TxnStore> {
+    Arc::new(TransactionTargetStore {
+        inner,
+        transaction_target_bytes,
+    })
 }
 
 pub(crate) fn transaction_bytes(transaction: &WriteTxn) -> usize {

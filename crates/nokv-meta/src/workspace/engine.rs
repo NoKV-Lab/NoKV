@@ -53,6 +53,7 @@ const SYSTEM_VALUE_FORMAT_VERSION: u8 = 1;
 const INITIAL_COMMIT_VERSION: u64 = 1;
 
 const MAX_COMMAND_ITEMS: usize = 256;
+const READ_FENCE_OPS: usize = 3;
 const MAX_DELIMITED_SCAN_ITEMS: usize = MAX_COMMAND_ITEMS * 2;
 const MAX_HISTORICAL_SCAN_PAGE_ROWS: usize = MAX_COMMAND_ITEMS;
 const MAX_HISTORICAL_SCAN_ATTEMPTS: usize = 4;
@@ -78,20 +79,16 @@ const MAX_STORED_VALUE_BYTES: usize = u16::MAX as usize;
 const MAX_RECORD_PAYLOAD_BYTES: usize = 60 * 1024;
 const MAX_COMMAND_VALUE_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
 const MAX_DETERMINISTIC_RESULT_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
-const MAX_EVENT_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
+pub(super) const MAX_EVENT_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
 
-/// Transitional transaction-store limits for the workspace schema.
+/// Local Holt transaction-store limits for the workspace schema.
 ///
-/// The decimal 16,000,000-byte transaction envelope preserves three
-/// high-amplification lifecycles characterized against the pre-provider
-/// Holt-backed engine: a 60-field, 61,203-byte projection on a short path, and
-/// a 4,096-byte path with 64 dependencies and a 57,243-byte projection, plus a
-/// successful disjoint 60-field replacement whose fully derived transaction is
-/// 9,859,124 bytes at the maximum tested event-union boundary.
-/// Together with the configured maximum mutation overhead it remains below
-/// Holt's 16 MiB WAL-record ceiling. This is a transitional compatibility
-/// profile, not proof that every domain-valid command fits; providers with a
-/// smaller hard transaction limit are not qualified for it.
+/// The decimal 16,000,000-byte envelope retains conservative headroom for
+/// schema-owned lifecycles and stays below Holt's 16 MiB WAL-record ceiling
+/// after configured mutation overhead. Format-11 publication, rename,
+/// restore, and path-index cleanup additionally plan against the selected
+/// store's lower transaction target; this local hard profile is not evidence
+/// that another adapter is qualified.
 pub const fn store_limits() -> StoreLimits {
     StoreLimits {
         max_reads: 8,
@@ -1729,6 +1726,103 @@ impl MetaShard {
         )
     }
 
+    /// Read one bounded set of exact metadata keys through one physical
+    /// snapshot and one owner/root/clock fence batch.
+    ///
+    /// Current values are decoded from that batch. Only keys that require
+    /// historical reconstruction fall back to their individual History scan.
+    pub(super) fn read_many_at(
+        &self,
+        root_id: RootId,
+        placement_generation: PlacementGeneration,
+        owner_epoch: OwnerEpoch,
+        requests: &[(MetadataFamily, Vec<u8>)],
+        version: ReadVersion,
+    ) -> Result<Vec<Option<Vec<u8>>>, MetaError> {
+        let maximum = self.point_read_batch_capacity();
+        if requests.len() > maximum {
+            return Err(invalid(format!(
+                "point-read batch count {} exceeds {maximum}",
+                requests.len()
+            )));
+        }
+        let _read_guard = self
+            .command_gate
+            .read()
+            .map_err(|error| internal("lock read gate", error))?;
+        for (_, key) in requests {
+            validate_root_scoped_bytes(root_id, key, "batched read key")?;
+        }
+        let context = ReadFenceContext {
+            root_id,
+            placement_generation,
+            owner_epoch,
+        };
+        let operations = requests
+            .iter()
+            .map(|(family, key)| ReadOp::Get(Key::new(family.keyspace(), key.clone())))
+            .collect();
+        let (clock, results) =
+            self.read_batch_at_fence(context, operations, "read metadata point batch")?;
+        if version > clock {
+            return Err(MetaError::ReadVersionInFuture {
+                requested: version.get(),
+                current: clock.get(),
+            });
+        }
+        if results.len() != requests.len() {
+            return Err(corrupt(
+                "transaction-store read",
+                "point batch result count does not match its request",
+            ));
+        }
+        let mut decoded = Vec::with_capacity(requests.len());
+        for ((family, key), result) in requests.iter().zip(results) {
+            let ReadResult::Get(raw) = result else {
+                return Err(corrupt(
+                    "transaction-store read",
+                    "point batch returned a scan result",
+                ));
+            };
+            #[cfg(feature = "metadata-read-stats")]
+            self.record_point(point_source(*family), raw.as_ref().map(Vec::len));
+            let current = raw
+                .as_deref()
+                .map(CurrentValue::decode)
+                .transpose()
+                .map_err(|error| corrupt(family.name(), error))?;
+            if let Some(current) = current {
+                if current.modified_version.get() > clock.get() {
+                    return Err(corrupt(
+                        family.name(),
+                        format!(
+                            "record version {} is newer than the captured commit clock {}",
+                            current.modified_version.get(),
+                            clock.get()
+                        ),
+                    ));
+                }
+                if current.modified_version.get() <= version.get() {
+                    decoded.push(Some(current.payload));
+                    continue;
+                }
+            } else if version == clock {
+                decoded.push(None);
+                continue;
+            }
+            decoded.push(self.read_at_fence(*family, key, version, context)?);
+        }
+        Ok(decoded)
+    }
+
+    pub(super) fn point_read_batch_capacity(&self) -> usize {
+        self.store
+            .profile()
+            .limits
+            .max_reads
+            .saturating_sub(READ_FENCE_OPS)
+    }
+
     /// Run dependent point reads at one captured logical version.
     ///
     /// `requested_version = None` captures the current version inside the
@@ -2381,7 +2475,7 @@ impl MetaShard {
         data_ops: Vec<ReadOp>,
         operation: &'static str,
     ) -> Result<(ReadVersion, Vec<ReadResult>), MetaError> {
-        let mut ops = Vec::with_capacity(3 + data_ops.len());
+        let mut ops = Vec::with_capacity(READ_FENCE_OPS + data_ops.len());
         ops.push(ReadOp::Get(Key::new(SYSTEM.id, SYSTEM_OWNER_FENCE_KEY)));
         ops.push(ReadOp::Get(Key::new(
             ROOT_FENCE.id,
@@ -4771,7 +4865,7 @@ mod tests {
     #[test]
     fn fresh_store_freezes_schema_shard_and_bootstrap_version() {
         let store = crate::workspace::test_support::memory(shard(1)).unwrap();
-        assert_eq!(keyspaces().len(), 29);
+        assert_eq!(keyspaces().len(), 30);
         assert_eq!(store.current_read_version().unwrap().get(), 1);
         assert_eq!(
             store.advance_owner_epoch(Some(epoch(1)), epoch(2)),

@@ -6612,6 +6612,8 @@ mod tests {
             index_value.clone(),
         )]))
         .unwrap();
+        let path_digest = meta::path_index_digest(&path);
+        let index_generation = types::PathIndexGenerationId::from_bytes([1; types::FIXED_ID_BYTES]);
         let revision_record = meta::ArtifactRevisionRecord {
             logical_size: 0,
             body_digest_uri: "sha256:body".to_owned(),
@@ -6628,6 +6630,8 @@ mod tests {
         };
         let path_record = meta::PathEntry {
             generation: types::Generation::new(1).unwrap(),
+            index_generation,
+            path_digest,
             artifact_revision_id: revision,
             body_digest_uri: "sha256:body".to_owned(),
             manifest_digest_uri: "sha256:manifest".to_owned(),
@@ -6643,12 +6647,19 @@ mod tests {
         let path_key = meta::path_current_key(root(), workbench_incarnation, &path);
         let reference_key =
             meta::path_revision_ref_key(root(), workbench_incarnation, &path, revision);
+        let locator_key = meta::path_index_locator_key(
+            root(),
+            workbench_incarnation,
+            path_digest,
+            index_generation,
+        );
         let index_key = meta::secondary_index_key(
             root(),
             &index_field,
             &index_value,
             workbench_incarnation,
-            &path,
+            path_digest,
+            index_generation,
         );
         let command = meta::MetadataCommand {
             schema_id: meta::SCHEMA_ID.to_owned(),
@@ -6680,6 +6691,11 @@ mod tests {
                     expected: None,
                 },
                 meta::CommandPredicate::Value {
+                    family: meta::MetadataFamily::PathIndexLocator,
+                    key: locator_key.clone(),
+                    expected: None,
+                },
+                meta::CommandPredicate::Value {
                     family: meta::MetadataFamily::SecondaryIndex,
                     key: index_key.clone(),
                     expected: None,
@@ -6706,11 +6722,21 @@ mod tests {
                     .unwrap(),
                 },
                 meta::CommandMutation::Put {
+                    family: meta::MetadataFamily::PathIndexLocator,
+                    key: locator_key,
+                    value: meta::PathIndexLocatorRecord {
+                        state: meta::PathIndexLocatorState::Published,
+                        path,
+                    }
+                    .encode()
+                    .unwrap(),
+                },
+                meta::CommandMutation::Put {
                     family: meta::MetadataFamily::SecondaryIndex,
                     key: index_key,
                     value: meta::SecondaryIndexRecord {
-                        path_generation: types::Generation::new(1).unwrap(),
-                        compact_projection: projection,
+                        path_digest,
+                        index_generation,
                     }
                     .encode()
                     .unwrap(),
@@ -6766,11 +6792,23 @@ mod tests {
         for index in 1..total_paths {
             let path = types::NormalizedRelativePath::new(format!("outputs/shared-{index:03}.bin"))
                 .unwrap();
+            let path_digest = meta::path_index_digest(&path);
+            let index_generation = types::PathIndexGenerationId::from_bytes(
+                u128::try_from(index + 1).unwrap().to_be_bytes(),
+            );
             let path_key = meta::path_current_key(root(), workbench_incarnation, &path);
+            let locator_key = meta::path_index_locator_key(
+                root(),
+                workbench_incarnation,
+                path_digest,
+                index_generation,
+            );
             let reference_key =
                 meta::path_revision_ref_key(root(), workbench_incarnation, &path, revision);
             let path_record = meta::PathEntry {
                 generation: types::Generation::new(1).unwrap(),
+                index_generation,
+                path_digest,
                 artifact_revision_id: revision,
                 body_digest_uri: "sha256:body".to_owned(),
                 manifest_digest_uri: "sha256:manifest".to_owned(),
@@ -6789,6 +6827,11 @@ mod tests {
                     expected: None,
                 },
                 meta::CommandPredicate::Value {
+                    family: meta::MetadataFamily::PathIndexLocator,
+                    key: locator_key.clone(),
+                    expected: None,
+                },
+                meta::CommandPredicate::Value {
                     family: meta::MetadataFamily::RevisionRef,
                     key: reference_key.clone(),
                     expected: None,
@@ -6799,6 +6842,16 @@ mod tests {
                     family: meta::MetadataFamily::PathCurrent,
                     key: path_key,
                     value: path_record.encode().unwrap(),
+                },
+                meta::CommandMutation::Put {
+                    family: meta::MetadataFamily::PathIndexLocator,
+                    key: locator_key,
+                    value: meta::PathIndexLocatorRecord {
+                        state: meta::PathIndexLocatorState::Published,
+                        path,
+                    }
+                    .encode()
+                    .unwrap(),
                 },
                 meta::CommandMutation::Put {
                     family: meta::MetadataFamily::RevisionRef,
@@ -6897,17 +6950,28 @@ mod tests {
         workbench_incarnation: types::WorkspaceIncarnationId,
         paths: &[&str],
     ) {
-        let mut predicates = Vec::with_capacity(paths.len());
-        let mut mutations = Vec::with_capacity(paths.len());
+        let mut predicates = Vec::with_capacity(paths.len() * 2);
+        let mut mutations = Vec::with_capacity(paths.len() * 2);
         for (index, raw_path) in paths.iter().enumerate() {
             let path = types::NormalizedRelativePath::new(*raw_path).unwrap();
             let key = meta::path_current_key(root(), workbench_incarnation, &path);
             let fill = u8::try_from(index + 1).unwrap();
+            let path_digest = meta::path_index_digest(&path);
+            let index_generation =
+                types::PathIndexGenerationId::from_bytes([fill; types::FIXED_ID_BYTES]);
+            let locator_key = meta::path_index_locator_key(
+                root(),
+                workbench_incarnation,
+                path_digest,
+                index_generation,
+            );
             let body_hex = format!("{fill:02x}").repeat(32);
             let manifest_fill = fill.saturating_add(0x40);
             let manifest_hex = format!("{manifest_fill:02x}").repeat(32);
             let entry = meta::PathEntry {
                 generation: types::Generation::new(u64::from(fill)).unwrap(),
+                index_generation,
+                path_digest,
                 artifact_revision_id: types::ArtifactRevisionId::from_bytes(
                     [fill; types::FIXED_ID_BYTES],
                 ),
@@ -6926,10 +6990,25 @@ mod tests {
                 key: key.clone(),
                 expected: None,
             });
+            predicates.push(meta::CommandPredicate::Value {
+                family: meta::MetadataFamily::PathIndexLocator,
+                key: locator_key.clone(),
+                expected: None,
+            });
             mutations.push(meta::CommandMutation::Put {
                 family: meta::MetadataFamily::PathCurrent,
                 key,
                 value: entry.encode().unwrap(),
+            });
+            mutations.push(meta::CommandMutation::Put {
+                family: meta::MetadataFamily::PathIndexLocator,
+                key: locator_key,
+                value: meta::PathIndexLocatorRecord {
+                    state: meta::PathIndexLocatorState::Published,
+                    path,
+                }
+                .encode()
+                .unwrap(),
             });
         }
         store
@@ -6965,6 +7044,8 @@ mod tests {
     ) -> protocol::WorkspacePath {
         let revision = types::ArtifactRevisionId::from_bytes([8; types::FIXED_ID_BYTES]);
         let path = types::NormalizedRelativePath::new("outputs/ranged.bin").unwrap();
+        let path_digest = meta::path_index_digest(&path);
+        let index_generation = types::PathIndexGenerationId::from_bytes([8; types::FIXED_ID_BYTES]);
         let revision_record = meta::ArtifactRevisionRecord {
             logical_size: row_count,
             body_digest_uri: "sha256:ranged-body".to_owned(),
@@ -6981,6 +7062,8 @@ mod tests {
         };
         let path_record = meta::PathEntry {
             generation: types::Generation::new(1).unwrap(),
+            index_generation,
+            path_digest,
             artifact_revision_id: revision,
             body_digest_uri: "sha256:ranged-body".to_owned(),
             manifest_digest_uri: "sha256:ranged-manifest".to_owned(),
@@ -6994,6 +7077,12 @@ mod tests {
         };
         let revision_key = meta::artifact_revision_key(root(), revision);
         let path_key = meta::path_current_key(root(), workbench_incarnation, &path);
+        let locator_key = meta::path_index_locator_key(
+            root(),
+            workbench_incarnation,
+            path_digest,
+            index_generation,
+        );
         store
             .execute(
                 &meta::MetadataCommand {
@@ -7020,6 +7109,11 @@ mod tests {
                             key: path_key.clone(),
                             expected: None,
                         },
+                        meta::CommandPredicate::Value {
+                            family: meta::MetadataFamily::PathIndexLocator,
+                            key: locator_key.clone(),
+                            expected: None,
+                        },
                     ],
                     mutations: vec![
                         meta::CommandMutation::Put {
@@ -7031,6 +7125,16 @@ mod tests {
                             family: meta::MetadataFamily::PathCurrent,
                             key: path_key,
                             value: path_record.encode().unwrap(),
+                        },
+                        meta::CommandMutation::Put {
+                            family: meta::MetadataFamily::PathIndexLocator,
+                            key: locator_key,
+                            value: meta::PathIndexLocatorRecord {
+                                state: meta::PathIndexLocatorState::Published,
+                                path: path.clone(),
+                            }
+                            .encode()
+                            .unwrap(),
                         },
                     ],
                     history_projection: Vec::new(),

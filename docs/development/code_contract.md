@@ -113,6 +113,11 @@ that owns them. Do not move domain-specific or single-use logic into a generic
   component-safe key codec.
 - `WorkspaceCurrent` is the visibility marker; staging must be absent from
   every query surface until marker publication.
+- SecondaryIndexV2 rows are derived, generation-fenced data. Publication and
+  rename may stage them in one bounded command, but only an atomic
+  `PathIndexLocator(Staged -> Published)` plus matching `PathCurrent`
+  transition makes them visible. Queries recheck the exact current path, and
+  asynchronous cleanup deletes only stale `Published` generations.
 - Keep object bytes out of the metadata store except compact immutable
   descriptors.
 - Publish objects first and metadata last. Metadata failure leaves no

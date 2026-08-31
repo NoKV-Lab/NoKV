@@ -52,6 +52,7 @@ SnapshotId               8 bytes, unsigned big-endian and unique within one Root
                                   exactly the numeric Workbench facade id
 OperationId             16 bytes, unique within one RootId
 GenericIndexGenerationId 16 bytes, never reused within one RootId
+PathIndexGenerationId   16 bytes, never reused within one RootId
 CommitId                32 bytes, root-global SHA-256 identity
 ```
 
@@ -85,7 +86,7 @@ exact key is a strict prefix of another valid path key. A child/subtree prefix
 appends NUL, so `a` cannot match `ab`. The empty path has no `PathCurrent`
 record; the workspace root is synthesized from `WorkspaceCurrent`. This path
 key layout was introduced by system format version 8 and is retained by
-version 10.
+version 11.
 
 The one shared normalizer enforces:
 
@@ -106,8 +107,11 @@ float, timestamp, bytes, and string values.
 
 ## Durable Format Registry
 
-`System.format_version` is `11`. Version 11 retains the format-10 keyspace
-catalog and fixed-width decimal RecoveryOutbox LSN keys. It changes
+`System.format_version` is `11`. Version 11 retains the format-10 path layout
+and fixed-width decimal RecoveryOutbox LSN keys. It adds
+`PathIndexLocator(0x021c)`, replaces path secondary-index rows with
+SecondaryIndexV2 generation identities, and changes `PathEntry` plus the other
+publication-owned records to value version `3`. It also changes
 `CommandDedupe` so one result contains an optional typed local recovery
 receipt. `RecoveryMode::LocalJournal` writes that receipt and the hash-chained
 RecoveryOutbox in the same transaction. `RecoveryMode::StoreAuthority` writes
@@ -123,7 +127,7 @@ evidence. Migration remains not qualified; every older or unknown marker is
 fail-closed and unchanged.
 
 Durable codecs are independently versioned:
-publication-owned workspace/path/revision records use value version `2`;
+publication-owned workspace/path/revision records use value version `3`;
 `CommitRecord` uses version `3` and dual-decodes version `2`, while its member,
 consumer, head, and tag records remain version `2`; `ChangeEvent` uses value
 version `2`, and the logical recovery-outbox record uses version `3` with
@@ -141,6 +145,9 @@ complete source workbench/incarnation, concrete source selector, and both path
 and Generic-index closure progress needed for source-independent terminal
 replay. Unknown versions fail closed. Keys do not repeat a version because the
 store-level schema marker gates their codec.
+SecondaryIndexV2 values use version `2` and contain only `path_digest` plus
+`PathIndexGenerationId`; `PathIndexLocator` values use version `1` and contain
+the locator state plus the one canonical normalized path.
 Generic index current, generation, row, reference, append-receipt,
 registration-operation, and commit-member payloads use value version `1`.
 Row binding is explicit: `Directory` cannot later decorate an artifact,
@@ -183,6 +190,7 @@ and name. Store adapters map this catalog to their physical layout.
 | `generic_index_current` | `0x0219` | `0x19` |
 | `generic_index_generation` | `0x021a` | `0x1a` |
 | `commit_generic_index_member` | `0x021b` | `0x1b` |
+| `path_index_locator` | `0x021c` | `0x1c` |
 
 System keyspaces use IDs `0x0101` through `0x0106`. Domain keyspaces use
 `0x0200 | format_tag`. The `MetadataFamily` format tags remain one byte and keep
@@ -216,6 +224,7 @@ GenericIndexRegistrationPhase: Preparing=1, Appending=2, Sealing=3,
 GenericIndexReferenceKind: Current=1, Commit=2, BuildCommit=3, Restore=4,
                            Registration=5
 GenericIndexRowBinding: Directory=1, Unbound=2, Artifact=3
+PathIndexLocatorState: Staged=1, Published=2
 PublishPhase:    Uploading=1, Finalizing=2, Published=3, Aborting=4,
                  Cleaning=5, Cleaned=6, Quarantined=7
 BuildCommitPhase: Building=1, Sealing=2, Complete=3, Aborting=4,
@@ -333,10 +342,10 @@ WorkspaceIncarnationClaim
 
 PathCurrent
   key: root_id | workspace_incarnation_id | normalized_relative_path
-  val: PathEntry: generation, artifact_revision_id, logical_size,
-       body_digest_uri, manifest_digest_uri, dependency_count,
-       dependency_depth, content_type, producer, manifest_id,
-       typed_index_projection
+  val: PathEntry: generation, path_index_generation_id, path_digest,
+       artifact_revision_id, logical_size, body_digest_uri,
+       manifest_digest_uri, dependency_count, dependency_depth,
+       content_type, producer, manifest_id, typed_index_projection
 
 ArtifactRevision
   key: root_id | artifact_revision_id
@@ -418,9 +427,24 @@ CommitConsumer
   val: consumer_epoch_at_add, created_version
 
 SecondaryIndex
-  key: root_id | index_id | encoded_value
-       | workspace_incarnation_id | ordered(normalized_relative_path)
-  val: path_generation, compact projection
+  key: root_id | len(field_id) | field_id | ordered_typed_value
+       | workspace_incarnation_id | path_digest | path_index_generation_id
+  val: path_digest, path_index_generation_id
+
+PathIndexLocator
+  key: root_id | workspace_incarnation_id | path_digest
+       | path_index_generation_id
+  val: Staged | Published, normalized_relative_path
+
+  path_digest = sha256(
+      "nokv.metadata.path-index.v1\0"
+      | u32be(normalized_path_bytes)
+      | normalized_path_bytes
+  )
+
+  A locator whose key digest disagrees with its canonical stored path is
+  corruption. Creation, query, and cleanup fail closed; no collision fallback
+  or alternate path lookup exists.
 
 ChangeEvent
   key: root_id | commit_version | event_sequence
@@ -505,6 +529,8 @@ truncation/compaction and fsck are not wired.
 
 ```text
 path_generation
+path_index_generation_id
+path_digest
 artifact_revision_id
 body_digest_uri
 manifest_digest_uri
@@ -523,9 +549,31 @@ record, or fallback path index.
 
 Clients attach queryable fields to `ArtifactDescriptor.index_fields` on the
 artifact publication request. The workspace executor validates and encodes
-that typed projection, and final publication updates `PathCurrent` and the
-corresponding `SecondaryIndex` rows in the same metadata command. There is no
-separate namespace-index registration RPC or second mutation path.
+that typed projection. Publication and rename first use one derived request id
+to create the generation's `Staged` locator and compact SecondaryIndexV2 rows.
+That command is invisible and has a durable replay receipt. One bounded final
+command then changes the locator to `Published` atomically with `PathCurrent`
+and the authoritative namespace, reference, event, and dedupe changes. Restore
+can write `Published` locators and rows while its workspace is hidden because
+`WorkspaceCurrent(Staging)` remains the outer visibility fence. There is no
+separate namespace-index registration RPC or alternate mutation path.
+
+An indexed query resolves each compact row through its exact locator and then
+the exact `PathCurrent` row at one fenced read version. It accepts only a
+`Published` locator whose workspace, path digest, and index generation match
+the current entry; staged or stale generations are invisible. These point
+joins are issued in store-profile-bounded batches. `PathCurrent` remains the
+authority even when an index is missing or stale.
+
+Remove deletes `PathCurrent`, which immediately makes its old published index
+generation stale and invisible. A root-wide, two-phase maintenance cursor
+reclaims stale SecondaryIndexV2 rows before stale published locators. Every
+delete predicates the exact derived row, exact published locator, and current
+`PathCurrent` payload or absence. A secondary row without its locator is
+corruption, not cleanup authority. The worker never deletes `Staged` locators;
+the owning durable publication or rename request must resume them. Cleanup
+pages shrink to the store transaction-planning target and return a durable,
+replayable cursor and row counts.
 
 A cold exact artifact lookup needs one logical `WorkspaceCurrent` point read
 and, only when its state is `Visible`, one logical `PathCurrent` point read.
@@ -712,10 +760,12 @@ evidence and the operator's verification transcript, transitions
 `Quarantined -> Cleaned`, and releases the revision claim when this operation
 owns it.
 
-The final metadata command creates the `ArtifactRevision` as `Available`, its
-manifest, the first path reference, `PathCurrent`, workspace revision, indexes,
-event, and dedupe result. A failed upload is invisible. A response-loss retry
-returns the stored result without allocating another revision.
+After its invisible index-stage command, the final metadata command creates the
+`ArtifactRevision` as `Available`, its manifest, the first path reference,
+`PathCurrent`, workspace revision, event, and dedupe result, and flips the exact
+locator to `Published`. It predicates every staged SecondaryIndexV2 row. A
+failed upload or incomplete stage is invisible. A response-loss retry returns
+the stored result without allocating another revision or index generation.
 
 Append stores immutable segments in the new revision manifest and atomically
 advances the path generation. A manifest row names the revision that physically
@@ -837,10 +887,11 @@ of them is an operation input mismatch.
    exact Sealed state/consumer epoch and build parent_count/parent_digest
 7. verify the revision and parent count/digest pairs against their exact rows
 8. CAS BuildCommit Building -> Sealing against all three closure digests
-9. one command publishes PathCurrent(metadata/run_manifest.json), its path ref,
-   WorkspaceCurrent, the sealed Commit, WorkbenchCommitHead, and the old/new
-   CommitConsumer rows/counts/epochs; it also releases the replaced path ref,
-   changes Sealing -> Complete, emits the event, and releases HistoryHold
+9. one command publishes PathCurrent(metadata/run_manifest.json), its
+   `Published` path-index locator, its path ref, WorkspaceCurrent, the sealed
+   Commit, WorkbenchCommitHead, and the old/new CommitConsumer
+   rows/counts/epochs; it also releases the replaced path ref, changes
+   Sealing -> Complete, emits the event, and releases HistoryHold
 ```
 
 The `Commit` seal is the closure proof. `CommitMember` path membership, unique
@@ -973,6 +1024,7 @@ The durable state machine is:
        `Sealed` Commit state/consumer epoch
 2. for each source entry, one bounded batch writes:
      - destination PathCurrent under the new incarnation
+     - its `Published` path-index locator and compact SecondaryIndexV2 rows
      - its Path RevisionRef
      - ordered RestoreMember with row digest
      - the next source cursor and member sequence

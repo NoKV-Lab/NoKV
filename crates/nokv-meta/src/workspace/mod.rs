@@ -28,6 +28,7 @@ mod remove;
 mod rename;
 mod restore;
 mod restore_records;
+mod secondary_index;
 mod snapshot;
 mod snapshot_query;
 mod snapshot_records;
@@ -180,11 +181,15 @@ pub use query::{
     MAX_QUERY_PREDICATES, MAX_QUERY_PROJECTION_FIELDS, MAX_QUERY_SORT_FIELDS,
 };
 pub use query_records::{
-    encode_ordered_index_scalar, secondary_index_field_prefix, secondary_index_key,
-    ChangeEventKind, ChangeEventRecord, FiniteFloat, QueryFieldId, QueryRecordError, QueryScalar,
-    QueryScalarType, SecondaryIndexRecord, TypedProjection, CHANGE_EVENT_VALUE_FORMAT_VERSION,
-    MAX_QUERY_FIELD_ID_BYTES, MAX_QUERY_SCALAR_BYTES, MAX_TYPED_PROJECTION_BYTES,
-    MAX_TYPED_PROJECTION_FIELDS, QUERY_RECORD_VALUE_FORMAT_VERSION,
+    decode_path_index_locator_key, decode_secondary_index_key, decode_secondary_index_row_key,
+    encode_ordered_index_scalar, path_index_digest, path_index_generation, path_index_locator_key,
+    secondary_index_field_prefix, secondary_index_key, secondary_index_value_prefix,
+    ChangeEventKind, ChangeEventRecord, FiniteFloat, PathIndexLocatorRecord, PathIndexLocatorState,
+    QueryFieldId, QueryRecordError, QueryScalar, QueryScalarType, SecondaryIndexRecord,
+    TypedProjection, CHANGE_EVENT_VALUE_FORMAT_VERSION, MAX_QUERY_FIELD_ID_BYTES,
+    MAX_QUERY_SCALAR_BYTES, MAX_TYPED_PROJECTION_BYTES, MAX_TYPED_PROJECTION_FIELDS,
+    PATH_INDEX_LOCATOR_VALUE_FORMAT_VERSION, QUERY_RECORD_VALUE_FORMAT_VERSION,
+    SECONDARY_INDEX_VALUE_FORMAT_VERSION,
 };
 #[cfg(feature = "metadata-read-stats")]
 pub use read_stats::{MetadataReadStats, MetadataReadStatsSessionError};
@@ -220,6 +225,11 @@ pub use restore_records::{
     MAX_RESTORE_MANIFEST_BYTES, MAX_RESTORE_MEMBERS, MAX_RESTORE_TERMINAL_ERROR_BYTES,
     RESTORE_MANIFEST_CONTENT_TYPE, RESTORE_MEMBER_VALUE_FORMAT_VERSION,
     RESTORE_OPERATION_VALUE_FORMAT_VERSION,
+};
+pub use secondary_index::{
+    cleanup_secondary_index_page, CleanupSecondaryIndexPageOutcome,
+    CleanupSecondaryIndexPageRequest, SecondaryIndexCleanupCursor, SecondaryIndexCleanupError,
+    SecondaryIndexCleanupPhase, MAX_SECONDARY_INDEX_CLEANUP_PAGE_SIZE,
 };
 pub use snapshot::{
     attach_snapshot_consumer, claim_expired_snapshot, finish_snapshot_reap, get_snapshot_at,

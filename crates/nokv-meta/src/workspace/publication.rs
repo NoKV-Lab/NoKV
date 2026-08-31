@@ -15,7 +15,8 @@ use nokv_types::{
     ArtifactRevisionId, BuildCommitPhase, CommandDigest, CommitVersion, GcClaimState, Generation,
     LogicalShardId, ObjectNamespaceId, OperationId, OperationKind, OwnerEpoch, PlacementGeneration,
     PublishPhase, ReadVersion, ReferenceEpoch, RequestId, RestorePhase, RevisionState, RootId,
-    StagedCleanupState, StagedProviderState, WorkspaceRevision, WorkspaceState, SHA256_BYTES,
+    StagedCleanupState, StagedProviderState, WorkspaceRevision, WorkspaceState, FIXED_ID_BYTES,
+    SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
 
@@ -32,7 +33,7 @@ use super::codec::{
 use super::commit::RUN_MANIFEST_PATH;
 use super::engine::{
     CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError, MetaShard,
-    MetadataCommand, MetadataCommandResult, RootFenceAction,
+    MetadataCommand, MetadataCommandResult, RootFenceAction, MAX_EVENT_BYTES,
 };
 use super::event_projection::change_event_projection;
 use super::keyspace::MetadataFamily;
@@ -47,8 +48,9 @@ use super::publish_operation_records::{
     MAX_STAGED_OBJECTS,
 };
 use super::query_records::{
-    secondary_index_key, ChangeEventKind, ChangeEventRecord, QueryRecordError,
-    SecondaryIndexRecord, TypedProjection,
+    path_index_digest, path_index_generation, path_index_locator_key, secondary_index_key,
+    ChangeEventKind, ChangeEventRecord, PathIndexLocatorRecord, PathIndexLocatorState,
+    QueryRecordError, SecondaryIndexRecord, TypedProjection,
 };
 use super::restore::RESTORE_MANIFEST_PATH;
 use super::restore_records::{
@@ -58,6 +60,7 @@ use super::restore_records::{
 };
 
 const MAX_COMMAND_ITEMS: usize = 256;
+const SECONDARY_INDEX_STAGE_RESULT_VERSION: u8 = 1;
 /// Maximum rows admitted by one recoverable publication batch.
 pub const MAX_PUBLICATION_BATCH_ROWS: usize = 192;
 const _: () = assert!(MAX_PUBLICATION_BATCH_ROWS + 2 <= MAX_COMMAND_ITEMS);
@@ -828,13 +831,13 @@ impl CommandPlan {
 fn secondary_index_rows(
     root_id: RootId,
     workspace_incarnation_id: nokv_types::WorkspaceIncarnationId,
-    path: &nokv_types::NormalizedRelativePath,
-    generation: Generation,
+    path_digest: [u8; SHA256_BYTES],
+    index_generation: nokv_types::PathIndexGenerationId,
     projection: &TypedProjection,
 ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, PublicationError> {
     let value = SecondaryIndexRecord {
-        path_generation: generation,
-        compact_projection: projection.clone(),
+        path_digest,
+        index_generation,
     }
     .encode()?;
     Ok(projection
@@ -842,11 +845,113 @@ fn secondary_index_rows(
         .iter()
         .map(|(field, scalar)| {
             (
-                secondary_index_key(root_id, field, scalar, workspace_incarnation_id, path),
+                secondary_index_key(
+                    root_id,
+                    field,
+                    scalar,
+                    workspace_incarnation_id,
+                    path_digest,
+                    index_generation,
+                ),
                 value.clone(),
             )
         })
         .collect())
+}
+
+fn secondary_index_stage_request_id(
+    root_id: RootId,
+    request_id: RequestId,
+    operation_id: OperationId,
+) -> RequestId {
+    let mut digest = Sha256::new();
+    digest.update(b"nokv.metadata.secondary-index-stage.v1\0");
+    digest.update(root_id.as_bytes());
+    digest.update(request_id.as_bytes());
+    digest.update(operation_id.as_bytes());
+    let digest: [u8; SHA256_BYTES] = digest.finalize().into();
+    RequestId::from_bytes(
+        digest[..FIXED_ID_BYTES]
+            .try_into()
+            .expect("SHA-256 prefix has request-id width"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn secondary_index_stage_input_digest(
+    root_id: RootId,
+    operation_id: OperationId,
+    operation_key: &[u8],
+    operation_payload: &[u8],
+    workspace_key: &[u8],
+    workspace_payload: &[u8],
+    path_key: &[u8],
+    current_path_payload: Option<&[u8]>,
+    locator_key: &[u8],
+    locator_payload: &[u8],
+    index_rows: &BTreeMap<Vec<u8>, Vec<u8>>,
+) -> [u8; SHA256_BYTES] {
+    let mut digest = Sha256::new();
+    digest.update(b"nokv.metadata.secondary-index-stage-input.v1\0");
+    digest.update(root_id.as_bytes());
+    digest.update(operation_id.as_bytes());
+    for value in [
+        operation_key,
+        operation_payload,
+        workspace_key,
+        workspace_payload,
+        path_key,
+    ] {
+        update_stage_digest_bytes(&mut digest, value);
+    }
+    match current_path_payload {
+        None => digest.update([0]),
+        Some(payload) => {
+            digest.update([1]);
+            update_stage_digest_bytes(&mut digest, payload);
+        }
+    }
+    update_stage_digest_bytes(&mut digest, locator_key);
+    update_stage_digest_bytes(&mut digest, locator_payload);
+    digest.update(
+        u32::try_from(index_rows.len())
+            .expect("typed projection field count fits u32")
+            .to_be_bytes(),
+    );
+    for (key, value) in index_rows {
+        update_stage_digest_bytes(&mut digest, key);
+        update_stage_digest_bytes(&mut digest, value);
+    }
+    digest.finalize().into()
+}
+
+fn update_stage_digest_bytes(digest: &mut Sha256, value: &[u8]) {
+    digest.update(
+        u64::try_from(value.len())
+            .expect("metadata byte length fits u64")
+            .to_be_bytes(),
+    );
+    digest.update(value);
+}
+
+fn encode_secondary_index_stage_result(input_digest: [u8; SHA256_BYTES]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(1 + SHA256_BYTES);
+    result.push(SECONDARY_INDEX_STAGE_RESULT_VERSION);
+    result.extend_from_slice(&input_digest);
+    result
+}
+
+fn validate_secondary_index_stage_result(
+    encoded: &[u8],
+    expected_input_digest: [u8; SHA256_BYTES],
+) -> Result<(), PublicationError> {
+    if encoded.len() != 1 + SHA256_BYTES || encoded[0] != SECONDARY_INDEX_STAGE_RESULT_VERSION {
+        return Err(PublicationError::ReplayResultMismatch);
+    }
+    if encoded[1..] != expected_input_digest {
+        return Err(PublicationError::OperationInputMismatch);
+    }
+    Ok(())
 }
 
 fn validate_begin_request(request: &BeginPublishRequest) -> Result<(), PublicationError> {
@@ -3267,6 +3372,91 @@ impl PublicationService<'_> {
         self.store.execute(&command).map_err(Into::into)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn stage_secondary_index(
+        &self,
+        context: PublicationContext,
+        operation_id: OperationId,
+        operation_key: &[u8],
+        operation_payload: &[u8],
+        workspace_key: &[u8],
+        workspace_payload: &[u8],
+        path_key: &[u8],
+        current_path_payload: Option<&[u8]>,
+        locator_key: &[u8],
+        locator_payload: &[u8],
+        index_rows: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<MetadataCommandResult, PublicationError> {
+        let input_digest = secondary_index_stage_input_digest(
+            context.root_id,
+            operation_id,
+            operation_key,
+            operation_payload,
+            workspace_key,
+            workspace_payload,
+            path_key,
+            current_path_payload,
+            locator_key,
+            locator_payload,
+            index_rows,
+        );
+        let stage_request_id =
+            secondary_index_stage_request_id(context.root_id, context.request_id, operation_id);
+        if let Some(replay) = self.store.lookup_request_result(
+            context.root_id,
+            context.placement_generation,
+            context.owner_epoch,
+            stage_request_id,
+        )? {
+            validate_secondary_index_stage_result(&replay.deterministic_result, input_digest)?;
+            return Ok(replay);
+        }
+        let mut plan = CommandPlan::default();
+        plan.assert_value(
+            MetadataFamily::Operation,
+            operation_key.to_vec(),
+            Some(operation_payload.to_vec()),
+        )?;
+        plan.assert_value(
+            MetadataFamily::WorkspaceCurrent,
+            workspace_key.to_vec(),
+            Some(workspace_payload.to_vec()),
+        )?;
+        plan.assert_value(
+            MetadataFamily::PathCurrent,
+            path_key.to_vec(),
+            current_path_payload.map(<[u8]>::to_vec),
+        )?;
+        plan.put_absent(
+            MetadataFamily::PathIndexLocator,
+            locator_key.to_vec(),
+            locator_payload.to_vec(),
+        )?;
+        for (key, value) in index_rows {
+            plan.put_absent(MetadataFamily::SecondaryIndex, key.clone(), value.clone())?;
+        }
+        plan.validate_bounds()?;
+        let command = MetadataCommand {
+            schema_id: SCHEMA_ID.to_owned(),
+            root_id: context.root_id,
+            logical_shard_id: context.logical_shard_id,
+            object_namespace_id: Some(context.object_namespace_id),
+            placement_generation: context.placement_generation,
+            owner_epoch: context.owner_epoch,
+            request_id: stage_request_id,
+            command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+            read_version: context.read_version,
+            root_fence_action: RootFenceAction::RequireActive,
+            predicates: plan.predicates,
+            mutations: plan.mutations,
+            history_projection: Vec::new(),
+            event_projection: Vec::new(),
+            deterministic_result: encode_secondary_index_stage_result(input_digest),
+        }
+        .seal();
+        self.store.execute(&command).map_err(Into::into)
+    }
+
     fn execute_plan_before_lease_deadline(
         &self,
         context: PublicationContext,
@@ -3377,15 +3567,6 @@ impl PublicationService<'_> {
             });
         }
         self.require_current_operation(request.context, &request.expected_operation)?;
-        let expected_commit_version = CommitVersion::new(
-            request
-                .context
-                .read_version
-                .get()
-                .checked_add(1)
-                .ok_or(PublicationError::CommitVersionOverflow)?,
-        )
-        .map_err(|_| PublicationError::CommitVersionOverflow)?;
 
         validate_dependency_seal(
             &request.expected_operation,
@@ -3549,22 +3730,13 @@ impl PublicationService<'_> {
             .transpose()?;
         let next_path_generation =
             validate_path_claim(&request.expected_operation.claim, current_path.as_ref())?;
-        let mut current_index_rows = match (&current_path, &current_projection) {
-            (Some(current), Some(projection)) => secondary_index_rows(
-                request.context.root_id,
-                request.expected_operation.workspace_incarnation_id,
-                &request.expected_operation.path,
-                current.record.generation,
-                projection,
-            )?,
-            (None, None) => BTreeMap::new(),
-            _ => unreachable!("path and decoded projection presence agree"),
-        };
-        let mut next_index_rows = secondary_index_rows(
+        let next_index_generation = path_index_generation(request.context.request_id);
+        let next_path_digest = path_index_digest(&request.expected_operation.path);
+        let next_index_rows = secondary_index_rows(
             request.context.root_id,
             request.expected_operation.workspace_incarnation_id,
-            &request.expected_operation.path,
-            next_path_generation,
+            next_path_digest,
+            next_index_generation,
             &next_projection,
         )?;
 
@@ -3648,6 +3820,81 @@ impl PublicationService<'_> {
             old_path_ref = Some((key, loaded));
         }
 
+        let locator_key = path_index_locator_key(
+            request.context.root_id,
+            request.expected_operation.workspace_incarnation_id,
+            next_path_digest,
+            next_index_generation,
+        );
+        let staged_locator_payload = PathIndexLocatorRecord {
+            state: PathIndexLocatorState::Staged,
+            path: request.expected_operation.path.clone(),
+        }
+        .encode()?;
+        let published_locator_payload = PathIndexLocatorRecord {
+            state: PathIndexLocatorState::Published,
+            path: request.expected_operation.path.clone(),
+        }
+        .encode()?;
+        let visible_event = matches!(
+            request.expected_operation.authority,
+            PublishAuthority::Visible
+        )
+        .then(|| {
+            change_event_projection(&ChangeEventRecord {
+                workbench_id: request.expected_operation.workbench_id.clone(),
+                workspace_incarnation_id: request.expected_operation.workspace_incarnation_id,
+                kind: ChangeEventKind::ArtifactPublished,
+                artifact_revision_id: Some(request.expected_operation.artifact_revision_id),
+                commit_id: None,
+                operation_id: Some(request.expected_operation.operation_id),
+                path: Some(request.expected_operation.path.clone()),
+                before: current_projection.clone().unwrap_or_default(),
+                after: next_projection.clone(),
+            })
+        })
+        .transpose()?;
+        if visible_event
+            .as_ref()
+            .is_some_and(|event| event.payload.len() > MAX_EVENT_BYTES)
+        {
+            return Err(PublicationError::Meta(MetaError::InvalidCommand {
+                reason: "event projection exceeds size bound".to_owned(),
+            }));
+        }
+        let staged = self.stage_secondary_index(
+            request.context,
+            request.expected_operation.operation_id,
+            &operation_key,
+            &expected_operation_payload,
+            &workspace_key,
+            &workspace.payload,
+            &path_key,
+            current_path
+                .as_ref()
+                .map(|current| current.payload.as_slice()),
+            &locator_key,
+            &staged_locator_payload,
+            &next_index_rows,
+        )?;
+        let execution_context = PublicationContext {
+            read_version: if staged.replayed {
+                request.context.read_version
+            } else {
+                ReadVersion::new(staged.commit_version.get())
+                    .expect("a commit version is a readable version")
+            },
+            ..request.context
+        };
+        let expected_commit_version = CommitVersion::new(
+            execution_context
+                .read_version
+                .get()
+                .checked_add(1)
+                .ok_or(PublicationError::CommitVersionOverflow)?,
+        )
+        .map_err(|_| PublicationError::CommitVersionOverflow)?;
+
         let mut owner_updates = BTreeMap::<ArtifactRevisionId, OwnerRevisionUpdate>::new();
         for (revision, loaded) in owner_records {
             let add_dependency = request
@@ -3708,6 +3955,8 @@ impl PublicationService<'_> {
         };
         let next_path = PathEntry {
             generation: next_path_generation,
+            index_generation: next_index_generation,
+            path_digest: next_path_digest,
             artifact_revision_id: request.expected_operation.artifact_revision_id,
             body_digest_uri: request.artifact.body_digest_uri.clone(),
             manifest_digest_uri: request.artifact.manifest_digest_uri.clone(),
@@ -3758,30 +4007,14 @@ impl PublicationService<'_> {
                 next_path.encode()?,
             )?,
         }
-        let index_keys = current_index_rows
-            .keys()
-            .chain(next_index_rows.keys())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        for key in index_keys {
-            match (
-                current_index_rows.remove(&key),
-                next_index_rows.remove(&key),
-            ) {
-                (Some(expected), Some(next)) if expected == next => {
-                    plan.assert_value(MetadataFamily::SecondaryIndex, key, Some(expected))?;
-                }
-                (Some(expected), Some(next)) => {
-                    plan.replace(MetadataFamily::SecondaryIndex, key, expected, next)?;
-                }
-                (Some(expected), None) => {
-                    plan.delete(MetadataFamily::SecondaryIndex, key, expected)?;
-                }
-                (None, Some(next)) => {
-                    plan.put_absent(MetadataFamily::SecondaryIndex, key, next)?;
-                }
-                (None, None) => unreachable!("secondary-index union key has one value"),
-            }
+        plan.replace(
+            MetadataFamily::PathIndexLocator,
+            locator_key,
+            staged_locator_payload,
+            published_locator_payload,
+        )?;
+        for (key, next) in next_index_rows {
+            plan.assert_value(MetadataFamily::SecondaryIndex, key, Some(next))?;
         }
         plan.put_absent(
             MetadataFamily::ArtifactRevision,
@@ -3789,7 +4022,7 @@ impl PublicationService<'_> {
             new_revision.encode()?,
         )?;
         self.release_revision_claim(
-            request.context,
+            execution_context,
             request.expected_operation.artifact_revision_id,
             request.expected_operation.operation_id,
             &mut plan,
@@ -3851,26 +4084,12 @@ impl PublicationService<'_> {
                 )?;
             }
         }
-        if matches!(
-            request.expected_operation.authority,
-            PublishAuthority::Visible
-        ) {
-            plan.events
-                .push(change_event_projection(&ChangeEventRecord {
-                    workbench_id: request.expected_operation.workbench_id.clone(),
-                    workspace_incarnation_id: request.expected_operation.workspace_incarnation_id,
-                    kind: ChangeEventKind::ArtifactPublished,
-                    artifact_revision_id: Some(request.expected_operation.artifact_revision_id),
-                    commit_id: None,
-                    operation_id: Some(request.expected_operation.operation_id),
-                    path: Some(request.expected_operation.path.clone()),
-                    before: current_projection.unwrap_or_default(),
-                    after: next_projection,
-                })?);
+        if let Some(event) = visible_event {
+            plan.events.push(event);
         }
 
         let result = self.execute_plan(
-            request.context,
+            execution_context,
             plan,
             published_operation_payload,
             PublicationAuthorityPurpose::Forward,
@@ -4189,8 +4408,12 @@ impl PublicationService<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use nokv_meta_store::{
+        Commit, ReadBatch, ReadSnapshot, StoreError, StoreProfile, TxnStore, WriteTxn,
+    };
     use tempfile::tempdir;
 
     use nokv_types::{
@@ -4221,6 +4444,52 @@ mod tests {
     use super::*;
 
     const TEST_BATCH_ROWS: usize = 300;
+
+    struct FailSecondArmedCommitStore {
+        inner: Arc<dyn TxnStore>,
+        armed: AtomicBool,
+        commit_index: AtomicUsize,
+    }
+
+    impl FailSecondArmedCommitStore {
+        fn new(inner: Arc<dyn TxnStore>) -> Self {
+            Self {
+                inner,
+                armed: AtomicBool::new(false),
+                commit_index: AtomicUsize::new(0),
+            }
+        }
+
+        fn arm(&self) {
+            self.commit_index.store(0, Ordering::Release);
+            self.armed.store(true, Ordering::Release);
+        }
+    }
+
+    impl TxnStore for FailSecondArmedCommitStore {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            self.inner.read(batch)
+        }
+
+        fn commit(&self, transaction: WriteTxn) -> Result<Commit, StoreError> {
+            if self.armed.load(Ordering::Acquire) {
+                let index = self.commit_index.fetch_add(1, Ordering::AcqRel);
+                if index == 1 {
+                    self.armed.store(false, Ordering::Release);
+                    return Ok(Commit::Conflict);
+                }
+            }
+            self.inner.commit(transaction)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
 
     fn shard() -> LogicalShardId {
         LogicalShardId::from_bytes([1; FIXED_ID_BYTES])
@@ -6684,8 +6953,8 @@ mod tests {
         let mut counter = 1;
         let store = ready_file_store(&database_path, &mut counter);
         let service = PublicationService::new(&store);
-        let projection = budget_projection(998);
-        assert_eq!(projection.encode().unwrap().len(), 61_203);
+        let projection = budget_projection(997);
+        assert_eq!(projection.encode().unwrap().len(), 61_143);
 
         let replaced_path = path("outputs/boundary-replace.bin");
         publish_full_with_projection(
@@ -6729,9 +6998,14 @@ mod tests {
             TypedProjection::empty(),
         );
         assert_eq!(replaced.result.path_generation, Generation::new(2).unwrap());
-        let replace_bytes =
-            capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
-        assert_eq!(replace_bytes, 11_799_467);
+        let replace_bytes = capture.with_last_commits(2, |transactions| {
+            transactions
+                .iter()
+                .map(crate::workspace::test_support::transaction_bytes)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(replace_bytes, vec![125_601, 318_292]);
+        assert!(replace_bytes.iter().all(|bytes| *bytes <= 900_000));
 
         let removed = remove_path(
             &store,
@@ -6755,7 +7029,8 @@ mod tests {
         assert_eq!(removed.removed_artifact_revision_id, revision(216));
         let remove_bytes =
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
-        assert_eq!(remove_bytes, 11_793_108);
+        assert_eq!(remove_bytes, 311_466);
+        assert!(remove_bytes <= 900_000);
     }
 
     #[test]
@@ -6792,12 +7067,32 @@ mod tests {
             removed_path.clone(),
             PublishClaim::CreateOnly,
             &dependencies,
-            projection,
+            projection.clone(),
         );
         drop(store);
 
-        let store = crate::workspace::test_support::open_file(&database_path, shard()).unwrap();
+        let (store, capture) = open_capturing_file_store(&database_path);
         let service = PublicationService::new(&store);
+        let created = publish_with_dependencies_and_projection(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(40_003),
+            revision(40_003),
+            maximum_path(102),
+            PublishClaim::CreateOnly,
+            &dependencies,
+            projection,
+        );
+        assert_eq!(created.result.path_generation, Generation::new(1).unwrap());
+        let create_bytes = capture.with_last_commits(2, |transactions| {
+            transactions
+                .iter()
+                .map(crate::workspace::test_support::transaction_bytes)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(create_bytes, vec![283_025, 573_060]);
+        assert!(create_bytes.iter().all(|bytes| *bytes <= 900_000));
         let replaced = publish_with_dependencies_and_projection(
             &service,
             &store,
@@ -6812,6 +7107,14 @@ mod tests {
             TypedProjection::empty(),
         );
         assert_eq!(replaced.result.path_generation, Generation::new(2).unwrap());
+        let replace_bytes = capture.with_last_commits(2, |transactions| {
+            transactions
+                .iter()
+                .map(crate::workspace::test_support::transaction_bytes)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(replace_bytes, vec![142_209, 433_036]);
+        assert!(replace_bytes.iter().all(|bytes| *bytes <= 900_000));
         let removed = remove_path(
             &store,
             RemovePathRequest {
@@ -6832,6 +7135,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(removed.removed_artifact_revision_id, revision(40_001));
+        assert_eq!(
+            capture.with_last_commit(crate::workspace::test_support::transaction_bytes),
+            357_070
+        );
     }
 
     #[test]
@@ -6908,10 +7215,14 @@ mod tests {
         );
         assert_eq!(replaced.result.path_generation, Generation::new(2).unwrap());
 
-        assert_eq!(
-            capture.with_last_commit(crate::workspace::test_support::transaction_bytes),
-            9_860_740
-        );
+        let transaction_bytes = capture.with_last_commits(2, |transactions| {
+            transactions
+                .iter()
+                .map(crate::workspace::test_support::transaction_bytes)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(transaction_bytes, vec![213_813, 366_418]);
+        assert!(transaction_bytes.iter().all(|bytes| *bytes <= 900_000));
     }
 
     #[test]
@@ -6975,9 +7286,9 @@ mod tests {
         let store = ready_file_store(&database_path, &mut counter);
         let service = PublicationService::new(&store);
         let artifact_path = path("outputs/disjoint-projections.bin");
-        let old_projection = budget_projection_with_prefix("oldget", 998);
+        let old_projection = budget_projection_with_prefix("oldget", 997);
         let next_projection = budget_projection_with_prefix("newget", 993);
-        assert_eq!(old_projection.encode().unwrap().len(), 61_203);
+        assert_eq!(old_projection.encode().unwrap().len(), 61_143);
         assert_eq!(next_projection.encode().unwrap().len(), 60_903);
         assert!(old_projection
             .fields()
@@ -7113,21 +7424,33 @@ mod tests {
             1,
             old_projection.clone(),
         );
+        let old_read = ReadVersion::new(created.commit_version.get()).unwrap();
+        let old_entry = PathEntry::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::PathCurrent,
+                &path_current_key(root(), incarnation(9), &artifact_path),
+                old_read,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let old_stage_key = secondary_index_key(
             root(),
             &stage_field,
             &QueryScalar::Unsigned(1),
             incarnation(9),
-            &artifact_path,
+            old_entry.path_digest,
+            old_entry.index_generation,
         );
         let old_owner_key = secondary_index_key(
             root(),
             &owner_field,
             &QueryScalar::String("alpha".to_owned()),
             incarnation(9),
-            &artifact_path,
+            old_entry.path_digest,
+            old_entry.index_generation,
         );
-        let old_read = ReadVersion::new(created.commit_version.get()).unwrap();
         assert!(store
             .read_at(
                 root(),
@@ -7158,14 +7481,25 @@ mod tests {
             1,
             new_projection.clone(),
         );
+        let current_read = ReadVersion::new(replaced.commit_version.get()).unwrap();
+        let new_entry = PathEntry::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::PathCurrent,
+                &path_current_key(root(), incarnation(9), &artifact_path),
+                current_read,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let new_stage_key = secondary_index_key(
             root(),
             &stage_field,
             &QueryScalar::Unsigned(2),
             incarnation(9),
-            &artifact_path,
+            new_entry.path_digest,
+            new_entry.index_generation,
         );
-        let current_read = ReadVersion::new(replaced.commit_version.get()).unwrap();
         assert!(store
             .read_at(
                 root(),
@@ -7176,7 +7510,7 @@ mod tests {
                 current_read,
             )
             .unwrap()
-            .is_none());
+            .is_some());
         assert!(store
             .read_at(
                 root(),
@@ -7187,7 +7521,7 @@ mod tests {
                 current_read,
             )
             .unwrap()
-            .is_none());
+            .is_some());
         let current_payload = store
             .read_at(
                 root(),
@@ -7202,8 +7536,8 @@ mod tests {
         assert_eq!(
             SecondaryIndexRecord::decode(&current_payload).unwrap(),
             SecondaryIndexRecord {
-                path_generation: Generation::new(2).unwrap(),
-                compact_projection: new_projection,
+                path_digest: new_entry.path_digest,
+                index_generation: new_entry.index_generation,
             }
         );
         assert!(store
@@ -7233,6 +7567,109 @@ mod tests {
                 .unwrap(),
             Some(current_payload)
         );
+    }
+
+    #[test]
+    fn finalize_resumes_a_durable_index_stage_after_the_clock_advances() {
+        let inner = crate::workspace::test_support::memory_txn_store().unwrap();
+        let failing = Arc::new(FailSecondArmedCommitStore::new(inner));
+        let mut counter = 1;
+        let store = prepare_store(
+            MetaShard::initialize(failing.clone(), shard()).unwrap(),
+            &mut counter,
+        );
+        let service = PublicationService::new(&store);
+        let artifact_path = path("outputs/resumable-index.bin");
+        let staged_rows = staged_rows(revision(230), 1);
+        let manifest = manifest_rows(&staged_rows);
+        let operation = publish_operation(
+            operation_id(230),
+            revision(230),
+            artifact_path.clone(),
+            PublishClaim::CreateOnly,
+            &staged_rows,
+            &manifest,
+        );
+        let operation = begin_operation(&service, &store, &mut counter, operation);
+        let operation = stage_all(
+            &service,
+            &store,
+            &mut counter,
+            operation,
+            &staged_rows,
+            &manifest,
+        );
+        let operation = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        let projection = TypedProjection::new(BTreeMap::from([(
+            QueryFieldId::new("run.stage").unwrap(),
+            QueryScalar::Unsigned(1),
+        )]))
+        .unwrap();
+        let mut artifact = published_artifact(&operation);
+        artifact.typed_index_projection = projection.encode().unwrap();
+        let first_context = publication_context(&store, &mut counter);
+        let request = FinalizePublishRequest {
+            context: first_context,
+            artifact,
+            expected_operation: operation,
+            dependency_owner_revision_ids: Vec::new(),
+        };
+
+        failing.arm();
+        assert!(matches!(
+            service.finalize_publish(request.clone()),
+            Err(PublicationError::Meta(MetaError::WriteConflict))
+        ));
+        let digest = path_index_digest(&artifact_path);
+        let generation = path_index_generation(first_context.request_id);
+        let locator_key = path_index_locator_key(root(), incarnation(9), digest, generation);
+        let staged_locator = PathIndexLocatorRecord::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::PathIndexLocator,
+                &locator_key,
+                store.current_read_version().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(staged_locator.state, PathIndexLocatorState::Staged);
+        store
+            .execute(&fence_command(
+                &store,
+                next_request(&mut counter),
+                RootFenceAction::RequireActive,
+            ))
+            .unwrap();
+
+        let resumed = service
+            .finalize_publish(FinalizePublishRequest {
+                context: PublicationContext {
+                    read_version: store.current_read_version().unwrap(),
+                    ..first_context
+                },
+                ..request
+            })
+            .unwrap();
+        assert!(!resumed.replayed);
+        let published_locator = PathIndexLocatorRecord::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::PathIndexLocator,
+                &locator_key,
+                ReadVersion::new(resumed.commit_version.get()).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(published_locator.state, PathIndexLocatorState::Published);
     }
 
     #[test]

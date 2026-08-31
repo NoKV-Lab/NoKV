@@ -27,7 +27,7 @@ features:
   - title: Path-primary metadata
     details: One normalized full path is namespace truth. Exact artifacts use point reads; child listing uses component-safe delimiter scans.
   - title: Immutable revisions
-    details: Stream bytes to S3-compatible storage first, then atomically publish a revision, path, indexes, event, and deterministic replay result.
+    details: Stream bytes to S3-compatible storage first, stage a bounded invisible index generation, then atomically publish the revision, path, index visibility, event, and deterministic replay result.
   - title: Root-local distribution
     details: Persist each Agent root on one logical shard, fence physical owners by epoch, and keep commit, restore, and GC reference ownership local.
 ---

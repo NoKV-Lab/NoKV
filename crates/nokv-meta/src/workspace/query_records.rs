@@ -15,14 +15,17 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use nokv_types::{
-    ArtifactRevisionId, CommitId, Generation, NormalizedRelativePath, OperationId, RootId,
-    WorkbenchId, WorkspaceIncarnationId, FIXED_ID_BYTES, SHA256_BYTES,
+    ArtifactRevisionId, CommitId, NormalizedRelativePath, OperationId, PathIndexGenerationId,
+    RequestId, RootId, WorkbenchId, WorkspaceIncarnationId, FIXED_ID_BYTES, SHA256_BYTES,
 };
-
-use super::codec::{push_ordered_path_components, PATH_EXACT_TERMINATOR};
+use sha2::{Digest, Sha256};
 
 /// Only supported typed-query payload format.
 pub const QUERY_RECORD_VALUE_FORMAT_VERSION: u8 = 1;
+/// Only supported compact secondary-index value format.
+pub const SECONDARY_INDEX_VALUE_FORMAT_VERSION: u8 = 2;
+/// Only supported path-index locator value format.
+pub const PATH_INDEX_LOCATOR_VALUE_FORMAT_VERSION: u8 = 1;
 /// Only supported durable change-event payload format.
 pub const CHANGE_EVENT_VALUE_FORMAT_VERSION: u8 = 2;
 /// Maximum number of fields in one path projection.
@@ -44,6 +47,24 @@ const BUILTIN_FIELD_IDS: &[&str] = &[
     "producer",
     "workbench_id",
 ];
+
+/// Canonical digest used by PathCurrent, path locators, and SecondaryIndexV2.
+pub fn path_index_digest(path: &NormalizedRelativePath) -> [u8; SHA256_BYTES] {
+    let mut digest = Sha256::new();
+    digest.update(b"nokv.metadata.path-index.v1\0");
+    digest.update(
+        u32::try_from(path.byte_len())
+            .expect("normalized path length fits u32")
+            .to_be_bytes(),
+    );
+    digest.update(path.as_str().as_bytes());
+    digest.finalize().into()
+}
+
+/// Mint the index generation owned by one never-reused root-scoped request.
+pub fn path_index_generation(request_id: RequestId) -> PathIndexGenerationId {
+    PathIndexGenerationId::from_bytes(*request_id.as_bytes())
+}
 
 /// Validated stable field identity used by predicates, projections, and groups.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -343,36 +364,92 @@ impl TypedProjection {
 /// Durable value stored beside a secondary-index key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecondaryIndexRecord {
-    pub path_generation: Generation,
-    pub compact_projection: TypedProjection,
+    pub path_digest: [u8; SHA256_BYTES],
+    pub index_generation: PathIndexGenerationId,
 }
 
 impl SecondaryIndexRecord {
     pub fn encode(&self) -> Result<Vec<u8>, QueryRecordError> {
-        let projection = self.compact_projection.encode()?;
-        let mut encoded = Vec::with_capacity(1 + 8 + 4 + projection.len());
-        encoded.push(QUERY_RECORD_VALUE_FORMAT_VERSION);
-        encoded.extend_from_slice(&self.path_generation.get().to_be_bytes());
-        put_bytes(&mut encoded, "compact_projection", &projection)?;
+        let mut encoded = Vec::with_capacity(1 + SHA256_BYTES + FIXED_ID_BYTES);
+        encoded.push(SECONDARY_INDEX_VALUE_FORMAT_VERSION);
+        encoded.extend_from_slice(&self.path_digest);
+        encoded.extend_from_slice(self.index_generation.as_bytes());
         Ok(encoded)
     }
 
     pub fn decode(encoded: &[u8]) -> Result<Self, QueryRecordError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_version(QUERY_RECORD_VALUE_FORMAT_VERSION)?;
-        let generation = decoder.u64("path_generation")?;
-        let path_generation =
-            Generation::new(generation).map_err(|_| QueryRecordError::ZeroScalar {
-                field: "path_generation",
-            })?;
-        let compact_projection = TypedProjection::decode(
-            decoder.bytes("compact_projection", MAX_TYPED_PROJECTION_BYTES)?,
-        )?;
+        decoder.require_version(SECONDARY_INDEX_VALUE_FORMAT_VERSION)?;
+        let path_digest = decoder.fixed("path_digest")?;
+        let index_generation =
+            PathIndexGenerationId::from_bytes(decoder.fixed("index_generation")?);
         decoder.finish()?;
         let record = Self {
-            path_generation,
-            compact_projection,
+            path_digest,
+            index_generation,
         };
+        if record.encode()? != encoded {
+            return Err(QueryRecordError::NonCanonicalEncoding);
+        }
+        Ok(record)
+    }
+}
+
+/// Durable publication state for one path-index locator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PathIndexLocatorState {
+    /// Index rows exist but PathCurrent has not published this generation.
+    Staged = 1,
+    /// PathCurrent published this generation in the same command as this flip.
+    Published = 2,
+}
+
+impl TryFrom<u8> for PathIndexLocatorState {
+    type Error = QueryRecordError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Staged),
+            2 => Ok(Self::Published),
+            value => Err(QueryRecordError::UnknownDiscriminant {
+                type_name: "PathIndexLocatorState",
+                value,
+            }),
+        }
+    }
+}
+
+/// One full path and its durable staging state stored once per generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathIndexLocatorRecord {
+    pub state: PathIndexLocatorState,
+    pub path: NormalizedRelativePath,
+}
+
+impl PathIndexLocatorRecord {
+    pub fn encode(&self) -> Result<Vec<u8>, QueryRecordError> {
+        let mut encoded = Vec::with_capacity(2 + 4 + self.path.byte_len());
+        encoded.push(PATH_INDEX_LOCATOR_VALUE_FORMAT_VERSION);
+        encoded.push(self.state as u8);
+        put_bytes(&mut encoded, "path", self.path.as_str().as_bytes())?;
+        Ok(encoded)
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, QueryRecordError> {
+        let mut decoder = Decoder::new(encoded);
+        decoder.require_version(PATH_INDEX_LOCATOR_VALUE_FORMAT_VERSION)?;
+        let state = PathIndexLocatorState::try_from(decoder.u8("locator_state")?)?;
+        let bytes = decoder.bytes("path", NormalizedRelativePath::MAX_BYTES)?;
+        let value = std::str::from_utf8(bytes)
+            .map_err(|_| QueryRecordError::InvalidUtf8 { field: "path" })?;
+        let path = NormalizedRelativePath::new(value.to_owned()).map_err(|error| {
+            QueryRecordError::InvalidPath {
+                reason: error.to_string(),
+            }
+        })?;
+        decoder.finish()?;
+        let record = Self { state, path };
         if record.encode()? != encoded {
             return Err(QueryRecordError::NonCanonicalEncoding);
         }
@@ -587,24 +664,209 @@ pub fn secondary_index_field_prefix(root: RootId, field: &QueryFieldId) -> Vec<u
     key
 }
 
-/// Canonical secondary-index key for one typed field value and path.
-///
-/// The ordered scalar is self-delimiting for variable-width values. Fixed
-/// values have a type-defined width, so the workspace and component-encoded
-/// path suffix is always unambiguous.
+/// Prefix for one exact typed field value in SecondaryIndexV2.
+pub fn secondary_index_value_prefix(
+    root: RootId,
+    field: &QueryFieldId,
+    value: &QueryScalar,
+) -> Vec<u8> {
+    let mut key = secondary_index_field_prefix(root, field);
+    key.extend_from_slice(&encode_ordered_index_scalar(value));
+    key
+}
+
+/// Canonical SecondaryIndexV2 key for one path identity.
 pub fn secondary_index_key(
     root: RootId,
     field: &QueryFieldId,
     value: &QueryScalar,
     workspace: WorkspaceIncarnationId,
-    path: &NormalizedRelativePath,
+    path_digest: [u8; SHA256_BYTES],
+    index_generation: PathIndexGenerationId,
 ) -> Vec<u8> {
-    let mut key = secondary_index_field_prefix(root, field);
-    key.extend_from_slice(&encode_ordered_index_scalar(value));
+    let mut key = secondary_index_value_prefix(root, field, value);
     key.extend_from_slice(workspace.as_bytes());
-    push_ordered_path_components(&mut key, path);
-    key.push(PATH_EXACT_TERMINATOR);
+    key.extend_from_slice(&path_digest);
+    key.extend_from_slice(index_generation.as_bytes());
     key
+}
+
+/// Decode the fixed identity suffix from one exact-value index scan.
+pub fn decode_secondary_index_key(
+    root: RootId,
+    field: &QueryFieldId,
+    value: &QueryScalar,
+    key: &[u8],
+) -> Option<(
+    WorkspaceIncarnationId,
+    [u8; SHA256_BYTES],
+    PathIndexGenerationId,
+)> {
+    let prefix = secondary_index_value_prefix(root, field, value);
+    const SUFFIX_BYTES: usize = FIXED_ID_BYTES + SHA256_BYTES + FIXED_ID_BYTES;
+    if key.len() != prefix.len() + SUFFIX_BYTES || !key.starts_with(&prefix) {
+        return None;
+    }
+    let suffix = &key[prefix.len()..];
+    let workspace = WorkspaceIncarnationId::from_bytes(suffix[..FIXED_ID_BYTES].try_into().ok()?);
+    let digest_offset = FIXED_ID_BYTES;
+    let generation_offset = digest_offset + SHA256_BYTES;
+    let path_digest = suffix[digest_offset..generation_offset].try_into().ok()?;
+    let index_generation =
+        PathIndexGenerationId::from_bytes(suffix[generation_offset..].try_into().ok()?);
+    Some((workspace, path_digest, index_generation))
+}
+
+/// Decode and fully validate one SecondaryIndexV2 key from a root-wide scan.
+pub fn decode_secondary_index_row_key(
+    root: RootId,
+    key: &[u8],
+) -> Option<(
+    QueryFieldId,
+    QueryScalar,
+    WorkspaceIncarnationId,
+    [u8; SHA256_BYTES],
+    PathIndexGenerationId,
+)> {
+    const IDENTITY_BYTES: usize = FIXED_ID_BYTES + SHA256_BYTES + FIXED_ID_BYTES;
+    let minimum = FIXED_ID_BYTES + 2 + 1 + 1 + IDENTITY_BYTES;
+    if key.len() < minimum || !key.starts_with(root.as_bytes()) {
+        return None;
+    }
+    let identity_offset = key.len().checked_sub(IDENTITY_BYTES)?;
+    let mut offset = FIXED_ID_BYTES;
+    let field_length = usize::from(u16::from_be_bytes(
+        key.get(offset..offset + 2)?.try_into().ok()?,
+    ));
+    offset += 2;
+    let field_end = offset.checked_add(field_length)?;
+    if field_end >= identity_offset {
+        return None;
+    }
+    let field = QueryFieldId::new(
+        std::str::from_utf8(key.get(offset..field_end)?)
+            .ok()?
+            .to_owned(),
+    )
+    .ok()?;
+    let scalar = decode_ordered_index_scalar(key.get(field_end..identity_offset)?)?;
+    let identity = key.get(identity_offset..)?;
+    let workspace = WorkspaceIncarnationId::from_bytes(identity[..FIXED_ID_BYTES].try_into().ok()?);
+    let digest_offset = FIXED_ID_BYTES;
+    let generation_offset = digest_offset + SHA256_BYTES;
+    let path_digest = identity[digest_offset..generation_offset].try_into().ok()?;
+    let index_generation =
+        PathIndexGenerationId::from_bytes(identity[generation_offset..].try_into().ok()?);
+    let decoded = (field, scalar, workspace, path_digest, index_generation);
+    (secondary_index_key(
+        root, &decoded.0, &decoded.1, decoded.2, decoded.3, decoded.4,
+    ) == key)
+        .then_some(decoded)
+}
+
+fn decode_ordered_index_scalar(encoded: &[u8]) -> Option<QueryScalar> {
+    let (&discriminant, payload) = encoded.split_first()?;
+    let scalar_type = QueryScalarType::try_from(discriminant).ok()?;
+    let scalar = match scalar_type {
+        QueryScalarType::Null if payload.is_empty() => QueryScalar::Null,
+        QueryScalarType::Boolean if payload.len() == 1 && payload[0] <= 1 => {
+            QueryScalar::Boolean(payload[0] == 1)
+        }
+        QueryScalarType::Signed | QueryScalarType::Timestamp if payload.len() == 8 => {
+            let ordered = u64::from_be_bytes(payload.try_into().ok()?);
+            let value = (ordered ^ (1_u64 << 63)) as i64;
+            if scalar_type == QueryScalarType::Signed {
+                QueryScalar::Signed(value)
+            } else {
+                QueryScalar::Timestamp(value)
+            }
+        }
+        QueryScalarType::Unsigned if payload.len() == 8 => {
+            QueryScalar::Unsigned(u64::from_be_bytes(payload.try_into().ok()?))
+        }
+        QueryScalarType::Float if payload.len() == 8 => {
+            let ordered = u64::from_be_bytes(payload.try_into().ok()?);
+            let bits = if ordered & (1_u64 << 63) == 0 {
+                !ordered
+            } else {
+                ordered ^ (1_u64 << 63)
+            };
+            QueryScalar::Float(FiniteFloat::from_canonical_bits(bits).ok()?)
+        }
+        QueryScalarType::Bytes | QueryScalarType::String => {
+            let value = decode_ordered_bytes(payload)?;
+            if value.len() > MAX_QUERY_SCALAR_BYTES {
+                return None;
+            }
+            if scalar_type == QueryScalarType::Bytes {
+                QueryScalar::Bytes(value)
+            } else {
+                QueryScalar::String(String::from_utf8(value).ok()?)
+            }
+        }
+        _ => return None,
+    };
+    (encode_ordered_index_scalar(&scalar) == encoded).then_some(scalar)
+}
+
+fn decode_ordered_bytes(encoded: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::new();
+    let mut offset = 0;
+    loop {
+        let byte = *encoded.get(offset)?;
+        offset += 1;
+        if byte != 0 {
+            decoded.push(byte);
+            continue;
+        }
+        match *encoded.get(offset)? {
+            0 if offset + 1 == encoded.len() => return Some(decoded),
+            0xff => {
+                decoded.push(0);
+                offset += 1;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Canonical locator key for one path-index generation.
+pub fn path_index_locator_key(
+    root: RootId,
+    workspace: WorkspaceIncarnationId,
+    path_digest: [u8; SHA256_BYTES],
+    index_generation: PathIndexGenerationId,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(FIXED_ID_BYTES * 3 + SHA256_BYTES);
+    key.extend_from_slice(root.as_bytes());
+    key.extend_from_slice(workspace.as_bytes());
+    key.extend_from_slice(&path_digest);
+    key.extend_from_slice(index_generation.as_bytes());
+    key
+}
+
+/// Decode one exact path-index locator key.
+pub fn decode_path_index_locator_key(
+    root: RootId,
+    key: &[u8],
+) -> Option<(
+    WorkspaceIncarnationId,
+    [u8; SHA256_BYTES],
+    PathIndexGenerationId,
+)> {
+    const KEY_BYTES: usize = FIXED_ID_BYTES * 3 + SHA256_BYTES;
+    if key.len() != KEY_BYTES || !key.starts_with(root.as_bytes()) {
+        return None;
+    }
+    let workspace = WorkspaceIncarnationId::from_bytes(
+        key[FIXED_ID_BYTES..FIXED_ID_BYTES * 2].try_into().ok()?,
+    );
+    let digest_offset = FIXED_ID_BYTES * 2;
+    let generation_offset = digest_offset + SHA256_BYTES;
+    let path_digest = key[digest_offset..generation_offset].try_into().ok()?;
+    let index_generation =
+        PathIndexGenerationId::from_bytes(key[generation_offset..].try_into().ok()?);
+    Some((workspace, path_digest, index_generation))
 }
 
 /// Strict typed-query payload failure.
@@ -1116,36 +1378,49 @@ mod tests {
         let field = field("run.label");
         let prefix = secondary_index_field_prefix(root, &field);
         let scalar = QueryScalar::String("same".to_owned());
-        let key_a = secondary_index_key(
-            root,
-            &field,
-            &scalar,
-            workspace,
-            &NormalizedRelativePath::new("a").unwrap(),
-        );
+        let digest_a = path_index_digest(&NormalizedRelativePath::new("a").unwrap());
+        let generation_a = PathIndexGenerationId::from_bytes([3; FIXED_ID_BYTES]);
+        let key_a = secondary_index_key(root, &field, &scalar, workspace, digest_a, generation_a);
+        let scalar_control = QueryScalar::String("same\0".to_owned());
         let key_a_control = secondary_index_key(
             root,
             &field,
-            &scalar,
+            &scalar_control,
             workspace,
-            &NormalizedRelativePath::new("a\u{1}").unwrap(),
+            digest_a,
+            generation_a,
         );
-        let key_ab = secondary_index_key(
-            root,
-            &field,
-            &scalar,
-            workspace,
-            &NormalizedRelativePath::new("ab").unwrap(),
-        );
+        let digest_ab = path_index_digest(&NormalizedRelativePath::new("ab").unwrap());
+        let key_ab = secondary_index_key(root, &field, &scalar, workspace, digest_ab, generation_a);
         assert!(key_a.starts_with(&prefix));
         assert!(key_a_control.starts_with(&prefix));
         assert!(key_ab.starts_with(&prefix));
         assert_ne!(key_a, key_ab);
-        assert!(!key_a_control.starts_with(&key_a));
-        assert!(!key_ab.starts_with(&key_a));
         assert!(key_a < key_a_control);
-        assert!(key_a_control < key_ab);
-        assert!(key_a < key_ab);
+        assert_eq!(
+            decode_secondary_index_key(root, &field, &scalar, &key_a),
+            Some((workspace, digest_a, generation_a))
+        );
+        assert_eq!(
+            decode_secondary_index_row_key(root, &key_a),
+            Some((
+                field.clone(),
+                scalar.clone(),
+                workspace,
+                digest_a,
+                generation_a,
+            ))
+        );
+        assert_eq!(
+            decode_secondary_index_key(root, &field, &scalar_control, &key_a),
+            None
+        );
+
+        let locator_key = path_index_locator_key(root, workspace, digest_a, generation_a);
+        assert_eq!(
+            decode_path_index_locator_key(root, &locator_key),
+            Some((workspace, digest_a, generation_a))
+        );
     }
 
     #[test]
@@ -1156,11 +1431,30 @@ mod tests {
         )]))
         .unwrap();
         let index = SecondaryIndexRecord {
-            path_generation: Generation::new(3).unwrap(),
-            compact_projection: projection.clone(),
+            path_digest: [3; SHA256_BYTES],
+            index_generation: PathIndexGenerationId::from_bytes([4; FIXED_ID_BYTES]),
         };
         let index_bytes = index.encode().unwrap();
         assert_eq!(SecondaryIndexRecord::decode(&index_bytes).unwrap(), index);
+
+        let locator = PathIndexLocatorRecord {
+            state: PathIndexLocatorState::Published,
+            path: NormalizedRelativePath::new("outputs/result.json").unwrap(),
+        };
+        let locator_bytes = locator.encode().unwrap();
+        assert_eq!(
+            PathIndexLocatorRecord::decode(&locator_bytes).unwrap(),
+            locator
+        );
+        let mut unknown_locator_state = locator_bytes;
+        unknown_locator_state[1] = 3;
+        assert_eq!(
+            PathIndexLocatorRecord::decode(&unknown_locator_state),
+            Err(QueryRecordError::UnknownDiscriminant {
+                type_name: "PathIndexLocatorState",
+                value: 3,
+            })
+        );
 
         let golden_event = ChangeEventRecord {
             workbench_id: WorkbenchId::new("wb").unwrap(),

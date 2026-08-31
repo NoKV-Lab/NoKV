@@ -54,7 +54,8 @@ A dataset publisher:
 1. creates or selects a Workbench;
 2. uploads immutable blocks for each artifact revision;
 3. verifies size and digest evidence;
-4. atomically publishes paths, references, indexes, and events;
+4. stages bounded index generations, then atomically publishes paths,
+   references, index visibility, and events;
 5. seals an immutable commit and optional durable tag.
 
 Training jobs consume the commit or tag rather than a mutable collection of

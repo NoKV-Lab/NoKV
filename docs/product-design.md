@@ -154,9 +154,11 @@ The object layout is revision-owned:
 nokv/artifacts/{logical_shard_id}/{root_id}/{artifact_revision_id}/blocks/{object_index}
 ```
 
-Object bytes upload first. One metadata command then publishes the immutable
-revision, manifest, path, workspace revision, indexes, event, reference
-changes, and deterministic replay result.
+Object bytes upload first. One bounded metadata command then stages an
+invisible secondary-index generation. One final metadata command atomically
+publishes the immutable revision, manifest, path, workspace revision,
+generation locator, event, reference changes, and deterministic replay result.
+The final command predicates every staged index row.
 
 Readers therefore see the previous complete revision or the new complete
 revision, never a partial body. A response lost after commit is safely replayed
@@ -169,7 +171,10 @@ multipart uploads remain first-class SDK operations.
 
 ## Discovery And Provenance
 
-Typed secondary indexes are updated atomically with the path entry. They serve:
+Typed secondary indexes are staged in bounded transactions and become visible
+atomically with the path entry through an exact generation-locator flip. Stale
+published generations are filtered on reads and reclaimed asynchronously. They
+serve:
 
 - dataset/version lookup;
 - run and producer lookup;

@@ -378,13 +378,13 @@ recovery journal. A planner target is nonzero and no greater than the hard
 batchers use the lower target when they can split work without changing
 visibility or atomicity.
 
-The current Holt serving envelope is sized around characterized
-high-amplification metadata states accepted by the current main branch; it is
-not yet a FoundationDB-portable schema envelope. The FDB characterization
-profile advertises a 900,000-byte planning target while retaining its existing
+The Holt serving envelope remains sized around characterized
+high-amplification metadata states. System format 11 also gives splittable
+workspace operations a 900,000-byte transaction-shape gate. The FDB
+characterization profile advertises that planning target while retaining its
 2,900,000-byte logical hard limit and conservative physical affected-data
-guard. Advertising that target does not make the current workspace schema fit
-it or qualify the adapter for serving.
+guard. Passing the logical shape gate is necessary but does not by itself
+qualify the adapter for serving.
 
 The serving budget covers:
 
@@ -411,24 +411,38 @@ no row. Adapter-specific encoding overhead still comes from the profile reserve.
 before physical I/O. The local serving profile sets a 16,000,000-byte logical
 write budget, an 8,205-byte encoded-key limit, a 65,535-byte value limit, and
 bounded read pages. After maximum mutation overhead, the write budget stays
-within Holt's 16 MiB WAL record envelope. File-backed tests preserve
-create/reopen/replace/remove for both a short path with a 61,203-byte typed
+within Holt's 16 MiB WAL record envelope. File-backed format-11 tests preserve
+create/reopen/replace/remove for both a short path with a 61,143-byte typed
 projection and a maximum-length path with 64 dependencies and a 57,243-byte
-projection. A separate successful replacement changes all 60 index fields at
-once: the before/after event is 61,323 bytes and the fully derived transaction
-is 9,859,124 bytes. The short-path replace-to-empty and remove transactions are
-also pinned at 11,797,827 and 11,791,492 bytes. These are characterized storage
-and metadata-engine compatibility results, not a universal domain-size proof.
+projection.
+
+SecondaryIndexV2 stages compact derived rows before one authoritative final
+command and uses a generation-fenced asynchronous cleanup cursor. Exact logical
+transaction-byte pins are:
+
+- short-path replace-to-empty: 125,601-byte stage and 318,292-byte final;
+- short-path remove: 311,466 bytes;
+- maximum-path, 64-dependency create: 283,025-byte stage and 573,060-byte final;
+- maximum-path replace-to-empty: 142,209-byte stage and 433,036-byte final;
+- maximum-path remove: 357,070 bytes;
+- disjoint 60-field republish with a 61,323-byte before/after event:
+  213,813-byte stage and 366,418-byte final;
+- maximum-projection rename: 397,058-byte stage and 696,582-byte final.
+
+Large restore copy/cleanup batches with a 61,203-byte projection and root-wide
+stale-index cleanup pages shrink against the same 900,000-byte planning target.
+The previous format-10
+fully derived transactions of 9,859,124, 11,797,827, and 11,791,492 bytes are
+historical redesign baselines, not current format-11 serving shapes. These are
+metadata-engine characterizations, not live FoundationDB qualification.
+
 The local-WAL server qualifies restart of the same exclusive namespace with an
 empty shared recovery frontier. It does not qualify rolling upgrade onto
-another store, copied-directory recovery, or checkpoint/log failover.
-
-The envelope exceeds FoundationDB's
-[10,000,000-byte hard transaction limit](https://apple.github.io/foundationdb/known-limitations.html),
-so an FDB adapter remains `NOT QUALIFIED` until publication/index maintenance
-is redesigned into bounded transactions. Treating FoundationDB's one-megabyte
-redesign recommendation as a new hard limit would strand existing valid Holt
-metadata.
+another store, copied-directory recovery, or checkpoint/log failover. The FDB
+adapter remains `NOT QUALIFIED` until the live conformance, failure,
+unknown-outcome, failover, and performance gates below are retained as
+evidence; the old monolithic publication transaction is no longer the schema
+blocker.
 
 Required transaction and read semantics are not optional capabilities. A store
 that cannot provide them fails during startup.
@@ -635,8 +649,8 @@ FoundationDB production work must address:
 
 - a root-scoped logical commit clock
 - physical affected-byte sizing and representative transaction qualification
-- bounded publication and secondary-index maintenance for states whose fully
-  derived transaction is larger than FoundationDB's hard budget
+- retained format-11 publication, restore, rename, and stale-index transaction
+  shape evidence on the real adapter
 - asynchronous server execution
 - unknown-outcome and conflict fault injection
 - failover and benchmark qualification

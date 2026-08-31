@@ -12,16 +12,16 @@
 use std::fmt;
 
 use nokv_types::{
-    ArtifactRevisionId, CommitVersion, GcClaimState, Generation, OperationId, ReferenceEpoch,
-    RevisionState, WorkbenchId, WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState,
-    FIXED_ID_BYTES, SHA256_BYTES,
+    ArtifactRevisionId, CommitVersion, GcClaimState, Generation, OperationId,
+    PathIndexGenerationId, ReferenceEpoch, RevisionState, WorkbenchId, WorkspaceIncarnationId,
+    WorkspaceRevision, WorkspaceState, FIXED_ID_BYTES, SHA256_BYTES,
 };
 
 /// Only supported value format for publication payload records.
 ///
-/// Version 2 makes `PathCurrent` a complete immutable `PathMetadata`
-/// projection, so exact reads never have to follow the revision-lifetime row.
-pub const PUBLICATION_VALUE_FORMAT_VERSION: u8 = 2;
+/// Version 3 adds the immutable path digest and path-index generation that
+/// fence SecondaryIndexV2 and its locator from stale staged rows.
+pub const PUBLICATION_VALUE_FORMAT_VERSION: u8 = 3;
 
 /// Maximum encoded digest URI length.
 pub const MAX_DIGEST_URI_BYTES: usize = 256;
@@ -74,6 +74,8 @@ pub struct ArtifactRevisionClaimRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathEntry {
     pub generation: Generation,
+    pub index_generation: PathIndexGenerationId,
+    pub path_digest: [u8; SHA256_BYTES],
     pub artifact_revision_id: ArtifactRevisionId,
     /// Digest URI for the complete resulting body, not an append delta.
     pub body_digest_uri: String,
@@ -340,6 +342,8 @@ impl PathEntry {
         let mut encoded = Vec::new();
         encoded.push(PUBLICATION_VALUE_FORMAT_VERSION);
         encoded.extend_from_slice(&self.generation.get().to_be_bytes());
+        encoded.extend_from_slice(self.index_generation.as_bytes());
+        encoded.extend_from_slice(&self.path_digest);
         encoded.extend_from_slice(self.artifact_revision_id.as_bytes());
         put_bounded_bytes(
             &mut encoded,
@@ -391,6 +395,9 @@ impl PathEntry {
                 field: "generation",
             }
         })?;
+        let index_generation =
+            PathIndexGenerationId::from_bytes(decoder.fixed("index_generation")?);
+        let path_digest = decoder.fixed("path_digest")?;
         let artifact_revision_id =
             ArtifactRevisionId::from_bytes(decoder.fixed("artifact_revision_id")?);
         let body_digest_uri = decoder.required_string("body_digest_uri", MAX_DIGEST_URI_BYTES)?;
@@ -408,6 +415,8 @@ impl PathEntry {
         decoder.finish()?;
         Ok(Self {
             generation,
+            index_generation,
+            path_digest,
             artifact_revision_id,
             body_digest_uri,
             manifest_digest_uri,
@@ -895,6 +904,8 @@ mod tests {
     fn path_entry() -> PathEntry {
         PathEntry {
             generation: generation(0x0102_0304_0506_0708),
+            index_generation: PathIndexGenerationId::from_bytes([0x22; FIXED_ID_BYTES]),
+            path_digest: [0x24; SHA256_BYTES],
             artifact_revision_id: ArtifactRevisionId::from_bytes([0x33; FIXED_ID_BYTES]),
             body_digest_uri: "sha256:body".to_owned(),
             manifest_digest_uri: "sha256:manifest".to_owned(),
@@ -1036,6 +1047,8 @@ mod tests {
         let expected = [
             &[PUBLICATION_VALUE_FORMAT_VERSION][..],
             &0x0102_0304_0506_0708_u64.to_be_bytes(),
+            &[0x22; FIXED_ID_BYTES],
+            &[0x24; SHA256_BYTES],
             &[0x33; FIXED_ID_BYTES],
             &11_u32.to_be_bytes(),
             b"sha256:body",
@@ -1382,7 +1395,7 @@ mod tests {
     #[test]
     fn decode_rejects_oversized_declared_length_before_allocation() {
         let mut encoded = path_entry().encode().unwrap();
-        let body_length_offset = 1 + 8 + FIXED_ID_BYTES;
+        let body_length_offset = 1 + 8 + FIXED_ID_BYTES + SHA256_BYTES + FIXED_ID_BYTES;
         encoded[body_length_offset..body_length_offset + 4]
             .copy_from_slice(&((MAX_DIGEST_URI_BYTES + 1) as u32).to_be_bytes());
         assert_eq!(
@@ -1398,7 +1411,7 @@ mod tests {
     #[test]
     fn invalid_strings_fail_closed() {
         let mut invalid_utf8 = path_entry().encode().unwrap();
-        let body_start = 1 + 8 + FIXED_ID_BYTES + 4;
+        let body_start = 1 + 8 + FIXED_ID_BYTES + SHA256_BYTES + FIXED_ID_BYTES + 4;
         invalid_utf8[body_start] = 0xff;
         assert_eq!(
             PathEntry::decode(&invalid_utf8),

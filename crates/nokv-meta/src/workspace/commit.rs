@@ -61,7 +61,11 @@ use super::publication_records::{
     ArtifactRevisionRecord, GcCandidateRecord, PathEntry, PublicationRecordCodecError,
     RevisionRefRecord, WorkspaceRecord,
 };
-use super::query_records::{ChangeEventKind, ChangeEventRecord, QueryRecordError, TypedProjection};
+use super::query_records::{
+    path_index_digest, path_index_generation, path_index_locator_key, ChangeEventKind,
+    ChangeEventRecord, PathIndexLocatorRecord, PathIndexLocatorState, QueryRecordError,
+    TypedProjection,
+};
 use super::snapshot_records::{HistoryHoldRecord, SnapshotRecordError};
 use nokv_types::{
     ArtifactRevisionId, BuildCommitPhase, CommitId, CommitRetirePhase, CommitState, CommitVersion,
@@ -1722,6 +1726,8 @@ impl<'a> CommitService<'a> {
 
         let next_path = PathEntry {
             generation: member.path_generation,
+            index_generation: path_index_generation(context.request_id),
+            path_digest: path_index_digest(&path),
             artifact_revision_id: member.artifact_revision_id,
             body_digest_uri: member.body_digest_uri,
             manifest_digest_uri: member.manifest_digest_uri,
@@ -1733,6 +1739,20 @@ impl<'a> CommitService<'a> {
             manifest_id: member.manifest_id,
             typed_index_projection: member.typed_projection,
         };
+        plan.put_absent(
+            MetadataFamily::PathIndexLocator,
+            path_index_locator_key(
+                context.root_id,
+                operation.source_workspace_incarnation_id,
+                next_path.path_digest,
+                next_path.index_generation,
+            ),
+            PathIndexLocatorRecord {
+                state: PathIndexLocatorState::Published,
+                path: path.clone(),
+            }
+            .encode()?,
+        )?;
         match current_path {
             None => plan.put_absent(MetadataFamily::PathCurrent, path_key, next_path.encode()?)?,
             Some(current) => {
@@ -3689,6 +3709,12 @@ mod tests {
     fn path_entry(index: usize, revision_id: ArtifactRevisionId) -> PathEntry {
         PathEntry {
             generation: Generation::new(1).unwrap(),
+            index_generation: nokv_types::PathIndexGenerationId::from_bytes(
+                *revision_id.as_bytes(),
+            ),
+            path_digest: path_index_digest(
+                &NormalizedRelativePath::new(format!("data/{index:04}.bin")).unwrap(),
+            ),
             artifact_revision_id: revision_id,
             body_digest_uri: format!("sha256:body-{index:04}"),
             manifest_digest_uri: format!("sha256:manifest-{index:04}"),

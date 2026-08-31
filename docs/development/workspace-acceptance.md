@@ -133,9 +133,10 @@ Required evidence:
 Required evidence:
 
 - immutable object blocks are uploaded and verified before metadata visibility;
-- one bounded, owner-fenced metadata command publishes the revision, manifest,
-  path, workspace revision, references, indexes, event, GC candidacy, and
-  deterministic result;
+- one bounded, owner-fenced command stages an invisible secondary-index
+  generation, and one final command publishes the revision, manifest, path,
+  workspace revision, references, exact index-generation locator, event, GC
+  candidacy, and deterministic result while predicating every staged row;
 - every mutation has the exact value or absence predicate required by its
   operation;
 - exact request replay returns the original typed result and commit version;

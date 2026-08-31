@@ -16,8 +16,8 @@ use std::fmt;
 use nokv_types::{
     ArtifactRevisionId, CommandDigest, CommitId, CommitState, CommitVersion, ConsumerEpoch,
     GcClaimState, Generation, GenericIndexReferenceKind, HistoryHoldState, NormalizedRelativePath,
-    OperationId, OperationKind, PublishPhase, ReadVersion, ReferenceEpoch, RestorePhase,
-    RevisionState, SnapshotId, SnapshotState, WorkbenchId, WorkspaceIncarnationId,
+    OperationId, OperationKind, PathIndexGenerationId, PublishPhase, ReadVersion, ReferenceEpoch,
+    RestorePhase, RevisionState, SnapshotId, SnapshotState, WorkbenchId, WorkspaceIncarnationId,
     WorkspaceRevision, WorkspaceState, FIXED_ID_BYTES, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
@@ -70,8 +70,9 @@ use super::publish_operation_records::{
     PublishAuthority, PublishClaim, PublishOperationRecord, PublishRecordError,
 };
 use super::query_records::{
-    secondary_index_key, ChangeEventKind, ChangeEventRecord, QueryFieldId, QueryRecordError,
-    QueryScalar, SecondaryIndexRecord, TypedProjection,
+    path_index_digest, path_index_locator_key, secondary_index_key, ChangeEventKind,
+    ChangeEventRecord, PathIndexLocatorRecord, PathIndexLocatorState, QueryFieldId,
+    QueryRecordError, QueryScalar, SecondaryIndexRecord, TypedProjection,
 };
 use super::restore_records::{
     RestoreCommitClosureProgress, RestoreCommitProvenance, RestoreCommitProvenanceV5,
@@ -84,9 +85,9 @@ use super::snapshot_records::{HistoryHoldRecord, SnapshotRecordError, SnapshotRe
 
 /// Maximum source rows copied by one metadata command.
 ///
-/// Each row may require one path, reference, member, and revision predicate /
-/// mutation pair. Forty-eight rows remain below the metadata layer's independent
-/// 256-item bounds even when every row names a distinct revision.
+/// The caller limit is independent from the command-item and byte limits. The
+/// planner admits fewer rows when their typed projections require more index
+/// predicates or when every row names a distinct revision.
 pub const MAX_RESTORE_BATCH_MEMBERS: usize = 48;
 /// Exact Workbench initialization path published before publication.
 pub const RESTORE_MANIFEST_PATH: &str = "metadata/restore_manifest.json";
@@ -750,6 +751,8 @@ struct PlannedCopiedMember {
     revision_ref_payload: Vec<u8>,
     restore_member_key: Vec<u8>,
     restore_member_payload: Vec<u8>,
+    path_index_locator_key: Vec<u8>,
+    path_index_locator_payload: Vec<u8>,
     secondary_index_rows: BTreeMap<Vec<u8>, Vec<u8>>,
     revision_after_copy: ArtifactRevisionRecord,
 }
@@ -1389,7 +1392,10 @@ pub fn copy_restore_batch(
         };
         let projection = TypedProjection::decode(&member.entry.typed_index_projection)?;
         let new_revision = revisions.insert(member.entry.artifact_revision_id);
-        let additional = 3 + projection.fields().len() + usize::from(new_revision);
+        // PathCurrent, RevisionRef, RestoreMember, PathIndexLocator, one row
+        // per projected field, and (once per distinct revision) the revision
+        // owner update.
+        let additional = 4 + projection.fields().len() + usize::from(new_revision);
         if command_items.saturating_add(additional) > MAX_COMMAND_ITEMS {
             break;
         }
@@ -1763,7 +1769,11 @@ fn plan_copy_batch(
             .next_member_sequence
             .checked_add(u64::try_from(offset).expect("batch offset fits u64"))
             .expect("sequence bound was checked");
-        let entry_payload = member.entry.encode()?;
+        let mut destination_entry = member.entry.clone();
+        destination_entry.index_generation =
+            restore_path_index_generation(context.root_id, next.operation_id, sequence);
+        destination_entry.path_digest = path_index_digest(&member.path);
+        let entry_payload = destination_entry.encode()?;
         plan.put_absent(
             MetadataFamily::PathCurrent,
             path_current_key(
@@ -1808,8 +1818,23 @@ fn plan_copy_batch(
         let index_rows = secondary_index_rows(
             context.root_id,
             next.destination_workspace_incarnation_id,
-            &member.path,
-            &member.entry,
+            &destination_entry,
+        )?;
+        let locator_key = path_index_locator_key(
+            context.root_id,
+            next.destination_workspace_incarnation_id,
+            destination_entry.path_digest,
+            destination_entry.index_generation,
+        );
+        let locator_payload = PathIndexLocatorRecord {
+            state: PathIndexLocatorState::Published,
+            path: member.path.clone(),
+        }
+        .encode()?;
+        plan.put_absent(
+            MetadataFamily::PathIndexLocator,
+            locator_key.clone(),
+            locator_payload.clone(),
         )?;
         for (key, value) in &index_rows {
             plan.put_absent(MetadataFamily::SecondaryIndex, key.clone(), value.clone())?;
@@ -1822,6 +1847,8 @@ fn plan_copy_batch(
             revision_ref_payload,
             restore_member_key,
             restore_member_payload,
+            path_index_locator_key: locator_key,
+            path_index_locator_payload: locator_payload,
             secondary_index_rows: index_rows,
             revision_after_copy,
         });
@@ -1849,6 +1876,17 @@ fn plan_copy_batch(
 }
 
 fn command_fits(store: &MetaShard, command: &MetadataCommand) -> Result<bool, RestoreError> {
+    if [
+        command.predicates.len(),
+        command.mutations.len(),
+        command.history_projection.len(),
+        command.event_projection.len(),
+    ]
+    .into_iter()
+    .any(|count| count > MAX_COMMAND_ITEMS)
+    {
+        return Ok(false);
+    }
     match store.command_fit(command, None) {
         Ok(CommandFit::Fits) => Ok(true),
         Ok(CommandFit::Exceeds { .. }) => Ok(false),
@@ -1923,6 +1961,11 @@ fn plan_single_member_cleanup_command(
     for (key, value) in &member.secondary_index_rows {
         plan.delete(MetadataFamily::SecondaryIndex, key.clone(), value.clone())?;
     }
+    plan.delete(
+        MetadataFamily::PathIndexLocator,
+        member.path_index_locator_key.clone(),
+        member.path_index_locator_payload.clone(),
+    )?;
     plan.delete(
         MetadataFamily::PathCurrent,
         path_current_key(
@@ -2324,7 +2367,7 @@ pub fn read_restore_source_run_manifest(
                 .to_owned(),
         });
     }
-    let path_entry = path_entry_from_commit_member(&member.record);
+    let path_entry = path_entry_from_commit_member(&path, &member.record);
     validate_destination_manifest_entry(&path_entry)?;
     validate_manifest_revision(store, context, &path_entry)?;
     let source_snapshot_read_version = match loaded.record.source {
@@ -3354,7 +3397,10 @@ pub fn cleanup_restore_batch(
                 let projection =
                     TypedProjection::decode_stored(&path.record.typed_index_projection)?;
                 let new_revision = revisions.insert(path.record.artifact_revision_id);
-                3 + projection.fields().len() + if new_revision { 2 } else { 0 }
+                // SecondaryIndex rows, PathIndexLocator, PathCurrent,
+                // RevisionRef, RestoreMember, and the optional distinct
+                // revision plus zero-reference candidate updates.
+                4 + projection.fields().len() + if new_revision { 2 } else { 0 }
             }
         };
         if command_items.saturating_add(additional) > MAX_COMMAND_ITEMS {
@@ -4381,7 +4427,7 @@ fn decode_source_member(
                     detail: error.to_string(),
                 }
             })?;
-            let entry = path_entry_from_commit_member(&member);
+            let entry = path_entry_from_commit_member(&path, &member);
             ("CommitMember", path, entry)
         }
     };
@@ -4784,9 +4830,16 @@ fn source_commit_matches_seal(commit: &CommitRecord, seal: &RestoreSourceCommitS
         && commit.generic_index_digest == seal.generic_index_digest
 }
 
-fn path_entry_from_commit_member(member: &CommitMemberRecord) -> PathEntry {
+fn path_entry_from_commit_member(
+    path: &NormalizedRelativePath,
+    member: &CommitMemberRecord,
+) -> PathEntry {
     PathEntry {
         generation: member.path_generation,
+        index_generation: PathIndexGenerationId::from_bytes(
+            *member.artifact_revision_id.as_bytes(),
+        ),
+        path_digest: path_index_digest(path),
         artifact_revision_id: member.artifact_revision_id,
         body_digest_uri: member.body_digest_uri.clone(),
         manifest_digest_uri: member.manifest_digest_uri.clone(),
@@ -4818,13 +4871,12 @@ struct PathChange {
 fn secondary_index_rows(
     root_id: nokv_types::RootId,
     workspace: WorkspaceIncarnationId,
-    path: &nokv_types::NormalizedRelativePath,
     entry: &PathEntry,
 ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, RestoreError> {
     let projection = TypedProjection::decode_stored(&entry.typed_index_projection)?;
     let payload = SecondaryIndexRecord {
-        path_generation: entry.generation,
-        compact_projection: projection.clone(),
+        path_digest: entry.path_digest,
+        index_generation: entry.index_generation,
     }
     .encode()?;
     Ok(projection
@@ -4832,11 +4884,36 @@ fn secondary_index_rows(
         .iter()
         .map(|(field, scalar)| {
             (
-                secondary_index_key(root_id, field, scalar, workspace, path),
+                secondary_index_key(
+                    root_id,
+                    field,
+                    scalar,
+                    workspace,
+                    entry.path_digest,
+                    entry.index_generation,
+                ),
                 payload.clone(),
             )
         })
         .collect())
+}
+
+fn restore_path_index_generation(
+    root_id: nokv_types::RootId,
+    operation_id: OperationId,
+    member_sequence: u64,
+) -> PathIndexGenerationId {
+    let mut digest = Sha256::new();
+    digest.update(b"nokv.restore.path-index-generation.v1\0");
+    digest.update(root_id.as_bytes());
+    digest.update(operation_id.as_bytes());
+    digest.update(member_sequence.to_be_bytes());
+    let digest: [u8; SHA256_BYTES] = digest.finalize().into();
+    PathIndexGenerationId::from_bytes(
+        digest[..FIXED_ID_BYTES]
+            .try_into()
+            .expect("SHA-256 prefix has path-index-generation width"),
+    )
 }
 
 fn apply_secondary_index_change(
@@ -4845,41 +4922,51 @@ fn apply_secondary_index_change(
     change: &PathChange,
     plan: &mut CommandPlan,
 ) -> Result<(), RestoreError> {
-    let mut before = change
-        .before
-        .as_ref()
-        .map(|loaded| {
-            secondary_index_rows(context.root_id, workspace, &change.path, &loaded.record)
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let mut after = change
-        .after
-        .as_ref()
-        .map(|entry| secondary_index_rows(context.root_id, workspace, &change.path, entry))
-        .transpose()?
-        .unwrap_or_default();
-    let keys = before
-        .keys()
-        .chain(after.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    for key in keys {
-        match (before.remove(&key), after.remove(&key)) {
-            (Some(expected), Some(next)) if expected == next => {
-                plan.assert_value(MetadataFamily::SecondaryIndex, key, Some(expected))?;
+    let Some(after) = change.after.as_ref() else {
+        if let Some(before) = change.before.as_ref() {
+            for (key, value) in secondary_index_rows(context.root_id, workspace, &before.record)? {
+                plan.delete(MetadataFamily::SecondaryIndex, key, value)?;
             }
-            (Some(expected), Some(next)) => {
-                plan.replace(MetadataFamily::SecondaryIndex, key, expected, next)?;
-            }
-            (Some(expected), None) => {
-                plan.delete(MetadataFamily::SecondaryIndex, key, expected)?;
-            }
-            (None, Some(next)) => {
-                plan.put_absent(MetadataFamily::SecondaryIndex, key, next)?;
-            }
-            (None, None) => unreachable!("secondary-index union key has one value"),
+            plan.delete(
+                MetadataFamily::PathIndexLocator,
+                path_index_locator_key(
+                    context.root_id,
+                    workspace,
+                    before.record.path_digest,
+                    before.record.index_generation,
+                ),
+                PathIndexLocatorRecord {
+                    state: PathIndexLocatorState::Published,
+                    path: change.path.clone(),
+                }
+                .encode()?,
+            )?;
         }
+        return Ok(());
+    };
+    let identity_unchanged = change.before.as_ref().is_some_and(|before| {
+        before.record.path_digest == after.path_digest
+            && before.record.index_generation == after.index_generation
+    });
+    if identity_unchanged {
+        return Ok(());
+    }
+    plan.put_absent(
+        MetadataFamily::PathIndexLocator,
+        path_index_locator_key(
+            context.root_id,
+            workspace,
+            after.path_digest,
+            after.index_generation,
+        ),
+        PathIndexLocatorRecord {
+            state: PathIndexLocatorState::Published,
+            path: change.path.clone(),
+        }
+        .encode()?,
+    )?;
+    for (key, value) in secondary_index_rows(context.root_id, workspace, after)? {
+        plan.put_absent(MetadataFamily::SecondaryIndex, key, value)?;
     }
     Ok(())
 }
@@ -6974,39 +7061,77 @@ mod tests {
                     .unwrap(),
             );
         }
-        for chunk in paths.chunks(100) {
-            let mut rows = Vec::with_capacity(chunk.len() * 2);
+        for chunk in paths.chunks(50) {
+            let mut rows = Vec::with_capacity(chunk.len() * 4);
             for path in chunk {
+                let projection = TypedProjection::new(BTreeMap::from([(
+                    QueryFieldId::new("source.class").unwrap(),
+                    QueryScalar::String("seed".to_owned()),
+                )]))
+                .unwrap();
+                let path_digest = path_index_digest(path);
+                let index_generation = PathIndexGenerationId::from_bytes(
+                    path_digest[..FIXED_ID_BYTES]
+                        .try_into()
+                        .expect("path digest prefix has generation width"),
+                );
+                let entry = PathEntry {
+                    generation: Generation::new(1).unwrap(),
+                    index_generation,
+                    path_digest,
+                    artifact_revision_id: source_revision,
+                    body_digest_uri: "sha256:source".to_owned(),
+                    manifest_digest_uri: "sha256:manifest".to_owned(),
+                    logical_size: 1,
+                    dependency_count: 0,
+                    dependency_depth: 0,
+                    content_type: "text/plain".to_owned(),
+                    producer: Some("test".to_owned()),
+                    manifest_id: None,
+                    typed_index_projection: projection.encode().unwrap(),
+                };
                 rows.push((
                     MetadataFamily::PathCurrent,
                     path_current_key(root(), source_incarnation, path),
-                    PathEntry {
-                        generation: Generation::new(1).unwrap(),
-                        artifact_revision_id: source_revision,
-                        body_digest_uri: "sha256:source".to_owned(),
-                        manifest_digest_uri: "sha256:manifest".to_owned(),
-                        logical_size: 1,
-                        dependency_count: 0,
-                        dependency_depth: 0,
-                        content_type: "text/plain".to_owned(),
-                        producer: Some("test".to_owned()),
-                        manifest_id: None,
-                        typed_index_projection: TypedProjection::new(BTreeMap::from([(
-                            QueryFieldId::new("source.class").unwrap(),
-                            QueryScalar::String("seed".to_owned()),
-                        )]))
-                        .unwrap()
-                        .encode()
-                        .unwrap(),
-                    }
-                    .encode()
-                    .unwrap(),
+                    entry.encode().unwrap(),
                 ));
                 rows.push((
                     MetadataFamily::RevisionRef,
                     path_revision_ref_key(root(), source_incarnation, path, source_revision),
                     RevisionRefRecord {
                         reference_epoch_at_add: ReferenceEpoch::new(1),
+                    }
+                    .encode()
+                    .unwrap(),
+                ));
+                rows.push((
+                    MetadataFamily::PathIndexLocator,
+                    path_index_locator_key(
+                        root(),
+                        source_incarnation,
+                        entry.path_digest,
+                        entry.index_generation,
+                    ),
+                    PathIndexLocatorRecord {
+                        state: PathIndexLocatorState::Published,
+                        path: path.clone(),
+                    }
+                    .encode()
+                    .unwrap(),
+                ));
+                rows.push((
+                    MetadataFamily::SecondaryIndex,
+                    secondary_index_key(
+                        root(),
+                        &QueryFieldId::new("source.class").unwrap(),
+                        &QueryScalar::String("seed".to_owned()),
+                        source_incarnation,
+                        entry.path_digest,
+                        entry.index_generation,
+                    ),
+                    SecondaryIndexRecord {
+                        path_digest: entry.path_digest,
+                        index_generation: entry.index_generation,
                     }
                     .encode()
                     .unwrap(),
@@ -7036,6 +7161,12 @@ mod tests {
             initialization: RestoreInitialization {
                 restore_manifest: PathEntry {
                     generation: Generation::new(1).unwrap(),
+                    index_generation: PathIndexGenerationId::from_bytes(
+                        *manifest_revision.as_bytes(),
+                    ),
+                    path_digest: path_index_digest(
+                        &nokv_types::NormalizedRelativePath::new("run_manifest.json").unwrap(),
+                    ),
                     artifact_revision_id: manifest_revision,
                     body_digest_uri: manifest_digest,
                     manifest_digest_uri: "sha256:manifest".to_owned(),
@@ -7279,8 +7410,59 @@ mod tests {
                 .unwrap()
                 .expect("seeded source path exists");
             let mut next = loaded.record;
+            next.index_generation = crate::workspace::path_index_generation(context.request_id);
+            next.path_digest = path_index_digest(path);
             next.typed_index_projection = encoded_projection.clone();
             let key = path_current_key(root(), source.source_incarnation, path);
+            let locator_key = path_index_locator_key(
+                root(),
+                source.source_incarnation,
+                next.path_digest,
+                next.index_generation,
+            );
+            let mut predicates = vec![
+                CommandPredicate::Value {
+                    family: MetadataFamily::PathCurrent,
+                    key: key.clone(),
+                    expected: Some(loaded.payload),
+                },
+                CommandPredicate::Value {
+                    family: MetadataFamily::PathIndexLocator,
+                    key: locator_key.clone(),
+                    expected: None,
+                },
+            ];
+            let mut mutations = vec![
+                CommandMutation::Put {
+                    family: MetadataFamily::PathCurrent,
+                    key: key.clone(),
+                    value: next.encode().unwrap(),
+                },
+                CommandMutation::Put {
+                    family: MetadataFamily::PathIndexLocator,
+                    key: locator_key,
+                    value: PathIndexLocatorRecord {
+                        state: PathIndexLocatorState::Published,
+                        path: path.clone(),
+                    }
+                    .encode()
+                    .unwrap(),
+                },
+            ];
+            for (index_key, index_value) in
+                secondary_index_rows(root(), source.source_incarnation, &next).unwrap()
+            {
+                predicates.push(CommandPredicate::Value {
+                    family: MetadataFamily::SecondaryIndex,
+                    key: index_key.clone(),
+                    expected: None,
+                });
+                mutations.push(CommandMutation::Put {
+                    family: MetadataFamily::SecondaryIndex,
+                    key: index_key,
+                    value: index_value,
+                });
+            }
             let command = MetadataCommand {
                 schema_id: SCHEMA_ID.to_owned(),
                 root_id: root(),
@@ -7294,16 +7476,8 @@ mod tests {
                 command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
                 read_version: context.read_version,
                 root_fence_action: RootFenceAction::RequireActive,
-                predicates: vec![CommandPredicate::Value {
-                    family: MetadataFamily::PathCurrent,
-                    key: key.clone(),
-                    expected: Some(loaded.payload),
-                }],
-                mutations: vec![CommandMutation::Put {
-                    family: MetadataFamily::PathCurrent,
-                    key: key.clone(),
-                    value: next.encode().unwrap(),
-                }],
+                predicates,
+                mutations,
                 history_projection: vec![HistoryProjection {
                     family: MetadataFamily::PathCurrent,
                     key,
@@ -8913,12 +9087,23 @@ mod tests {
             },
         )
         .unwrap();
+        let staged_path = read_record(
+            &store,
+            write_context(&store, &mut counter, initial_owner),
+            MetadataFamily::PathCurrent,
+            &path_current_key(root(), incarnation(30), &source.paths[0]),
+            PathEntry::decode,
+        )
+        .unwrap()
+        .unwrap()
+        .record;
         let index_key = secondary_index_key(
             root(),
             &QueryFieldId::new("source.class").unwrap(),
             &QueryScalar::String("seed".to_owned()),
             incarnation(30),
-            &source.paths[0],
+            staged_path.path_digest,
+            staged_path.index_generation,
         );
         let staged_index = store
             .read_at(
@@ -8932,10 +9117,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            SecondaryIndexRecord::decode(&staged_index)
-                .unwrap()
-                .path_generation,
-            Generation::new(1).unwrap()
+            SecondaryIndexRecord::decode(&staged_index).unwrap(),
+            SecondaryIndexRecord {
+                path_digest: staged_path.path_digest,
+                index_generation: staged_path.index_generation,
+            }
         );
         assert!(get_visible_workspace_at(
             &store,
@@ -9372,14 +9558,14 @@ mod tests {
                 .map(|index| {
                     (
                         QueryFieldId::new(format!("capacity.field_{index:02}")).unwrap(),
-                        QueryScalar::String("x".repeat(998)),
+                        QueryScalar::String("x".repeat(997)),
                     )
                 })
                 .collect(),
         )
         .unwrap();
         // Keep the fixture at the largest valid stored projection shape.
-        assert_eq!(projection.encode().unwrap().len(), 61_323);
+        assert_eq!(projection.encode().unwrap().len(), 61_263);
         replace_source_projection(&store, &mut counter, current_owner, &source, projection);
         let snapshot_id = mint_source_snapshot(&store, &mut counter, current_owner, &source);
         let begun = begin_snapshot_restore(
@@ -9470,6 +9656,103 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn large_restore_copy_and_cleanup_transaction_shapes_stay_below_fdb_target() {
+        let inner = crate::workspace::test_support::memory_txn_store().unwrap();
+        let (capturing, capture) = crate::workspace::test_support::capture_txn_store(inner);
+        let targeted = crate::workspace::test_support::with_transaction_target(capturing, 900_000);
+        let store = MetaShard::initialize(targeted, shard()).unwrap();
+        let mut counter = 1_925_u128;
+        let current_owner = owner(1);
+        activate_root(&store, &mut counter, current_owner);
+        let source = seed_source(&store, &mut counter, current_owner, 4);
+        let projection = TypedProjection::new(
+            (0..super::super::query_records::MAX_TYPED_PROJECTION_FIELDS)
+                .map(|index| {
+                    (
+                        QueryFieldId::new(format!("restore.capacity_{index:02}")).unwrap(),
+                        QueryScalar::String("x".repeat(994)),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(projection.encode().unwrap().len(), 61_203);
+        replace_source_projection(&store, &mut counter, current_owner, &source, projection);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, current_owner, &source);
+        let begun = begin_snapshot_restore(
+            &store,
+            &mut counter,
+            current_owner,
+            &source,
+            snapshot_id,
+            "transaction-shape",
+            incarnation(39),
+        );
+        let operation_id = begun.operation.operation_id;
+        start_restore_copy(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+
+        loop {
+            let copied = copy_restore_batch(
+                &store,
+                write_context(&store, &mut counter, current_owner),
+                CopyRestoreBatchRequest {
+                    operation_id,
+                    limit: MAX_RESTORE_BATCH_MEMBERS,
+                },
+            )
+            .unwrap();
+            let transaction_bytes =
+                capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
+            assert!(transaction_bytes <= 900_000);
+            if copied.command.operation.source_eof {
+                break;
+            }
+        }
+
+        abort_restore(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            &AbortRestoreRequest {
+                operation_id,
+                terminal_error: RestoreTerminalError {
+                    kind: RestoreTerminalErrorKind::AbortedByCaller,
+                    message: "transaction-shape cleanup".to_owned(),
+                    evidence_digest: None,
+                },
+            },
+        )
+        .unwrap();
+        start_restore_cleanup(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        loop {
+            let cleaned = cleanup_restore_batch(
+                &store,
+                write_context(&store, &mut counter, current_owner),
+                CopyRestoreBatchRequest {
+                    operation_id,
+                    limit: MAX_RESTORE_BATCH_MEMBERS,
+                },
+            )
+            .unwrap();
+            let transaction_bytes =
+                capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
+            assert!(transaction_bytes <= 900_000);
+            if cleaned.source_eof {
+                break;
+            }
+        }
     }
 
     #[test]
@@ -9944,7 +10227,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(first.copied_members, 1);
+        assert_eq!(first.copied_members, 2);
         let mut cleanup = first;
         while !cleanup.source_eof {
             cleanup = cleanup_restore_batch(
@@ -10205,6 +10488,16 @@ mod tests {
             operation_id,
             &source.initialization,
         );
+        let staged_path = read_record(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            MetadataFamily::PathCurrent,
+            &path_current_key(root(), incarnation(32), &source.paths[0]),
+            PathEntry::decode,
+        )
+        .unwrap()
+        .unwrap()
+        .record;
         let publication_context = write_context(&store, &mut counter, current_owner);
         abort_restore(
             &store,
@@ -10285,7 +10578,8 @@ mod tests {
             &QueryFieldId::new("source.class").unwrap(),
             &QueryScalar::String("seed".to_owned()),
             incarnation(32),
-            &source.paths[0],
+            staged_path.path_digest,
+            staged_path.index_generation,
         );
         assert!(store
             .read_at(
@@ -10454,6 +10748,28 @@ mod tests {
 
     fn operation(fill: u8) -> OperationId {
         OperationId::from_bytes([fill; FIXED_ID_BYTES])
+    }
+
+    #[test]
+    fn restore_path_index_generation_is_stable_and_member_unique() {
+        let first = restore_path_index_generation(root(), operation(1), 0);
+
+        assert_eq!(
+            first,
+            restore_path_index_generation(root(), operation(1), 0)
+        );
+        assert_ne!(
+            first,
+            restore_path_index_generation(root(), operation(1), 1)
+        );
+        assert_ne!(
+            first,
+            restore_path_index_generation(root(), operation(2), 0)
+        );
+        assert_ne!(
+            first,
+            restore_path_index_generation(RootId::from_bytes([3; FIXED_ID_BYTES]), operation(1), 0,)
+        );
     }
 
     fn body_digest_uri(body: &[u8]) -> String {
@@ -12431,6 +12747,10 @@ mod tests {
             &RestoreInitialization {
                 restore_manifest: PathEntry {
                     generation: Generation::new(1).unwrap(),
+                    index_generation: PathIndexGenerationId::from_bytes(*revision(0x14).as_bytes()),
+                    path_digest: path_index_digest(
+                        &nokv_types::NormalizedRelativePath::new("run_manifest.json").unwrap(),
+                    ),
                     artifact_revision_id: revision(0x14),
                     body_digest_uri: body_digest_uri(restore_manifest_body),
                     manifest_digest_uri: "sha256:manifest".to_owned(),
