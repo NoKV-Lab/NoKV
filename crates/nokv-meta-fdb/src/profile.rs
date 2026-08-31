@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use nokv_meta_store::{AckBoundary, Authority, StoreLimits, StoreProfile};
+use nokv_meta_store::{AckBoundary, Authority, RecoveryMode, StoreLimits, StoreProfile};
 
 pub(crate) const PHYSICAL_AFFECTED_BYTES: usize = 9_500_000;
 
@@ -21,6 +21,8 @@ pub(crate) const FDB_LIMITS: StoreLimits = StoreLimits {
 
 pub(crate) const FDB_PROFILE: StoreProfile = StoreProfile {
     limits: FDB_LIMITS,
+    transaction_target_bytes: 900_000,
     ack: AckBoundary::SharedCommit,
     authority: Authority::Shared,
+    recovery: RecoveryMode::StoreAuthority,
 };

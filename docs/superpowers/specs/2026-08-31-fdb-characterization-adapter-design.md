@@ -199,6 +199,8 @@ The first profile declares:
 ```text
 authority                 Shared
 acknowledgement            SharedCommit
+recovery                   StoreAuthority
+transaction_target_bytes   900,000
 max_reads                  8
 max_checks                 1024
 max_mutations              1024
@@ -211,9 +213,11 @@ max_result_bytes           8 MiB
 ```
 
 The logical key and value limits fit below FoundationDB's physical limits even
-with the maximum adapter envelope. The read and transaction byte limits are
-lower than the current serving profile, so `MetaShard::bind` must reject this
-adapter. No code weakens the serving limits to make the adapter bind.
+with the maximum adapter envelope. The read and hard transaction byte limits
+are lower than the current serving profile, so `MetaShard::bind` must reject
+this adapter. The 900,000-byte target is future planner input and does not claim
+that the current workspace schema fits it. No code weakens the serving limits
+to make the adapter bind.
 
 Before physical I/O, the adapter performs checked 64-bit affected-byte
 accounting over encoded keys, range endpoints, conflict ranges, and mutation

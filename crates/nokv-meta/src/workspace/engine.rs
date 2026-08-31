@@ -4032,7 +4032,9 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use nokv_meta_store::{AckBoundary, Authority, LimitKind, StoreProfile, UnknownCommit};
+    use nokv_meta_store::{
+        AckBoundary, Authority, LimitKind, RecoveryMode, StoreProfile, UnknownCommit,
+    };
     use tempfile::tempdir;
 
     use super::super::query_records::{ChangeEventKind, ChangeEventRecord, TypedProjection};
@@ -4322,8 +4324,10 @@ mod tests {
         fn profile(&self) -> StoreProfile {
             StoreProfile {
                 limits: self.limits,
+                transaction_target_bytes: self.limits.max_transaction_bytes,
                 ack: AckBoundary::LocalSync,
                 authority: Authority::Local,
+                recovery: RecoveryMode::LocalJournal,
             }
         }
 

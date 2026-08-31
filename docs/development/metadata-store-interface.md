@@ -367,12 +367,21 @@ match Holt or FoundationDB error types.
 
 ## Limits
 
-`StoreProfile` reports the store-advertised logical request limits, the
-acknowledgement boundary, and the location of recovery authority. NoKV defines
-one serving transaction envelope that every qualified store profile must meet.
-The Holt cutover sizes that envelope around characterized high-amplification
-metadata states accepted by the current main branch; it is not yet a
-FoundationDB-portable schema envelope.
+`StoreProfile` reports the store-advertised hard logical request limits, the
+preferred transaction-planning target, the acknowledgement boundary, the
+location of recovery authority, and whether domain commands require a local
+recovery journal. A planner target is nonzero and no greater than the hard
+`max_transaction_bytes` limit. Adapters always enforce the hard limit; domain
+batchers use the lower target when they can split work without changing
+visibility or atomicity.
+
+The current Holt serving envelope is sized around characterized
+high-amplification metadata states accepted by the current main branch; it is
+not yet a FoundationDB-portable schema envelope. The FDB characterization
+profile advertises a 900,000-byte planning target while retaining its existing
+2,900,000-byte logical hard limit and conservative physical affected-data
+guard. Advertising that target does not make the current workspace schema fit
+it or qualify the adapter for serving.
 
 The serving budget covers:
 
@@ -582,9 +591,9 @@ admitted by the default build. Bootstrap does not yet select provider
 construction from a provider-neutral persistent configuration.
 
 In the target runtime, open mode does not decide successor admission.
-`StoreProfile::authority` and the server's qualification policy decide whether
-a successor has a valid recovery path. `AckBoundary` alone is not a failover
-policy.
+`StoreProfile::authority`, `StoreProfile::recovery`, and the server's
+qualification policy decide whether a successor has a valid recovery path.
+`AckBoundary` alone is not a failover policy.
 
 An admitted successor must include every commit that returned `Applied` under
 that authority. Adapter conformance and server failover tests must prove this
@@ -594,14 +603,17 @@ before the profile can qualify.
 
 The initial profiles are:
 
-| Store | `Authority` | `AckBoundary` | Successor status |
-| --- | --- | --- | --- |
-| `HoltStore` | `Local` | `LocalSync` | Same exclusive namespace restart qualified; replacement/cross-host failover refused |
-| `FdbStore` | `Shared` | `SharedCommit` | Proposed, not qualified |
-| `HoltClusterStore` | `Replicated` | `QuorumCommit` | Proposed, not implemented |
+| Store | Transaction target | `Authority` | `AckBoundary` | `RecoveryMode` | Successor status |
+| --- | ---: | --- | --- | --- | --- |
+| `HoltStore` | hard limit | `Local` | `LocalSync` | `LocalJournal` | Same exclusive namespace restart qualified; replacement/cross-host failover refused |
+| `FdbStore` | 900,000 bytes | `Shared` | `SharedCommit` | `StoreAuthority` | Proposed, not qualified |
+| `HoltClusterStore` | not defined | `Replicated` | `QuorumCommit` | `StoreAuthority` | Proposed, not implemented |
 
-The current hash-chained `RecoveryOutbox` is local recovery and export material.
-It is not the consensus log for `HoltClusterStore`.
+`RecoveryMode::LocalJournal` requires the command's local recovery receipt and
+hash-chained `RecoveryOutbox` material in the same transaction. With
+`RecoveryMode::StoreAuthority`, the shared or replicated store is the recovery
+evidence and domain commands do not write that second local chain. The current
+outbox is not the consensus log for `HoltClusterStore`.
 
 `OwnerEpoch`, NoKV `ReadVersion`, and a replicated log term or index remain
 separate values. A store implementation must not substitute one for another.

@@ -5,8 +5,8 @@
 
 use crate::{
     AckBoundary, Authority, Check, Commit, Key, Keyspace, LimitKind, Mutation, ReadBatch, ReadOp,
-    ReadResult, ReadSnapshot, Scan, ScanItem, ScanPage, StoreError, StoreLimits, StoreProfile,
-    TxnStore, UnknownCommit, WriteTxn,
+    ReadResult, ReadSnapshot, RecoveryMode, Scan, ScanItem, ScanPage, StoreError, StoreLimits,
+    StoreProfile, TxnStore, UnknownCommit, WriteTxn,
 };
 
 const FIRST: Keyspace = Keyspace::new(1);
@@ -31,8 +31,10 @@ impl TxnStore for FakeStore {
     fn profile(&self) -> StoreProfile {
         StoreProfile {
             limits: limits(),
+            transaction_target_bytes: limits().max_transaction_bytes,
             ack: AckBoundary::LocalSync,
             authority: Authority::Local,
+            recovery: RecoveryMode::LocalJournal,
         }
     }
 
@@ -70,6 +72,11 @@ fn trait_is_object_safe() {
     store.ready().unwrap();
     assert_eq!(store.profile().ack, AckBoundary::LocalSync);
     assert_eq!(store.profile().authority, Authority::Local);
+    assert_eq!(store.profile().recovery, RecoveryMode::LocalJournal);
+    assert_eq!(
+        store.profile().transaction_target_bytes,
+        limits().max_transaction_bytes
+    );
     assert_eq!(
         store
             .commit(WriteTxn {

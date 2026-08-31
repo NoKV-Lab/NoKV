@@ -16,8 +16,9 @@ use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
 
 use crate::{
-    Check, Commit, Key, Keyspace, LimitKind, Mutation, ReadBatch, ReadOp, ReadResult, Scan,
-    ScanItem, ScanPage, StoreError, StoreProfile, TxnStore, UnknownCommit, WriteTxn,
+    AckBoundary, Authority, Check, Commit, Key, Keyspace, LimitKind, Mutation, ReadBatch, ReadOp,
+    ReadResult, RecoveryMode, Scan, ScanItem, ScanPage, StoreError, StoreProfile, TxnStore,
+    UnknownCommit, WriteTxn,
 };
 
 const LINEAR: Keyspace = Keyspace::new(0x7f01);
@@ -85,8 +86,8 @@ pub fn run<S>(
     let reopened_profile = reopened.profile();
     check_profile(reopened_profile);
     assert_eq!(
-        reopened_profile.authority, profile.authority,
-        "reopen changed the recovery authority"
+        reopened_profile, profile,
+        "reopen changed the store profile"
     );
     for (key, expected) in persisted {
         assert_eq!(
@@ -168,6 +169,23 @@ pub fn assert_poisoned<S>(
 
 fn check_profile(profile: StoreProfile) {
     let limits = profile.limits;
+    assert!(
+        profile.transaction_target_bytes > 0,
+        "store transaction planning target is zero"
+    );
+    assert!(
+        profile.transaction_target_bytes <= limits.max_transaction_bytes,
+        "store transaction planning target exceeds its hard transaction limit"
+    );
+    match (profile.authority, profile.ack, profile.recovery) {
+        (Authority::Local, AckBoundary::LocalSync, RecoveryMode::LocalJournal)
+        | (Authority::Shared, AckBoundary::SharedCommit, RecoveryMode::StoreAuthority)
+        | (Authority::Replicated, AckBoundary::QuorumCommit, RecoveryMode::StoreAuthority) => {}
+        combination => panic!(
+            "store authority, acknowledgement boundary, and recovery mode are inconsistent: \
+             {combination:?}"
+        ),
+    }
     assert!(
         limits.max_reads >= 2,
         "store must support two reads per batch"
@@ -1067,7 +1085,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::{AckBoundary, Authority, ReadSnapshot, StoreLimits};
+    use crate::{AckBoundary, Authority, ReadSnapshot, RecoveryMode, StoreLimits};
 
     #[derive(Clone)]
     struct MemoryStore {
@@ -1139,8 +1157,10 @@ mod tests {
                 max_result_rows: 16,
                 max_result_bytes: 512,
             },
+            transaction_target_bytes: 256,
             ack: AckBoundary::LocalSync,
             authority: Authority::Local,
+            recovery: RecoveryMode::LocalJournal,
         }
     }
 
@@ -1215,6 +1235,48 @@ mod tests {
                 })
             },
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "store transaction planning target is zero")]
+    fn profile_rejects_zero_transaction_target() {
+        let mut invalid = profile();
+        invalid.transaction_target_bytes = 0;
+        check_profile(invalid);
+    }
+
+    #[test]
+    #[should_panic(expected = "store transaction planning target exceeds")]
+    fn profile_rejects_transaction_target_above_hard_limit() {
+        let mut invalid = profile();
+        invalid.transaction_target_bytes = invalid.limits.max_transaction_bytes + 1;
+        check_profile(invalid);
+    }
+
+    #[test]
+    #[should_panic(expected = "recovery mode are inconsistent")]
+    fn profile_rejects_local_authority_without_local_journal() {
+        let mut invalid = profile();
+        invalid.recovery = RecoveryMode::StoreAuthority;
+        check_profile(invalid);
+    }
+
+    #[test]
+    #[should_panic(expected = "recovery mode are inconsistent")]
+    fn profile_rejects_shared_authority_with_local_acknowledgement() {
+        let mut invalid = profile();
+        invalid.authority = Authority::Shared;
+        invalid.recovery = RecoveryMode::StoreAuthority;
+        check_profile(invalid);
+    }
+
+    #[test]
+    #[should_panic(expected = "recovery mode are inconsistent")]
+    fn profile_rejects_shared_authority_with_local_journal() {
+        let mut invalid = profile();
+        invalid.authority = Authority::Shared;
+        invalid.ack = AckBoundary::SharedCommit;
+        check_profile(invalid);
     }
 
     struct PoisonStore {

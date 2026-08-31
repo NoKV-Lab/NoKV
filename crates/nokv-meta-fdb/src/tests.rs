@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use nokv_meta_store::{
-    AckBoundary, Authority, Check, Key, Keyspace, LimitKind, Mutation, ReadBatch, ReadOp, Scan,
-    StoreError, WriteTxn,
+    AckBoundary, Authority, Check, Key, Keyspace, LimitKind, Mutation, ReadBatch, ReadOp,
+    RecoveryMode, Scan, StoreError, WriteTxn,
 };
 
 use crate::affected_bytes::{ensure_observed_transaction_size, validate_read, validate_write};
@@ -127,6 +127,8 @@ fn scan_cursors_distinguish_rows_from_common_prefixes() {
 fn profile_is_shared_and_below_serving_transaction_limits() {
     assert_eq!(FDB_PROFILE.authority, Authority::Shared);
     assert_eq!(FDB_PROFILE.ack, AckBoundary::SharedCommit);
+    assert_eq!(FDB_PROFILE.recovery, RecoveryMode::StoreAuthority);
+    assert_eq!(FDB_PROFILE.transaction_target_bytes, 900_000);
     assert_eq!(FDB_PROFILE.limits, FDB_LIMITS);
     assert_eq!(FDB_LIMITS.max_transaction_bytes, 2_900_000);
 }
