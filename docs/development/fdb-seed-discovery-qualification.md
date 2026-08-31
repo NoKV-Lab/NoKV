@@ -5,8 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # FoundationDB Seed Discovery Live Qualification
 
-Status: approved design for FoundationDB serving Gate 7. This document does not
-claim that Gate 7 or the complete FDB serving profile has passed.
+Status: implemented and qualified for FoundationDB serving Gate 7. The complete
+FDB serving profile remains not qualified; see the
+[qualification record](./fdb-root-fix-qualification-2026-08-31.md#gate-7-seed-discovery-qualification).
 
 ## Decision
 
@@ -184,7 +185,7 @@ run therefore has raw diagnostics but no terminal `PASS`.
 
 ## Package And File Boundary
 
-The planned implementation surface is:
+The implementation surface is:
 
 ```text
 bench/Cargo.toml

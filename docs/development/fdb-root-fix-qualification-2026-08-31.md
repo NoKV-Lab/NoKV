@@ -61,6 +61,39 @@ retained separately because it predates only the lifecycle retry change:
 target/qualification/fdb-root-fix-288a6c80-20260831T145502Z/
 ```
 
+## Gate 7 Seed Discovery Qualification
+
+Gate 7 is **PASS**. The environment-gated Rust workload described by the
+[seed-discovery qualification contract](./fdb-seed-discovery-qualification.md)
+ran from one clean source revision against the exact `nokv-fdb` candidate, a
+fresh FDB prefix, and a fresh RustFS object root. The retained bundle is:
+
+```text
+target/qualification/fdb-seed-gate7-final-20260901/
+```
+
+The bundle contains the candidate and cluster-file digests, FDB 7.3.79 status
+before and after the run, pinned RustFS service identity and HTTP health before
+and after the run, complete A/B route tuples, process PIDs and takeover
+timeline, client transport attempts, typed peer transcripts with wire-frame
+hashes, and the atomic terminal result.
+
+| Scenario | Result | Retained oracle |
+| --- | --- | --- |
+| Multiple seeds | PASS | Two distinct configured seeds were contacted in recorded order. |
+| Failed first seed | PASS | The first connection was refused and the later typed seed resolved A. |
+| Owner endpoint change | PASS | The same client failed at A, refreshed through seeds, and succeeded through the strictly newer B route. |
+| Stale discovery | PASS | An authentic A observation after B was cached could not regress the resolver. |
+| Stale owner hint | PASS | A typed `NotOwner` response carrying A was ignored; authoritative refresh retained B. |
+| Same-generation endpoint drift | PASS | A B-generation tuple with only its endpoint changed was rejected. |
+| Immutable identity drift | PASS | A foreign logical-shard identity was rejected and its endpoint received no workspace request. |
+| Final mutation/read | PASS | The persistent client created and read back one workspace through B. |
+
+The qualification client used only the NoKV seed and workspace TCP protocol;
+only the candidate server processes connected to FDB. This result closes Gate
+7 only. Gates 2, 6, 8, 9, and 10 remain `NOT QUALIFIED`, so the overall FDB
+serving profile remains **NOT QUALIFIED**.
+
 ## Root-Fix Acceptance Matrix
 
 | Check | Result | Evidence |
@@ -111,7 +144,7 @@ executable test configuration without weakening either check.
 | 4. Takeover | PASS | Concurrent contenders, monotonic expiry observation, generation advance, owner kill, and live takeover ran. |
 | 5. Provision crashes | PASS | Preparation/finalization crash cuts and external admission retry converged. |
 | 6. Serve crashes | NOT QUALIFIED | Active-owner loss passed, but every pre-activation and post-activation crash cut has not been retained. |
-| 7. Seed discovery | NOT QUALIFIED | Multiple seeds, failed-first seed, and takeover refresh passed; the full stale-hint and endpoint-change matrix is not yet retained as one gate. |
+| 7. Seed discovery | PASS | One clean-head live bundle retained multiple seeds, failed-first fallback, A-to-B refresh, stale discovery and owner hints, same-generation endpoint drift, immutable identity drift, and final mutation/read through B. |
 | 8. Lifecycle | NOT QUALIFIED | Live publication ran through FDB, but restore, snapshot, retirement, GC, and ambiguous-delete quarantine have not all run live. |
 | 9. Limits | NOT QUALIFIED | Deterministic 900,000-byte planning tests pass, but the maximum physical affected-byte envelope is not yet measured and retained against the live cluster. |
 | 10. Performance | NOT QUALIFIED | Concurrency is a correctness stress result, not controlled latency/throughput qualification. |
