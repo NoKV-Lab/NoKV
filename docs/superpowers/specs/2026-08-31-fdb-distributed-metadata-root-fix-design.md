@@ -24,6 +24,9 @@ boundaries:
 2. secondary-index stage replay binds only immutable staged-write intent.
    Volatile operation heartbeats, workspace revisions, and current path
    payloads remain transaction predicates but are not request-reuse identity.
+3. lifecycle recovery treats a settled metadata-store `Unavailable` result as
+   retryable work. The independent control lease, owner-loss signal, metadata
+   session fence, and non-retryable errors continue to fail serving closed.
 
 The fix does not increase retry counts, roll a `Ready` catalog backward, add a
 compatibility path, or weaken any ownership or publication predicate.
@@ -60,6 +63,23 @@ attempts produced five such failures. Packet capture showed identical encoded
 publication intent across the failed retries; the mismatch arose during
 `CompleteArtifactPublish`, after stage commit and repeated final-transaction
 conflicts.
+
+### Transient FDB read failure stops a healthy owner
+
+During final acceptance, one FDB process was killed from a healthy three-node
+double-redundancy cluster. FDB remained available, but one lifecycle scan
+received error 1031 after its bounded transaction timeout. The adapter mapped
+that settled read failure to `StoreError::Unavailable`, whose contract permits
+an upper-layer retry. The lifecycle runner instead treated it as terminal,
+removed the local route, and stopped the RPC server before the control lease
+reported ownership loss.
+
+Lifecycle scans must retry only `StoreError::Unavailable` and existing unstable
+read results, including the owner check performed during the poll wait. The
+RPC loop renews the control lease independently. A failed renewal sets the
+owner-loss signal; a metadata `Fenced` result, identity mismatch, corruption,
+or unknown commit outcome remains terminal. This preserves session fencing
+while preventing a settled transient read from manufacturing owner loss.
 
 ## Scope
 
@@ -206,6 +226,9 @@ row accumulation and keeps existing cleanup ownership unchanged.
   final publication semantics without importing FoundationDB.
 - `nokv-meta-fdb` and `nokv-control-fdb` require no new automatic raw
   transaction retry.
+- `nokv-server` lifecycle orchestration owns the high-level retry disposition
+  for provider-neutral `StoreError::Unavailable`; it does not inspect an FDB
+  error code or provider name.
 
 No forwarding wrapper or compatibility API remains after callers move to the
 prepared provisioning flow.
@@ -239,8 +262,8 @@ observed failure and is rejected.
 Deterministic tests must prove:
 
 - missing object configuration causes no FDB catalog mutation;
-- namespace ensure or provider admission failure leaves root and shard in
-  `Provisioning`;
+- namespace ensure or provider admission failure leaves the new root and any
+  new shard in `Provisioning`, without rolling an existing Ready shard back;
 - retry after every preparation/finalization cut point converges to the same
   identities and `Ready` state;
 - a stale preparation owner cannot finalize or release a successor session;
@@ -249,6 +272,8 @@ Deterministic tests must prove:
 - a valid operation heartbeat between attempts replays successfully;
 - changed locator or index rows under the same stage request id still fail;
 - outer RPC request reuse with changed input still fails.
+- lifecycle metadata `Unavailable` retries without uninstalling the route,
+  while metadata fencing and control owner loss remain terminal.
 
 The real-boundary regression uses the exact built `nokv-fdb` binary, a
 three-process FDB 7.3 cluster, and RustFS. It must run:

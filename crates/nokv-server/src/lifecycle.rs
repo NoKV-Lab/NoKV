@@ -482,7 +482,11 @@ impl LifecycleRunner {
                 LifecycleError::InvalidOptions("poll interval overflows monotonic time".to_owned())
             })?;
         loop {
-            self.require_current_owner()?;
+            match self.require_current_owner() {
+                Ok(()) => {}
+                Err(error) if retryable_lifecycle(&error) => {}
+                Err(error) => return Err(error),
+            }
             if shutdown.load(AtomicOrdering::Acquire) {
                 return Ok(true);
             }
@@ -1685,7 +1689,13 @@ fn concurrent_meta(error: &meta::MetaError) -> bool {
 fn retryable_lifecycle(error: &LifecycleError) -> bool {
     matches!(
         error,
-        LifecycleError::Meta(meta::MetaError::ReadStabilityExhausted { .. })
+        LifecycleError::Meta(
+            meta::MetaError::ReadStabilityExhausted { .. }
+                | meta::MetaError::Store {
+                    source: nokv_meta_store::StoreError::Unavailable(_),
+                    ..
+                }
+        )
     ) || matches!(
         error,
         LifecycleError::DurabilityBarrier {
@@ -1778,6 +1788,26 @@ mod tests {
         let error = meta::MetaError::ReadStabilityExhausted { attempts: 4 };
         assert!(concurrent_meta(&error));
         assert!(retryable_lifecycle(&LifecycleError::Meta(error)));
+    }
+
+    #[test]
+    fn unavailable_metadata_is_retryable_but_fencing_is_terminal() {
+        let unavailable = LifecycleError::Meta(meta::MetaError::Store {
+            operation: "read required record",
+            source: nokv_meta_store::StoreError::Unavailable(
+                "FoundationDB transaction timed out".to_owned(),
+            ),
+        });
+        assert!(retryable_lifecycle(&unavailable));
+
+        let fenced = LifecycleError::Meta(meta::MetaError::Store {
+            operation: "read required record",
+            source: nokv_meta_store::StoreError::Fenced {
+                expected_owner_epoch: 7,
+                expected_session_generation: 9,
+            },
+        });
+        assert!(!retryable_lifecycle(&fenced));
     }
 
     #[test]

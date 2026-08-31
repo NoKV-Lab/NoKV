@@ -165,10 +165,14 @@ git diff --check
 4. Kill the active owner and prove session fencing plus seed failover; then
    stop one FDB node and prove write/read continuity under the configured
    redundancy mode.
-5. Retain logs, catalog snapshots, transaction-shape evidence, container and
+5. Treat only provider-neutral, settled metadata `Unavailable` results as
+   retryable lifecycle work, including poll-wait owner checks. Keep control
+   owner loss, metadata fencing, corruption, and unknown outcomes terminal;
+   add a regression for this classification before rerunning node loss.
+6. Retain logs, catalog snapshots, transaction-shape evidence, container and
    library versions, exact commands, and an explicit `PASS`/`FAIL`/`NOT RUN`
    matrix.
-6. Keep the distributed metadata mode `NOT QUALIFIED` if any required gate is
+7. Keep the distributed metadata mode `NOT QUALIFIED` if any required gate is
    missing, flaky, or fails.
 
 **Acceptance**
