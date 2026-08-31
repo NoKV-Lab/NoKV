@@ -1,0 +1,22 @@
+[package]
+name = "nokv-control-fdb"
+version = "0.1.0"
+description = "FoundationDB catalog, route, and owner-session control for NoKV."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = []
+fdb = ["nokv-fdb/fdb"]
+
+[dependencies]
+nokv-control.workspace = true
+nokv-fdb.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }

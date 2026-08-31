@@ -6,12 +6,13 @@ SPDX-License-Identifier: Apache-2.0
 # Metadata Store Interface
 
 Implemented: the storage-neutral interface, local Holt adapter, `MetaShard`
-cutover, a process-global FoundationDB runtime boundary, and a non-default
-FoundationDB characterization adapter. The serving local profile still uses
-Holt through `TxnStore`; FoundationDB is **NOT QUALIFIED** and is not wired
-into `nokv-server`. Pending: FoundationDB control/session admission, discovery,
-serving composition and qualification, replicated Holt, and owner-safe
-response delivery.
+cutover, a process-global FoundationDB runtime boundary, a non-default
+FoundationDB characterization adapter, and FoundationDB-backed manifest,
+catalog, route, session, and heartbeat control transactions. The serving local
+profile still uses Holt through `TxnStore`; FoundationDB is **NOT QUALIFIED**
+and is not wired into `nokv-server`. Pending: session-fenced metadata,
+discovery, serving composition and qualification, replicated Holt, and
+owner-safe response delivery.
 
 The [code contract](./code_contract.md), [architecture](../architecture.md),
 and [metadata schema](../metadata-schema.md) remain normative.
@@ -69,6 +70,12 @@ responsibilities:
   cluster file and binary metadata subspace through `nokv-fdb`. Its live tests
   are feature gated, and its synchronous `TxnStore` bridge remains
   characterization-only.
+- `nokv-control` owns provider-neutral store-manifest, catalog, route, owner
+  session, heartbeat, and transition types in addition to the legacy control
+  contract retained until the etcd removal slice.
+- `nokv-control-fdb` maps those distributed control types to versioned FDB
+  records and separate stable-session and heartbeat keys. Its takeover TTL is
+  measured only by the contender's local monotonic clock.
 
 `bootstrap_shard` opens one `MetaShard` for a logical-shard owner and attaches
 all Active roots found at startup. The server constructs the Holt adapter and
@@ -89,6 +96,8 @@ flowchart TB
     Store --> Holt["HoltStore"]
     Store --> Fdb["FdbStore"]
     Fdb --> FdbRuntime["nokv-fdb process runtime"]
+    FdbControl["nokv-control-fdb"] --> FdbRuntime
+    FdbControl --> ControlTypes["nokv-control types"]
     Store --> Cluster["HoltClusterStore"]
 
     Control["nokv-control<br/>placement + lease + owner epoch"] -.-> Server
@@ -109,6 +118,7 @@ Implemented and reserved names are:
 | Embedded Holt implementation | `HoltStore` | Implemented |
 | FoundationDB implementation | `FdbStore` | Characterization only; `NOT QUALIFIED` |
 | Process-global FoundationDB runtime | `FdbRuntime` | Implemented; feature gated and non-restartable |
+| FoundationDB catalog and ownership control | `FdbControlStore` | Implemented; feature gated and not yet composed into serving |
 | Replicated Holt implementation | `HoltClusterStore` | Reserved |
 | Workspace metadata error | `MetaError` | Implemented |
 | Physical store error | `StoreError` | Implemented |
@@ -132,6 +142,8 @@ flowchart BT
     Holt["nokv-meta-holt"] --> Interface
     Fdb["nokv-meta-fdb"] --> Interface
     Fdb --> FdbRuntime["nokv-fdb"]
+    FdbControl["nokv-control-fdb"] --> FdbRuntime
+    FdbControl --> ControlTypes["nokv-control"]
     Server["nokv-server"] --> Meta
     Server --> Interface
     Server --> Holt
@@ -150,6 +162,8 @@ The exact dependency rules are:
 - `nokv-fdb` is the only package that imports the selected FoundationDB Rust
   binding
 - `nokv-meta-fdb` depends on `nokv-meta-store` and `nokv-fdb`
+- `nokv-control-fdb` depends on `nokv-control` and `nokv-fdb`; it does not
+  import the FoundationDB binding directly
 - store adapters do not depend on `nokv-meta` or know workspace record types
 - `nokv-server` is the only production composition root
 
@@ -697,7 +711,9 @@ The FoundationDB adapter uses the following evidence gates:
 | --- | --- | --- |
 | Common runtime, prefix, option, and error tests | `cargo test -p nokv-fdb` | Required in the default workspace; does not load `libfdb_c` |
 | Pure options, encoding, limit, and error tests | `cargo test -p nokv-meta-fdb` | Required in the default workspace; does not load `libfdb_c` |
-| Binding API compile | `cargo check -p nokv-fdb --features fdb --all-targets && cargo check -p nokv-meta-fdb --features fdb --all-targets` | Required for the selected 7.3 API |
+| Catalog, route, session, heartbeat, codec, and monotonic-observer tests | `cargo test -p nokv-control && cargo test -p nokv-control-fdb` | Required in the default workspace; does not load `libfdb_c` |
+| Binding API compile | `cargo check -p nokv-fdb --features fdb --all-targets && cargo check -p nokv-meta-fdb --features fdb --all-targets && cargo check -p nokv-control-fdb --features fdb --all-targets` | Required for the selected 7.3 API |
+| Concurrent owner acquisition, takeover, and stale-owner fencing | `NOKV_TEST_FDB_CLUSTER_FILE=/absolute/path cargo test -p nokv-control-fdb --features fdb --test fdb_control -- --ignored --nocapture` | Environment-gated; `NOT QUALIFIED` unless the run and output are retained |
 | Shared conformance, binary scans, conflict, reopen, and namespace isolation | `NOKV_TEST_FDB_CLUSTER_FILE=/absolute/path cargo test -p nokv-meta-fdb --features fdb --test fdb_conformance -- --ignored --nocapture` | Environment-gated; `NOT QUALIFIED` unless the run and output are retained |
 | Unknown outcome, process/network loss, failover, and representative performance | Dedicated fault and benchmark environments | `NOT QUALIFIED` |
 
@@ -734,10 +750,10 @@ Completed in the local Holt cutover:
 
 Remaining work:
 
-1. Add the FDB catalog, ownership session, discovery, and persistent serving
-   admission around the implemented process runtime.
-2. Add exact session checks and metadata-transaction unknown-outcome recovery
-   orchestration without raw transaction retries.
+1. Add discovery and persistent serving composition around the implemented FDB
+   runtime and control store.
+2. Add exact stable-session checks and metadata-transaction unknown-outcome
+   recovery orchestration without raw transaction retries.
 3. Qualify the non-default `nokv-meta-fdb` adapter only after its
    large-transaction, workspace, failure, failover, and benchmark gates pass.
 4. Add `HoltClusterStore` only after its replicated transaction format exists.

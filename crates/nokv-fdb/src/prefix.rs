@@ -6,7 +6,7 @@
 use crate::FdbConfigError;
 
 const PHYSICAL_MAGIC: &[u8] = b"\x15nokv-fdb\x00";
-const PHYSICAL_ENCODING_VERSION: u8 = 1;
+pub const FDB_PHYSICAL_ENCODING_VERSION: u8 = 1;
 const MAX_COMPONENT_BYTES: usize = u16::MAX as usize;
 pub const MAX_STORE_PREFIX_BYTES: usize = 64;
 
@@ -42,7 +42,7 @@ impl FdbStorePrefix {
         }
         let mut encoded = Vec::with_capacity(PHYSICAL_MAGIC.len() + 2 + token.len());
         encoded.extend_from_slice(PHYSICAL_MAGIC);
-        encoded.push(PHYSICAL_ENCODING_VERSION);
+        encoded.push(FDB_PHYSICAL_ENCODING_VERSION);
         encoded.push(
             u8::try_from(token.len()).expect("validated FoundationDB store prefix fits one byte"),
         );

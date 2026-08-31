@@ -1497,6 +1497,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nokv-control-fdb"
+version = "0.1.0"
+dependencies = [
+ "nokv-control",
+ "nokv-fdb",
+ "sha2 0.10.9",
+ "uuid",
+]
+
+[[package]]
 name = "nokv-fdb"
 version = "0.1.0"
 dependencies = [

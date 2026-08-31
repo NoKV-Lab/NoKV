@@ -23,7 +23,8 @@ mod runtime;
 pub use error::{classify_error, FdbErrorDisposition, FdbLimit, FdbOperationError};
 pub use options::{FdbConfigError, FdbConnectionOptions};
 pub use prefix::{
-    lexicographic_successor, FdbStorePrefix, FdbSubspace, FdbSubspaceKind, MAX_STORE_PREFIX_BYTES,
+    lexicographic_successor, FdbStorePrefix, FdbSubspace, FdbSubspaceKind,
+    FDB_PHYSICAL_ENCODING_VERSION, MAX_STORE_PREFIX_BYTES,
 };
 
 #[cfg(feature = "fdb")]
