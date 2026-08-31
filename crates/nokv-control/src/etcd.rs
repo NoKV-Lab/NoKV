@@ -30,6 +30,8 @@ pub struct EtcdControlStore {
     options: EtcdControlStoreOptions,
     runtime: Runtime,
     client: Client,
+    #[cfg(test)]
+    suspend_recovery_test_hook: SuspendRecoveryTestHook,
 }
 
 struct StoredRootPlacement {
@@ -51,53 +53,56 @@ struct StoredOwnerSession {
 #[cfg(test)]
 type SuspendRecoveryMissingSessionHook = Box<dyn FnOnce() + Send + 'static>;
 
+/// Per-store test hook for the missing-session suspension path. Instance
+/// state, never a process global: concurrent tests each own their store, so
+/// one test's pause can neither collide with another test's install nor
+/// poison a mutex that unrelated tests consult.
 #[cfg(test)]
-static SUSPEND_RECOVERY_MISSING_SESSION_HOOK: std::sync::OnceLock<
-    std::sync::Mutex<Option<(LogicalShardId, SuspendRecoveryMissingSessionHook)>>,
-> = std::sync::OnceLock::new();
-
-#[cfg(test)]
-fn install_suspend_recovery_missing_session_hook(
-    logical_shard_id: LogicalShardId,
-    hook: impl FnOnce() + Send + 'static,
-) {
-    let slot = SUSPEND_RECOVERY_MISSING_SESSION_HOOK.get_or_init(|| std::sync::Mutex::new(None));
-
-    let mut guard = slot
-        .lock()
-        .expect("suspend-recovery test-hook mutex must remain available");
-
-    assert!(
-        guard.is_none(),
-        "suspend-recovery missing-session hook is already installed"
-    );
-
-    *guard = Some((logical_shard_id, Box::new(hook)));
+#[derive(Clone, Default)]
+struct SuspendRecoveryTestHook {
+    slot: std::sync::Arc<
+        std::sync::Mutex<Option<(LogicalShardId, SuspendRecoveryMissingSessionHook)>>,
+    >,
 }
 
 #[cfg(test)]
-fn run_suspend_recovery_missing_session_hook(logical_shard_id: &LogicalShardId) {
-    let slot = SUSPEND_RECOVERY_MISSING_SESSION_HOOK.get_or_init(|| std::sync::Mutex::new(None));
-
-    let hook = {
-        let mut guard = slot
+impl SuspendRecoveryTestHook {
+    fn install(&self, logical_shard_id: LogicalShardId, hook: impl FnOnce() + Send + 'static) {
+        let mut guard = self
+            .slot
             .lock()
             .expect("suspend-recovery test-hook mutex must remain available");
 
-        let should_run = guard
-            .as_ref()
-            .map(|(expected, _)| expected == logical_shard_id)
-            .unwrap_or(false);
+        assert!(
+            guard.is_none(),
+            "suspend-recovery missing-session hook is already installed for this store"
+        );
 
-        if should_run {
-            guard.take().map(|(_, hook)| hook)
-        } else {
-            None
+        *guard = Some((logical_shard_id, Box::new(hook)));
+    }
+
+    fn run(&self, logical_shard_id: &LogicalShardId) {
+        let hook = {
+            let mut guard = self
+                .slot
+                .lock()
+                .expect("suspend-recovery test-hook mutex must remain available");
+
+            let should_run = guard
+                .as_ref()
+                .map(|(expected, _)| expected == logical_shard_id)
+                .unwrap_or(false);
+
+            if should_run {
+                guard.take().map(|(_, hook)| hook)
+            } else {
+                None
+            }
+        };
+
+        if let Some(hook) = hook {
+            hook();
         }
-    };
-
-    if let Some(hook) = hook {
-        hook();
     }
 }
 
@@ -118,7 +123,19 @@ impl EtcdControlStore {
             options,
             runtime,
             client,
+            #[cfg(test)]
+            suspend_recovery_test_hook: SuspendRecoveryTestHook::default(),
         })
+    }
+
+    #[cfg(test)]
+    fn install_suspend_recovery_missing_session_hook(
+        &self,
+        logical_shard_id: LogicalShardId,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        self.suspend_recovery_test_hook
+            .install(logical_shard_id, hook);
     }
 
     pub fn options(&self) -> &EtcdControlStoreOptions {
@@ -674,6 +691,8 @@ impl ControlStore for EtcdControlStore {
         let mut client = self.client.clone();
         let options = self.options.clone();
         let lease = lease.clone();
+        #[cfg(test)]
+        let test_hook = self.suspend_recovery_test_hook.clone();
 
         self.block_on(async move {
             let current = fetch_logical_shard(&mut client, &options, &lease.logical_shard_id)
@@ -688,7 +707,7 @@ impl ControlStore for EtcdControlStore {
             let result = match session {
                 None => {
                     #[cfg(test)]
-                    run_suspend_recovery_missing_session_hook(&lease.logical_shard_id);
+                    test_hook.run(&lease.logical_shard_id);
 
                     if exact_recovery_record_is_sessionless(&mut client, &options, &current).await?
                     {
@@ -1453,6 +1472,16 @@ fn etcd_backend(error: etcd_client::Error) -> ControlError {
     ControlError::Backend(format!("etcd: {error}"))
 }
 
+// The `#[ignore]` tests below run only against a real etcd:
+//
+//   NOKV_TEST_ETCD_ENDPOINT=http://127.0.0.1:2379 \
+//     cargo test -p nokv-control --features etcd -- --ignored
+//
+// `--features etcd` is load-bearing: without it this module is not compiled,
+// so `-- --ignored` silently runs zero tests and reads as green. The tests
+// are safe under the default parallel test runner: every test derives a
+// unique key prefix and shard id, and the suspend-recovery pause hook is
+// per-store state, not a process global.
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
@@ -2104,7 +2133,7 @@ mod tests {
 
         let (resume_tx, resume_rx) = mpsc::channel();
 
-        install_suspend_recovery_missing_session_hook(logical_shard_id, move || {
+        cleanup_store.install_suspend_recovery_missing_session_hook(logical_shard_id, move || {
             reached_tx
                 .send(())
                 .expect("test must signal the missing-session boundary");
@@ -2384,7 +2413,7 @@ mod tests {
 
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
 
-        install_suspend_recovery_missing_session_hook(logical_shard_id, move || {
+        cleanup_store.install_suspend_recovery_missing_session_hook(logical_shard_id, move || {
             reached_tx
                 .send(())
                 .expect("test must signal that cleanup observed the absent L1 session");
