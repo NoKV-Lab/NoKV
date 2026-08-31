@@ -851,6 +851,7 @@ fn run_server(config: ServeConfig) -> Result<(), String> {
     let server = WorkspaceServer::new(
         ServerOptions {
             bind: config.bind,
+            health_bind: None,
             handshake_timeout: Duration::from_millis(config.handshake_timeout_millis),
             read_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),

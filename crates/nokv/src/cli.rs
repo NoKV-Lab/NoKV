@@ -68,6 +68,7 @@ pub struct ObjectConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerConfig {
     pub bind: SocketAddr,
+    pub health_endpoint: Option<SocketAddr>,
     pub handshake_timeout_millis: u64,
     pub max_inflight_connections: usize,
     pub advertise_endpoint: Option<String>,
@@ -291,6 +292,7 @@ impl Default for ServerConfig {
             bind: DEFAULT_SERVER_BIND
                 .parse()
                 .expect("default server bind is valid"),
+            health_endpoint: None,
             handshake_timeout_millis: DEFAULT_HANDSHAKE_TIMEOUT_MILLIS,
             max_inflight_connections: DEFAULT_MAX_INFLIGHT_CONNECTIONS,
             advertise_endpoint: None,
@@ -408,6 +410,12 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             }
             "--bind" => {
                 server.bind = parse_address("--bind", next_value(&mut arguments, &argument)?)?;
+            }
+            "--health-endpoint" => {
+                server.health_endpoint = Some(parse_address(
+                    "--health-endpoint",
+                    next_value(&mut arguments, &argument)?,
+                )?);
             }
             "--handshake-timeout-millis" => {
                 server.handshake_timeout_millis = parse_number(

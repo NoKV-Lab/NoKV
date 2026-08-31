@@ -626,6 +626,9 @@ OWNER:
   serve validates every active root's Agent binding; it does not require or compare one shard-wide AgentId
   --root-id HEX32 --etcd-endpoint URL --node-id ID
   --advertise-endpoint HOST:PORT --bind HOST:PORT
+  --health-endpoint HOST:PORT serves optional /healthz, /readyz, and /stats
+    (liveness; admission retained while not draining or owner-lost; one JSON
+    counter snapshot)
   --handshake-timeout-millis N --max-inflight-connections N
   --metadata-create PATH starts the first standalone local-WAL owner
   --metadata-reopen PATH restarts the same exclusive local-WAL authority after lease loss
@@ -995,6 +998,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     let server = WorkspaceServer::new(
         ServerOptions {
             bind: invocation.server.bind,
+            health_bind: invocation.server.health_endpoint,
             handshake_timeout: Duration::from_millis(invocation.server.handshake_timeout_millis),
             read_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),
