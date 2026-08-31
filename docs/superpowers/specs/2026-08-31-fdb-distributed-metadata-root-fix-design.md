@@ -7,10 +7,12 @@ SPDX-License-Identifier: Apache-2.0
 
 **Decision date:** 2026-08-31
 
-**Status:** Approved and in implementation.
+**Status:** Implemented; scoped root-fix acceptance passed.
 
-**Qualification:** FoundationDB remains `NOT QUALIFIED` until this design is
-implemented and the real-cluster gates complete without an unsupported claim.
+**Qualification:** FoundationDB remains `NOT QUALIFIED` until all real-cluster
+gates complete without an unsupported claim.
+The scoped result and remaining ten-gate boundary are recorded in the
+[2026-08-31 qualification report](../../development/fdb-root-fix-qualification-2026-08-31.md).
 
 ## Decision
 
