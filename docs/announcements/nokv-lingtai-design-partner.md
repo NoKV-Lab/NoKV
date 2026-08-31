@@ -11,6 +11,12 @@
 > requires it, backed by NoKV's path-native workspace format. It does not use
 > NoKV as a FUSE/POSIX mount.
 > See [Product Design](../product-design.md).
+>
+> Update (2026-08): the optional Workbench MCP sidecar described on this page
+> is deprecated and is not a supported NoKV integration surface. The stable
+> boundary was and remains the 18-tool Workbench semantic contract, reached
+> through the native full CLI and the direct Python SDK. The text below is
+> preserved as published.
 
 This announcement marks the start of the design-partner collaboration between
 **NoKV** and **LingTai**

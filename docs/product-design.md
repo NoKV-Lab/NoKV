@@ -17,13 +17,12 @@ The supported front doors, in delivery order, are:
 
 1. the native full `nokv` CLI, including all 18 Workbench operations;
 2. the direct Python SDK for embedded programmatic callers;
-3. the Rust SDK for lower-level native integrations; and
-4. the optional MCP sidecar for hosts that require MCP discovery and transport.
+3. the Rust SDK for lower-level native integrations.
 
 The complete 18-tool [Workbench contract](./workbench-contract.md) fixes shared
 behavior across these surfaces. Downstream Agent systems normally provide
 skills that invoke the CLI, or call the Python SDK when an in-process boundary
-is preferable. MCP is not required to deploy or operate NoKV.
+is preferable.
 
 NoKV also provides explicit materialize/collect adapters for executables that
 require local files.
@@ -77,7 +76,8 @@ Workbench-specific result shaping stays above the storage core:
 - grep matching;
 - section projection;
 - the delta digest returned by append;
-- friendly errors and optional MCP-sidecar envelopes;
+- friendly errors, and the JSON-RPC result envelope the qualification harness
+  consumes;
 - stable `run_manifest.json` and `restore_manifest.json` projections.
 
 Workbench responses do not contain storage-specific node identities. Stable

@@ -36,8 +36,7 @@ This decision changes internal metadata storage and shard bootstrap. It
 preserves these Agent and Workbench boundaries:
 
 - the 18-tool Workbench semantic contract
-- primary native CLI Workbench commands, secondary Python SDK behavior, and
-  optional MCP-sidecar tool behavior
+- primary native CLI Workbench commands and secondary Python SDK behavior
 - the path-native `PathCurrent` namespace
 - immutable artifact storage
 - root placement in `nokv-control`

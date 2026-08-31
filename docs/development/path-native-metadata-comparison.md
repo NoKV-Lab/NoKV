@@ -14,8 +14,7 @@ Workbench behavior and does not treat a code-shape reduction as measured
 latency or throughput.
 
 The stable 18-tool Workbench facade is unchanged. Its primary delivery is the
-native full CLI, followed by the direct Python SDK; MCP is an optional sidecar
-transport and is outside this metadata comparison. The comparison stops at the
+native full CLI, followed by the direct Python SDK. The comparison stops at the
 metadata boundary and excludes object-body I/O, transport, WAL device cost,
 and recovery-log chunking unless stated otherwise.
 

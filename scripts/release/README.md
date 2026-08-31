@@ -55,9 +55,7 @@ Agent systems should normally expose skills over that command. The direct
 Python SDK is the secondary embedded distribution. Neither installation creates
 a NoKV deployment: callers must still supply the selected control-plane
 endpoint, object-store configuration, root identity, and stable Agent
-presentation root. A LingTai or other MCP-compatible host may run the optional
-MCP sidecar through the Homebrew-installed `nokv` executable with final
-argument `mcp`; that transport is not required for CLI or Python SDK use.
+presentation root.
 
 ## Release invariants
 

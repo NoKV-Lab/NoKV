@@ -8,8 +8,8 @@ SPDX-License-Identifier: Apache-2.0
 NoKV is an Agent-native distributed workspace and artifact store. Its primary
 product surface is the native full `nokv` CLI; the direct Python SDK is the
 secondary embedded surface. The stable
-[Workbench contract](../workbench-contract.md) defines shared semantics, while
-MCP is an optional sidecar transport for hosts that require it. NoKV persists
+[Workbench contract](../workbench-contract.md) defines shared semantics. NoKV
+persists
 workspace metadata through the storage-neutral transaction-store contract.
 Holt is the current serving local adapter. S3-compatible storage owns durable artifact
 bytes.
@@ -41,7 +41,7 @@ These are the package boundaries:
 | `crates/nokv-agent/` | Transport-free Workbench/Agent tool schemas, the 18-tool Workbench facade, the seven-tool generic Agent profile, stable result shaping, and adapters over SDK traits. | Import Holt/layout, object providers, server implementations, FUSE, or duplicate SDK state machines. |
 | `crates/nokv-python/` | Direct Python SDK, explicit materialize/collect adapters, and Workbench-scoped immutable compatibility adapters for fsspec, checkpoint, and torch DCP callers. | Own metadata layout, bypass `nokv-client`, reimplement range/retry planning, promise POSIX directory/inode semantics or an arbitrary root filesystem, or import FUSE. |
 | `crates/nokv-server/` | Shard-owner process, versioned RPC, startup/schema gates, health, backup/log sync, and background lifecycle workers. | Own domain semantics outside `nokv-meta`, leak provider internals into RPC, or silently migrate/fallback between schemas. |
-| `crates/nokv/` | Thin native full `nokv` CLI and optional MCP sidecar wiring over client and Agent interfaces. | Own metadata semantics, durable layout, object-provider behavior, or embed a second implementation of the SDK. |
+| `crates/nokv/` | Thin native full `nokv` CLI wiring over client and Agent interfaces. | Own metadata semantics, durable layout, object-provider behavior, or embed a second implementation of the SDK. |
 | `bench/` | Contract, recovery, and performance workloads with explicit environment and workload profiles. | Own product APIs, add benchmark-only product behavior, or compare results from materially different profiles as equivalent. |
 
 FUSE, POSIX emulation, CSI, and arbitrary-root generic filesystem integration
@@ -68,8 +68,8 @@ become canonical metadata or introduce fields outside that contract.
 
 Delivery priority and semantic ownership are separate. The CLI is the default
 integration surface, the Python SDK is second for in-process callers, and the
-MCP endpoint is an optional sidecar. Agent frameworks should build skills over
-the CLI or Python SDK by default. None of those transports may fork the stable
+Rust SDK is third for native integrations. The `nokv mcp` sidecar is deprecated
+and is not a supported surface. None of these transports may fork the stable
 Workbench semantics or duplicate the client state machines.
 
 The Agent adapter owns canonical Workbench projections. It must recompute any

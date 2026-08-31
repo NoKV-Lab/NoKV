@@ -7,10 +7,15 @@ SPDX-License-Identifier: Apache-2.0
 
 These assets validate the same 18-tool Workbench semantics exported by
 `crates/nokv-agent`. The native full CLI is the primary integration surface,
-and the direct Python SDK is second for embedded callers. The MCP-focused
-assets here qualify the optional `nokv mcp` sidecar; they do not make MCP a
-required deployment component or define a runtime-specific metadata layout,
-capability alias, migration helper, or filesystem frontend.
+and the direct Python SDK is second for embedded callers.
+
+Several runners here still reach the 18 tools through a `nokv mcp` child
+process. That sidecar is deprecated and is not a supported NoKV integration
+surface: it survives only as this harness's transport, evidence produced over
+it qualifies that transport alone, and nothing here makes MCP a deployment
+component or defines a runtime-specific metadata layout, capability alias,
+migration helper, or filesystem frontend. Re-pointing these runners at
+`nokv workbench <tool>` is tracked work, not a documentation change.
 
 The checked-in integration assets are deliberately small:
 
@@ -95,12 +100,8 @@ PYTHONPATH=scripts/workbench python3 -m unittest \
 python3 scripts/workbench/fork_restore_recovery_gate_test.py
 ```
 
-To qualify the optional sidecar, register the built binary in an MCP-compatible
-Agent runtime as a stdio MCP command:
-
-```text
-/absolute/path/to/nokv <root, route, object, and workbench options> mcp
-```
+The runners below invoke the built binary directly; do not register it in an
+Agent runtime as an MCP command.
 
 The deployment must provide one persisted `RootId` placement, its
 `LogicalShardId`, current placement generation and owner epoch, a reachable
@@ -155,13 +156,16 @@ is not a NoKV namespace. Keep the configured Workbench root stable across
 restarts because canonical v1 manifest presentation paths are replay-bound;
 `RootId`, not this display root, remains the storage/routing identity.
 
-`nokv serve` publishes shared recovery segments by default
-(`--recovery-publication shared`), which is what the recovery gates qualify.
-Until shared checkpoint compaction exists that chain is bounded by the Control
-record size, so a long-lived deployment such as a partner pre-pilot should run
-`--recovery-publication local-only`: the exclusive Holt WAL is then the only
-recovery authority, nothing is published, and `--metadata-recover-log` is not
-available for that shard.
+`nokv serve` defaults to `--recovery-publication local-only`: the exclusive
+local Holt WAL is the only recovery authority, nothing is published to Control,
+and `--metadata-recover-log` is not available for that shard. Every gate in
+this directory runs on that default, so the recovery gates qualify local-WAL
+recovery only.
+
+Shared publication (`--recovery-publication shared`) is an unqualified opt-in
+and no gate exercises it. Until shared checkpoint compaction exists the segment
+chain is bounded by the Control record size, and a shard that reaches that
+bound loses its owner fence and stops accepting writes.
 
 The deterministic evidence directory contains `plan.json`, exact paired
 requests/responses in `mcp-transcript.jsonl`, `processes.jsonl` and process

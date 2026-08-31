@@ -63,9 +63,10 @@ Closes | Fixes | Relates to #
       shard-local atomicity; no split root or cross-shard transaction is implied.
 - [ ] Agent-interface changes keep the transport-free facade and schemas in
       `nokv-agent`, routing and workflows in `nokv-client`, and the concrete
-      backend plus native full CLI and optional MCP-sidecar wiring in `nokv`.
+      backend plus native full CLI wiring in `nokv`.
 - [ ] User-facing integration guidance orders the native full CLI first, the
-      direct Python SDK second, and MCP only as an optional sidecar.
+      direct Python SDK second, and the Rust SDK third, and does not present the
+      deprecated `nokv mcp` sidecar as a supported NoKV surface.
 
 ## Claims and Evidence
 

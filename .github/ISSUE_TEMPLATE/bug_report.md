@@ -37,7 +37,7 @@ If applicable, add screenshots or paste logs to help explain your problem.
  - OS: [e.g. Linux, macOS]
  - Rust Version: [e.g. 1.88]
  - NoKV Version: [e.g. commit SHA or release tag]
- - Surface: [e.g. native CLI, Python SDK, Rust SDK, optional MCP sidecar, Workbench contract, server, materialize/collect]
+ - Surface: [e.g. native CLI, Python SDK, Rust SDK, Workbench contract, server, materialize/collect]
  - Deployment topology: [e.g. local/direct or routed; include root id, logical shard, placement generation, owner, and epoch if relevant]
  - Object backend and version: [e.g. S3-compatible service and version]
  - Command and relevant configuration: [redact secrets]
