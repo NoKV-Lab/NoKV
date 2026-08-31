@@ -14,6 +14,7 @@ mod error;
 mod executor;
 mod legacy_rejection;
 mod lifecycle;
+mod metadata_url;
 mod recovery_installer;
 mod recovery_publisher;
 mod registry;
@@ -36,6 +37,10 @@ pub use lifecycle::{
     LifecycleDeleteDisposition, LifecycleDeleteError, LifecycleDeletePurpose,
     LifecycleDeleteRequest, LifecycleDurabilityBarrier, LifecycleError, LifecycleObjectDeleter,
     LifecycleRunner, LifecycleRunnerOptions,
+};
+pub use metadata_url::{
+    FoundationDbMetadataUrl, HoltMetadataUrl, MetadataUrl, MetadataUrlError,
+    MAX_FOUNDATIONDB_PREFIX_BYTES,
 };
 pub use recovery_installer::{
     install_recovery_log, validate_local_recovery_prefix, LocalRecoveryPrefixReport,
