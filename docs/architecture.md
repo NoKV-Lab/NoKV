@@ -11,7 +11,7 @@ Status: normative workspace architecture.
 
 ```mermaid
 flowchart LR
-    Skills["Downstream Agent skills"] --> CLI["Native full nokv CLI"]
+    Integrations["Downstream Agent integrations"] --> CLI["Native full nokv CLI"]
     CLI --> Agent["Transport-free Workbench facade"]
     Agent --> SDK["Rust Agent SDK"]
     CLI --> SDK
@@ -20,12 +20,16 @@ flowchart LR
     Local --> Python
 
     SDK --> Router["Root router"]
-    Router --> Control["Control plane<br/>root placement + owner lease"]
+    Router -.-> Seed["NoKV seeds<br/>route discovery / refresh"]
     Router --> Owner["Fenced logical-shard owner"]
 
     Owner --> Meta["NoKV metadata semantics"]
     Meta --> Store["TxnStore<br/>ordered reads + checked writes"]
-    Store --> Holt["HoltStore<br/>serving local adapter"]
+    Store --> Holt["Holt adapter<br/>standalone"]
+    Store --> FdbMeta["FDB metadata adapter<br/>distributed, feature gated"]
+    Owner -.-> FdbControl["FDB control adapter<br/>catalog + route + session<br/>(FDB mode only)"]
+    FdbMeta --> FDB["FoundationDB<br/>shared authority"]
+    FdbControl --> FDB
 
     SDK --> Data["Direct immutable-object data path"]
     Data --> Cache["Local NVMe soft cache"]
@@ -35,7 +39,11 @@ flowchart LR
 
 The metadata and object paths are separate. Small control and namespace records
 go through the shard owner. Clients stream immutable blocks directly through
-the object boundary after receiving a revision/upload plan.
+the object boundary after receiving a revision/upload plan. Exactly one
+metadata adapter is selected by the explicit metadata URL: standalone Holt has
+no distributed control plane, while distributed FDB keeps control and metadata
+records in the same shared authority. There is no provider auto-selection,
+migration, fallback, or dual-write path.
 
 FUSE, POSIX, CSI, and fsspec are not architecture layers.
 
@@ -55,12 +63,20 @@ flowchart TD
     Server --> Meta["nokv-meta"]
     Server --> Store["nokv-meta-store"]
     Server --> HoltAdapter["nokv-meta-holt"]
+    Server --> FdbMetaAdapter["nokv-meta-fdb"]
     Server --> Control["nokv-control"]
+    Server --> FdbControlAdapter["nokv-control-fdb"]
+    Server --> FdbRuntime["nokv-fdb"]
     Server --> Object
     Meta --> Types
     Meta --> Store
     HoltAdapter --> Store
     HoltAdapter --> Holt["Holt"]
+    FdbMetaAdapter --> Store
+    FdbMetaAdapter --> FdbRuntime
+    FdbControlAdapter --> Control
+    FdbControlAdapter --> FdbRuntime
+    FdbRuntime --> FDB["FoundationDB"]
     Control --> Types
     Object --> Types
 ```
@@ -72,7 +88,10 @@ Key constraints:
 
 - types and protocol are storage-neutral;
 - metadata owns durable semantics, logical keyspaces, and record codecs;
-- the Holt adapter owns the physical tree mapping and local durability;
+- the Holt adapter owns the standalone physical mapping and local durability;
+- the feature-gated FDB metadata and control adapters share the process-global
+  `nokv-fdb` runtime but retain separate domain ownership;
+- the server selects exactly one metadata runtime from an explicit URL;
 - control owns root placement and owner fencing, not path semantics;
 - object owns provider I/O, not reachability;
 - client uses protocol/routing and never imports meta/server;
@@ -123,7 +142,7 @@ sequenceDiagram
     participant C as SDK
     participant R as Router
     participant M as Shard owner
-    participant S as TxnStore (Holt local profile)
+    participant S as TxnStore (selected Holt or FDB profile)
     participant O as Object backend/cache
 
     C->>R: stat/open(root, workbench, path)
@@ -205,7 +224,7 @@ sequenceDiagram
     participant C as SDK
     participant M as Shard owner
     participant O as Object backend
-    participant S as TxnStore (Holt local profile)
+    participant S as TxnStore (selected Holt or FDB profile)
 
     C->>M: begin publish + request id
     M-->>C: operation/revision/object plan
@@ -217,9 +236,10 @@ sequenceDiagram
     M-->>C: generation + revision + digest
 ```
 
-The command validates schema, local root fence, owner epoch, request id,
-workspace/path generations, and revision reference state before applying any
-mutation. It atomically publishes:
+The command validates schema, root fence, the selected provider's exact owner
+predicate, request id, workspace/path generations, and revision reference state
+before applying any mutation. In FDB mode the stable-session predicate is part
+of the same physical transaction. The command atomically publishes:
 
 - the revision and block manifest;
 - the new path and workspace revision;
@@ -315,16 +335,19 @@ NoKV deliberately avoids a lazy overlay that would tax every later read/list.
 
 ## Sharding And Ownership
 
-The control plane persists placement before a root's first write:
+The selected serving runtime fixes placement before a root's first write:
 
 ```text
 RootId -> immutable LogicalShardId
-LogicalShardId -> current physical owner, lease, epoch
+LogicalShardId -> current owner identity and fencing generation
 ```
 
-The owner installs or validates `RootFence` in its metadata shard and checks
-the lease epoch in the same physical transaction as each metadata commit.
-Placement is never inferred from a path or modulo the number of owners.
+Standalone Holt derives one local logical shard and installs its local
+`RootFence` without a distributed catalog or lease service. Distributed FDB
+persists the root/shard catalog, route, and exact owner session before serving.
+The owner validates `RootFence` and its provider-specific ownership predicate in
+the same physical transaction as each metadata commit. Placement is never
+inferred from a path or modulo the number of owners.
 
 A hot root's logical shard may be assigned to a dedicated physical process.
 That is owner movement, not a change to logical shard or object keys.
