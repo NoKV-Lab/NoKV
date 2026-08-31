@@ -5635,6 +5635,10 @@ fn meta_failure(error: meta::MetaError) -> protocol::RpcFailure {
         error @ meta::MetaError::Store {
             source: nokv_meta_store::StoreError::OutcomeUnknown { .. },
             ..
+        }
+        | error @ meta::MetaError::Store {
+            source: nokv_meta_store::StoreError::Fenced { .. },
+            ..
         } => failure(
             protocol::ErrorCode::NotOwner,
             error.to_string(),
@@ -10226,6 +10230,19 @@ mod tests {
         });
         assert_eq!(known_not_applied.code, protocol::ErrorCode::Internal);
         assert!(known_not_applied.retryable);
+
+        let fenced = meta_failure(meta::MetaError::Store {
+            operation: "commit",
+            source: nokv_meta_store::StoreError::Fenced {
+                expected_owner_epoch: 7,
+                expected_session_generation: 9,
+            },
+        });
+        assert!(!internal_metadata_conflict(&fenced));
+        assert_eq!(fenced.code, protocol::ErrorCode::NotOwner);
+        assert_eq!(fenced.conflict, Some(protocol::ConflictKind::RootPlacement));
+        assert!(fenced.retryable);
+        assert!(fenced.message.contains("7/9"));
 
         let limit = meta_failure(meta::MetaError::Store {
             operation: "commit",

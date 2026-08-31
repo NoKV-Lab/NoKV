@@ -6,10 +6,15 @@
 use nokv_meta_store::{Check, LimitKind, Mutation, ReadBatch, ReadOp, StoreError, WriteTxn};
 
 use crate::codec::KeyCodec;
-use crate::profile::{FDB_LIMITS, PHYSICAL_AFFECTED_BYTES};
+use crate::profile::{FDB_LIMITS, FDB_SESSION_FENCE_READS, PHYSICAL_AFFECTED_BYTES};
+use crate::FdbMetadataSessionFence;
 
-pub(crate) fn validate_read(codec: &KeyCodec, batch: &ReadBatch) -> Result<(), StoreError> {
-    let mut bytes = 0_usize;
+pub(crate) fn validate_read(
+    codec: &KeyCodec,
+    session_fence: &FdbMetadataSessionFence,
+    batch: &ReadBatch,
+) -> Result<(), StoreError> {
+    let mut bytes = session_fence_affected_bytes(session_fence)?;
     for op in &batch.ops {
         match op {
             ReadOp::Get(key) => {
@@ -29,8 +34,12 @@ pub(crate) fn validate_read(codec: &KeyCodec, batch: &ReadBatch) -> Result<(), S
     ensure_budget(LimitKind::ReadBytes, bytes)
 }
 
-pub(crate) fn validate_write(codec: &KeyCodec, txn: &WriteTxn) -> Result<(), StoreError> {
-    let mut bytes = 0_usize;
+pub(crate) fn validate_write(
+    codec: &KeyCodec,
+    session_fence: &FdbMetadataSessionFence,
+    txn: &WriteTxn,
+) -> Result<(), StoreError> {
+    let mut bytes = session_fence_affected_bytes(session_fence)?;
     for check in &txn.checks {
         match check {
             Check::Value { key, .. } | Check::Absent { key } => {
@@ -76,6 +85,18 @@ pub(crate) fn ensure_observed_transaction_size(bytes: i64) -> Result<(), StoreEr
         ))
     })?;
     ensure_budget(LimitKind::TransactionBytes, actual)
+}
+
+pub(crate) fn session_fence_affected_bytes(
+    session_fence: &FdbMetadataSessionFence,
+) -> Result<usize, StoreError> {
+    add(
+        multiply(
+            FDB_SESSION_FENCE_READS,
+            point_range_bytes(session_fence.key().len())?,
+        )?,
+        session_fence.expected_value().len(),
+    )
 }
 
 fn point_range_bytes(encoded: usize) -> Result<usize, StoreError> {

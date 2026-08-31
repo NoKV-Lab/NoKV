@@ -7,8 +7,8 @@
 //!
 //! The default build exposes configuration and physical-envelope validation
 //! without importing or linking the FoundationDB client. Enable the `fdb`
-//! feature to construct [`FdbStore`]. This adapter is not qualified for NoKV
-//! serving and is not wired into `nokv-server`.
+//! feature to construct an exact-session-fenced [`FdbStore`]. This adapter is
+//! not qualified for NoKV serving and is not wired into `nokv-server`.
 
 #[cfg(any(feature = "fdb", test))]
 mod affected_bytes;
@@ -22,7 +22,7 @@ mod store;
 
 #[cfg(feature = "fdb")]
 pub use nokv_fdb::{FdbRuntime, FdbRuntimeError};
-pub use options::FdbOptions;
+pub use options::{FdbMetadataSessionFence, FdbOptions};
 #[cfg(feature = "fdb")]
 pub use store::FdbStore;
 

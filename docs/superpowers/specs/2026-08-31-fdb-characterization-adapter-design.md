@@ -146,6 +146,7 @@ pub struct FdbOptions {
     cluster_file: PathBuf,
     namespace: Vec<u8>,
     transaction_timeout: Duration,
+    session_fence: FdbMetadataSessionFence,
 }
 
 pub struct FdbStore { /* FoundationDB-only internals */ }
@@ -156,11 +157,12 @@ impl FdbStore {
 }
 ```
 
-`FdbOptions::new` requires an explicit absolute cluster-file path and an
-explicit namespace. The path must be valid UTF-8 because the selected binding
-passes it to the FoundationDB C API. The namespace must contain 1 through 64
-arbitrary bytes. It is a physical isolation token, not a Workbench, root,
-logical-shard, or schema identity.
+`FdbOptions::new` requires an explicit absolute cluster-file path, namespace,
+and immutable stable-session predicate. The path must be valid UTF-8 because
+the selected binding passes it to the FoundationDB C API. The namespace must
+contain 1 through 64 arbitrary bytes. It is a physical isolation token, not a
+Workbench, root, logical-shard, or schema identity. The session key must belong
+to that prefix; its expected owner epoch and session generation are nonzero.
 
 The default transaction timeout is 4 seconds. Accepted values are 1
 millisecond through 4 seconds. There is no retry-count option in the first
@@ -171,7 +173,8 @@ while it is running share the same guard. Dropping the final runtime, database,
 and transaction handle stops the network permanently; a later start fails
 instead of attempting an unsupported restart. `FdbStore::open` validates
 options, uses that runtime to open the database, and retains an immutable
-`StoreProfile`. It does not initialize or migrate the NoKV schema.
+`StoreProfile`. Open verifies the exact session before returning. It does not
+initialize or migrate the NoKV schema.
 
 ## Physical Key Encoding
 
@@ -284,14 +287,16 @@ successor of the previous row or common prefix. All network fetches for one
 `ReadBatch` remain inside its original FoundationDB transaction so the results
 cannot mix read versions.
 
-`ready` opens a transaction, applies the timeout, and obtains a read version.
-It must perform cluster I/O; a network-thread-only no-op is insufficient.
+`ready` opens a transaction, applies the timeout, verifies the exact stable
+session, and obtains a read version. It must perform cluster I/O; a
+network-thread-only no-op is insufficient.
 
 ## Commit Data Flow
 
 1. Validate `WriteTxn` against the profile and physical affected-byte budget.
 2. Create one FoundationDB transaction and apply its timeout.
-3. Evaluate `Value`, `Absent`, and `EmptyPrefix` checks with ordinary
+3. Verify the exact stable session key, then evaluate `Value`, `Absent`, and
+   `EmptyPrefix` checks with ordinary
    non-snapshot reads so FoundationDB installs the required read-conflict
    ranges.
 4. If any check is false, discard the transaction and return
@@ -301,8 +306,10 @@ It must perform cluster I/O; a network-thread-only no-op is insufficient.
 
 The adapter does not use `Database::run`, automatic idempotency, or `on_error`
 for commit retries. A concurrent write that invalidates a read-conflict range
-causes FoundationDB `not_committed`; the adapter returns `Commit::Conflict` and
-does not re-evaluate the transaction internally.
+causes FoundationDB `not_committed`. The adapter reads the stable session once
+in a fresh transaction: a replacement returns `StoreError::Fenced`; an
+unchanged session returns `Commit::Conflict`. It does not re-evaluate or retry
+the write transaction internally.
 
 ## Error Mapping
 

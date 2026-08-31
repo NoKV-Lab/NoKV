@@ -13,10 +13,14 @@ The adapter uses `nokv-fdb` for the explicit 7.3 API selection, shared network
 lifetime, database/transaction handles, physical store envelope, common
 options, and error classification. A caller starts one `FdbRuntime` and passes
 that guard to every `FdbStore::open`; reopen tests keep the guard alive while
-individual stores are dropped.
+individual stores are dropped. Every open also requires one
+`FdbMetadataSessionFence` containing the exact stable session key/value plus
+the expected owner epoch and session generation. Metadata transactions never
+read the independently renewed heartbeat key.
 
-The default build tests options, physical key encoding, limits, and error
-classification without importing or linking the FoundationDB client:
+The default build tests options, session-fence validation, physical key
+encoding, limits, and error classification without importing or linking the
+FoundationDB client:
 
 ```bash
 cargo test -p nokv-meta-fdb
@@ -41,6 +45,7 @@ cargo test -p nokv-meta-fdb --features fdb \
   --test fdb_conformance -- --ignored --nocapture
 ```
 
-Passing this suite characterizes the adapter contract. It does not qualify
-workspace behavior, unknown outcomes, process or network loss, failover, or
-performance.
+The live suite proves that heartbeat changes do not fence metadata and that a
+session replacement fences an already-open store's next read and write.
+Passing it characterizes the adapter contract. It does not qualify workspace
+behavior, unknown outcomes, process or network loss, failover, or performance.

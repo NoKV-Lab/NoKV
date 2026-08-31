@@ -6,45 +6,78 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use nokv_fdb::{classify_error, lexicographic_successor, FdbErrorDisposition, FdbLimit};
+use nokv_fdb::{
+    classify_error, lexicographic_successor, FdbErrorDisposition, FdbLimit, FdbStorePrefix,
+    FdbSubspaceKind,
+};
 use nokv_meta_store::{
     AckBoundary, Authority, Check, Key, Keyspace, LimitKind, Mutation, ReadBatch, ReadOp,
     RecoveryMode, Scan, StoreError, WriteTxn,
 };
 
-use crate::affected_bytes::{ensure_observed_transaction_size, validate_read, validate_write};
+use crate::affected_bytes::{
+    ensure_observed_transaction_size, session_fence_affected_bytes, validate_read, validate_write,
+};
 use crate::codec::KeyCodec;
 use crate::options::MAX_NAMESPACE_BYTES;
-use crate::profile::{FDB_LIMITS, FDB_PROFILE, PHYSICAL_AFFECTED_BYTES};
-use crate::FdbOptions;
+use crate::profile::{FDB_LIMITS, FDB_PROFILE, FDB_SESSION_FENCE_READS, PHYSICAL_AFFECTED_BYTES};
+use crate::{FdbMetadataSessionFence, FdbOptions};
 
 const FIRST: Keyspace = Keyspace::new(0x0102);
 const SECOND: Keyspace = Keyspace::new(0x0103);
 
+fn session_fence(namespace: &[u8]) -> FdbMetadataSessionFence {
+    let key = FdbStorePrefix::new(namespace)
+        .unwrap()
+        .subspace(FdbSubspaceKind::LeaseSession)
+        .component(&[7; 16])
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    FdbMetadataSessionFence::new(key, b"encoded-owner-session".to_vec(), 11, 13).unwrap()
+}
+
+fn options(cluster_file: impl Into<PathBuf>, namespace: Vec<u8>) -> FdbOptions {
+    let fence = session_fence(&namespace);
+    FdbOptions::new(cluster_file, namespace, fence)
+}
+
 #[test]
 fn options_require_explicit_bounded_configuration() {
-    let valid = FdbOptions::new("/tmp/fdb.cluster", b"test".to_vec());
+    let valid = options("/tmp/fdb.cluster", b"test".to_vec());
     valid.validate().unwrap();
     assert_eq!(valid.transaction_timeout(), Duration::from_secs(4));
+    assert_eq!(valid.session_fence().expected_owner_epoch(), 11);
+    assert_eq!(valid.session_fence().expected_session_generation(), 13);
 
     assert!(matches!(
-        FdbOptions::new("relative.cluster", b"test".to_vec()).validate(),
+        options("relative.cluster", b"test".to_vec()).validate(),
         Err(StoreError::InvalidRequest(_))
     ));
     assert!(matches!(
-        FdbOptions::new(PathBuf::from("/"), b"test".to_vec()).validate(),
+        options(PathBuf::from("/"), b"test".to_vec()).validate(),
         Err(StoreError::InvalidRequest(_))
     ));
     assert!(matches!(
-        FdbOptions::new("/tmp/fdb\0.cluster", b"test".to_vec()).validate(),
+        options("/tmp/fdb\0.cluster", b"test".to_vec()).validate(),
         Err(StoreError::InvalidRequest(_))
     ));
     assert!(matches!(
-        FdbOptions::new("/tmp/fdb.cluster", Vec::<u8>::new()).validate(),
+        FdbOptions::new(
+            "/tmp/fdb.cluster",
+            Vec::<u8>::new(),
+            session_fence(b"different")
+        )
+        .validate(),
         Err(StoreError::InvalidRequest(_))
     ));
     assert!(matches!(
-        FdbOptions::new("/tmp/fdb.cluster", vec![0; MAX_NAMESPACE_BYTES + 1]).validate(),
+        FdbOptions::new(
+            "/tmp/fdb.cluster",
+            vec![0; MAX_NAMESPACE_BYTES + 1],
+            session_fence(b"different")
+        )
+        .validate(),
         Err(StoreError::InvalidRequest(_))
     ));
     assert!(matches!(
@@ -58,6 +91,40 @@ fn options_require_explicit_bounded_configuration() {
         valid
             .with_transaction_timeout(Duration::from_millis(4001))
             .validate(),
+        Err(StoreError::InvalidRequest(_))
+    ));
+
+    assert!(matches!(
+        FdbMetadataSessionFence::new(Vec::<u8>::new(), b"session".to_vec(), 1, 1),
+        Err(StoreError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        FdbMetadataSessionFence::new(b"key".to_vec(), b"session".to_vec(), 0, 1),
+        Err(StoreError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        FdbOptions::new(
+            "/tmp/fdb.cluster",
+            b"test".to_vec(),
+            session_fence(b"another-store")
+        )
+        .validate(),
+        Err(StoreError::InvalidRequest(_))
+    ));
+    let heartbeat_key = FdbStorePrefix::new(b"test")
+        .unwrap()
+        .subspace(FdbSubspaceKind::LeaseHeartbeat)
+        .component(&[7; 16])
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    assert!(matches!(
+        FdbOptions::new(
+            "/tmp/fdb.cluster",
+            b"test".to_vec(),
+            FdbMetadataSessionFence::new(heartbeat_key, b"heartbeat".to_vec(), 1, 1).unwrap()
+        )
+        .validate(),
         Err(StoreError::InvalidRequest(_))
     ));
 }
@@ -131,11 +198,14 @@ fn profile_is_shared_and_below_serving_transaction_limits() {
     assert_eq!(FDB_PROFILE.transaction_target_bytes, 900_000);
     assert_eq!(FDB_PROFILE.limits, FDB_LIMITS);
     assert_eq!(FDB_LIMITS.max_transaction_bytes, 2_900_000);
+    assert_eq!(FDB_SESSION_FENCE_READS, 1);
 }
 
 #[test]
 fn affected_byte_budget_accounts_for_encoded_ranges_and_mutations() {
     let codec = KeyCodec::new(&[b'n'; MAX_NAMESPACE_BYTES]).unwrap();
+    let fence = session_fence(&[b'n'; MAX_NAMESPACE_BYTES]);
+    assert!(session_fence_affected_bytes(&fence).unwrap() > fence.key().len());
     let read = ReadBatch {
         ops: vec![
             ReadOp::Get(Key::new(FIRST, b"point")),
@@ -149,7 +219,7 @@ fn affected_byte_budget_accounts_for_encoded_ranges_and_mutations() {
             }),
         ],
     };
-    validate_read(&codec, &read).unwrap();
+    validate_read(&codec, &fence, &read).unwrap();
 
     let write = WriteTxn {
         checks: vec![
@@ -171,7 +241,7 @@ fn affected_byte_budget_accounts_for_encoded_ranges_and_mutations() {
             },
         ],
     };
-    validate_write(&codec, &write).unwrap();
+    validate_write(&codec, &fence, &write).unwrap();
 
     assert!(matches!(
         ensure_observed_transaction_size((PHYSICAL_AFFECTED_BYTES + 1) as i64),
@@ -196,7 +266,7 @@ fn affected_byte_budget_accounts_for_encoded_ranges_and_mutations() {
         })],
     };
     assert!(matches!(
-        validate_read(&codec, &overflowing_scan),
+        validate_read(&codec, &fence, &overflowing_scan),
         Err(StoreError::InvalidRequest(_))
     ));
 }

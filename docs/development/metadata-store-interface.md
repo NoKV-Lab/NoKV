@@ -8,11 +8,11 @@ SPDX-License-Identifier: Apache-2.0
 Implemented: the storage-neutral interface, local Holt adapter, `MetaShard`
 cutover, a process-global FoundationDB runtime boundary, a non-default
 FoundationDB characterization adapter, and FoundationDB-backed manifest,
-catalog, route, session, and heartbeat control transactions. The serving local
-profile still uses Holt through `TxnStore`; FoundationDB is **NOT QUALIFIED**
-and is not wired into `nokv-server`. Pending: session-fenced metadata,
-discovery, serving composition and qualification, replicated Holt, and
-owner-safe response delivery.
+catalog, route, session, and heartbeat control transactions, versioned seed
+discovery, and exact-session-fenced FoundationDB metadata transactions. The
+serving local profile still uses Holt through `TxnStore`; FoundationDB is **NOT
+QUALIFIED** and is not wired into `nokv-server`. Pending: serving composition
+and qualification, replicated Holt, and owner-safe lifecycle composition.
 
 The [code contract](./code_contract.md), [architecture](../architecture.md),
 and [metadata schema](../metadata-schema.md) remain normative.
@@ -67,9 +67,10 @@ responsibilities:
   prefix/subspaces, and error classification. Its default feature set does not
   compile or link the FoundationDB client.
 - `nokv-meta-fdb` maps the neutral requests to one explicit FoundationDB
-  cluster file and binary metadata subspace through `nokv-fdb`. Its live tests
-  are feature gated, and its synchronous `TxnStore` bridge remains
-  characterization-only.
+  cluster file and binary metadata subspace through `nokv-fdb`. Every store
+  handle is bound to one immutable stable-session key/value predicate and
+  expected owner/session generation. Its live tests are feature gated, and its
+  synchronous `TxnStore` bridge remains characterization-only.
 - `nokv-control` owns provider-neutral store-manifest, catalog, route, owner
   session, heartbeat, and transition types in addition to the legacy control
   contract retained until the etcd removal slice.
@@ -248,6 +249,13 @@ NoKV `ReadVersion` remains a domain version. A store must not expose Holt
 record versions, FoundationDB versions, or consensus log indexes as a NoKV
 read version.
 
+Every FoundationDB metadata read first reads the exact stable owner-session
+key without snapshot mode in the same transaction, then performs metadata
+reads at that transaction's one read version. An absent or mismatching session
+returns `StoreError::Fenced`. The independent heartbeat key is never read by a
+metadata transaction, so routine renewal does not conflict with metadata
+traffic.
+
 ## Write Contract
 
 `WriteTxn` contains checks and mutations:
@@ -320,6 +328,13 @@ characterization adapter repeats the checks with non-snapshot reads in one
 transaction so FoundationDB registers the required conflict ranges. These
 mechanisms remain adapter details.
 
+The FoundationDB adapter also reads the exact stable session key before every
+write. A takeover that commits after that read conflicts with the metadata
+commit. After a definite FoundationDB conflict, the adapter reads only the
+session key in a fresh transaction: a changed session returns
+`StoreError::Fenced`; an unchanged session remains the ordinary
+`Commit::Conflict`. This classification read is not a raw commit retry.
+
 ## Receipt Boundary
 
 `TxnStore` does not define a second provider receipt format. Every successful
@@ -348,6 +363,7 @@ directory, copy/rollback, or cross-host failover is not qualified.
 
 - invalid request
 - configured limit exceeded
+- physical ownership fenced before the call could apply
 - unavailable before a commit could apply
 - commit outcome unknown, with one recovery state
 - corrupt physical state
@@ -381,8 +397,10 @@ request. Reading dedupe from the uncertain instance is not durability evidence.
 
 The FoundationDB characterization adapter maps `commit_unknown_result` and
 every other maybe-committed error to `MayCommit`; it never retries the raw
-transaction. The Holt adapter maps `DefinitelyNotApplied` through
-normal physical error classification. When that classification is
+transaction. A missing, replaced, or racing stable session returns the typed
+`Fenced` error so the server can return `NotOwner` instead of retrying it as a
+metadata predicate conflict. The Holt adapter maps `DefinitelyNotApplied`
+through normal physical error classification. When that classification is
 `Unavailable`, the server exposes a retryable request-local failure without
 fencing the shard; a classified corruption remains non-retryable. It poisons
 `OutcomeUnknown` and unclassified atomic errors until reopen and WAL replay
@@ -714,7 +732,7 @@ The FoundationDB adapter uses the following evidence gates:
 | Catalog, route, session, heartbeat, codec, and monotonic-observer tests | `cargo test -p nokv-control && cargo test -p nokv-control-fdb` | Required in the default workspace; does not load `libfdb_c` |
 | Binding API compile | `cargo check -p nokv-fdb --features fdb --all-targets && cargo check -p nokv-meta-fdb --features fdb --all-targets && cargo check -p nokv-control-fdb --features fdb --all-targets` | Required for the selected 7.3 API |
 | Concurrent owner acquisition, takeover, and stale-owner fencing | `NOKV_TEST_FDB_CLUSTER_FILE=/absolute/path cargo test -p nokv-control-fdb --features fdb --test fdb_control -- --ignored --nocapture` | Environment-gated; `NOT QUALIFIED` unless the run and output are retained |
-| Shared conformance, binary scans, conflict, reopen, and namespace isolation | `NOKV_TEST_FDB_CLUSTER_FILE=/absolute/path cargo test -p nokv-meta-fdb --features fdb --test fdb_conformance -- --ignored --nocapture` | Environment-gated; `NOT QUALIFIED` unless the run and output are retained |
+| Shared conformance, binary scans, conflict, reopen, namespace isolation, heartbeat independence, and stale-session fencing | `NOKV_TEST_FDB_CLUSTER_FILE=/absolute/path cargo test -p nokv-meta-fdb --features fdb --test fdb_conformance -- --ignored --nocapture` | Environment-gated; `NOT QUALIFIED` unless the run and output are retained |
 | Unknown outcome, process/network loss, failover, and representative performance | Dedicated fault and benchmark environments | `NOT QUALIFIED` |
 
 ### Adapter Fault Tests

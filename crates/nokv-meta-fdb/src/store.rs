@@ -16,7 +16,7 @@ use nokv_meta_store::{
 use crate::affected_bytes::{ensure_observed_transaction_size, validate_read, validate_write};
 use crate::codec::KeyCodec;
 use crate::profile::{FDB_LIMITS, FDB_PROFILE, PHYSICAL_AFFECTED_BYTES};
-use crate::FdbOptions;
+use crate::{FdbMetadataSessionFence, FdbOptions};
 
 /// FoundationDB implementation of the storage-neutral metadata transaction contract.
 ///
@@ -24,6 +24,7 @@ use crate::FdbOptions;
 pub struct FdbStore {
     database: FdbDatabase,
     codec: KeyCodec,
+    session_fence: FdbMetadataSessionFence,
 }
 
 impl FdbStore {
@@ -32,7 +33,13 @@ impl FdbStore {
         let database =
             FdbDatabase::open(runtime, options.connection_options()).map_err(map_open_error)?;
         let codec = KeyCodec::new(options.namespace())?;
-        Ok(Self { database, codec })
+        let store = Self {
+            database,
+            codec,
+            session_fence: options.session_fence().clone(),
+        };
+        store.ready()?;
+        Ok(store)
     }
 
     fn transaction(&self) -> Result<FdbTransaction, StoreError> {
@@ -42,6 +49,7 @@ impl FdbStore {
 
     fn read_inner(&self, batch: &ReadBatch) -> Result<ReadSnapshot, StoreError> {
         let transaction = self.transaction()?;
+        self.require_current_session(&transaction)?;
         let mut results = Vec::with_capacity(batch.ops.len());
         for op in &batch.ops {
             match op {
@@ -69,6 +77,7 @@ impl FdbStore {
 
     fn commit_inner(&self, txn: &WriteTxn) -> Result<Commit, StoreError> {
         let transaction = self.transaction()?;
+        self.require_current_session(&transaction)?;
         for check in &txn.checks {
             let matches = match check {
                 Check::Value { key, expected } => {
@@ -113,7 +122,49 @@ impl FdbStore {
 
         match transaction.commit() {
             Ok(_) => Ok(Commit::Applied),
-            Err(error) => map_commit_error(error),
+            Err(error) => self.map_commit_error(error),
+        }
+    }
+
+    fn require_current_session(&self, transaction: &FdbTransaction) -> Result<(), StoreError> {
+        let current = transaction
+            .get(self.session_fence.key(), false)
+            .map_err(map_operation_error)?;
+        if current.as_deref() == Some(self.session_fence.expected_value()) {
+            Ok(())
+        } else {
+            Err(self.fenced())
+        }
+    }
+
+    fn verify_current_session(&self) -> Result<(), StoreError> {
+        let transaction = self.transaction()?;
+        self.require_current_session(&transaction)
+    }
+
+    fn fenced(&self) -> StoreError {
+        StoreError::Fenced {
+            expected_owner_epoch: self.session_fence.expected_owner_epoch(),
+            expected_session_generation: self.session_fence.expected_session_generation(),
+        }
+    }
+
+    fn map_commit_error(&self, error: FdbOperationError) -> Result<Commit, StoreError> {
+        match error.disposition() {
+            FdbErrorDisposition::Conflict => {
+                // A takeover can race after the in-transaction session read.
+                // Re-read only the stable session key in a fresh transaction
+                // so that ownership loss is never reported as a domain check
+                // conflict. This is not a raw commit retry.
+                self.verify_current_session()?;
+                Ok(Commit::Conflict)
+            }
+            FdbErrorDisposition::CommitUnknown => Err(StoreError::OutcomeUnknown {
+                state: UnknownCommit::MayCommit,
+                reason: error.to_string(),
+            }),
+            FdbErrorDisposition::Limit(kind) => Err(limit_error(kind)),
+            FdbErrorDisposition::Unavailable => Err(StoreError::Unavailable(error.to_string())),
         }
     }
 }
@@ -125,20 +176,20 @@ impl TxnStore for FdbStore {
 
     fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
         batch.validate(&FDB_LIMITS)?;
-        validate_read(&self.codec, &batch)?;
+        validate_read(&self.codec, &self.session_fence, &batch)?;
         self.read_inner(&batch)
     }
 
     fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
         txn.validate(&FDB_LIMITS)?;
-        validate_write(&self.codec, &txn)?;
+        validate_write(&self.codec, &self.session_fence, &txn)?;
         self.commit_inner(&txn)
     }
 
     fn ready(&self) -> Result<(), StoreError> {
-        self.transaction()?
-            .read_version()
-            .map_err(map_operation_error)?;
+        let transaction = self.transaction()?;
+        self.require_current_session(&transaction)?;
+        transaction.read_version().map_err(map_operation_error)?;
         Ok(())
     }
 }
@@ -315,18 +366,6 @@ fn map_open_error(error: FdbOpenError) -> StoreError {
     match error {
         FdbOpenError::Config(error) => StoreError::InvalidRequest(error.to_string()),
         FdbOpenError::Operation(error) => map_operation_error(error),
-    }
-}
-
-fn map_commit_error(error: FdbOperationError) -> Result<Commit, StoreError> {
-    match error.disposition() {
-        FdbErrorDisposition::Conflict => Ok(Commit::Conflict),
-        FdbErrorDisposition::CommitUnknown => Err(StoreError::OutcomeUnknown {
-            state: UnknownCommit::MayCommit,
-            reason: error.to_string(),
-        }),
-        FdbErrorDisposition::Limit(kind) => Err(limit_error(kind)),
-        FdbErrorDisposition::Unavailable => Err(StoreError::Unavailable(error.to_string())),
     }
 }
 

@@ -6,6 +6,9 @@
 use nokv_meta_store::{AckBoundary, Authority, RecoveryMode, StoreLimits, StoreProfile};
 
 pub(crate) const PHYSICAL_AFFECTED_BYTES: usize = 9_500_000;
+/// One adapter-owned non-snapshot read reserves the stable owner-session key.
+/// It is additional to the caller-visible `StoreLimits::max_reads` budget.
+pub(crate) const FDB_SESSION_FENCE_READS: usize = 1;
 
 pub(crate) const FDB_LIMITS: StoreLimits = StoreLimits {
     max_reads: 8,
