@@ -66,11 +66,13 @@ Each checked write carries:
 - typed handling for definite rejection, applied commit, conflict, and unknown
   commit outcome.
 
-The metadata layer plans to a 900,000-byte logical transaction target for the
-FDB profile. The FDB adapter must reject an oversized request before dispatch.
-It must not split one logical metadata command into independently visible
-transactions. Large secondary-index work is staged through domain-owned,
-generation-fenced records and one authoritative final command.
+The metadata layer plans to and enforces a 900,000-byte logical transaction
+target for the FDB profile before dispatch. The FDB adapter independently
+rejects requests above its advertised hard logical or conservative physical
+affected-byte limits. It must not split one logical metadata command into
+independently visible transactions. Large secondary-index work is staged
+through domain-owned, generation-fenced records and one authoritative final
+command.
 
 ## Persistent Manifest
 

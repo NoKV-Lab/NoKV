@@ -1476,7 +1476,13 @@ mod tests {
                 .unwrap(),
             ));
         }
-        seed_rows(&store, request(3), rows);
+        for (batch_index, batch) in rows.chunks(9).enumerate() {
+            seed_rows(
+                &store,
+                request(3 + u128::try_from(batch_index).unwrap()),
+                batch.to_vec(),
+            );
+        }
 
         let mut counter = 100_u128;
         let mut cursor = None;

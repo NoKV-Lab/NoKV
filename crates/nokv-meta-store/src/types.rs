@@ -100,7 +100,8 @@ pub struct StoreLimits {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreProfile {
     pub limits: StoreLimits,
-    /// Preferred logical affected-byte ceiling used by domain batch planners.
+    /// Serving logical affected-byte ceiling used by domain batch planners
+    /// and enforced before a metadata transaction is dispatched.
     ///
     /// The adapter still enforces `limits.max_transaction_bytes` as its hard
     /// request limit. This target must be nonzero and no greater than that hard

@@ -73,6 +73,12 @@ const HISTORY_KEY_OVERHEAD_BYTES: usize =
     1 + std::mem::size_of::<u32>() + std::mem::size_of::<u64>();
 const MAX_DERIVED_KEY_BYTES: usize = MAX_COMMAND_KEY_BYTES + HISTORY_KEY_OVERHEAD_BYTES;
 const MAX_STORED_VALUE_BYTES: usize = u16::MAX as usize;
+// One maximum delimiter-aware scan is issued with the owner, root, and commit
+// clock point reads in the same snapshot. Its conservative read estimate is
+// one lookahead row, maximum-size start and end keys, and the three fence keys.
+const MIN_SERVING_READ_BYTES: usize =
+    (MAX_DELIMITED_SCAN_ITEMS + READ_FENCE_OPS + 3) * MAX_DERIVED_KEY_BYTES + 1;
+const MIN_TRANSACTION_TARGET_BYTES: usize = 900_000;
 // Domain payloads are wrapped in CurrentValue, HistoryValue, or
 // CommandDedupeRecord before insertion. Keep explicit headroom for every
 // durable envelope without binding the schema to one adapter.
@@ -85,10 +91,9 @@ pub(super) const MAX_EVENT_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
 ///
 /// The decimal 16,000,000-byte envelope retains conservative headroom for
 /// schema-owned lifecycles and stays below Holt's 16 MiB WAL-record ceiling
-/// after configured mutation overhead. Format-11 publication, rename,
-/// restore, and path-index cleanup additionally plan against the selected
-/// store's lower transaction target; this local hard profile is not evidence
-/// that another adapter is qualified.
+/// after configured mutation overhead. Every format-11 metadata commit is
+/// planned and admitted against the selected store's transaction target; this
+/// local hard profile is not evidence that another adapter is qualified.
 pub const fn store_limits() -> StoreLimits {
     StoreLimits {
         max_reads: 8,
@@ -3360,8 +3365,9 @@ impl MetaShard {
         batch: ReadBatch,
         operation: &'static str,
     ) -> Result<ReadSnapshot, MetaError> {
+        let limits = self.store.profile().limits;
         batch
-            .validate(&store_limits())
+            .validate(&limits)
             .map_err(|source| store_error(operation, source))?;
         self.store
             .read(batch)
@@ -3369,7 +3375,10 @@ impl MetaShard {
     }
 
     fn commit(&self, operation: &'static str, txn: WriteTxn) -> Result<Commit, MetaError> {
-        txn.validate(&store_limits())
+        let profile = self.store.profile();
+        let mut planning_limits = profile.limits;
+        planning_limits.max_transaction_bytes = profile.transaction_target_bytes;
+        txn.validate(&planning_limits)
             .map_err(|source| store_error(operation, source))?;
         self.store
             .commit(txn)
@@ -3387,7 +3396,16 @@ impl MetaShard {
         reserved_gets: usize,
         operation: &'static str,
     ) -> Result<ScanPage, MetaError> {
-        let scan = scan_request(keyspace, prefix, after, limit, delimiter, reserved_gets)?;
+        let limits = self.store.profile().limits;
+        let scan = scan_request(
+            keyspace,
+            prefix,
+            after,
+            limit,
+            delimiter,
+            reserved_gets,
+            &limits,
+        )?;
         let snapshot = self.read_batch(
             ReadBatch {
                 ops: vec![ReadOp::Scan(scan)],
@@ -3414,7 +3432,8 @@ impl MetaShard {
         context: ReadFenceContext,
         operation: &'static str,
     ) -> Result<Option<ScanPage>, MetaError> {
-        let scan = scan_request(keyspace, prefix, after, limit, delimiter, 3)?;
+        let limits = self.store.profile().limits;
+        let scan = scan_request(keyspace, prefix, after, limit, delimiter, 3, &limits)?;
         let (clock, mut results) =
             self.read_batch_at_fence(context, vec![ReadOp::Scan(scan)], operation)?;
         let Some(ReadResult::Scan(page)) = results.pop() else {
@@ -4089,12 +4108,7 @@ fn validate_store_profile(profile: StoreProfile) -> Result<(), MetaError> {
             actual.max_value_bytes,
             required.max_value_bytes,
         ),
-        ("read bytes", actual.max_read_bytes, required.max_read_bytes),
-        (
-            "transaction bytes",
-            actual.max_transaction_bytes,
-            required.max_transaction_bytes,
-        ),
+        ("read bytes", actual.max_read_bytes, MIN_SERVING_READ_BYTES),
         (
             "result rows",
             actual.max_result_rows,
@@ -4114,12 +4128,18 @@ fn validate_store_profile(profile: StoreProfile) -> Result<(), MetaError> {
             });
         }
     }
-    if profile.transaction_target_bytes == 0
-        || profile.transaction_target_bytes > actual.max_transaction_bytes
-    {
+    if profile.transaction_target_bytes < MIN_TRANSACTION_TARGET_BYTES {
         return Err(MetaError::SchemaGate {
             reason: format!(
-                "metadata store transaction target {} must be in 1..={}",
+                "metadata store transaction target {} is below serving schema minimum {MIN_TRANSACTION_TARGET_BYTES}",
+                profile.transaction_target_bytes
+            ),
+        });
+    }
+    if profile.transaction_target_bytes > actual.max_transaction_bytes {
+        return Err(MetaError::SchemaGate {
+            reason: format!(
+                "metadata store transaction target {} exceeds hard transaction limit {}",
                 profile.transaction_target_bytes, actual.max_transaction_bytes
             ),
         });
@@ -4192,8 +4212,8 @@ fn scan_request(
     limit: usize,
     delimiter: Option<u8>,
     reserved_gets: usize,
+    limits: &StoreLimits,
 ) -> Result<Scan, MetaError> {
-    let limits = store_limits();
     let reserved_bytes = reserved_gets
         .checked_mul(limits.max_value_bytes)
         .ok_or_else(|| internal("build scan", "point-read reserve overflow"))?;
@@ -4583,10 +4603,14 @@ mod tests {
         }
 
         fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
-            self.inner.read(batch)
+            batch.validate(&self.profile.limits)?;
+            let snapshot = self.inner.read(batch.clone())?;
+            snapshot.validate(&batch, &self.profile.limits)?;
+            Ok(snapshot)
         }
 
         fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            txn.validate(&self.profile.limits)?;
             self.inner.commit(txn)
         }
 
@@ -4599,6 +4623,26 @@ mod tests {
         StoreProfile {
             limits: store_limits(),
             transaction_target_bytes: store_limits().max_transaction_bytes,
+            ack: AckBoundary::SharedCommit,
+            authority: Authority::Shared,
+            recovery: RecoveryMode::StoreAuthority,
+        }
+    }
+
+    fn fdb_serving_profile() -> StoreProfile {
+        StoreProfile {
+            limits: StoreLimits {
+                max_reads: 8,
+                max_checks: 1_024,
+                max_mutations: 1_024,
+                max_key_bytes: 8_205,
+                max_value_bytes: 65_535,
+                max_read_bytes: 4_500_000,
+                max_transaction_bytes: 2_900_000,
+                max_result_rows: 1_024,
+                max_result_bytes: 8 * 1024 * 1024,
+            },
+            transaction_target_bytes: 900_000,
             ack: AckBoundary::SharedCommit,
             authority: Authority::Shared,
             recovery: RecoveryMode::StoreAuthority,
@@ -4916,6 +4960,68 @@ mod tests {
     }
 
     #[test]
+    fn initialization_accepts_the_fdb_serving_profile() {
+        let store = Arc::new(ProfileOverrideStore {
+            inner: crate::workspace::test_support::memory_txn_store().unwrap(),
+            profile: fdb_serving_profile(),
+        });
+        let store = make_store_ready(MetaShard::initialize(store, shard(1)).unwrap());
+        let version = store.current_read_version().unwrap();
+
+        assert!(store
+            .scan_delimited_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &scoped_key(root(2), b"fdb-read-budget/"),
+                b'/',
+                version,
+                None,
+                MAX_DELIMITED_SCAN_ITEMS,
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn initialization_rejects_a_profile_below_the_maximum_fenced_scan_budget() {
+        let mut limits = fdb_serving_profile().limits;
+        limits.max_read_bytes = MIN_SERVING_READ_BYTES - 1;
+        let error = match MetaShard::initialize(Arc::new(ProfileOnlyStore { limits }), shard(1)) {
+            Ok(_) => panic!("a profile below one maximum fenced scan must not bind"),
+            Err(error) => error,
+        };
+        let required = MIN_SERVING_READ_BYTES.to_string();
+        assert!(matches!(
+            error,
+            MetaError::SchemaGate { reason }
+                if reason.contains("read bytes") && reason.contains(&required)
+        ));
+    }
+
+    #[test]
+    fn initialization_rejects_a_transaction_target_below_the_serving_floor() {
+        let mut profile = fdb_serving_profile();
+        profile.transaction_target_bytes = 899_999;
+        let store = Arc::new(ProfileOverrideStore {
+            inner: Arc::new(ProfileOnlyStore {
+                limits: profile.limits,
+            }),
+            profile,
+        });
+        let error = match MetaShard::initialize(store, shard(1)) {
+            Ok(_) => panic!("a transaction target below the serving floor must not bind"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            MetaError::SchemaGate { reason }
+                if reason.contains("transaction target") && reason.contains("900000")
+        ));
+    }
+
+    #[test]
     fn initialization_rejects_an_inconsistent_recovery_profile_before_io() {
         let mut profile = shared_profile();
         profile.ack = AckBoundary::LocalSync;
@@ -5212,6 +5318,55 @@ mod tests {
         ));
         assert_eq!(store.current_read_version().unwrap(), version_before);
         assert_eq!(store.recovery_state().unwrap(), recovery_before);
+    }
+
+    #[test]
+    fn actual_metadata_commit_enforces_the_store_transaction_target() {
+        let store = Arc::new(ProfileOverrideStore {
+            inner: crate::workspace::test_support::memory_txn_store().unwrap(),
+            profile: fdb_serving_profile(),
+        });
+        let store = make_store_ready(MetaShard::initialize(store, shard(1)).unwrap());
+        let version_before = store.current_read_version().unwrap();
+        let mut command = base_command(&store, request(83), RootFenceAction::RequireActive);
+        for index in 0..16 {
+            let key = scoped_key(root(2), format!("fdb-target/{index:02}").as_bytes());
+            command.predicates.push(CommandPredicate::Value {
+                family: MetadataFamily::Operation,
+                key: key.clone(),
+                expected: None,
+            });
+            command.mutations.push(CommandMutation::Put {
+                family: MetadataFamily::Operation,
+                key,
+                value: vec![index as u8; MAX_COMMAND_VALUE_BYTES],
+            });
+        }
+        let command = command.seal();
+        assert!(matches!(
+            store.command_fit(&command, None),
+            Ok(CommandFit::Exceeds {
+                kind: CommandLimit::TransactionBytes,
+                actual,
+                maximum: 900_000,
+            }) if actual < 2_900_000
+        ));
+
+        let error = store
+            .execute(&command)
+            .expect_err("an actual FDB metadata commit must honor the planner target");
+        assert!(matches!(
+            error,
+            MetaError::Store {
+                operation: "execute metadata command",
+                source: StoreError::LimitExceeded {
+                    kind: LimitKind::TransactionBytes,
+                    maximum: 900_000,
+                    ..
+                },
+            }
+        ));
+        assert_eq!(store.current_read_version().unwrap(), version_before);
     }
 
     #[test]
