@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::{ControlError, LogicalShardId, ObjectNamespaceId, PlacementGeneration, RootId};
+use crate::{
+    AgentId, ControlError, LogicalShardId, ObjectNamespaceId, PlacementGeneration, RootId,
+};
 
 pub const STORE_ID_BYTES: usize = 16;
 pub const PROVIDER_NAMESPACE_DIGEST_BYTES: usize = 32;
@@ -163,6 +165,7 @@ impl TryFrom<u8> for CatalogEntryState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RootCatalogEntry {
     root_id: RootId,
+    agent_id: AgentId,
     object_namespace_id: ObjectNamespaceId,
     logical_shard_id: LogicalShardId,
     placement_generation: PlacementGeneration,
@@ -172,6 +175,7 @@ pub struct RootCatalogEntry {
 impl RootCatalogEntry {
     pub const fn new(
         root_id: RootId,
+        agent_id: AgentId,
         object_namespace_id: ObjectNamespaceId,
         logical_shard_id: LogicalShardId,
         placement_generation: PlacementGeneration,
@@ -179,6 +183,7 @@ impl RootCatalogEntry {
     ) -> Self {
         Self {
             root_id,
+            agent_id,
             object_namespace_id,
             logical_shard_id,
             placement_generation,
@@ -188,6 +193,10 @@ impl RootCatalogEntry {
 
     pub const fn root_id(&self) -> RootId {
         self.root_id
+    }
+
+    pub const fn agent_id(&self) -> AgentId {
+        self.agent_id
     }
 
     pub const fn object_namespace_id(&self) -> ObjectNamespaceId {
@@ -251,6 +260,7 @@ pub fn validate_root_catalog_transition(
     next: &RootCatalogEntry,
 ) -> Result<(), ControlError> {
     if expected.root_id != next.root_id
+        || expected.agent_id != next.agent_id
         || expected.object_namespace_id != next.object_namespace_id
         || expected.logical_shard_id != next.logical_shard_id
         || expected.placement_generation != next.placement_generation
@@ -342,6 +352,7 @@ mod tests {
 
         let provisioning = RootCatalogEntry::new(
             root(1),
+            AgentId::from_bytes([4; 16]),
             ObjectNamespaceId::from_bytes([2; 16]),
             shard(3),
             PlacementGeneration::new(1).unwrap(),
@@ -353,11 +364,22 @@ mod tests {
 
         let rebound = RootCatalogEntry::new(
             root(1),
+            AgentId::from_bytes([4; 16]),
             ObjectNamespaceId::from_bytes([9; 16]),
             shard(3),
             PlacementGeneration::new(1).unwrap(),
             CatalogEntryState::Ready,
         );
         assert!(validate_root_catalog_transition(&provisioning, &rebound).is_err());
+
+        let rebound_agent = RootCatalogEntry::new(
+            root(1),
+            AgentId::from_bytes([5; 16]),
+            ObjectNamespaceId::from_bytes([2; 16]),
+            shard(3),
+            PlacementGeneration::new(1).unwrap(),
+            CatalogEntryState::Ready,
+        );
+        assert!(validate_root_catalog_transition(&provisioning, &rebound_agent).is_err());
     }
 }

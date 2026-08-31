@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use nokv_control::{
-    plan_heartbeat_renewal, plan_owner_acquisition, CatalogEntryState, ControlError,
+    plan_heartbeat_renewal, plan_owner_acquisition, AgentId, CatalogEntryState, ControlError,
     LogicalShardId, NodeId, ObjectNamespaceId, OwnershipSnapshot, PlacementGeneration,
     RootCatalogEntry, RootId, RpcEndpoint, ShardCatalogEntry, ShardRoute, StoreId, StoreManifest,
     StoreProvider, PROVIDER_NAMESPACE_DIGEST_BYTES, STORE_ID_BYTES,
@@ -96,6 +96,7 @@ fn frozen_control_records_round_trip_and_reject_corruption() {
 
     let root_entry = RootCatalogEntry::new(
         root(1),
+        AgentId::from_bytes([7; 16]),
         ObjectNamespaceId::from_bytes([2; 16]),
         shard(3),
         PlacementGeneration::new(4).unwrap(),

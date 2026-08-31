@@ -4,10 +4,10 @@
  */
 
 use nokv_control::{
-    CatalogEntryState, ControlError, HeartbeatSequence, LogicalShardId, NodeId, ObjectNamespaceId,
-    OwnerEpoch, OwnerHeartbeat, OwnerSession, PlacementGeneration, RootCatalogEntry, RootId,
-    RpcEndpoint, SessionGeneration, ShardCatalogEntry, ShardRoute, ShardRouteState, StoreId,
-    StoreManifest, StoreProvider,
+    AgentId, CatalogEntryState, ControlError, HeartbeatSequence, LogicalShardId, NodeId,
+    ObjectNamespaceId, OwnerEpoch, OwnerHeartbeat, OwnerSession, PlacementGeneration,
+    RootCatalogEntry, RootId, RpcEndpoint, SessionGeneration, ShardCatalogEntry, ShardRoute,
+    ShardRouteState, StoreId, StoreManifest, StoreProvider,
 };
 
 const RECORD_MAGIC: &[u8] = b"\x16nokv-control\0";
@@ -57,6 +57,7 @@ pub(crate) fn decode_manifest(bytes: &[u8]) -> Result<StoreManifest, ControlErro
 pub(crate) fn encode_root_catalog(entry: &RootCatalogEntry) -> Vec<u8> {
     let mut encoder = Encoder::new(RecordKind::RootCatalog);
     encoder.fixed(entry.root_id().as_bytes());
+    encoder.fixed(entry.agent_id().as_bytes());
     encoder.fixed(entry.object_namespace_id().as_bytes());
     encoder.fixed(entry.logical_shard_id().as_bytes());
     encoder.u64(entry.placement_generation().get());
@@ -67,6 +68,7 @@ pub(crate) fn encode_root_catalog(entry: &RootCatalogEntry) -> Vec<u8> {
 pub(crate) fn decode_root_catalog(bytes: &[u8]) -> Result<RootCatalogEntry, ControlError> {
     let mut decoder = Decoder::new(bytes, RecordKind::RootCatalog, "root catalog")?;
     let root_id = RootId::from_bytes(decoder.fixed("root id")?);
+    let agent_id = AgentId::from_bytes(decoder.fixed("agent id")?);
     let object_namespace_id = ObjectNamespaceId::from_bytes(decoder.fixed("object namespace id")?);
     let logical_shard_id = LogicalShardId::from_bytes(decoder.fixed("logical shard id")?);
     let placement_generation = PlacementGeneration::new(decoder.u64("placement generation")?)
@@ -75,6 +77,7 @@ pub(crate) fn decode_root_catalog(bytes: &[u8]) -> Result<RootCatalogEntry, Cont
     decoder.finish()?;
     Ok(RootCatalogEntry::new(
         root_id,
+        agent_id,
         object_namespace_id,
         logical_shard_id,
         placement_generation,

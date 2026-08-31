@@ -58,6 +58,16 @@ pub trait DistributedControlStore: Send + Sync {
         logical_shard_id: &LogicalShardId,
     ) -> Result<OwnershipSnapshot, ControlError>;
 
+    /// Acquire the fenced session used only to initialize a Provisioning
+    /// shard. The route remains Activating and cannot be published until the
+    /// shard catalog reaches Ready.
+    fn acquire_provisioning_owner(
+        &self,
+        logical_shard_id: &LogicalShardId,
+        owner: crate::NodeId,
+        endpoint: RpcEndpoint,
+    ) -> Result<OwnerSession, ControlError>;
+
     /// Acquire an unassigned shard immediately, or take over only after the
     /// exact observed session/heartbeat pair has remained unchanged for the
     /// configured local TTL.

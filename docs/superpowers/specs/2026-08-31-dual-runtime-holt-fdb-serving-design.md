@@ -344,8 +344,8 @@ lease/shard/<logical-shard-id>/heartbeat
 meta/<logical-shard-id>/<keyspace>/<logical-key>
 ```
 
-- `catalog/root` binds a root to one object namespace, logical shard, and
-  placement generation.
+- `catalog/root` binds a root to one Agent identity, object namespace, logical
+  shard, and placement generation.
 - `catalog/shard` stores stable shard identity and lifecycle state.
 - `route/shard` stores acquisition/serving state, advertised RPC endpoint,
   owner epoch, and session generation.

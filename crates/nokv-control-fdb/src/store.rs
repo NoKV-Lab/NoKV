@@ -187,6 +187,56 @@ impl FdbControlStore {
         self.observer.record(&update.snapshot()?, self.now());
         Ok(())
     }
+
+    fn acquire_owner_in_state(
+        &self,
+        logical_shard_id: &LogicalShardId,
+        owner: NodeId,
+        endpoint: RpcEndpoint,
+        required_state: CatalogEntryState,
+    ) -> Result<OwnerSession, ControlError> {
+        let transaction = self.transaction()?;
+        let shard = read_shard_catalog(&transaction, &self.keys, logical_shard_id, false)?
+            .ok_or(ControlError::LogicalShardNotFound(*logical_shard_id))?;
+        if shard.state() != required_state {
+            return Err(ControlError::InvalidCatalogTransition {
+                record: "shard catalog",
+                reason: format!(
+                    "owner acquisition requires {required_state:?}, actual {:?}",
+                    shard.state()
+                ),
+            });
+        }
+        let current = self.read_ownership(&transaction, logical_shard_id, false)?;
+        let immediate =
+            current.route().state() == ShardRouteState::Unassigned && current.session().is_none();
+        if !immediate {
+            if let Some(remaining) =
+                self.observer
+                    .remaining(&current, self.now(), self.options.lease_ttl())
+            {
+                return Err(ControlError::OwnershipObservationPending {
+                    logical_shard_id: *logical_shard_id,
+                    remaining_millis: u64::try_from(remaining.as_millis())
+                        .expect("validated ownership TTL fits u64 milliseconds"),
+                });
+            }
+        }
+        let update = plan_owner_acquisition(&current, owner, endpoint)?;
+        let session = update
+            .session()
+            .expect("owner acquisition always creates a session")
+            .clone();
+        self.commit_ownership(
+            transaction,
+            &update,
+            "acquire a logical shard owner",
+            true,
+            true,
+            true,
+        )?;
+        Ok(session)
+    }
 }
 
 impl DistributedControlStore for FdbControlStore {
@@ -439,53 +489,27 @@ impl DistributedControlStore for FdbControlStore {
         Ok(ownership)
     }
 
+    fn acquire_provisioning_owner(
+        &self,
+        logical_shard_id: &LogicalShardId,
+        owner: NodeId,
+        endpoint: RpcEndpoint,
+    ) -> Result<OwnerSession, ControlError> {
+        self.acquire_owner_in_state(
+            logical_shard_id,
+            owner,
+            endpoint,
+            CatalogEntryState::Provisioning,
+        )
+    }
+
     fn acquire_owner(
         &self,
         logical_shard_id: &LogicalShardId,
         owner: NodeId,
         endpoint: RpcEndpoint,
     ) -> Result<OwnerSession, ControlError> {
-        let transaction = self.transaction()?;
-        let shard = read_shard_catalog(&transaction, &self.keys, logical_shard_id, false)?
-            .ok_or(ControlError::LogicalShardNotFound(*logical_shard_id))?;
-        if shard.state() != CatalogEntryState::Ready {
-            return Err(ControlError::InvalidCatalogTransition {
-                record: "shard catalog",
-                reason: format!(
-                    "owner acquisition requires Ready, actual {:?}",
-                    shard.state()
-                ),
-            });
-        }
-        let current = self.read_ownership(&transaction, logical_shard_id, false)?;
-        let immediate =
-            current.route().state() == ShardRouteState::Unassigned && current.session().is_none();
-        if !immediate {
-            if let Some(remaining) =
-                self.observer
-                    .remaining(&current, self.now(), self.options.lease_ttl())
-            {
-                return Err(ControlError::OwnershipObservationPending {
-                    logical_shard_id: *logical_shard_id,
-                    remaining_millis: u64::try_from(remaining.as_millis())
-                        .expect("validated ownership TTL fits u64 milliseconds"),
-                });
-            }
-        }
-        let update = plan_owner_acquisition(&current, owner, endpoint)?;
-        let session = update
-            .session()
-            .expect("owner acquisition always creates a session")
-            .clone();
-        self.commit_ownership(
-            transaction,
-            &update,
-            "acquire a logical shard owner",
-            true,
-            true,
-            true,
-        )?;
-        Ok(session)
+        self.acquire_owner_in_state(logical_shard_id, owner, endpoint, CatalogEntryState::Ready)
     }
 
     fn renew_owner(&self, session: &OwnerSession) -> Result<OwnerHeartbeat, ControlError> {
@@ -506,6 +530,20 @@ impl DistributedControlStore for FdbControlStore {
 
     fn activate_route(&self, session: &OwnerSession) -> Result<ShardRoute, ControlError> {
         let transaction = self.transaction()?;
+        let shard =
+            read_shard_catalog(&transaction, &self.keys, &session.logical_shard_id(), false)?
+                .ok_or(ControlError::LogicalShardNotFound(
+                    session.logical_shard_id(),
+                ))?;
+        if shard.state() != CatalogEntryState::Ready {
+            return Err(ControlError::InvalidCatalogTransition {
+                record: "shard catalog",
+                reason: format!(
+                    "route activation requires Ready, actual {:?}",
+                    shard.state()
+                ),
+            });
+        }
         let current = self.read_ownership(&transaction, &session.logical_shard_id(), false)?;
         let update = plan_route_activation(&current, session)?;
         let route = update.route().clone();
