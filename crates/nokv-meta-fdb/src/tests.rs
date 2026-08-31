@@ -6,14 +6,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use nokv_fdb::{classify_error, lexicographic_successor, FdbErrorDisposition, FdbLimit};
 use nokv_meta_store::{
     AckBoundary, Authority, Check, Key, Keyspace, LimitKind, Mutation, ReadBatch, ReadOp,
     RecoveryMode, Scan, StoreError, WriteTxn,
 };
 
 use crate::affected_bytes::{ensure_observed_transaction_size, validate_read, validate_write};
-use crate::codec::{lexicographic_successor, KeyCodec};
-use crate::errors::{classify_error, ErrorDisposition};
+use crate::codec::KeyCodec;
 use crate::options::MAX_NAMESPACE_BYTES;
 use crate::profile::{FDB_LIMITS, FDB_PROFILE, PHYSICAL_AFFECTED_BYTES};
 use crate::FdbOptions;
@@ -64,8 +64,8 @@ fn options_require_explicit_bounded_configuration() {
 
 #[test]
 fn physical_encoding_is_namespace_and_keyspace_safe() {
-    let first = KeyCodec::new(b"a");
-    let second = KeyCodec::new(b"ab");
+    let first = KeyCodec::new(b"a").unwrap();
+    let second = KeyCodec::new(b"ab").unwrap();
     assert_ne!(first.store_prefix(), second.store_prefix());
     assert!(!second.store_prefix().starts_with(first.store_prefix()));
 
@@ -81,7 +81,7 @@ fn physical_encoding_is_namespace_and_keyspace_safe() {
         Err(StoreError::Corrupt(_))
     ));
 
-    let binary = KeyCodec::new(&[0, u8::MAX]);
+    let binary = KeyCodec::new(&[0, u8::MAX]).unwrap();
     let binary_key = [0, b'/', u8::MAX, 0];
     let encoded_binary = binary.encode(FIRST, &binary_key);
     assert_eq!(
@@ -98,7 +98,7 @@ fn physical_encoding_is_namespace_and_keyspace_safe() {
 
 #[test]
 fn scan_cursors_distinguish_rows_from_common_prefixes() {
-    let codec = KeyCodec::new(b"test");
+    let codec = KeyCodec::new(b"test").unwrap();
     let row_at_prefix = Scan {
         keyspace: FIRST,
         prefix: b"p/".to_vec(),
@@ -135,7 +135,7 @@ fn profile_is_shared_and_below_serving_transaction_limits() {
 
 #[test]
 fn affected_byte_budget_accounts_for_encoded_ranges_and_mutations() {
-    let codec = KeyCodec::new(&[b'n'; MAX_NAMESPACE_BYTES]);
+    let codec = KeyCodec::new(&[b'n'; MAX_NAMESPACE_BYTES]).unwrap();
     let read = ReadBatch {
         ops: vec![
             ReadOp::Get(Key::new(FIRST, b"point")),
@@ -203,20 +203,29 @@ fn affected_byte_budget_accounts_for_encoded_ranges_and_mutations() {
 
 #[test]
 fn fdb_error_codes_preserve_conflict_unknown_and_limits() {
-    assert_eq!(classify_error(1020, false), ErrorDisposition::Conflict);
-    assert_eq!(classify_error(1021, false), ErrorDisposition::Unknown);
-    assert_eq!(classify_error(1020, true), ErrorDisposition::Unknown);
+    assert_eq!(classify_error(1020, false), FdbErrorDisposition::Conflict);
+    assert_eq!(
+        classify_error(1021, false),
+        FdbErrorDisposition::CommitUnknown
+    );
+    assert_eq!(
+        classify_error(1020, true),
+        FdbErrorDisposition::CommitUnknown
+    );
     assert_eq!(
         classify_error(2101, false),
-        ErrorDisposition::Limit(LimitKind::TransactionBytes)
+        FdbErrorDisposition::Limit(FdbLimit::TransactionBytes)
     );
     assert_eq!(
         classify_error(2102, false),
-        ErrorDisposition::Limit(LimitKind::KeyBytes)
+        FdbErrorDisposition::Limit(FdbLimit::KeyBytes)
     );
     assert_eq!(
         classify_error(2103, false),
-        ErrorDisposition::Limit(LimitKind::ValueBytes)
+        FdbErrorDisposition::Limit(FdbLimit::ValueBytes)
     );
-    assert_eq!(classify_error(1007, false), ErrorDisposition::Unavailable);
+    assert_eq!(
+        classify_error(1007, false),
+        FdbErrorDisposition::Unavailable
+    );
 }

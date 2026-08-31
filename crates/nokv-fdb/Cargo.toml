@@ -1,0 +1,18 @@
+[package]
+name = "nokv-fdb"
+version = "0.1.0"
+description = "Process-global FoundationDB runtime and physical key envelope for NoKV."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = []
+fdb = ["dep:foundationdb", "dep:futures"]
+
+[dependencies]
+foundationdb = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }

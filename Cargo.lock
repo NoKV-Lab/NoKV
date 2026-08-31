@@ -1497,6 +1497,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nokv-fdb"
+version = "0.1.0"
+dependencies = [
+ "foundationdb",
+ "futures",
+]
+
+[[package]]
 name = "nokv-meta"
 version = "0.1.0"
 dependencies = [
@@ -1511,8 +1519,7 @@ dependencies = [
 name = "nokv-meta-fdb"
 version = "0.1.0"
 dependencies = [
- "foundationdb",
- "futures",
+ "nokv-fdb",
  "nokv-meta-store",
  "uuid",
 ]

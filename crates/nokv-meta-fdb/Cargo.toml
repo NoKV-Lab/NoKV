@@ -11,11 +11,10 @@ homepage.workspace = true
 
 [features]
 default = []
-fdb = ["dep:foundationdb", "dep:futures"]
+fdb = ["nokv-fdb/fdb"]
 
 [dependencies]
-foundationdb = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
+nokv-fdb.workspace = true
 nokv-meta-store.workspace = true
 
 [dev-dependencies]

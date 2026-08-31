@@ -14,14 +14,14 @@
 mod affected_bytes;
 #[cfg(any(feature = "fdb", test))]
 mod codec;
-#[cfg(any(feature = "fdb", test))]
-mod errors;
 mod options;
 #[cfg(any(feature = "fdb", test))]
 mod profile;
 #[cfg(feature = "fdb")]
 mod store;
 
+#[cfg(feature = "fdb")]
+pub use nokv_fdb::{FdbRuntime, FdbRuntimeError};
 pub use options::FdbOptions;
 #[cfg(feature = "fdb")]
 pub use store::FdbStore;

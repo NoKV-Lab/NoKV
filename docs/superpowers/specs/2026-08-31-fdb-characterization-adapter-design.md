@@ -7,7 +7,9 @@ SPDX-License-Identifier: Apache-2.0
 
 **Decision date:** 2026-08-31
 
-**Status:** Implemented as a non-default characterization adapter.
+**Status:** Implemented as a non-default characterization adapter; the shared
+FoundationDB runtime was subsequently extracted into `nokv-fdb` by the
+[dual-runtime serving design](./2026-08-31-dual-runtime-holt-fdb-serving-design.md).
 
 **Qualification:** `NOT QUALIFIED` for NoKV serving.
 
@@ -20,11 +22,11 @@ conflict handling, physical limit enforcement, and error mapping against a
 real FoundationDB cluster. It is not selectable by `nokv-server` and cannot
 serve a `MetaShard`.
 
-The adapter uses `foundationdb-rs` 0.11.0 with the `fdb-7_3` API feature. It
-keeps the current synchronous `TxnStore` interface by blocking on the binding's
-futures inside the adapter. This bridge has an explicit removal condition: the
-future async `TxnStore` cutover replaces it, and NoKV does not retain sync and
-async store interfaces in parallel.
+`nokv-fdb` uses `foundationdb-rs` 0.11.0 with the `fdb-7_3` API feature and
+owns the binding's synchronous database/transaction wrappers. The metadata
+adapter keeps the current synchronous `TxnStore` interface without importing
+FoundationDB or its futures directly. No automatic raw transaction retry is
+introduced.
 
 This change does not modify etcd, Holt, control-plane routing, CLI options,
 Python APIs, or server bootstrap.
@@ -32,7 +34,7 @@ Python APIs, or server bootstrap.
 ## Goals
 
 - Implement `ReadBatch`, `WriteTxn`, `ready`, and `StoreProfile` without
-  exposing FoundationDB types outside `nokv-meta-fdb`.
+  exposing FoundationDB binding types outside `nokv-fdb`.
 - Preserve the exact `TxnStore` semantics for consistent reads, exact checks,
   atomic mutations, conflicts, and unknown commit outcomes.
 - Use an unambiguous, ordered physical key encoding for one adapter namespace.
@@ -104,37 +106,42 @@ outcome reconciliation, and large-transaction decomposition are also absent.
 
 ## Package Boundary
 
-The implementation adds this dependency direction:
+The implemented package split has this dependency direction:
 
 ```text
-nokv-meta-fdb -> nokv-meta-store
-nokv-meta-fdb -> foundationdb (feature-gated)
+nokv-fdb -> foundationdb (feature-gated)
+nokv-meta-fdb -> nokv-fdb + nokv-meta-store
 ```
 
-`nokv-meta-fdb` must not depend on `nokv-meta`, `nokv-server`,
-`nokv-control`, `nokv-meta-holt`, protocol, client, Agent, Python, or CLI
-packages. It owns only physical configuration, key encoding, FoundationDB
-operations, physical limits, and adapter error mapping.
+`nokv-fdb` owns the process runtime, common options and prefix envelope,
+database/transaction handles, and error classification. `nokv-meta-fdb` must
+not import the FoundationDB binding directly. Neither crate may depend on
+`nokv-meta`, `nokv-server`, `nokv-control`, `nokv-meta-holt`, protocol, client,
+Agent, Python, or CLI packages. The metadata adapter owns only metadata
+keyspace encoding, physical limits, `TxnStore` mapping, and adapter-specific
+error mapping.
 
-The crate is a workspace member with no default features. Its `fdb` feature
+Both crates are workspace members with no default features. `nokv-fdb/fdb`
 activates `foundationdb = 0.11.0`, with upstream default features disabled and
-the `fdb-7_3` and `embedded-fdb-include` features enabled. The embedded headers
-allow a feature-level `cargo check` without a system FoundationDB header;
-linking and running the adapter still require a compatible `libfdb_c`. Code
-that imports or links the FoundationDB binding is compiled only under the
-crate's `fdb` feature. Options and pure key encoding tests remain available in
-the default build.
+the `fdb-7_3` and `embedded-fdb-include` features enabled;
+`nokv-meta-fdb/fdb` forwards only to that feature. The embedded headers allow a
+feature-level `cargo check` without a system FoundationDB header; linking and
+running still require a compatible `libfdb_c`. Default options, lifecycle,
+prefix, keyspace, limit, and error tests compile without the binding.
 
-The code contract gains an explicit `nokv-meta-fdb` row. Public product docs do
-not list FoundationDB as a supported serving backend.
+The code contract has explicit `nokv-fdb` and `nokv-meta-fdb` rows. Public
+product docs do not list FoundationDB as a supported serving backend.
 
 ## Public Adapter API
 
-The crate always exposes `FdbOptions`, so its validation and key-envelope
-configuration can be tested in default builds. It exposes `FdbStore` only when
-the `fdb` feature is enabled:
+`nokv-fdb` always exposes `FdbConnectionOptions`, `FdbStorePrefix`, and common
+error classification. With `fdb`, it exposes the process runtime and owned
+database/transaction wrappers. `nokv-meta-fdb` always exposes `FdbOptions` and
+exposes `FdbStore` only with `fdb`:
 
 ```rust
+pub struct FdbRuntime { /* one shared process guard */ }
+
 pub struct FdbOptions {
     cluster_file: PathBuf,
     namespace: Vec<u8>,
@@ -144,7 +151,8 @@ pub struct FdbOptions {
 pub struct FdbStore { /* FoundationDB-only internals */ }
 
 impl FdbStore {
-    pub fn open(options: FdbOptions) -> Result<Self, StoreError>;
+    pub fn open(runtime: &FdbRuntime, options: FdbOptions)
+        -> Result<Self, StoreError>;
 }
 ```
 
@@ -158,10 +166,12 @@ The default transaction timeout is 4 seconds. Accepted values are 1
 millisecond through 4 seconds. There is no retry-count option in the first
 adapter because `commit` performs one physical attempt.
 
-`FdbStore::open` validates options, opens the configured database, and retains
-an immutable `StoreProfile`. It does not initialize or migrate the NoKV schema.
-Freshness and schema markers remain `MetaShard` responsibilities in a later
-serving phase.
+`FdbRuntime::start` selects API version 730 and starts the network once. Calls
+while it is running share the same guard. Dropping the final runtime, database,
+and transaction handle stops the network permanently; a later start fails
+instead of attempting an unsupported restart. `FdbStore::open` validates
+options, uses that runtime to open the database, and retains an immutable
+`StoreProfile`. It does not initialize or migrate the NoKV schema.
 
 ## Physical Key Encoding
 
@@ -169,25 +179,30 @@ Every key uses this byte layout:
 
 ```text
 0x15
-"nokv-meta-fdb"
+"nokv-fdb"
 0x00
 0x01                         # physical encoding version
 namespace_len:u8
 namespace:[u8; namespace_len]
-keyspace:u16be
+0x07                         # Metadata subspace tag
+0x0002                       # component length
+keyspace:u16be               # component bytes
 logical_key:bytes
 ```
 
-The length byte makes namespaces such as `a` and `ab` disjoint. Big-endian
+The store-token length and component lengths make tokens/components such as
+`a` and `ab` disjoint. The common envelope reserves stable tags for system,
+catalog, route, session, heartbeat, and metadata subspaces. Big-endian
 `Keyspace` encoding preserves numeric keyspace order. Raw logical-key bytes are
 appended unchanged, so lexicographic order within a keyspace matches the
 `TxnStore` contract.
 
-The store prefix ends after `namespace`; a keyspace prefix adds the two-byte
-keyspace. Point keys append the logical key. Prefix range ends use the shortest
-lexicographic successor of the complete encoded prefix. An exclusive row cursor
-starts at `encoded_row || 0x00`. A delimiter-folded common-prefix cursor skips
-the complete common prefix by starting at its lexicographic successor.
+The store prefix ends after `namespace`; a metadata keyspace prefix adds the
+subspace tag plus a length-delimited two-byte keyspace component. Point keys
+append the logical key. Prefix range ends use the shortest lexicographic
+successor of the complete encoded prefix. An exclusive row cursor starts at
+`encoded_row || 0x00`. A delimiter-folded common-prefix cursor skips the
+complete common prefix by starting at its lexicographic successor.
 
 The adapter never parses or owns `nokv_workspace` record bytes. The physical
 encoding version only versions the adapter envelope.
@@ -236,10 +251,10 @@ transaction limit and retains a regression test for the estimator.
 
 ## Synchronous Bridge And Time Bounds
 
-`FdbStore` holds the thread-safe FoundationDB database handle. Each `TxnStore`
-method uses `futures::executor::block_on` on the calling thread. The FDB C
-client's network thread drives the underlying future; the adapter does not
-create a Tokio runtime.
+`FdbStore` holds a `nokv-fdb` database handle. The common wrapper uses
+`futures::executor::block_on` on the calling thread; the FDB C client's one
+process-global network thread drives the underlying future. Neither crate
+creates a Tokio runtime.
 
 Every transaction receives the configured FoundationDB transaction timeout.
 The adapter does not call an unbounded retry helper. A definite transient
@@ -312,6 +327,8 @@ adapter cannot be wired into the server in this phase.
 
 - option validation, including absolute UTF-8 cluster files, namespace bounds,
   and timeout bounds
+- process-runtime start-once, handle sharing, final shutdown, terminal start
+  failure, and no-restart state using a binding-free lifecycle harness
 - physical key and range encoding, namespace non-overlap, keyspace ordering,
   arbitrary-byte keys, row cursors, and common-prefix cursors
 - logical and physical affected-byte accounting, including overflow cases
@@ -370,8 +387,9 @@ The implementation is ready for review when:
 - default `cargo clippy --workspace --all-targets -- -D warnings` passes
 - default `cargo test --workspace` passes without `libfdb_c`
 - `git diff --check` passes
-- the FDB-feature crate compiles in an environment containing a compatible
-  7.3 client library, or is reported `NOT RUN` with the missing dependency
+- both FDB-feature crates compile against the selected binding; linking and
+  running require a compatible 7.3 client library and are reported `NOT RUN`
+  when that dependency is missing
 - the ignored live suite passes against a disposable FoundationDB namespace,
   or is reported `NOT RUN` with the missing cluster/client dependency
 - the implementation changes no etcd, Holt, control, server, CLI, or Python
@@ -391,12 +409,12 @@ Passing default unit tests does not upgrade FoundationDB beyond
 
 ## Follow-up Gates For Serving
 
-Serving work requires a separate design and all of these changes:
+The dual-runtime design supersedes the original serving checklist. Remaining
+serving work still requires all of these gates:
 
-- replace the synchronous store and server path with one async path
-- decompose valid NoKV commands whose physical affected data exceeds the FDB
-  budget while preserving visibility, idempotency, and index atomicity
-- persist and validate provider-neutral store identity and configuration digest
+- persist and validate the provider-neutral store identity and exact prefix
+- add catalog, route, ownership session, and heartbeat transactions
+- fence every owner-required metadata transaction with the stable session key
 - reconcile metadata transaction unknown outcomes at domain-request scope
 - qualify workspace behavior, response loss, process loss, failover, and
   representative performance

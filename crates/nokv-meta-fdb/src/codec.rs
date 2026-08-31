@@ -3,28 +3,26 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use nokv_fdb::{lexicographic_successor, FdbStorePrefix, FdbSubspace, FdbSubspaceKind};
 #[cfg(feature = "fdb")]
 use nokv_meta_store::Key;
 use nokv_meta_store::{Keyspace, Scan, StoreError};
 
-const PHYSICAL_MAGIC: &[u8] = b"\x15nokv-meta-fdb\x00";
-const PHYSICAL_ENCODING_VERSION: u8 = 1;
-
 #[derive(Clone, Debug)]
 pub(crate) struct KeyCodec {
-    store_prefix: Vec<u8>,
+    _store_prefix: FdbStorePrefix,
+    metadata: FdbSubspace,
 }
 
 impl KeyCodec {
-    pub(crate) fn new(namespace: &[u8]) -> Self {
-        let mut store_prefix = Vec::with_capacity(PHYSICAL_MAGIC.len() + 2 + namespace.len());
-        store_prefix.extend_from_slice(PHYSICAL_MAGIC);
-        store_prefix.push(PHYSICAL_ENCODING_VERSION);
-        store_prefix.push(
-            u8::try_from(namespace.len()).expect("validated FdbStore namespace fits one byte"),
-        );
-        store_prefix.extend_from_slice(namespace);
-        Self { store_prefix }
+    pub(crate) fn new(namespace: &[u8]) -> Result<Self, StoreError> {
+        let store_prefix = FdbStorePrefix::new(namespace)
+            .map_err(|error| StoreError::InvalidRequest(error.to_string()))?;
+        let metadata = store_prefix.subspace(FdbSubspaceKind::Metadata);
+        Ok(Self {
+            _store_prefix: store_prefix,
+            metadata,
+        })
     }
 
     #[cfg(feature = "fdb")]
@@ -39,9 +37,10 @@ impl KeyCodec {
     }
 
     pub(crate) fn encoded_len(&self, logical_key_bytes: usize) -> Result<usize, StoreError> {
-        self.store_prefix
+        self.metadata
+            .as_bytes()
             .len()
-            .checked_add(2)
+            .checked_add(4)
             .and_then(|bytes| bytes.checked_add(logical_key_bytes))
             .ok_or_else(|| {
                 StoreError::InvalidRequest(
@@ -51,10 +50,11 @@ impl KeyCodec {
     }
 
     pub(crate) fn keyspace_prefix(&self, keyspace: Keyspace) -> Vec<u8> {
-        let mut prefix = Vec::with_capacity(self.store_prefix.len() + 2);
-        prefix.extend_from_slice(&self.store_prefix);
-        prefix.extend_from_slice(&keyspace.get().to_be_bytes());
-        prefix
+        self.metadata
+            .component(&keyspace.get().to_be_bytes())
+            .expect("a two-byte keyspace is a valid FDB component")
+            .as_bytes()
+            .to_vec()
     }
 
     pub(crate) fn scan_bounds(&self, scan: &Scan) -> Result<(Vec<u8>, Vec<u8>), StoreError> {
@@ -103,19 +103,8 @@ impl KeyCodec {
 
     #[cfg(test)]
     pub(crate) fn store_prefix(&self) -> &[u8] {
-        &self.store_prefix
+        self._store_prefix.as_bytes()
     }
-}
-
-pub(crate) fn lexicographic_successor(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut successor = bytes.to_vec();
-    while let Some(byte) = successor.pop() {
-        if byte != u8::MAX {
-            successor.push(byte + 1);
-            return Some(successor);
-        }
-    }
-    None
 }
 
 fn is_common_prefix_cursor(scan: &Scan, after: &[u8]) -> bool {

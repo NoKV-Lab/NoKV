@@ -6,11 +6,12 @@ SPDX-License-Identifier: Apache-2.0
 # Metadata Store Interface
 
 Implemented: the storage-neutral interface, local Holt adapter, `MetaShard`
-cutover, and a non-default FoundationDB characterization adapter. The serving
-local profile still uses Holt through `TxnStore`; FoundationDB is **NOT
-QUALIFIED** and is not wired into `nokv-server`. Pending: FoundationDB serving
-qualification, replicated Holt, provider-neutral runtime admission, and
-owner-safe response delivery.
+cutover, a process-global FoundationDB runtime boundary, and a non-default
+FoundationDB characterization adapter. The serving local profile still uses
+Holt through `TxnStore`; FoundationDB is **NOT QUALIFIED** and is not wired
+into `nokv-server`. Pending: FoundationDB control/session admission, discovery,
+serving composition and qualification, replicated Holt, and owner-safe
+response delivery.
 
 The [code contract](./code_contract.md), [architecture](../architecture.md),
 and [metadata schema](../metadata-schema.md) remain normative.
@@ -60,9 +61,14 @@ responsibilities:
   acknowledgement boundaries, recovery authority, and physical errors.
 - `nokv-meta-holt` maps the neutral requests to Holt trees, views, atomic
   batches, WAL acknowledgement, reopen, poison handling, and diagnostics.
+- `nokv-fdb` owns the one process-global FoundationDB 7.3 API/network runtime,
+  common database/transaction handles, connection options, physical store
+  prefix/subspaces, and error classification. Its default feature set does not
+  compile or link the FoundationDB client.
 - `nokv-meta-fdb` maps the neutral requests to one explicit FoundationDB
-  cluster file and binary namespace. Its dependency and live tests are feature
-  gated, and its synchronous bridge is characterization-only.
+  cluster file and binary metadata subspace through `nokv-fdb`. Its live tests
+  are feature gated, and its synchronous `TxnStore` bridge remains
+  characterization-only.
 
 `bootstrap_shard` opens one `MetaShard` for a logical-shard owner and attaches
 all Active roots found at startup. The server constructs the Holt adapter and
@@ -82,6 +88,7 @@ flowchart TB
     Meta --> Store["TxnStore"]
     Store --> Holt["HoltStore"]
     Store --> Fdb["FdbStore"]
+    Fdb --> FdbRuntime["nokv-fdb process runtime"]
     Store --> Cluster["HoltClusterStore"]
 
     Control["nokv-control<br/>placement + lease + owner epoch"] -.-> Server
@@ -101,6 +108,7 @@ Implemented and reserved names are:
 | Ordered transaction store interface | `TxnStore` | Implemented |
 | Embedded Holt implementation | `HoltStore` | Implemented |
 | FoundationDB implementation | `FdbStore` | Characterization only; `NOT QUALIFIED` |
+| Process-global FoundationDB runtime | `FdbRuntime` | Implemented; feature gated and non-restartable |
 | Replicated Holt implementation | `HoltClusterStore` | Reserved |
 | Workspace metadata error | `MetaError` | Implemented |
 | Physical store error | `StoreError` | Implemented |
@@ -123,6 +131,7 @@ flowchart BT
     Meta["nokv-meta"] --> Interface["nokv-meta-store"]
     Holt["nokv-meta-holt"] --> Interface
     Fdb["nokv-meta-fdb"] --> Interface
+    Fdb --> FdbRuntime["nokv-fdb"]
     Server["nokv-server"] --> Meta
     Server --> Interface
     Server --> Holt
@@ -138,8 +147,9 @@ The exact dependency rules are:
 - `nokv-meta` production code depends on `nokv-meta-store`, not Holt. Dev-only
   workspace tests can compose a qualified adapter through test support
 - `nokv-meta-holt` depends on `nokv-meta-store` and Holt
-- `nokv-meta-fdb` depends on `nokv-meta-store` and the selected FoundationDB
-  Rust binding
+- `nokv-fdb` is the only package that imports the selected FoundationDB Rust
+  binding
+- `nokv-meta-fdb` depends on `nokv-meta-store` and `nokv-fdb`
 - store adapters do not depend on `nokv-meta` or know workspace record types
 - `nokv-server` is the only production composition root
 
@@ -685,8 +695,9 @@ The FoundationDB adapter uses the following evidence gates:
 
 | Gate | Command or environment | Qualification |
 | --- | --- | --- |
+| Common runtime, prefix, option, and error tests | `cargo test -p nokv-fdb` | Required in the default workspace; does not load `libfdb_c` |
 | Pure options, encoding, limit, and error tests | `cargo test -p nokv-meta-fdb` | Required in the default workspace; does not load `libfdb_c` |
-| Binding API compile | `cargo check -p nokv-meta-fdb --features fdb --all-targets` | Required for the selected 7.3 API |
+| Binding API compile | `cargo check -p nokv-fdb --features fdb --all-targets && cargo check -p nokv-meta-fdb --features fdb --all-targets` | Required for the selected 7.3 API |
 | Shared conformance, binary scans, conflict, reopen, and namespace isolation | `NOKV_TEST_FDB_CLUSTER_FILE=/absolute/path cargo test -p nokv-meta-fdb --features fdb --test fdb_conformance -- --ignored --nocapture` | Environment-gated; `NOT QUALIFIED` unless the run and output are retained |
 | Unknown outcome, process/network loss, failover, and representative performance | Dedicated fault and benchmark environments | `NOT QUALIFIED` |
 
@@ -723,12 +734,12 @@ Completed in the local Holt cutover:
 
 Remaining work:
 
-1. Add provider-neutral configuration, persistent runtime binding, admission,
-   and metadata-transaction unknown-outcome recovery orchestration.
-2. Replace the synchronous store and server path with one async path.
-3. Qualify the non-default `nokv-meta-fdb` characterization adapter only after
-   its async, large-transaction, provider-admission, workspace, failure,
-   failover, and benchmark gates pass.
+1. Add the FDB catalog, ownership session, discovery, and persistent serving
+   admission around the implemented process runtime.
+2. Add exact session checks and metadata-transaction unknown-outcome recovery
+   orchestration without raw transaction retries.
+3. Qualify the non-default `nokv-meta-fdb` adapter only after its
+   large-transaction, workspace, failure, failover, and benchmark gates pass.
 4. Add `HoltClusterStore` only after its replicated transaction format exists.
 
 The cutover retains no forwarding constructors, aliases, fallback stores, or

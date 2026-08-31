@@ -3,9 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use foundationdb::options::{StreamingMode, TransactionOption};
-use foundationdb::{Database, FdbError, RangeOption, Transaction};
-use futures::executor::block_on;
+use nokv_fdb::{
+    lexicographic_successor, FdbDatabase, FdbErrorDisposition, FdbLimit, FdbOpenError,
+    FdbOperationError, FdbRangeRequest, FdbRuntime, FdbTransaction,
+};
 use nokv_meta_store::{
     Check, Commit, Keyspace, LimitKind, Mutation, ReadBatch, ReadOp, ReadResult, ReadSnapshot,
     Scan, ScanItem, ScanPage, StoreError, StoreLimits, StoreProfile, TxnStore, UnknownCommit,
@@ -13,8 +14,7 @@ use nokv_meta_store::{
 };
 
 use crate::affected_bytes::{ensure_observed_transaction_size, validate_read, validate_write};
-use crate::codec::{lexicographic_successor, KeyCodec};
-use crate::errors::{classify_error, ErrorDisposition};
+use crate::codec::KeyCodec;
 use crate::profile::{FDB_LIMITS, FDB_PROFILE, PHYSICAL_AFFECTED_BYTES};
 use crate::FdbOptions;
 
@@ -22,38 +22,25 @@ use crate::FdbOptions;
 ///
 /// This characterization adapter is intentionally not wired into NoKV serving.
 pub struct FdbStore {
-    database: Database,
-    options: FdbOptions,
+    database: FdbDatabase,
     codec: KeyCodec,
 }
 
 impl FdbStore {
-    pub fn open(options: FdbOptions) -> Result<Self, StoreError> {
+    pub fn open(runtime: &FdbRuntime, options: FdbOptions) -> Result<Self, StoreError> {
         options.validate()?;
-        let database = Database::from_path(options.cluster_file_str())
-            .map_err(|error| map_operation_error("open FoundationDB database", error))?;
-        let codec = KeyCodec::new(options.namespace());
-        Ok(Self {
-            database,
-            options,
-            codec,
-        })
+        let database =
+            FdbDatabase::open(runtime, options.connection_options()).map_err(map_open_error)?;
+        let codec = KeyCodec::new(options.namespace())?;
+        Ok(Self { database, codec })
     }
 
-    fn transaction(&self) -> Result<Transaction, StoreError> {
-        let transaction = self
-            .database
-            .create_trx()
-            .map_err(|error| map_operation_error("create FoundationDB transaction", error))?;
-        transaction
-            .set_option(TransactionOption::Timeout(
-                self.options.transaction_timeout_millis(),
-            ))
-            .map_err(|error| map_operation_error("set FoundationDB transaction timeout", error))?;
+    fn transaction(&self) -> Result<FdbTransaction, StoreError> {
+        let transaction = self.database.transaction().map_err(map_operation_error)?;
         Ok(transaction)
     }
 
-    async fn read_async(&self, batch: &ReadBatch) -> Result<ReadSnapshot, StoreError> {
+    fn read_inner(&self, batch: &ReadBatch) -> Result<ReadSnapshot, StoreError> {
         let transaction = self.transaction()?;
         let mut results = Vec::with_capacity(batch.ops.len());
         for op in &batch.ops {
@@ -62,15 +49,16 @@ impl FdbStore {
                     let physical_key = self.codec.encode_key(key);
                     let value = transaction
                         .get(&physical_key, true)
-                        .await
-                        .map_err(|error| map_operation_error("read FoundationDB key", error))?
-                        .map(|value| value.as_ref().to_vec());
+                        .map_err(map_operation_error)?;
                     results.push(ReadResult::Get(value));
                 }
                 ReadOp::Scan(scan) => {
-                    results.push(ReadResult::Scan(
-                        scan_page(&transaction, &self.codec, scan, &FDB_LIMITS).await?,
-                    ));
+                    results.push(ReadResult::Scan(scan_page(
+                        &transaction,
+                        &self.codec,
+                        scan,
+                        &FDB_LIMITS,
+                    )?));
                 }
             }
         }
@@ -79,7 +67,7 @@ impl FdbStore {
         Ok(snapshot)
     }
 
-    async fn commit_async(&self, txn: &WriteTxn) -> Result<Commit, StoreError> {
+    fn commit_inner(&self, txn: &WriteTxn) -> Result<Commit, StoreError> {
         let transaction = self.transaction()?;
         for check in &txn.checks {
             let matches = match check {
@@ -87,10 +75,7 @@ impl FdbStore {
                     let physical_key = self.codec.encode_key(key);
                     transaction
                         .get(&physical_key, false)
-                        .await
-                        .map_err(|error| {
-                            map_operation_error("evaluate FoundationDB value check", error)
-                        })?
+                        .map_err(map_operation_error)?
                         .as_deref()
                         == Some(expected.as_slice())
                 }
@@ -98,14 +83,11 @@ impl FdbStore {
                     let physical_key = self.codec.encode_key(key);
                     transaction
                         .get(&physical_key, false)
-                        .await
-                        .map_err(|error| {
-                            map_operation_error("evaluate FoundationDB absent check", error)
-                        })?
+                        .map_err(map_operation_error)?
                         .is_none()
                 }
                 Check::EmptyPrefix { keyspace, prefix } => {
-                    prefix_is_empty(&transaction, &self.codec, *keyspace, prefix).await?
+                    prefix_is_empty(&transaction, &self.codec, *keyspace, prefix)?
                 }
             };
             if !matches {
@@ -125,14 +107,13 @@ impl FdbStore {
         }
 
         let observed_size = transaction
-            .get_approximate_size()
-            .await
-            .map_err(|error| map_operation_error("measure FoundationDB transaction size", error))?;
+            .approximate_size()
+            .map_err(map_operation_error)?;
         ensure_observed_transaction_size(observed_size)?;
 
-        match transaction.commit().await {
+        match transaction.commit() {
             Ok(_) => Ok(Commit::Applied),
-            Err(error) => map_commit_error(error.into()),
+            Err(error) => map_commit_error(error),
         }
     }
 }
@@ -145,28 +126,25 @@ impl TxnStore for FdbStore {
     fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
         batch.validate(&FDB_LIMITS)?;
         validate_read(&self.codec, &batch)?;
-        block_on(self.read_async(&batch))
+        self.read_inner(&batch)
     }
 
     fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
         txn.validate(&FDB_LIMITS)?;
         validate_write(&self.codec, &txn)?;
-        block_on(self.commit_async(&txn))
+        self.commit_inner(&txn)
     }
 
     fn ready(&self) -> Result<(), StoreError> {
-        block_on(async {
-            self.transaction()?
-                .get_read_version()
-                .await
-                .map_err(|error| map_operation_error("obtain FoundationDB read version", error))?;
-            Ok(())
-        })
+        self.transaction()?
+            .read_version()
+            .map_err(map_operation_error)?;
+        Ok(())
     }
 }
 
-async fn prefix_is_empty(
-    transaction: &Transaction,
+fn prefix_is_empty(
+    transaction: &FdbTransaction,
     codec: &KeyCodec,
     keyspace: Keyspace,
     prefix: &[u8],
@@ -180,18 +158,22 @@ async fn prefix_is_empty(
         delimiter: None,
     };
     let (begin, end) = codec.scan_bounds(&scan)?;
-    let mut options = RangeOption::from((begin, end));
-    options.limit = Some(1);
-    options.mode = StreamingMode::WantAll;
     let values = transaction
-        .get_range(&options, 1, false)
-        .await
-        .map_err(|error| map_operation_error("evaluate FoundationDB prefix check", error))?;
-    Ok(values.is_empty())
+        .get_range(&FdbRangeRequest {
+            begin,
+            end,
+            limit: Some(1),
+            target_bytes: 0,
+            iteration: 1,
+            snapshot: false,
+            reverse: false,
+        })
+        .map_err(map_operation_error)?;
+    Ok(values.items.is_empty())
 }
 
-async fn scan_page(
-    transaction: &Transaction,
+fn scan_page(
+    transaction: &FdbTransaction,
     codec: &KeyCodec,
     scan: &Scan,
     limits: &StoreLimits,
@@ -207,30 +189,33 @@ async fn scan_page(
         } else {
             remaining.saturating_add(1)
         };
-        let mut options = RangeOption::from((begin.clone(), end.clone()));
-        options.limit = Some(fetch_limit);
-        options.target_bytes = scan.max_bytes;
-        options.mode = StreamingMode::WantAll;
         let values = transaction
-            .get_range(&options, 1, true)
-            .await
-            .map_err(|error| map_operation_error("scan FoundationDB range", error))?;
-        if values.is_empty() {
+            .get_range(&FdbRangeRequest {
+                begin: begin.clone(),
+                end: end.clone(),
+                limit: Some(fetch_limit),
+                target_bytes: scan.max_bytes,
+                iteration: 1,
+                snapshot: true,
+                reverse: false,
+            })
+            .map_err(map_operation_error)?;
+        if values.items.is_empty() {
             break;
         }
 
-        let batch_has_more = values.more();
+        let batch_has_more = values.more;
         let mut next_begin = None;
         let mut skipped_common_prefix = false;
-        for value in &values {
-            let logical_key = codec.decode_key(scan.keyspace, value.key())?;
+        for value in &values.items {
+            let logical_key = codec.decode_key(scan.keyspace, &value.key)?;
             if !logical_key.starts_with(scan.prefix.as_slice()) {
                 return Err(StoreError::Corrupt(
                     "FoundationDB returned a key outside the requested logical prefix".to_owned(),
                 ));
             }
-            validate_row(&logical_key, value.value(), limits)?;
-            let item = fold_scan_item(scan, logical_key, value.value());
+            validate_row(&logical_key, &value.value, limits)?;
+            let item = fold_scan_item(scan, logical_key, &value.value);
             let item_bytes = scan_item_bytes(&item)?;
             let next_bytes = result_bytes.checked_add(item_bytes).ok_or_else(|| {
                 StoreError::Corrupt(
@@ -266,7 +251,7 @@ async fn scan_page(
                 break;
             }
 
-            let mut row_successor = value.key().to_vec();
+            let mut row_successor = value.key.clone();
             row_successor.push(0);
             next_begin = Some(row_successor);
         }
@@ -326,53 +311,43 @@ fn scan_item_bytes(item: &ScanItem) -> Result<usize, StoreError> {
     }
 }
 
-fn map_commit_error(error: FdbError) -> Result<Commit, StoreError> {
-    match classify_error(error.code(), error.is_maybe_committed()) {
-        ErrorDisposition::Conflict => Ok(Commit::Conflict),
-        ErrorDisposition::Unknown => Err(StoreError::OutcomeUnknown {
+fn map_open_error(error: FdbOpenError) -> StoreError {
+    match error {
+        FdbOpenError::Config(error) => StoreError::InvalidRequest(error.to_string()),
+        FdbOpenError::Operation(error) => map_operation_error(error),
+    }
+}
+
+fn map_commit_error(error: FdbOperationError) -> Result<Commit, StoreError> {
+    match error.disposition() {
+        FdbErrorDisposition::Conflict => Ok(Commit::Conflict),
+        FdbErrorDisposition::CommitUnknown => Err(StoreError::OutcomeUnknown {
             state: UnknownCommit::MayCommit,
-            reason: fdb_reason("commit FoundationDB transaction", error),
+            reason: error.to_string(),
         }),
-        ErrorDisposition::Limit(kind) => Err(limit_error(kind)),
-        ErrorDisposition::Unavailable => Err(StoreError::Unavailable(fdb_reason(
-            "commit FoundationDB transaction",
-            error,
-        ))),
+        FdbErrorDisposition::Limit(kind) => Err(limit_error(kind)),
+        FdbErrorDisposition::Unavailable => Err(StoreError::Unavailable(error.to_string())),
     }
 }
 
-fn map_operation_error(operation: &str, error: FdbError) -> StoreError {
-    match classify_error(error.code(), false) {
-        ErrorDisposition::Limit(kind) => limit_error(kind),
-        ErrorDisposition::Conflict | ErrorDisposition::Unknown | ErrorDisposition::Unavailable => {
-            StoreError::Unavailable(fdb_reason(operation, error))
-        }
+fn map_operation_error(error: FdbOperationError) -> StoreError {
+    match error.disposition() {
+        FdbErrorDisposition::Limit(kind) => limit_error(kind),
+        FdbErrorDisposition::Conflict
+        | FdbErrorDisposition::CommitUnknown
+        | FdbErrorDisposition::Unavailable => StoreError::Unavailable(error.to_string()),
     }
 }
 
-fn limit_error(kind: LimitKind) -> StoreError {
-    let maximum = match kind {
-        LimitKind::KeyBytes => FDB_LIMITS.max_key_bytes,
-        LimitKind::ValueBytes => FDB_LIMITS.max_value_bytes,
-        LimitKind::TransactionBytes => PHYSICAL_AFFECTED_BYTES,
-        LimitKind::ReadBytes => PHYSICAL_AFFECTED_BYTES,
-        LimitKind::Reads
-        | LimitKind::Checks
-        | LimitKind::Mutations
-        | LimitKind::ResultRows
-        | LimitKind::ResultBytes => PHYSICAL_AFFECTED_BYTES,
+fn limit_error(fdb_kind: FdbLimit) -> StoreError {
+    let (kind, maximum) = match fdb_kind {
+        FdbLimit::KeyBytes => (LimitKind::KeyBytes, FDB_LIMITS.max_key_bytes),
+        FdbLimit::ValueBytes => (LimitKind::ValueBytes, FDB_LIMITS.max_value_bytes),
+        FdbLimit::TransactionBytes => (LimitKind::TransactionBytes, PHYSICAL_AFFECTED_BYTES),
     };
     StoreError::LimitExceeded {
         kind,
         actual: maximum.saturating_add(1),
         maximum,
     }
-}
-
-fn fdb_reason(operation: &str, error: FdbError) -> String {
-    format!(
-        "{operation} failed with FoundationDB error {}: {}",
-        error.code(),
-        error.message()
-    )
 }

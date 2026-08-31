@@ -9,6 +9,12 @@ SPDX-License-Identifier: Apache-2.0
 FoundationDB. It is a non-default characterization adapter and is **NOT
 QUALIFIED** for NoKV serving. `nokv-server` does not select or import it.
 
+The adapter uses `nokv-fdb` for the explicit 7.3 API selection, shared network
+lifetime, database/transaction handles, physical store envelope, common
+options, and error classification. A caller starts one `FdbRuntime` and passes
+that guard to every `FdbStore::open`; reopen tests keep the guard alive while
+individual stores are dropped.
+
 The default build tests options, physical key encoding, limits, and error
 classification without importing or linking the FoundationDB client:
 
