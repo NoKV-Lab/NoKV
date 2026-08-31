@@ -13,10 +13,10 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nokv_control::{
-    plan_owner_acquisition, validate_root_catalog_transition, CatalogEntryState, ControlError,
-    CreateOutcome, DistributedControlStore, NodeId, OwnerSession, RootCatalogEntry, RpcEndpoint,
-    ShardCatalogEntry, ShardRouteState, StoreId, StoreManifest, StoreProvider,
-    SUPPORTED_WORKSPACE_FORMAT_VERSION,
+    plan_owner_acquisition, validate_root_catalog_transition, validate_shard_catalog_transition,
+    CatalogEntryState, ControlError, CreateOutcome, DistributedControlStore, NodeId, OwnerSession,
+    RootCatalogEntry, RpcEndpoint, ShardCatalogEntry, ShardRouteState, StoreId, StoreManifest,
+    StoreProvider, SUPPORTED_WORKSPACE_FORMAT_VERSION,
 };
 use nokv_control_fdb::{FdbControlOptions, FdbControlStore, FdbSessionFence};
 use nokv_fdb::{FdbRuntime, FDB_PHYSICAL_ENCODING_VERSION};
@@ -69,6 +69,81 @@ pub struct FdbProvisionOutcome {
     pub root: RootCatalogEntry,
     pub shard: ShardCatalogEntry,
     pub preexisting: bool,
+}
+
+/// A provisioned metadata root whose object namespace has not yet been
+/// admitted. No control-plane owner session is retained by this handle.
+///
+/// The process-global FDB runtime stays alive so the caller can perform object
+/// provider I/O before finalizing the catalogs without trying to restart the
+/// FoundationDB network in the same process.
+pub struct FdbPreparedProvision {
+    runtime: FdbRuntime,
+    url: FoundationDbMetadataUrl,
+    manifest: StoreManifest,
+    control: Arc<FdbControlStore>,
+    root: RootCatalogEntry,
+    shard: ShardCatalogEntry,
+    preexisting: bool,
+}
+
+impl FdbPreparedProvision {
+    pub const fn root(&self) -> RootCatalogEntry {
+        self.root
+    }
+
+    pub const fn shard(&self) -> ShardCatalogEntry {
+        self.shard
+    }
+
+    pub const fn preexisting(&self) -> bool {
+        self.preexisting
+    }
+
+    /// Reacquire exact ownership after external object-namespace admission and
+    /// converge both catalogs to Ready. A failed call can be retried on the
+    /// same handle; every call rereads authoritative catalog state and opens a
+    /// fresh session-fenced metadata handle.
+    pub fn finalize_after_namespace_admission(&self) -> Result<FdbProvisionOutcome, ServerError> {
+        let (root, shard) =
+            load_exact_provision_catalogs(self.control.as_ref(), self.root, self.shard)?;
+        if root.state() == CatalogEntryState::Ready && shard.state() == CatalogEntryState::Ready {
+            return Ok(FdbProvisionOutcome {
+                root,
+                shard,
+                preexisting: self.preexisting,
+            });
+        }
+
+        let session = acquire_exact_session(
+            self.control.as_ref(),
+            shard.logical_shard_id(),
+            shard.state(),
+            provision_owner(self.manifest.store_id(), root.root_id())?,
+            RpcEndpoint::new(PROVISION_ENDPOINT)?,
+            false,
+            &NEVER_SHUTDOWN,
+        )?;
+        let result = (|| {
+            let meta = open_provisioning_meta(
+                &self.runtime,
+                &self.url,
+                self.control.as_ref(),
+                &session,
+                shard.state(),
+            )?;
+            advance_shared_owner(meta.as_ref(), &session)?;
+            reconcile_root_fence(meta.as_ref(), self.manifest.store_id(), &session, root)?;
+            let ready_root = cas_root_ready(self.control.as_ref(), root)?;
+            let ready_shard = cas_shard_ready(self.control.as_ref(), shard)?;
+            Ok(FdbProvisionOutcome {
+                root: ready_root,
+                shard: ready_shard,
+                preexisting: self.preexisting,
+            })
+        })();
+        finish_exact_session(self.control.as_ref(), &session, result)
+    }
 }
 
 #[derive(Clone)]
@@ -394,13 +469,18 @@ pub fn format_fdb(
     }
 }
 
-/// Provision one root through create-only shared catalog records and an exact
+/// Prepare one root through create-only shared catalog records and an exact
 /// session-fenced metadata root fence.
-pub fn provision_fdb(
+///
+/// Provisioning ownership is released before this function returns. The
+/// caller must admit the returned object namespace and then invoke
+/// [`FdbPreparedProvision::finalize_after_namespace_admission`] to make the
+/// catalogs Ready.
+pub fn prepare_fdb_provision(
     url: &FoundationDbMetadataUrl,
     root_id: RootId,
     agent_id: AgentId,
-) -> Result<FdbProvisionOutcome, ServerError> {
+) -> Result<FdbPreparedProvision, ServerError> {
     let runtime = start_runtime()?;
     let options = control_options(url)?;
     let manifest = FdbControlStore::inspect_manifest(&runtime, &options)?;
@@ -417,11 +497,16 @@ pub fn provision_fdb(
         CatalogEntryState::Provisioning,
     );
     let (root, preexisting) = create_or_load_root(control.as_ref(), desired_root)?;
+    validate_provision_catalog_states(root, shard)?;
     if root.state() == CatalogEntryState::Ready && shard.state() == CatalogEntryState::Ready {
-        return Ok(FdbProvisionOutcome {
+        return Ok(FdbPreparedProvision {
+            runtime,
+            url: url.clone(),
+            manifest,
+            control,
             root,
             shard,
-            preexisting: true,
+            preexisting,
         });
     }
     let session = acquire_exact_session(
@@ -438,24 +523,18 @@ pub fn provision_fdb(
             open_provisioning_meta(&runtime, url, control.as_ref(), &session, shard.state())?;
         advance_shared_owner(meta.as_ref(), &session)?;
         reconcile_root_fence(meta.as_ref(), manifest.store_id(), &session, root)?;
-        let ready_root = cas_root_ready(control.as_ref(), root)?;
-        let ready_shard = cas_shard_ready(control.as_ref(), shard)?;
-        Ok(FdbProvisionOutcome {
-            root: ready_root,
-            shard: ready_shard,
-            preexisting,
-        })
+        Ok(())
     })();
-    let release = release_owner_exact(control.as_ref(), &session);
-    match (result, release) {
-        (Ok(outcome), Ok(())) => Ok(outcome),
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(_), Err(cleanup)) => Err(cleanup),
-        (Err(primary), Err(cleanup)) => Err(ServerError::BootstrapRollback {
-            primary: primary.to_string(),
-            rollback: cleanup.to_string(),
-        }),
-    }
+    finish_exact_session(control.as_ref(), &session, result)?;
+    Ok(FdbPreparedProvision {
+        runtime,
+        url: url.clone(),
+        manifest,
+        control,
+        root,
+        shard,
+        preexisting,
+    })
 }
 
 /// Acquire every Ready shard, open exact session-fenced metadata handles, and
@@ -614,6 +693,65 @@ fn create_or_load_root(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn load_exact_provision_catalogs(
+    control: &FdbControlStore,
+    prepared_root: RootCatalogEntry,
+    prepared_shard: ShardCatalogEntry,
+) -> Result<(RootCatalogEntry, ShardCatalogEntry), ServerError> {
+    let root = control
+        .get_root_catalog(&prepared_root.root_id())?
+        .ok_or_else(|| {
+            ServerError::InvalidBootstrap(format!(
+                "prepared FoundationDB root {:?} disappeared before finalization",
+                prepared_root.root_id()
+            ))
+        })?;
+    let shard = control
+        .get_shard_catalog(&prepared_shard.logical_shard_id())?
+        .ok_or(ControlError::LogicalShardNotFound(
+            prepared_shard.logical_shard_id(),
+        ))?;
+
+    validate_root_catalog_transition(
+        &prepared_root.with_state(CatalogEntryState::Provisioning),
+        &root,
+    )?;
+    validate_shard_catalog_transition(
+        &prepared_shard.with_state(CatalogEntryState::Provisioning),
+        &shard,
+    )?;
+    validate_provision_catalog_states(root, shard)?;
+    Ok((root, shard))
+}
+
+fn validate_provision_catalog_states(
+    root: RootCatalogEntry,
+    shard: ShardCatalogEntry,
+) -> Result<(), ServerError> {
+    if root.logical_shard_id() != shard.logical_shard_id() {
+        return Err(ServerError::InvalidBootstrap(format!(
+            "FoundationDB root {:?} references shard {:?}, not prepared shard {:?}",
+            root.root_id(),
+            root.logical_shard_id(),
+            shard.logical_shard_id()
+        )));
+    }
+    if root.state() == CatalogEntryState::Retired || shard.state() == CatalogEntryState::Retired {
+        return Err(ServerError::InvalidBootstrap(format!(
+            "retired FoundationDB catalogs cannot be provisioned: root {:?}, shard {:?}",
+            root.state(),
+            shard.state()
+        )));
+    }
+    if root.state() == CatalogEntryState::Provisioning && shard.state() == CatalogEntryState::Ready
+    {
+        return Err(ServerError::InvalidBootstrap(
+            "FoundationDB shard is Ready while its root is still Provisioning".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn cas_root_ready(
@@ -1022,6 +1160,23 @@ fn release_owner_exact(
     }
 }
 
+fn finish_exact_session<T>(
+    control: &FdbControlStore,
+    session: &OwnerSession,
+    result: Result<T, ServerError>,
+) -> Result<T, ServerError> {
+    let release = release_owner_exact(control, session);
+    match (result, release) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(ServerError::BootstrapRollback {
+            primary: primary.to_string(),
+            rollback: cleanup.to_string(),
+        }),
+    }
+}
+
 fn rollback_prepared(
     control: &FdbControlStore,
     registry: &RootOwnerRegistry,
@@ -1125,6 +1280,24 @@ fn lower_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn catalog_pair(
+        root_state: CatalogEntryState,
+        shard_state: CatalogEntryState,
+    ) -> (RootCatalogEntry, ShardCatalogEntry) {
+        let logical_shard_id = LogicalShardId::from_bytes([4; 16]);
+        (
+            RootCatalogEntry::new(
+                RootId::from_bytes([1; 16]),
+                AgentId::from_bytes([2; 16]),
+                ObjectNamespaceId::from_bytes([3; 16]),
+                logical_shard_id,
+                PlacementGeneration::new(1).unwrap(),
+                root_state,
+            ),
+            ShardCatalogEntry::new(logical_shard_id, shard_state),
+        )
+    }
+
     #[test]
     fn derived_store_children_are_stable_nonzero_and_domain_separated() {
         let store = StoreId::from_bytes([1; 16]);
@@ -1150,5 +1323,29 @@ mod tests {
             derive_request_id(first, root, b"install"),
             derive_request_id(second, root, b"install")
         );
+    }
+
+    #[test]
+    fn provision_catalog_state_matrix_only_allows_forward_crash_cuts() {
+        for states in [
+            (
+                CatalogEntryState::Provisioning,
+                CatalogEntryState::Provisioning,
+            ),
+            (CatalogEntryState::Ready, CatalogEntryState::Provisioning),
+            (CatalogEntryState::Ready, CatalogEntryState::Ready),
+        ] {
+            let (root, shard) = catalog_pair(states.0, states.1);
+            assert!(validate_provision_catalog_states(root, shard).is_ok());
+        }
+
+        for states in [
+            (CatalogEntryState::Provisioning, CatalogEntryState::Ready),
+            (CatalogEntryState::Retired, CatalogEntryState::Provisioning),
+            (CatalogEntryState::Ready, CatalogEntryState::Retired),
+        ] {
+            let (root, shard) = catalog_pair(states.0, states.1);
+            assert!(validate_provision_catalog_states(root, shard).is_err());
+        }
     }
 }

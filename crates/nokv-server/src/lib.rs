@@ -33,8 +33,8 @@ pub use executor::{
 };
 #[cfg(feature = "fdb")]
 pub use fdb_runtime::{
-    format_fdb, provision_fdb, serve_fdb, FdbFormatOutcome, FdbFormatState, FdbProvisionOutcome,
-    FdbServedRoot, FdbServingRuntime,
+    format_fdb, prepare_fdb_provision, serve_fdb, FdbFormatOutcome, FdbFormatState,
+    FdbPreparedProvision, FdbProvisionOutcome, FdbServedRoot, FdbServingRuntime,
 };
 pub use holt_runtime::{
     format_holt, provision_holt, serve_holt, HoltFormatOutcome, HoltFormatState,

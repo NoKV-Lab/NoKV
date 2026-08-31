@@ -600,13 +600,16 @@ fn run_metadata_provision(
         nokv_server::MetadataUrl::FoundationDb(url) => {
             #[cfg(feature = "fdb")]
             {
-                let outcome = nokv_server::provision_fdb(&url, root_id, agent_id)
-                    .map_err(|error| error.to_string())?;
-                let namespace_id = outcome.root.object_namespace_id();
                 let objects = CliObjectStore::build(&invocation.client.object)?;
+                let prepared = nokv_server::prepare_fdb_provision(&url, root_id, agent_id)
+                    .map_err(|error| error.to_string())?;
+                let namespace_id = prepared.root().object_namespace_id();
                 objects.ensure_namespace(namespace_id)?;
                 let objects = objects.bind(namespace_id)?;
                 objects.validate_agent_capabilities()?;
+                let outcome = prepared
+                    .finalize_after_namespace_admission()
+                    .map_err(|error| error.to_string())?;
                 print_json(&json!({
                     "status": "success",
                     "operation": "provision",
