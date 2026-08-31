@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 **Decision date:** 2026-08-31
 
-**Status:** Direction approved; written review pending.
+**Status:** Approved and in implementation.
 
 **Qualification:** FoundationDB remains `NOT QUALIFIED` until this design is
 implemented and the real-cluster gates complete without an unsupported claim.
@@ -17,9 +17,10 @@ implemented and the real-cluster gates complete without an unsupported claim.
 Fix the two observed distributed-metadata failures at their state-machine
 boundaries:
 
-1. FDB provisioning becomes a recoverable prepare/admit/finalize flow. A root
-   and shard remain `Provisioning` until the exact object namespace exists and
-   passes provider admission.
+1. FDB provisioning becomes a recoverable prepare/admit/finalize flow. A new
+   root remains `Provisioning` until the exact object namespace exists and
+   passes provider admission. A newly created shard remains `Provisioning` as
+   well; an existing shared shard that is already `Ready` never rolls back.
 2. secondary-index stage replay binds only immutable staged-write intent.
    Volatile operation heartbeats, workspace revisions, and current path
    payloads remain transaction predicates but are not request-reuse identity.
@@ -88,12 +89,12 @@ Preparation performs these steps:
 2. derive and create-or-load the root, object namespace, and logical shard;
 3. validate that any existing root has the same agent, namespace, shard, and
    placement identity;
-4. acquire a provisioning owner session;
+4. acquire an exact owner session for the shard's current lifecycle state;
 5. open or initialize metadata, advance the shared owner fence, and reconcile
    the root fence;
 6. release the exact provisioning session;
-7. return a handle whose catalog state is still `Provisioning`, unless the
-   exact root was already `Ready`.
+7. return a handle whose root catalog is still `Provisioning`, unless the
+   exact root was already `Ready`; preserve an existing shard's `Ready` state.
 
 No owner session remains live while the CLI calls the external object service.
 This avoids coupling provider latency to the ten-second ownership lease.
@@ -123,7 +124,7 @@ state.
 Finalization rereads the root and shard catalogs. If both are already exact and
 `Ready`, it returns the deterministic preexisting outcome. Otherwise it:
 
-1. reacquires a provisioning owner session;
+1. reacquires an exact owner session for the shard's current lifecycle state;
 2. reopens the same FDB metadata namespace under that session;
 3. advances and reconciles the metadata/root fences to the new exact session;
 4. conditionally changes the root to `Ready`;
@@ -146,6 +147,7 @@ on a `Ready` shard, so no partial state becomes discoverable.
 | During object admission | `Provisioning`; marker may be absent or exact | Re-run idempotent ensure and admission |
 | After object admission, before finalization | `Provisioning` plus exact marker | Re-verify marker, then finalize |
 | Root `Ready`, shard `Provisioning` | Not serveable | Complete the shard transition |
+| New root `Provisioning`, existing shard `Ready` | Existing roots remain serveable; new root is hidden | Admit the new namespace binding, then finalize only the new root |
 | Both `Ready`, response lost | Ready and serveable | Exact readback returns the same outcome |
 
 No path deletes catalog rows or attempts to roll `Ready` back to

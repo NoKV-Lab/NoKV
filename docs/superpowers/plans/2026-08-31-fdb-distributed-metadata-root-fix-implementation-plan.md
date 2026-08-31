@@ -22,8 +22,9 @@ Make the distributed metadata path recoverable at its two confirmed failure
 boundaries:
 
 1. Provision a root as `Provisioning`, release its owner session, admit the
-   object namespace, then reacquire ownership and finalize the catalogs as
-   `Ready`.
+   object namespace, then reacquire ownership and finalize the root and any
+   newly created shard as `Ready`; preserve an existing shared shard's Ready
+   state throughout.
 2. Make a durable secondary-index stage replay depend only on immutable staged
    write intent, while keeping the first-stage transaction's exact predicates
    over the current operation, workspace, and path payloads.
@@ -57,13 +58,14 @@ boundaries:
 1. Add a prepared-provision handle that owns the process-global FDB runtime,
    control store, URL, exact root catalog, exact shard catalog, and preexisting
    outcome state.
-2. Change preparation to create or validate the `Provisioning` catalogs,
-   acquire the exact shard session, initialize/open metadata, advance the
-   shared owner fence, reconcile the root fence, and release the session before
-   returning the handle.
-3. Leave both catalogs `Provisioning` until external namespace admission has
-   succeeded. An already-Ready root is returned through the same handle so the
-   caller still revalidates its object namespace.
+2. Change preparation to create or validate the root and shared-shard
+   catalogs, acquire the exact session for the shard's current state,
+   initialize/open metadata, advance the shared owner fence, reconcile the root
+   fence, and release the session before returning the handle.
+3. Leave a new root and any newly created shard `Provisioning` until external
+   namespace admission has succeeded. Preserve an existing shared shard's
+   `Ready` state. An already-Ready root is returned through the same handle so
+   the caller still revalidates its object namespace.
 4. Add `finalize_after_namespace_admission`: reread and validate the exact
    catalogs, reject invalid partial states, reacquire a fresh exact session,
    reopen and reconcile the metadata fence, CAS root then shard to `Ready`, and

@@ -745,12 +745,6 @@ fn validate_provision_catalog_states(
             shard.state()
         )));
     }
-    if root.state() == CatalogEntryState::Provisioning && shard.state() == CatalogEntryState::Ready
-    {
-        return Err(ServerError::InvalidBootstrap(
-            "FoundationDB shard is Ready while its root is still Provisioning".to_owned(),
-        ));
-    }
     Ok(())
 }
 
@@ -1326,12 +1320,13 @@ mod tests {
     }
 
     #[test]
-    fn provision_catalog_state_matrix_only_allows_forward_crash_cuts() {
+    fn provision_catalog_state_matrix_allows_new_roots_on_ready_shards() {
         for states in [
             (
                 CatalogEntryState::Provisioning,
                 CatalogEntryState::Provisioning,
             ),
+            (CatalogEntryState::Provisioning, CatalogEntryState::Ready),
             (CatalogEntryState::Ready, CatalogEntryState::Provisioning),
             (CatalogEntryState::Ready, CatalogEntryState::Ready),
         ] {
@@ -1340,7 +1335,6 @@ mod tests {
         }
 
         for states in [
-            (CatalogEntryState::Provisioning, CatalogEntryState::Ready),
             (CatalogEntryState::Retired, CatalogEntryState::Provisioning),
             (CatalogEntryState::Ready, CatalogEntryState::Retired),
         ] {
