@@ -24,10 +24,13 @@ This distinction is intentional:
   physical transaction envelope, and controlled performance evidence remain
   incomplete.
 
-The implementation and test scope follows the
-[root-fix design](../superpowers/specs/2026-08-31-fdb-distributed-metadata-root-fix-design.md)
-and
-[implementation plan](../superpowers/plans/2026-08-31-fdb-distributed-metadata-root-fix-implementation-plan.md).
+The normative runtime and package boundaries are the
+[metadata-store interface](./metadata-store-interface.md),
+[code contract](./code_contract.md), and
+[metadata schema](../metadata-schema.md). This root-fix record covers
+recoverable prepare/admit/finalize provisioning, immutable secondary-index
+stage replay, Ready-shard preservation, and retry of settled transient metadata
+reads. It does not expand the serving qualification boundary below.
 
 ## Candidate And Topology
 
