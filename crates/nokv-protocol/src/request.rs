@@ -51,6 +51,36 @@ pub(crate) const MAX_PARENT_COMMITS: usize = 32;
 const MAX_RESTORE_MANIFEST_BYTES: u64 = 1024 * 1024;
 const _: () = assert!(MAX_QUERY_PAGE_LIMIT <= PageRequest::MAX_LIMIT);
 
+/// Top-level operation frame. Discovery is deliberately not root-routed.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "rpc", content = "payload", rename_all = "snake_case")]
+pub enum RpcRequest {
+    DiscoverRoute(DiscoverRouteRequest),
+    Workspace(Box<WorkspaceRpcRequest>),
+}
+
+impl RpcRequest {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::DiscoverRoute(request) => request.validate(),
+            Self::Workspace(request) => request.validate(),
+        }
+    }
+}
+
+/// Route lookup sent to any configured NoKV seed.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoverRouteRequest {
+    pub root_id: crate::types::RootIdentity,
+}
+
+impl DiscoverRouteRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+}
+
 /// One root-routed metadata or lifecycle request.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

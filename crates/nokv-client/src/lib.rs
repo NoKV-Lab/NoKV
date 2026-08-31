@@ -34,7 +34,10 @@ pub use generic_index::{
 pub use route::ControlRouteResolver;
 #[cfg(feature = "etcd")]
 pub use route::EtcdRouteOptions;
-pub use route::{ResolvedRoute, RouteRefreshMode, RouteResolver, StaticRouteResolver};
+pub use route::{
+    ResolvedRoute, RouteRefreshMode, RouteResolver, SeedRouteOptions, SeedRouteResolver,
+    StaticRouteResolver,
+};
 pub use sdk::{ClientCall, ClientOptions, WorkspaceClient};
 pub use snapshot_workflow::{
     SnapshotMintOptions, SnapshotRenewOptions, SnapshotRetireOptions, SnapshotRetireOutcome,

@@ -13,11 +13,87 @@ use crate::request::{
 use crate::types::{
     validate_capability_set, validate_field_id, validate_optional_text, ArtifactDescriptor,
     ArtifactManifestRow, ArtifactRevisionIdentity, ByteRange, CommitIdentity, ContentType, Digest,
-    DigestUri, FieldValue, GenericIndexGenerationIdentity, OperationIdentity, OperationKind,
-    OperationToken, PathMetadata, RequestIdentity, RootRoute, ScalarValue, SnapshotAlias,
-    WorkbenchName, WorkspaceCapability, WorkspaceIdentity, WorkspacePath,
+    DigestUri, DiscoveredRoute, FieldValue, GenericIndexGenerationIdentity, OperationIdentity,
+    OperationKind, OperationToken, PathMetadata, RequestIdentity, RootIdentity, RootRoute,
+    ScalarValue, SnapshotAlias, WorkbenchName, WorkspaceCapability, WorkspaceIdentity,
+    WorkspacePath,
 };
 use crate::{WORKSPACE_CAPABILITY_SCHEMA, WORKSPACE_PREFLIGHT_SCHEMA, WORKSPACE_PROTOCOL_SCHEMA};
+
+/// Top-level operation response matching [`crate::RpcRequest`].
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "rpc", content = "payload", rename_all = "snake_case")]
+pub enum RpcResponse {
+    DiscoverRoute(DiscoverRouteResponse),
+    Workspace(Box<WorkspaceRpcResponse>),
+}
+
+impl RpcResponse {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::DiscoverRoute(response) => response.validate(),
+            Self::Workspace(response) => response.validate(),
+        }
+    }
+}
+
+/// Result of looking up one root through a NoKV seed.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoverRouteResponse {
+    pub root_id: RootIdentity,
+    pub outcome: DiscoverRouteOutcome,
+}
+
+impl DiscoverRouteResponse {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        match &self.outcome {
+            DiscoverRouteOutcome::Found(route) => {
+                route.validate()?;
+                if route.root_id != self.root_id {
+                    return Err(ProtocolError::invalid(
+                        "discovery.route.root_id",
+                        "must equal the requested root identity",
+                    ));
+                }
+            }
+            DiscoverRouteOutcome::Failure(failure) => {
+                failure.validate()?;
+                if !matches!(
+                    failure.code,
+                    crate::ErrorCode::RouteUnavailable | crate::ErrorCode::RouteExpired
+                ) {
+                    return Err(ProtocolError::invalid(
+                        "discovery.failure.code",
+                        "must classify route availability or expiry",
+                    ));
+                }
+                if !failure.retryable {
+                    return Err(ProtocolError::invalid(
+                        "discovery.failure.retryable",
+                        "discovery failures must be retryable",
+                    ));
+                }
+                if let Some(route) = &failure.route_hint {
+                    if route.root_id != self.root_id {
+                        return Err(ProtocolError::invalid(
+                            "discovery.failure.route_hint.root_id",
+                            "must equal the requested root identity",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "status", content = "body", rename_all = "snake_case")]
+pub enum DiscoverRouteOutcome {
+    Found(DiscoveredRoute),
+    Failure(RpcFailure),
+}
 
 /// One response to one exact root-routed request.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

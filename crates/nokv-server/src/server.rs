@@ -13,15 +13,46 @@ use std::time::{Duration, Instant};
 
 use nokv_protocol::{
     decode_handshake_payload, decode_request, encode_handshake_frame, encode_response,
-    has_handshake_magic, ErrorCode, HandshakeKind, ProtocolError, RpcFailure, WorkspaceHandshake,
-    WorkspaceRpcOutcome, WorkspaceRpcResponse, HANDSHAKE_PAYLOAD_BYTES, MAX_FRAME_BYTES,
-    WORKSPACE_PROTOCOL_SCHEMA,
+    has_handshake_magic, DiscoverRouteOutcome, DiscoverRouteRequest, DiscoverRouteResponse,
+    DiscoveredRoute, ErrorCode, HandshakeKind, ProtocolError, RootIdentity, RpcFailure, RpcRequest,
+    RpcResponse, WorkspaceHandshake, WorkspaceRpcOutcome, WorkspaceRpcResponse,
+    HANDSHAKE_PAYLOAD_BYTES, MAX_FRAME_BYTES, WORKSPACE_PROTOCOL_SCHEMA,
 };
 
 use crate::legacy_rejection::{legacy_rejection_response, MAX_LEGACY_FIRST_FRAME_BYTES};
 use crate::{RootOwnerRegistry, ServerError, ShardOwner};
 
 static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Storage-neutral source consulted by a NoKV seed for one route lookup.
+pub trait RouteDiscoverySource: Send + Sync {
+    fn discover_route(&self, root_id: RootIdentity) -> Result<DiscoveredRoute, RpcFailure>;
+}
+
+impl<T> RouteDiscoverySource for Arc<T>
+where
+    T: RouteDiscoverySource + ?Sized,
+{
+    fn discover_route(&self, root_id: RootIdentity) -> Result<DiscoveredRoute, RpcFailure> {
+        (**self).discover_route(root_id)
+    }
+}
+
+#[derive(Default)]
+struct UnavailableRouteDiscovery;
+
+impl RouteDiscoverySource for UnavailableRouteDiscovery {
+    fn discover_route(&self, _root_id: RootIdentity) -> Result<DiscoveredRoute, RpcFailure> {
+        Err(RpcFailure {
+            code: ErrorCode::RouteUnavailable,
+            message: "route discovery is not configured on this seed".to_owned(),
+            retryable: true,
+            conflict: None,
+            current_generation: None,
+            route_hint: None,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServerOptions {
@@ -141,6 +172,7 @@ pub struct WorkspaceServer {
     registry: Arc<RootOwnerRegistry>,
     ownership: Vec<ShardOwner>,
     owner_loss: OwnerLossSignal,
+    discovery: Arc<dyn RouteDiscoverySource>,
 }
 
 impl WorkspaceServer {
@@ -157,7 +189,14 @@ impl WorkspaceServer {
             owner_loss: registry.owner_loss_signal(),
             registry,
             ownership,
+            discovery: Arc::new(UnavailableRouteDiscovery),
         })
+    }
+
+    /// Install the seed-visible route source for this server process.
+    pub fn with_discovery_source(mut self, source: Arc<dyn RouteDiscoverySource>) -> Self {
+        self.discovery = source;
+        self
     }
 
     pub fn health(&self) -> Result<ServerHealth, ServerError> {
@@ -213,6 +252,7 @@ impl WorkspaceServer {
             listener,
             self.options,
             Arc::clone(&self.registry),
+            Arc::clone(&self.discovery),
             self.owner_loss.clone(),
             shutdown,
             || self.renew_ownership(),
@@ -220,9 +260,19 @@ impl WorkspaceServer {
     }
 
     pub fn dispatch_frame(&self, encoded: &[u8]) -> Result<Vec<u8>, ServerError> {
-        let request = decode_request(encoded)?;
-        let response = self.registry.dispatch_guarded(request)?;
-        encode_response(response.response()).map_err(ServerError::Protocol)
+        match decode_request(encoded)? {
+            RpcRequest::DiscoverRoute(request) => {
+                encode_response(&discovery_response(self.discovery.as_ref(), request))
+                    .map_err(ServerError::Protocol)
+            }
+            RpcRequest::Workspace(request) => {
+                let response = self.registry.dispatch_guarded(*request)?;
+                encode_response(&RpcResponse::Workspace(Box::new(
+                    response.response().clone(),
+                )))
+                .map_err(ServerError::Protocol)
+            }
+        }
     }
 }
 
@@ -230,6 +280,7 @@ fn serve_socket_loop(
     listener: TcpListener,
     options: ServerOptions,
     registry: Arc<RootOwnerRegistry>,
+    discovery: Arc<dyn RouteDiscoverySource>,
     owner_loss: OwnerLossSignal,
     shutdown: &AtomicBool,
     mut renew_ownership: impl FnMut() -> Result<(), ServerError>,
@@ -268,11 +319,12 @@ fn serve_socket_loop(
                     .set_nonblocking(false)
                     .map_err(ServerError::Connection)?;
                 let registry = Arc::clone(&registry);
+                let discovery = Arc::clone(&discovery);
                 thread::Builder::new()
                     .name("nokv-workspace-rpc".to_owned())
                     .spawn(move || {
                         let _permit = permit;
-                        let _ = serve_connection(stream, registry, options);
+                        let _ = serve_connection(stream, registry, discovery, options);
                     })
                     .map_err(ServerError::Connection)?;
             }
@@ -392,6 +444,7 @@ fn release_ownership(ownership: Vec<ShardOwner>) -> Result<(), ServerError> {
 fn serve_connection(
     mut stream: TcpStream,
     registry: Arc<RootOwnerRegistry>,
+    discovery: Arc<dyn RouteDiscoverySource>,
     options: ServerOptions,
 ) -> Result<(), ServerError> {
     if !admit_current_protocol(&mut stream, options.handshake_timeout)? {
@@ -404,11 +457,18 @@ fn serve_connection(
         .set_write_timeout(Some(options.write_timeout))
         .map_err(ServerError::Connection)?;
     while let Some(request) = read_frame(&mut stream)? {
-        let request = decode_request(&request)?;
-        let response = registry.dispatch_guarded(request)?;
-        let encoded = encode_response_or_internal_failure(response.response())?;
-        write_frame(&mut stream, &encoded)?;
-        drop(response);
+        match decode_request(&request)? {
+            RpcRequest::DiscoverRoute(request) => {
+                let response = discovery_response(discovery.as_ref(), request);
+                write_frame(&mut stream, &encode_response(&response)?)?;
+            }
+            RpcRequest::Workspace(request) => {
+                let response = registry.dispatch_guarded(*request)?;
+                let encoded = encode_response_or_internal_failure(response.response())?;
+                write_frame(&mut stream, &encoded)?;
+                drop(response);
+            }
+        }
         if registry.owner_loss_signal().is_lost() {
             return Err(ServerError::InvalidBootstrap(
                 "control-plane owner was lost".to_owned(),
@@ -416,6 +476,55 @@ fn serve_connection(
         }
     }
     Ok(())
+}
+
+fn discovery_response(
+    source: &dyn RouteDiscoverySource,
+    request: DiscoverRouteRequest,
+) -> RpcResponse {
+    let outcome = match source.discover_route(request.root_id) {
+        Ok(route) => match route.validate() {
+            Ok(()) if route.root_id == request.root_id => DiscoverRouteOutcome::Found(route),
+            Ok(()) => DiscoverRouteOutcome::Failure(RpcFailure {
+                code: ErrorCode::RouteUnavailable,
+                message: "discovery source returned a route for another root".to_owned(),
+                retryable: true,
+                conflict: None,
+                current_generation: None,
+                route_hint: None,
+            }),
+            Err(error) => DiscoverRouteOutcome::Failure(RpcFailure {
+                code: ErrorCode::RouteUnavailable,
+                message: format!("discovery source returned an invalid route: {error}"),
+                retryable: true,
+                conflict: None,
+                current_generation: None,
+                route_hint: None,
+            }),
+        },
+        Err(failure)
+            if failure.validate().is_ok()
+                && failure.retryable
+                && matches!(
+                    failure.code,
+                    ErrorCode::RouteUnavailable | ErrorCode::RouteExpired
+                ) =>
+        {
+            DiscoverRouteOutcome::Failure(failure)
+        }
+        Err(_) => DiscoverRouteOutcome::Failure(RpcFailure {
+            code: ErrorCode::RouteUnavailable,
+            message: "discovery source returned an invalid failure".to_owned(),
+            retryable: true,
+            conflict: None,
+            current_generation: None,
+            route_hint: None,
+        }),
+    };
+    RpcResponse::DiscoverRoute(DiscoverRouteResponse {
+        root_id: request.root_id,
+        outcome,
+    })
 }
 
 /// Encodes one response frame. A success projection that fails wire
@@ -426,7 +535,7 @@ fn serve_connection(
 fn encode_response_or_internal_failure(
     response: &WorkspaceRpcResponse,
 ) -> Result<Vec<u8>, ServerError> {
-    match encode_response(response) {
+    match encode_response(&RpcResponse::Workspace(Box::new(response.clone()))) {
         Ok(encoded) => Ok(encoded),
         Err(ProtocolError::FrameTooLarge { bytes, max }) => {
             Err(ServerError::FrameTooLarge { bytes, max })
@@ -450,7 +559,7 @@ fn encode_response_or_internal_failure(
                     route_hint: None,
                 }),
             };
-            Ok(encode_response(&failure)?)
+            Ok(encode_response(&RpcResponse::Workspace(Box::new(failure)))?)
         }
     }
 }
@@ -630,16 +739,65 @@ mod tests {
     use std::sync::mpsc;
 
     use nokv_protocol::{
-        decode_handshake_frame, decode_response, encode_handshake_frame, encode_request,
-        CreateWorkspaceRequest, HandshakeKind, LogicalShardIdentity, ObjectNamespaceIdentity,
-        RequestIdentity, RootIdentity, RootRoute, RpcFailure, WorkbenchName, WorkspaceHandshake,
-        WorkspaceIdentity, WorkspaceRequest, WorkspaceResult, WorkspaceRpcOutcome,
-        WorkspaceRpcRequest, WorkspaceSummary, HANDSHAKE_FRAME_BYTES, HANDSHAKE_PAYLOAD_BYTES,
+        decode_handshake_frame, encode_handshake_frame, CreateWorkspaceRequest, HandshakeKind,
+        LogicalShardIdentity, ObjectNamespaceIdentity, RequestIdentity, RootIdentity, RootRoute,
+        RpcFailure, WorkbenchName, WorkspaceHandshake, WorkspaceIdentity, WorkspaceRequest,
+        WorkspaceResult, WorkspaceRpcOutcome, WorkspaceRpcRequest, WorkspaceSummary,
+        HANDSHAKE_FRAME_BYTES, HANDSHAKE_PAYLOAD_BYTES,
     };
     use serde::{Deserialize, Serialize};
 
     use super::*;
     use crate::{ExecutedRequest, WorkspaceRequestExecutor};
+
+    fn encode_request(request: &WorkspaceRpcRequest) -> Result<Vec<u8>, ProtocolError> {
+        nokv_protocol::encode_request(&RpcRequest::Workspace(Box::new(request.clone())))
+    }
+
+    fn encode_response(response: &WorkspaceRpcResponse) -> Result<Vec<u8>, ProtocolError> {
+        nokv_protocol::encode_response(&RpcResponse::Workspace(Box::new(response.clone())))
+    }
+
+    fn decode_response(encoded: &[u8]) -> Result<WorkspaceRpcResponse, ProtocolError> {
+        match nokv_protocol::decode_response(encoded)? {
+            RpcResponse::Workspace(response) => Ok(*response),
+            RpcResponse::DiscoverRoute(_) => Err(ProtocolError::Decode(
+                "expected a workspace response".to_owned(),
+            )),
+        }
+    }
+
+    fn serve_connection(
+        stream: TcpStream,
+        registry: Arc<RootOwnerRegistry>,
+        options: ServerOptions,
+    ) -> Result<(), ServerError> {
+        super::serve_connection(
+            stream,
+            registry,
+            Arc::new(UnavailableRouteDiscovery),
+            options,
+        )
+    }
+
+    fn serve_socket_loop(
+        listener: TcpListener,
+        options: ServerOptions,
+        registry: Arc<RootOwnerRegistry>,
+        owner_loss: OwnerLossSignal,
+        shutdown: &AtomicBool,
+        renew_ownership: impl FnMut() -> Result<(), ServerError>,
+    ) -> Result<(), ServerError> {
+        super::serve_socket_loop(
+            listener,
+            options,
+            registry,
+            Arc::new(UnavailableRouteDiscovery),
+            owner_loss,
+            shutdown,
+            renew_ownership,
+        )
+    }
 
     struct CountingExecutor {
         calls: AtomicUsize,
@@ -662,6 +820,27 @@ mod tests {
                 commit_version: Some(9),
                 replayed: false,
             })
+        }
+    }
+
+    struct FixedDiscovery {
+        route: DiscoveredRoute,
+    }
+
+    impl RouteDiscoverySource for FixedDiscovery {
+        fn discover_route(&self, root_id: RootIdentity) -> Result<DiscoveredRoute, RpcFailure> {
+            if self.route.root_id == root_id {
+                Ok(self.route.clone())
+            } else {
+                Err(RpcFailure {
+                    code: ErrorCode::RouteUnavailable,
+                    message: "root is not present on this seed".to_owned(),
+                    retryable: true,
+                    conflict: None,
+                    current_generation: None,
+                    route_hint: None,
+                })
+            }
         }
     }
 
@@ -695,6 +874,50 @@ mod tests {
                 workspace_incarnation_id: WorkspaceIdentity([5; 16]),
             }),
         }
+    }
+
+    #[test]
+    fn discovery_returns_a_complete_serving_route() {
+        let route = DiscoveredRoute::new(
+            route(),
+            13,
+            nokv_protocol::OwnerEndpoint::new("127.0.0.1:7750").unwrap(),
+            nokv_protocol::RouteState::Serving,
+        )
+        .unwrap();
+        let response = discovery_response(
+            &FixedDiscovery {
+                route: route.clone(),
+            },
+            DiscoverRouteRequest {
+                root_id: route.root_id,
+            },
+        );
+        let encoded = nokv_protocol::encode_response(&response).unwrap();
+        let decoded = nokv_protocol::decode_response(&encoded).unwrap();
+        assert_eq!(decoded, response);
+        let RpcResponse::DiscoverRoute(response) = decoded else {
+            panic!("discovery must return a discovery envelope");
+        };
+        assert_eq!(response.outcome, DiscoverRouteOutcome::Found(route));
+    }
+
+    #[test]
+    fn discovery_unavailable_is_typed_and_retryable() {
+        let response = discovery_response(
+            &UnavailableRouteDiscovery,
+            DiscoverRouteRequest {
+                root_id: route().root_id,
+            },
+        );
+        let RpcResponse::DiscoverRoute(response) = response else {
+            panic!("discovery must return a discovery envelope");
+        };
+        let DiscoverRouteOutcome::Failure(failure) = response.outcome else {
+            panic!("unconfigured discovery must fail");
+        };
+        assert_eq!(failure.code, ErrorCode::RouteUnavailable);
+        assert!(failure.retryable);
     }
 
     #[test]
@@ -825,13 +1048,16 @@ mod tests {
         let (registry, executor) = registry();
         let serving = thread::spawn(move || serve_connection(server, registry, options()));
 
-        let mut legacy = encode_request(&request()).unwrap();
-        let position = legacy
-            .windows(WORKSPACE_PROTOCOL_SCHEMA.len())
-            .position(|window| window == WORKSPACE_PROTOCOL_SCHEMA.as_bytes())
-            .unwrap();
-        legacy[position..position + WORKSPACE_PROTOCOL_SCHEMA.len()]
-            .copy_from_slice(crate::legacy_rejection::LEGACY_V3_SCHEMA.as_bytes());
+        #[derive(Serialize)]
+        struct LegacyFrame {
+            schema: &'static str,
+            payload: WorkspaceRpcRequest,
+        }
+        let legacy = rmp_serde::to_vec_named(&LegacyFrame {
+            schema: crate::legacy_rejection::LEGACY_V3_SCHEMA,
+            payload: request(),
+        })
+        .unwrap();
         write_frame(&mut client, &legacy).unwrap();
         let response = read_frame(&mut client).unwrap().unwrap();
         let response = decode_response(&response).unwrap();
@@ -902,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_hello_gets_v9_incompatible_and_zero_dispatch() {
+    fn v7_hello_gets_v10_incompatible_and_zero_dispatch() {
         let (mut client, server) = streams();
         let (registry, executor) = registry();
         let serving = thread::spawn(move || serve_connection(server, registry, options()));

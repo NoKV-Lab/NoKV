@@ -2947,8 +2947,9 @@ impl MetadataWorkspaceRequestExecutor {
         &self,
         request: &protocol::WorkspaceRpcRequest,
     ) -> Result<bool, protocol::RpcFailure> {
-        let encoded = protocol::encode_request(request)
-            .map_err(|error| invalid_argument(error.to_string()))?;
+        let encoded =
+            protocol::encode_request(&protocol::RpcRequest::Workspace(Box::new(request.clone())))
+                .map_err(|error| invalid_argument(error.to_string()))?;
         let mut hasher = Sha256::new();
         hasher.update(b"nokv.server.rpc-request.v1\0");
         hasher.update(&encoded);
@@ -10028,15 +10029,17 @@ mod tests {
             .fields
             .iter()
             .all(|field| !field.generic_custom && field.scalar_types.is_empty()));
-        protocol::encode_response(&protocol::WorkspaceRpcResponse {
-            route: route(1),
-            request_id: protocol::RequestIdentity([0x5b; types::FIXED_ID_BYTES]),
-            commit_version: None,
-            replayed: false,
-            outcome: protocol::WorkspaceRpcOutcome::Success(Box::new(
-                protocol::WorkspaceResult::Catalog(full_page),
-            )),
-        })
+        protocol::encode_response(&protocol::RpcResponse::Workspace(Box::new(
+            protocol::WorkspaceRpcResponse {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x5b; types::FIXED_ID_BYTES]),
+                commit_version: None,
+                replayed: false,
+                outcome: protocol::WorkspaceRpcOutcome::Success(Box::new(
+                    protocol::WorkspaceResult::Catalog(full_page),
+                )),
+            },
+        )))
         .expect("ArtifactV1 catalog with custom index fields must encode on the wire");
 
         executor

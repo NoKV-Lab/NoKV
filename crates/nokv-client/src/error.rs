@@ -55,6 +55,7 @@ pub enum ClientError {
     InvalidRoute(String),
     Transport(TransportError),
     Protocol(ProtocolError),
+    Discovery(RpcFailure),
     Rpc(RpcFailure),
     ResponseMismatch(String),
     MissingCapabilities(Vec<WorkspaceCapability>),
@@ -77,6 +78,7 @@ impl ClientError {
     pub fn retryable(&self) -> bool {
         match self {
             Self::Transport(error) => error.retryable(),
+            Self::Discovery(error) => error.retryable,
             Self::Rpc(error) => error.retryable,
             Self::Object(error) => error.retryable(),
             Self::ArtifactUpload(error) => error.retryable(),
@@ -98,6 +100,7 @@ impl ClientError {
 
     pub(crate) fn rpc_failure(&self) -> Option<&RpcFailure> {
         match self {
+            Self::Discovery(failure) => Some(failure),
             Self::Rpc(failure) => Some(failure),
             Self::ArtifactPublishFailed { source, .. } => source.rpc_failure(),
             Self::RetryExhausted { last_error, .. } => last_error.rpc_failure(),
@@ -135,6 +138,9 @@ impl fmt::Display for ClientError {
             Self::InvalidRoute(message) => write!(formatter, "invalid root route: {message}"),
             Self::Transport(error) => write!(formatter, "RPC transport failed: {error}"),
             Self::Protocol(error) => write!(formatter, "RPC protocol failed: {error}"),
+            Self::Discovery(error) => {
+                write!(formatter, "route discovery failed: {}", error.message)
+            }
             Self::Rpc(error) => write!(formatter, "workspace request failed: {}", error.message),
             Self::ResponseMismatch(message) => {
                 write!(formatter, "workspace response mismatch: {message}")
@@ -203,6 +209,7 @@ impl std::error::Error for ClientError {
             Self::RetryExhausted { last_error, .. } => Some(last_error.as_ref()),
             Self::InvalidOptions(_)
             | Self::InvalidRoute(_)
+            | Self::Discovery(_)
             | Self::Rpc(_)
             | Self::ResponseMismatch(_)
             | Self::MissingCapabilities(_)

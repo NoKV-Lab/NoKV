@@ -370,7 +370,7 @@ fn not_owner_response(
             retryable: true,
             conflict: Some(ConflictKind::RootPlacement),
             current_generation: None,
-            route_hint,
+            route_hint: None,
         }),
     }
 }
@@ -625,7 +625,7 @@ mod tests {
             panic!("stale preflight route must fail");
         };
         assert_eq!(failure.code, ErrorCode::NotOwner);
-        assert_eq!(failure.route_hint, Some(route(8)));
+        assert_eq!(failure.route_hint, None);
 
         let current = registry.dispatch(preflight_request(route(8))).unwrap();
         let WorkspaceRpcOutcome::Success(result) = current.outcome else {
@@ -646,7 +646,7 @@ mod tests {
             panic!("stale route must fail");
         };
         assert_eq!(failure.code, ErrorCode::NotOwner);
-        assert_eq!(failure.route_hint, Some(route(8)));
+        assert_eq!(failure.route_hint, None);
     }
 
     #[test]

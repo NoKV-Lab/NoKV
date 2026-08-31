@@ -159,22 +159,23 @@ continuations retain one exact root read version. Live continuations may move
 to a newer root read version only while the target workspace incarnation and
 revision remain unchanged; target drift fails closed, and an initial bounded
 collection may restart in full but never merges workspace revisions. This
-contract is gated by operation schema `nokv.workspace.rpc.v9`; v7 added the
+contract is gated by operation schema `nokv.workspace.rpc.v10`; v7 added the
 exact read-version fence used by path point reads, v8 added the required typed
 `Prefix`/`Exact` catalog path match so an artifact cannot inherit fields from
-same-name descendants, and v9 adds an explicit query profile plus tagged query
-rows and authoritative search, aggregate, and catalog totals/facets. V3 first
+same-name descendants, v9 added an explicit query profile plus tagged query
+rows and authoritative search, aggregate, and catalog totals/facets, and v10
+separates seed discovery from root-routed workspace requests. V3 first
 added the provider-neutral object namespace identity to every root route.
 
 Each TCP connection starts with the fixed-width, schema-neutral transport
 handshake v1. The client offers one exact operation schema, and the server
-accepts only `nokv.workspace.rpc.v9`; the handshake version remains stable when
+accepts only `nokv.workspace.rpc.v10`; the handshake version remains stable when
 the operation schema changes. For upgrade diagnostics, the server recognizes
 only operation-first envelopes from the public v2 client and the post-tag v3
 client. It parses a bounded route/request header, ignores the operation, emits
 one schema-readable failure, and closes without dispatch. The v2 client gets
-its exact v2 failure envelope; the v3 client gets a v9 failure envelope so its
-decoder reports the v9/v3 schema mismatch. Unknown legacy schemas, malformed
+its exact v2 failure envelope; the v3 client gets a v10 failure envelope so its
+decoder reports the v10/v3 schema mismatch. Unknown legacy schemas, malformed
 envelopes, and malformed handshakes fail closed. This is a read-only rejection
 path, not a legacy response decoder or operation fallback.
 

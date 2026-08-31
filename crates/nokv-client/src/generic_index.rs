@@ -452,14 +452,30 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use nokv_protocol::{
-        decode_request, encode_response, Digest, GenericIndexFieldValues, LogicalShardIdentity,
-        ObjectNamespaceIdentity, QueryOperator, RelativePath, RootIdentity, RootRoute, ScalarValue,
-        WorkbenchName, WorkspacePreflightResult, WorkspaceRpcOutcome, WorkspaceRpcRequest,
-        WorkspaceRpcResponse,
+        Digest, GenericIndexFieldValues, LogicalShardIdentity, ObjectNamespaceIdentity,
+        QueryOperator, RelativePath, RootIdentity, RootRoute, ScalarValue, WorkbenchName,
+        WorkspacePreflightResult, WorkspaceRpcOutcome, WorkspaceRpcRequest, WorkspaceRpcResponse,
     };
 
     use super::*;
     use crate::{ClientOptions, StaticRouteResolver, TransportError};
+
+    fn decode_request(encoded: &[u8]) -> Result<WorkspaceRpcRequest, nokv_protocol::ProtocolError> {
+        match nokv_protocol::decode_request(encoded)? {
+            nokv_protocol::RpcRequest::Workspace(request) => Ok(*request),
+            nokv_protocol::RpcRequest::DiscoverRoute(_) => Err(
+                nokv_protocol::ProtocolError::Decode("expected workspace request".to_owned()),
+            ),
+        }
+    }
+
+    fn encode_response(
+        response: &WorkspaceRpcResponse,
+    ) -> Result<Vec<u8>, nokv_protocol::ProtocolError> {
+        nokv_protocol::encode_response(&nokv_protocol::RpcResponse::Workspace(Box::new(
+            response.clone(),
+        )))
+    }
 
     #[derive(Debug)]
     struct GenericWorkflowTransport {

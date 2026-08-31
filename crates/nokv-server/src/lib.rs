@@ -51,5 +51,7 @@ pub use recovery_publisher::{
     RecoveryPublicationMode, RecoveryPublisher, RecoveryPublisherError, RecoveryPublishingExecutor,
 };
 pub use registry::RootOwnerRegistry;
-pub use server::{OwnerLossSignal, ServerHealth, ServerOptions, WorkspaceServer};
+pub use server::{
+    OwnerLossSignal, RouteDiscoverySource, ServerHealth, ServerOptions, WorkspaceServer,
+};
 pub use service::{ExecutedRequest, WorkspaceRequestExecutor};

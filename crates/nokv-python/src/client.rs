@@ -1445,7 +1445,7 @@ fn client_error(error: ClientError) -> PyErr {
 
 fn client_error_code(error: &ClientError) -> Option<nokv_protocol::ErrorCode> {
     match error {
-        ClientError::Rpc(failure) => Some(failure.code),
+        ClientError::Discovery(failure) | ClientError::Rpc(failure) => Some(failure.code),
         ClientError::ArtifactPublishFailed { source, .. }
         | ClientError::RetryExhausted {
             last_error: source, ..

@@ -4,6 +4,7 @@
  */
 
 use std::fmt;
+use std::net::SocketAddr;
 
 use nokv_types::{
     ArtifactRevisionId, CommitId, GenericIndexGenerationId, LogicalShardId, NormalizedRelativePath,
@@ -127,6 +128,141 @@ impl RootRoute {
         })?;
         OwnerEpoch::new(self.owner_epoch)
             .map_err(|error| ProtocolError::invalid("route.owner_epoch", error.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Discovery-visible state of one logical-shard route.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteState {
+    Unassigned,
+    Activating,
+    Serving,
+    FailClosed,
+}
+
+/// Canonical socket endpoint advertised by a serving owner.
+#[repr(transparent)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct OwnerEndpoint(String);
+
+impl OwnerEndpoint {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 512
+            || value.trim() != value
+            || value.chars().any(char::is_control)
+            || value.chars().any(char::is_whitespace)
+        {
+            return Err(ProtocolError::invalid(
+                "owner_endpoint",
+                "must be a canonical non-empty socket address",
+            ));
+        }
+        let endpoint = value.parse::<SocketAddr>().map_err(|error| {
+            ProtocolError::invalid(
+                "owner_endpoint",
+                format!("is not a socket address: {error}"),
+            )
+        })?;
+        if endpoint.port() == 0 || endpoint.to_string() != value {
+            return Err(ProtocolError::invalid(
+                "owner_endpoint",
+                "must be a canonical socket address with a nonzero port",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn socket_addr(&self) -> SocketAddr {
+        self.0
+            .parse()
+            .expect("validated owner endpoint remains a socket address")
+    }
+}
+
+impl<'de> Deserialize<'de> for OwnerEndpoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(de::Error::custom)
+    }
+}
+
+impl fmt::Display for OwnerEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Complete storage-neutral route returned by NoKV seed discovery.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveredRoute {
+    pub root_id: RootIdentity,
+    pub logical_shard_id: LogicalShardIdentity,
+    pub object_namespace_id: ObjectNamespaceIdentity,
+    pub placement_generation: u64,
+    pub owner_epoch: u64,
+    pub session_generation: u64,
+    pub owner_endpoint: OwnerEndpoint,
+    pub route_state: RouteState,
+}
+
+impl DiscoveredRoute {
+    pub fn new(
+        route: RootRoute,
+        session_generation: u64,
+        owner_endpoint: OwnerEndpoint,
+        route_state: RouteState,
+    ) -> Result<Self, ProtocolError> {
+        let discovered = Self {
+            root_id: route.root_id,
+            logical_shard_id: route.logical_shard_id,
+            object_namespace_id: route.object_namespace_id,
+            placement_generation: route.placement_generation,
+            owner_epoch: route.owner_epoch,
+            session_generation,
+            owner_endpoint,
+            route_state,
+        };
+        discovered.validate()?;
+        Ok(discovered)
+    }
+
+    pub const fn route(&self) -> RootRoute {
+        RootRoute {
+            root_id: self.root_id,
+            logical_shard_id: self.logical_shard_id,
+            object_namespace_id: self.object_namespace_id,
+            placement_generation: self.placement_generation,
+            owner_epoch: self.owner_epoch,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.route().validate()?;
+        if self.session_generation == 0 {
+            return Err(ProtocolError::invalid(
+                "discovered_route.session_generation",
+                "must be greater than zero",
+            ));
+        }
+        if self.route_state != RouteState::Serving {
+            return Err(ProtocolError::invalid(
+                "discovered_route.route_state",
+                "only a serving route is usable",
+            ));
+        }
         Ok(())
     }
 }

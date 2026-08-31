@@ -6,11 +6,11 @@
 use serde::{de::DeserializeOwned, de::IgnoredAny, Deserialize, Serialize};
 
 use crate::error::ProtocolError;
-use crate::request::WorkspaceRpcRequest;
-use crate::response::WorkspaceRpcResponse;
+use crate::request::RpcRequest;
+use crate::response::RpcResponse;
 
 /// The exact and only accepted wire schema.
-pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v9";
+pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v10";
 /// Exact schema for the versioned workspace RPC preflight exchange.
 pub const WORKSPACE_PREFLIGHT_SCHEMA: &str = "nokv.workspace.rpc_preflight.v1";
 /// Exact schema for the advertised workspace RPC capability set.
@@ -25,24 +25,24 @@ struct Frame<T> {
     payload: T,
 }
 
-pub fn encode_request(request: &WorkspaceRpcRequest) -> Result<Vec<u8>, ProtocolError> {
+pub fn encode_request(request: &RpcRequest) -> Result<Vec<u8>, ProtocolError> {
     request.validate()?;
     encode_payload(request)
 }
 
-pub fn decode_request(encoded: &[u8]) -> Result<WorkspaceRpcRequest, ProtocolError> {
-    let request: WorkspaceRpcRequest = decode_payload(encoded)?;
+pub fn decode_request(encoded: &[u8]) -> Result<RpcRequest, ProtocolError> {
+    let request: RpcRequest = decode_payload(encoded)?;
     request.validate()?;
     Ok(request)
 }
 
-pub fn encode_response(response: &WorkspaceRpcResponse) -> Result<Vec<u8>, ProtocolError> {
+pub fn encode_response(response: &RpcResponse) -> Result<Vec<u8>, ProtocolError> {
     response.validate()?;
     encode_payload(response)
 }
 
-pub fn decode_response(encoded: &[u8]) -> Result<WorkspaceRpcResponse, ProtocolError> {
-    let response: WorkspaceRpcResponse = decode_payload(encoded)?;
+pub fn decode_response(encoded: &[u8]) -> Result<RpcResponse, ProtocolError> {
+    let response: RpcResponse = decode_payload(encoded)?;
     response.validate()?;
     Ok(response)
 }
@@ -112,9 +112,47 @@ mod tests {
         SortField, WorkbenchName, WorkspaceCapability, WorkspaceContinuationFence,
         WorkspaceIdentity, WorkspacePath, WorkspacePreflightRequest, WorkspacePreflightResult,
         WorkspaceReadView, WorkspaceRequest, WorkspaceResult, WorkspaceRpcOutcome,
-        WorkspaceRpcResponse, WorkspaceSummary,
+        WorkspaceRpcRequest, WorkspaceRpcResponse, WorkspaceSummary,
     };
     use sha2::{Digest as _, Sha256};
+
+    fn encode_request(request: &WorkspaceRpcRequest) -> Result<Vec<u8>, ProtocolError> {
+        super::encode_request(&RpcRequest::Workspace(Box::new(request.clone())))
+    }
+
+    fn decode_request(encoded: &[u8]) -> Result<WorkspaceRpcRequest, ProtocolError> {
+        match super::decode_request(encoded)? {
+            RpcRequest::Workspace(request) => Ok(*request),
+            RpcRequest::DiscoverRoute(_) => Err(ProtocolError::invalid(
+                "rpc",
+                "expected a workspace request",
+            )),
+        }
+    }
+
+    fn encode_response(response: &WorkspaceRpcResponse) -> Result<Vec<u8>, ProtocolError> {
+        super::encode_response(&RpcResponse::Workspace(Box::new(response.clone())))
+    }
+
+    fn decode_response(encoded: &[u8]) -> Result<WorkspaceRpcResponse, ProtocolError> {
+        match super::decode_response(encoded)? {
+            RpcResponse::Workspace(response) => Ok(*response),
+            RpcResponse::DiscoverRoute(_) => Err(ProtocolError::invalid(
+                "rpc",
+                "expected a workspace response",
+            )),
+        }
+    }
+
+    fn encode_unvalidated_request(request: &WorkspaceRpcRequest) -> Result<Vec<u8>, ProtocolError> {
+        super::encode_payload(&RpcRequest::Workspace(Box::new(request.clone())))
+    }
+
+    fn encode_unvalidated_response(
+        response: &WorkspaceRpcResponse,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        super::encode_payload(&RpcResponse::Workspace(Box::new(response.clone())))
+    }
 
     fn route() -> RootRoute {
         RootRoute {
@@ -234,7 +272,7 @@ mod tests {
 
     #[test]
     fn request_round_trips_with_exact_schema() {
-        assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v9");
+        assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v10");
         let expected = request();
         let encoded = encode_request(&expected).unwrap();
         assert!(encoded
@@ -244,7 +282,50 @@ mod tests {
     }
 
     #[test]
-    fn get_path_read_version_fence_has_one_exact_v9_encoding() {
+    fn discovery_and_workspace_use_distinct_top_level_envelopes() {
+        let discovery = RpcRequest::DiscoverRoute(crate::DiscoverRouteRequest {
+            root_id: route().root_id,
+        });
+        let encoded = super::encode_request(&discovery).unwrap();
+        assert_eq!(super::decode_request(&encoded).unwrap(), discovery);
+
+        let discovered = crate::DiscoveredRoute::new(
+            route(),
+            13,
+            crate::OwnerEndpoint::new("127.0.0.1:7750").unwrap(),
+            crate::RouteState::Serving,
+        )
+        .unwrap();
+        let response = RpcResponse::DiscoverRoute(crate::DiscoverRouteResponse {
+            root_id: discovered.root_id,
+            outcome: crate::DiscoverRouteOutcome::Found(discovered),
+        });
+        let encoded = super::encode_response(&response).unwrap();
+        assert_eq!(super::decode_response(&encoded).unwrap(), response);
+    }
+
+    #[test]
+    fn discovery_rejects_nonserving_routes_and_zero_sessions() {
+        let mut discovered = crate::DiscoveredRoute {
+            root_id: route().root_id,
+            logical_shard_id: route().logical_shard_id,
+            object_namespace_id: route().object_namespace_id,
+            placement_generation: route().placement_generation,
+            owner_epoch: route().owner_epoch,
+            session_generation: 0,
+            owner_endpoint: crate::OwnerEndpoint::new("127.0.0.1:7750").unwrap(),
+            route_state: crate::RouteState::Serving,
+        };
+        assert!(discovered.validate().is_err());
+        discovered.session_generation = 1;
+        discovered.route_state = crate::RouteState::Activating;
+        assert!(discovered.validate().is_err());
+        assert!(crate::OwnerEndpoint::new("127.0.0.1:0").is_err());
+        assert!(crate::OwnerEndpoint::new("localhost:7750").is_err());
+    }
+
+    #[test]
+    fn get_path_read_version_fence_has_one_exact_v10_encoding() {
         let expected = WorkspaceRpcRequest {
             route: route(),
             request_id: RequestIdentity([0x41; 16]),
@@ -266,15 +347,15 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(&encoded)),
             [
-                152, 96, 133, 203, 129, 19, 138, 5, 38, 11, 167, 93, 209, 135, 43, 102, 106, 192,
-                203, 92, 203, 127, 210, 2, 97, 154, 198, 134, 15, 231, 117, 227,
+                246, 253, 30, 111, 243, 183, 7, 10, 201, 73, 139, 236, 187, 29, 123, 15, 24, 252,
+                147, 204, 11, 233, 103, 147, 139, 227, 2, 166, 239, 11, 95, 132,
             ],
-            "update only for an intentional GetPath v9 wire change"
+            "update only for an intentional GetPath v10 wire change"
         );
     }
 
     #[test]
-    fn artifact_v1_query_and_catalog_keep_one_exact_v9_encoding() {
+    fn artifact_v1_query_and_catalog_keep_one_exact_v10_encoding() {
         let search = WorkspaceRpcRequest {
             route: route(),
             request_id: RequestIdentity([0x3a; 16]),
@@ -392,10 +473,10 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(golden.finalize()),
             [
-                243, 187, 50, 41, 238, 93, 202, 53, 218, 51, 99, 43, 64, 54, 43, 228, 160, 117,
-                242, 236, 190, 145, 147, 61, 209, 66, 62, 59, 60, 147, 224, 126,
+                34, 20, 63, 219, 1, 231, 247, 108, 66, 46, 37, 71, 56, 101, 26, 144, 21, 199, 64,
+                67, 14, 118, 86, 137, 67, 140, 123, 246, 230, 132, 228, 64,
             ],
-            "update only for an intentional ArtifactV1 v9 wire change"
+            "update only for an intentional ArtifactV1 v10 wire change"
         );
         assert_eq!(decode_request(&encoded_search).unwrap(), search);
         assert_eq!(
@@ -409,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_exact_catalog_path_match_has_one_exact_v9_encoding() {
+    fn generic_exact_catalog_path_match_has_one_exact_v10_encoding() {
         let expected = WorkspaceRpcRequest {
             route: route(),
             request_id: RequestIdentity([0x42; 16]),
@@ -436,15 +517,15 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(&encoded)),
             [
-                22, 120, 49, 175, 132, 202, 191, 110, 171, 159, 138, 140, 243, 119, 170, 1, 197,
-                111, 140, 115, 97, 239, 209, 181, 137, 224, 15, 0, 208, 54, 47, 150,
+                77, 102, 45, 236, 123, 111, 26, 16, 81, 249, 215, 136, 95, 66, 99, 192, 134, 120,
+                69, 15, 51, 130, 237, 27, 59, 225, 222, 245, 196, 212, 109, 167,
             ],
-            "update only for an intentional Catalog Exact v9 wire change"
+            "update only for an intentional Catalog Exact v10 wire change"
         );
     }
 
     #[test]
-    fn generic_registration_surface_has_one_exact_v9_encoding() {
+    fn generic_registration_surface_has_one_exact_v10_encoding() {
         let begin = generic_begin_request();
         let append = generic_append_request();
         let finalize = WorkspaceRpcRequest {
@@ -554,10 +635,10 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(golden.finalize()),
             [
-                80, 250, 26, 67, 213, 86, 32, 15, 233, 192, 206, 142, 129, 138, 254, 229, 187, 230,
-                57, 139, 111, 100, 36, 160, 85, 219, 244, 164, 59, 206, 141, 68,
+                165, 5, 250, 152, 58, 248, 106, 79, 166, 247, 84, 90, 144, 29, 249, 142, 73, 227,
+                41, 163, 226, 133, 248, 169, 61, 159, 138, 196, 189, 3, 10, 4,
             ],
-            "update only for an intentional Generic registration v9 wire change"
+            "update only for an intentional Generic registration v10 wire change"
         );
         for request in [&begin, &append, &finalize, &abort, &get] {
             assert_eq!(
@@ -582,7 +663,7 @@ mod tests {
             unreachable!();
         };
         begin.capabilities.swap(0, 1);
-        let encoded = encode_payload(&unsorted_catalog).unwrap();
+        let encoded = encode_unvalidated_request(&unsorted_catalog).unwrap();
         assert!(matches!(
             decode_request(&encoded),
             Err(ProtocolError::InvalidField {
@@ -600,7 +681,7 @@ mod tests {
         begin.capabilities[0]
             .operators
             .insert(1, QueryOperator::Equal);
-        assert!(decode_request(&encode_payload(&duplicate_operator).unwrap()).is_err());
+        assert!(decode_request(&encode_unvalidated_request(&duplicate_operator).unwrap()).is_err());
 
         let mut unsupported_value = generic_append_request();
         let WorkspaceRequest::AppendGenericIndexRows(append) = &mut unsupported_value.operation
@@ -608,7 +689,7 @@ mod tests {
             unreachable!();
         };
         append.rows[0].values[0].values[0] = ScalarValue::Boolean(true);
-        assert!(decode_request(&encode_payload(&unsupported_value).unwrap()).is_err());
+        assert!(decode_request(&encode_unvalidated_request(&unsupported_value).unwrap()).is_err());
 
         let mut oversized_row = generic_append_request();
         let WorkspaceRequest::AppendGenericIndexRows(append) = &mut oversized_row.operation else {
@@ -618,7 +699,7 @@ mod tests {
             "x".repeat(crate::MAX_GENERIC_INDEX_ROW_BYTES),
         )];
         assert!(matches!(
-            decode_request(&encode_payload(&oversized_row).unwrap()),
+            decode_request(&encode_unvalidated_request(&oversized_row).unwrap()),
             Err(ProtocolError::InvalidField {
                 field: "generic_index.row",
                 ..
@@ -637,7 +718,7 @@ mod tests {
                 WorkspaceResult::GenericIndexRegistration(aba),
             )),
         };
-        assert!(decode_response(&encode_payload(&response).unwrap()).is_err());
+        assert!(decode_response(&encode_unvalidated_response(&response).unwrap()).is_err());
 
         let mut invalid_empty_closure =
             generic_registration_status(0x50, 0x51, GenericIndexRegistrationPhase::Appending);
@@ -652,7 +733,7 @@ mod tests {
             )),
         };
         assert!(matches!(
-            decode_response(&encode_payload(&response).unwrap()),
+            decode_response(&encode_unvalidated_response(&response).unwrap()),
             Err(ProtocolError::InvalidField {
                 field: "generic_index.row_digest",
                 ..
@@ -684,7 +765,7 @@ mod tests {
                 },
             ))),
         };
-        assert!(decode_response(&encode_payload(&response).unwrap()).is_err());
+        assert!(decode_response(&encode_unvalidated_response(&response).unwrap()).is_err());
     }
 
     #[test]
@@ -741,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_namespace_search_rows_round_trip_and_validate_under_v9() {
+    fn generic_namespace_search_rows_round_trip_and_validate_under_v10() {
         let response = WorkspaceRpcResponse {
             route: route(),
             request_id: RequestIdentity([0x43; 16]),
@@ -826,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_path_request_and_result_round_trip_under_v9() {
+    fn rename_path_request_and_result_round_trip_under_v10() {
         let source = WorkspacePath {
             workbench: WorkbenchName::new("run-42").unwrap(),
             path: RelativePath::new("outputs/a.bin").unwrap(),
@@ -934,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_v9_late_binding_and_source_manifest_read_round_trip() {
+    fn restore_v10_late_binding_and_source_manifest_read_round_trip() {
         let restore_identity = RestoreManifestIdentity {
             publication_operation_id: OperationIdentity([0x21; 16]),
             artifact_revision_id: ArtifactRevisionIdentity([0x22; 16]),
@@ -962,10 +1043,10 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(&encoded_prepare)),
             [
-                226, 134, 226, 39, 198, 246, 100, 40, 82, 81, 12, 226, 107, 121, 36, 218, 21, 88,
-                4, 251, 18, 245, 47, 185, 77, 61, 156, 189, 133, 10, 82, 238,
+                217, 135, 250, 74, 147, 11, 191, 151, 86, 139, 126, 68, 40, 249, 107, 179, 242, 18,
+                20, 236, 219, 214, 58, 148, 143, 54, 167, 189, 163, 222, 86, 67,
             ],
-            "update only for an intentional restore-v9 wire change"
+            "update only for an intentional restore-v10 wire change"
         );
 
         let bind = WorkspaceRpcRequest {
@@ -1077,7 +1158,7 @@ mod tests {
             source_manifest
         );
 
-        let mut complete_v9_golden = Sha256::new();
+        let mut complete_v10_golden = Sha256::new();
         for encoded in [
             encoded_prepare,
             encoded_bind,
@@ -1085,16 +1166,16 @@ mod tests {
             encoded_prepared,
             encoded_source_manifest,
         ] {
-            complete_v9_golden.update((encoded.len() as u64).to_be_bytes());
-            complete_v9_golden.update(encoded);
+            complete_v10_golden.update((encoded.len() as u64).to_be_bytes());
+            complete_v10_golden.update(encoded);
         }
         assert_eq!(
-            <[u8; 32]>::from(complete_v9_golden.finalize()),
+            <[u8; 32]>::from(complete_v10_golden.finalize()),
             [
-                192, 172, 119, 203, 234, 108, 69, 6, 60, 113, 123, 111, 217, 92, 150, 200, 118, 26,
-                191, 109, 229, 182, 216, 245, 50, 111, 123, 229, 72, 78, 20, 83,
+                117, 212, 171, 155, 122, 234, 7, 47, 63, 111, 69, 230, 234, 116, 106, 86, 224, 82,
+                125, 12, 240, 113, 15, 162, 170, 112, 120, 10, 40, 123, 124, 54,
             ],
-            "update only for an intentional restore-v9 wire change"
+            "update only for an intentional restore-v10 wire change"
         );
     }
 
@@ -1222,7 +1303,7 @@ mod tests {
             decode_request(&encoded),
             Err(ProtocolError::SchemaMismatch {
                 actual: "nokv.workspace.rpc.v8".to_owned(),
-                expected: "nokv.workspace.rpc.v9",
+                expected: "nokv.workspace.rpc.v10",
             })
         );
 
@@ -1275,7 +1356,7 @@ mod tests {
             decode_request(&actual_v4),
             Err(ProtocolError::SchemaMismatch {
                 actual: "nokv.workspace.rpc.v4".to_owned(),
-                expected: "nokv.workspace.rpc.v9",
+                expected: "nokv.workspace.rpc.v10",
             })
         );
 
@@ -1303,17 +1384,18 @@ mod tests {
             decode_response(&encoded),
             Err(ProtocolError::SchemaMismatch {
                 actual: "nokv.workspace.rpc.v4".to_owned(),
-                expected: "nokv.workspace.rpc.v9",
+                expected: "nokv.workspace.rpc.v10",
             })
         );
     }
 
     #[test]
-    fn v6_through_v8_are_rejected_before_zero_payload_dispatch() {
+    fn v6_through_v9_are_rejected_before_zero_payload_dispatch() {
         for schema in [
             "nokv.workspace.rpc.v6",
             "nokv.workspace.rpc.v7",
             "nokv.workspace.rpc.v8",
+            "nokv.workspace.rpc.v9",
         ] {
             let encoded = rmp_serde::to_vec_named(&Frame {
                 schema: schema.to_owned(),
@@ -1416,8 +1498,8 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(encode_request(&expected).unwrap())),
             [
-                31, 24, 197, 114, 99, 88, 106, 26, 248, 214, 147, 168, 109, 245, 95, 31, 88, 31,
-                166, 130, 127, 59, 54, 215, 115, 133, 136, 208, 224, 225, 195, 17,
+                222, 84, 135, 253, 77, 252, 32, 108, 186, 186, 73, 14, 245, 144, 24, 33, 15, 37,
+                194, 180, 96, 219, 141, 39, 103, 33, 240, 169, 19, 236, 2, 108,
             ],
             "update only for an intentional capability-v2 wire change"
         );
@@ -1444,7 +1526,7 @@ mod tests {
         v1.capability_schema = "nokv.workspace.rpc_capabilities.v1".to_owned();
         invalid.operation = WorkspaceRequest::Preflight(v1);
         assert!(matches!(
-            decode_request(&encode_payload(&invalid).unwrap()),
+            decode_request(&encode_unvalidated_request(&invalid).unwrap()),
             Err(ProtocolError::InvalidField {
                 field: "preflight.capability_schema",
                 ..
@@ -1462,7 +1544,7 @@ mod tests {
             outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::Preflight(v1_result))),
         };
         assert!(matches!(
-            decode_response(&encode_payload(&v1_response).unwrap()),
+            decode_response(&encode_unvalidated_response(&v1_response).unwrap()),
             Err(ProtocolError::InvalidField {
                 field: "preflight.capability_schema",
                 ..
