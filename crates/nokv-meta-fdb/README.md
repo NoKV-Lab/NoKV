@@ -3,11 +3,12 @@ Copyright 2024-2026 The NoKV Authors.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# NoKV FoundationDB Characterization Adapter
+# NoKV FoundationDB Metadata Adapter
 
 `nokv-meta-fdb` implements the storage-neutral `TxnStore` contract over
-FoundationDB. It is a non-default characterization adapter and is **NOT
-QUALIFIED** for NoKV serving. `nokv-server` does not select or import it.
+FoundationDB. It is selected only by the non-default, feature-gated FDB
+runtime in `nokv-server` and remains **NOT QUALIFIED** for NoKV serving until
+the live serving gates are retained as evidence.
 
 The adapter uses `nokv-fdb` for the explicit 7.3 API selection, shared network
 lifetime, database/transaction handles, physical store envelope, common

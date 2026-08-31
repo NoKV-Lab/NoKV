@@ -34,5 +34,5 @@ NOKV_TEST_FDB_CLUSTER_FILE=/absolute/fdb.cluster \
   --test fdb_control -- --ignored --nocapture
 ```
 
-This package does not wire FoundationDB into `nokv-server` and does not qualify
-FDB serving by itself.
+`nokv-server` composes this package only behind its non-default `fdb` feature.
+This package and its unit tests do not qualify FDB serving by themselves.

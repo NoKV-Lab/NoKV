@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Custom CLI, MCP adapter, and shard-owner process for NoKV Agent workspaces.
+// Custom CLI, MCP adapter, and shard-owner process for NoKV Agent workspaces.
 
 mod backend;
 mod build_info;
@@ -593,6 +593,9 @@ USAGE:
   nokv format --meta-url holt:///absolute/path
   nokv --root-id HEX32 --agent-id HEX32 provision --meta-url holt:///absolute/path
   nokv [owner options] serve --meta-url holt:///absolute/path
+  nokv-fdb format --meta-url 'fdb:///absolute/fdb.cluster?prefix=nokv-prod'
+  nokv-fdb --root-id HEX32 --agent-id HEX32 provision --meta-url 'fdb:///absolute/fdb.cluster?prefix=nokv-prod'
+  nokv-fdb [owner options] serve --meta-url 'fdb:///absolute/fdb.cluster?prefix=nokv-prod'
   nokv schema
   nokv version [--json]
   nokv --version
@@ -621,7 +624,9 @@ AGENT PRESENTATION:
 
 OWNER:
   --meta-url holt:///absolute/path selects one exclusive standalone Holt store
+  --meta-url fdb:///absolute/fdb.cluster?prefix=NAME selects shared FDB metadata in nokv-fdb
   format creates format 11 explicitly; provision and serve only reopen that exact store
+  FDB support is feature gated and remains NOT QUALIFIED until all live serving gates pass
   provision first binds RootId to an explicit AgentId, then creates namespace, shard, and affinity
   --adopt-legacy-agent-binding is a one-time explicit migration for a verified legacy root
   --adopt-legacy-object-namespace is a one-time explicit migration after verifying bucket/prefix
@@ -689,10 +694,30 @@ fn run_format(invocation: &Invocation) -> Result<(), String> {
                 "physical_encoding_version": outcome.manifest.physical_encoding_version(),
             }))
         }
-        nokv_server::MetadataUrl::FoundationDb(_) => Err(
-            "this binary has no FoundationDB runtime composition; use the feature-enabled nokv-fdb binary"
-                .to_owned(),
-        ),
+        nokv_server::MetadataUrl::FoundationDb(url) => {
+            #[cfg(feature = "fdb")]
+            {
+                let outcome = nokv_server::format_fdb(&url, build_info::VERSION)
+                    .map_err(|error| error.to_string())?;
+                print_json(&json!({
+                    "status": "success",
+                    "operation": "format",
+                    "provider": "foundationdb",
+                    "created": outcome.state == nokv_server::FdbFormatState::Created,
+                    "store_id": encode_lowercase_hex(outcome.manifest.store_id().as_bytes()),
+                    "workspace_format_version": outcome.manifest.workspace_format_version(),
+                    "physical_encoding_version": outcome.manifest.physical_encoding_version(),
+                }))
+            }
+            #[cfg(not(feature = "fdb"))]
+            {
+                let _ = url;
+                Err(
+                    "this binary has no FoundationDB runtime composition; use the feature-enabled nokv-fdb binary"
+                        .to_owned(),
+                )
+            }
+        }
     }
 }
 
@@ -758,10 +783,38 @@ fn run_metadata_provision(
                 "lifecycle": "ready",
             }))
         }
-        nokv_server::MetadataUrl::FoundationDb(_) => Err(
-            "this binary has no FoundationDB runtime composition; use the feature-enabled nokv-fdb binary"
-                .to_owned(),
-        ),
+        nokv_server::MetadataUrl::FoundationDb(url) => {
+            #[cfg(feature = "fdb")]
+            {
+                let outcome = nokv_server::provision_fdb(&url, root_id, agent_id)
+                    .map_err(|error| error.to_string())?;
+                let namespace_id = outcome.root.object_namespace_id();
+                let objects = CliObjectStore::build(&invocation.client.object)?;
+                objects.ensure_namespace(namespace_id)?;
+                let objects = objects.bind(namespace_id)?;
+                objects.validate_agent_capabilities()?;
+                print_json(&json!({
+                    "status": "success",
+                    "operation": "provision",
+                    "provider": "foundationdb",
+                    "preexisting": outcome.preexisting,
+                    "root_id": encode_lowercase_hex(outcome.root.root_id().as_bytes()),
+                    "agent_id": encode_lowercase_hex(outcome.root.agent_id().as_bytes()),
+                    "logical_shard_id": encode_lowercase_hex(outcome.shard.logical_shard_id().as_bytes()),
+                    "object_namespace_id": encode_lowercase_hex(namespace_id.as_bytes()),
+                    "placement_generation": outcome.root.placement_generation().get(),
+                    "lifecycle": "ready",
+                }))
+            }
+            #[cfg(not(feature = "fdb"))]
+            {
+                let _ = (url, agent_id);
+                Err(
+                    "this binary has no FoundationDB runtime composition; use the feature-enabled nokv-fdb binary"
+                        .to_owned(),
+                )
+            }
+        }
     }
 }
 
@@ -932,11 +985,216 @@ fn install_shutdown_signal() -> Result<Arc<std::sync::atomic::AtomicBool>, Strin
 fn run_server(invocation: &Invocation) -> Result<(), String> {
     match configured_metadata_url(invocation)? {
         Some(nokv_server::MetadataUrl::Holt(url)) => run_holt_server(invocation, &url),
-        Some(nokv_server::MetadataUrl::FoundationDb(_)) => Err(
-            "this binary has no FoundationDB runtime composition; use the feature-enabled nokv-fdb binary"
-                .to_owned(),
-        ),
+        Some(nokv_server::MetadataUrl::FoundationDb(url)) => {
+            #[cfg(feature = "fdb")]
+            {
+                run_fdb_server(invocation, &url)
+            }
+            #[cfg(not(feature = "fdb"))]
+            {
+                let _ = url;
+                Err(
+                    "this binary has no FoundationDB runtime composition; use the feature-enabled nokv-fdb binary"
+                        .to_owned(),
+                )
+            }
+        }
         None => run_etcd_server(invocation),
+    }
+}
+
+#[cfg(feature = "fdb")]
+fn release_fdb_runtime_after(
+    runtime: &nokv_server::FdbServingRuntime,
+    primary: impl Into<String>,
+) -> String {
+    let primary = primary.into();
+    match runtime.release_ownership() {
+        Ok(()) => primary,
+        Err(cleanup) => format!("{primary}; FoundationDB owner release failed: {cleanup}"),
+    }
+}
+
+#[cfg(feature = "fdb")]
+fn run_fdb_server(
+    invocation: &Invocation,
+    metadata: &nokv_server::FoundationDbMetadataUrl,
+) -> Result<(), String> {
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    use nokv_control::NodeId;
+    use nokv_server::{
+        ArtifactLifecycleDeleter, CommittedMetadataDurability, LifecycleObjectDeleter,
+        LifecycleRunner, LifecycleRunnerOptions, ServerOptions,
+    };
+
+    if invocation.server.lifecycle_interval_millis == 0
+        || invocation.server.lifecycle_interval_millis > 60_000
+    {
+        return Err("--lifecycle-interval-millis must be within 1..=60000".to_owned());
+    }
+    if invocation.server.handshake_timeout_millis == 0
+        || invocation.server.handshake_timeout_millis > 60_000
+    {
+        return Err("--handshake-timeout-millis must be within 1..=60000".to_owned());
+    }
+    if invocation.server.max_inflight_connections == 0
+        || invocation.server.max_inflight_connections > 4_096
+    {
+        return Err("--max-inflight-connections must be within 1..=4096".to_owned());
+    }
+    let node_id = NodeId::new(
+        invocation
+            .server
+            .node_id
+            .clone()
+            .ok_or_else(|| "FoundationDB serve requires --node-id".to_owned())?,
+    )
+    .map_err(|error| format!("invalid --node-id: {error:?}"))?;
+    let endpoint = invocation
+        .server
+        .advertise_endpoint
+        .as_deref()
+        .ok_or_else(|| "serve requires --advertise-endpoint".to_owned())?
+        .parse::<std::net::SocketAddr>()
+        .map_err(|error| format!("invalid --advertise-endpoint: {error}"))?;
+    let shutdown = install_shutdown_signal()?;
+    let runtime = nokv_server::serve_fdb(metadata, node_id, endpoint, shutdown.as_ref())
+        .map_err(|error| error.to_string())?;
+    let namespace = runtime
+        .roots()
+        .first()
+        .expect("serve_fdb requires at least one Ready root")
+        .route()
+        .object_namespace_id;
+    if runtime
+        .roots()
+        .iter()
+        .any(|root| root.route().object_namespace_id != namespace)
+    {
+        return Err(release_fdb_runtime_after(
+            &runtime,
+            "FoundationDB roots do not share one object namespace",
+        ));
+    }
+    let namespace_id = nokv_types::ObjectNamespaceId::from(namespace);
+    let objects = match CliObjectStore::build(&invocation.client.object)
+        .and_then(|objects| objects.bind(namespace_id))
+        .and_then(|objects| {
+            objects.validate_agent_capabilities()?;
+            Ok(objects)
+        }) {
+        Ok(objects) => Arc::new(objects),
+        Err(primary) => return Err(release_fdb_runtime_after(&runtime, primary)),
+    };
+    let listener = match TcpListener::bind(invocation.server.bind) {
+        Ok(listener) => listener,
+        Err(error) => {
+            return Err(release_fdb_runtime_after(
+                &runtime,
+                format!("cannot bind RPC listener: {error}"),
+            ));
+        }
+    };
+    if let Err(error) = listener.set_nonblocking(true) {
+        return Err(release_fdb_runtime_after(
+            &runtime,
+            format!("cannot prepare RPC listener: {error}"),
+        ));
+    }
+    let server = runtime
+        .workspace_server(ServerOptions {
+            bind: invocation.server.bind,
+            handshake_timeout: Duration::from_millis(invocation.server.handshake_timeout_millis),
+            read_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
+            lease_renew_interval: runtime.lease_renew_interval(),
+            max_inflight_connections: invocation.server.max_inflight_connections,
+        })
+        .map_err(|error| error.to_string())?;
+    let owner_loss = server.owner_loss_signal();
+    let lifecycle_objects: Arc<dyn LifecycleObjectDeleter> =
+        Arc::new(ArtifactLifecycleDeleter::new(objects));
+    let durability = Arc::new(CommittedMetadataDurability);
+    let mut lifecycles = Vec::with_capacity(runtime.roots().len());
+    for root in runtime.roots() {
+        match LifecycleRunner::new(
+            Arc::clone(root.meta()),
+            Arc::clone(runtime.registry()),
+            root.route(),
+            owner_loss.clone(),
+            Arc::clone(&lifecycle_objects),
+            durability.clone(),
+            LifecycleRunnerOptions {
+                poll_interval: Duration::from_millis(invocation.server.lifecycle_interval_millis),
+                ..LifecycleRunnerOptions::default()
+            },
+        ) {
+            Ok(lifecycle) => lifecycles.push(lifecycle),
+            Err(error) => {
+                let primary = error.to_string();
+                return Err(match server.release_ownership() {
+                    Ok(()) => primary,
+                    Err(cleanup) => {
+                        format!("{primary}; FoundationDB owner release failed: {cleanup}")
+                    }
+                });
+            }
+        }
+    }
+    let mut lifecycle_workers = Vec::with_capacity(lifecycles.len());
+    for (index, lifecycle) in lifecycles.into_iter().enumerate() {
+        let worker_owner_loss = owner_loss.clone();
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = std::thread::Builder::new()
+            .name(format!("nokv-fdb-lifecycle-{index}"))
+            .spawn(move || {
+                let result = lifecycle.run_until_owner_loss_or_shutdown(worker_shutdown.as_ref());
+                if result.is_err() {
+                    worker_owner_loss.fail_closed();
+                }
+                result
+            });
+        match worker {
+            Ok(worker) => lifecycle_workers.push(worker),
+            Err(error) => {
+                owner_loss.fail_closed();
+                let mut failures = vec![format!("cannot start lifecycle worker: {error}")];
+                join_lifecycle_workers(lifecycle_workers, &mut failures);
+                if let Err(error) = server.release_ownership() {
+                    failures.push(format!("FoundationDB owner release failed: {error}"));
+                }
+                return Err(failures.join("; "));
+            }
+        }
+    }
+    if let Err(error) = runtime.activate_routes() {
+        owner_loss.fail_closed();
+        let mut failures = vec![format!("cannot publish FoundationDB routes: {error}")];
+        join_lifecycle_workers(lifecycle_workers, &mut failures);
+        if let Err(error) = server.release_ownership() {
+            failures.push(format!("FoundationDB owner release failed: {error}"));
+        }
+        return Err(failures.join("; "));
+    }
+
+    let server_result = server.serve_until_shutdown(listener, shutdown.as_ref());
+    if server_result.is_err() {
+        owner_loss.fail_closed();
+    }
+    let mut failures = Vec::new();
+    join_lifecycle_workers(lifecycle_workers, &mut failures);
+    if let Err(error) = server.release_ownership() {
+        failures.push(format!("FoundationDB owner release failed: {error}"));
+    }
+    if let Err(error) = server_result {
+        failures.push(format!("RPC server stopped: {error}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }
 

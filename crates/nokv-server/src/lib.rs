@@ -12,6 +12,8 @@
 mod bootstrap;
 mod error;
 mod executor;
+#[cfg(feature = "fdb")]
+mod fdb_runtime;
 mod holt_runtime;
 mod legacy_rejection;
 mod lifecycle;
@@ -32,6 +34,11 @@ pub use executor::{
     RestoreInitializationBarrier, RestoreInitializationBarrierEvidence,
     RestoreInitializationBarrierPhase, RestoreManifestBindingEvidence,
     RestoreManifestPublicationEvidence,
+};
+#[cfg(feature = "fdb")]
+pub use fdb_runtime::{
+    format_fdb, provision_fdb, serve_fdb, FdbFormatOutcome, FdbFormatState, FdbProvisionOutcome,
+    FdbServedRoot, FdbServingRuntime,
 };
 pub use holt_runtime::{
     format_holt, provision_holt, serve_holt, HoltFormatOutcome, HoltFormatState,

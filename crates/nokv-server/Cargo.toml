@@ -12,11 +12,22 @@ homepage.workspace = true
 [features]
 default = []
 etcd = ["nokv-control/etcd"]
+fdb = [
+    "dep:nokv-control-fdb",
+    "dep:nokv-fdb",
+    "dep:nokv-meta-fdb",
+    "nokv-control-fdb/fdb",
+    "nokv-fdb/fdb",
+    "nokv-meta-fdb/fdb",
+]
 restore-crash-test-support = []
 
 [dependencies]
 nokv-control.workspace = true
+nokv-control-fdb = { workspace = true, optional = true }
+nokv-fdb = { workspace = true, optional = true }
 nokv-meta.workspace = true
+nokv-meta-fdb = { workspace = true, optional = true }
 nokv-meta-holt.workspace = true
 nokv-meta-store.workspace = true
 nokv-object.workspace = true

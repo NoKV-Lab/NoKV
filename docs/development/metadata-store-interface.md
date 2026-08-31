@@ -6,13 +6,13 @@ SPDX-License-Identifier: Apache-2.0
 # Metadata Store Interface
 
 Implemented: the storage-neutral interface, local Holt adapter, `MetaShard`
-cutover, a process-global FoundationDB runtime boundary, a non-default
-FoundationDB characterization adapter, and FoundationDB-backed manifest,
-catalog, route, session, and heartbeat control transactions, versioned seed
-discovery, and exact-session-fenced FoundationDB metadata transactions. The
-serving local profile still uses Holt through `TxnStore`; FoundationDB is **NOT
-QUALIFIED** and is not wired into `nokv-server`. Pending: serving composition
-and qualification, replicated Holt, and owner-safe lifecycle composition.
+cutover, a process-global FoundationDB runtime boundary, FoundationDB-backed
+manifest, catalog, route, session, heartbeat and exact-session-fenced metadata
+transactions, versioned seed discovery, and non-default FDB format, provision,
+and serving composition. The default binary exposes Holt but not FDB;
+FoundationDB is **NOT QUALIFIED** until the live serving gates pass. Pending:
+qualification, removal of the legacy etcd surfaces, replicated Holt, and
+retained failure/performance evidence.
 
 The [code contract](./code_contract.md), [architecture](../architecture.md),
 and [metadata schema](../metadata-schema.md) remain normative.
@@ -69,8 +69,8 @@ responsibilities:
 - `nokv-meta-fdb` maps the neutral requests to one explicit FoundationDB
   cluster file and binary metadata subspace through `nokv-fdb`. Every store
   handle is bound to one immutable stable-session key/value predicate and
-  expected owner/session generation. Its live tests are feature gated, and its
-  synchronous `TxnStore` bridge remains characterization-only.
+  expected owner/session generation. Its live tests and server composition are
+  feature gated; neither source wiring nor unit tests qualify serving.
 - `nokv-control` owns provider-neutral store-manifest, catalog, route, owner
   session, heartbeat, and transition types in addition to the legacy control
   contract retained until the etcd removal slice.
@@ -117,9 +117,9 @@ Implemented and reserved names are:
 | One logical metadata shard | `MetaShard` | Implemented |
 | Ordered transaction store interface | `TxnStore` | Implemented |
 | Embedded Holt implementation | `HoltStore` | Implemented |
-| FoundationDB implementation | `FdbStore` | Characterization only; `NOT QUALIFIED` |
+| FoundationDB implementation | `FdbStore` | Feature-gated serving candidate; `NOT QUALIFIED` |
 | Process-global FoundationDB runtime | `FdbRuntime` | Implemented; feature gated and non-restartable |
-| FoundationDB catalog and ownership control | `FdbControlStore` | Implemented; feature gated and not yet composed into serving |
+| FoundationDB catalog and ownership control | `FdbControlStore` | Implemented and feature-gated in FDB serving; `NOT QUALIFIED` |
 | Replicated Holt implementation | `HoltClusterStore` | Reserved |
 | Workspace metadata error | `MetaError` | Implemented |
 | Physical store error | `StoreError` | Implemented |
@@ -665,7 +665,7 @@ The initial profiles are:
 | Store | Transaction target | `Authority` | `AckBoundary` | `RecoveryMode` | Successor status |
 | --- | ---: | --- | --- | --- | --- |
 | `HoltStore` | hard limit | `Local` | `LocalSync` | `LocalJournal` | Same exclusive namespace restart qualified; replacement/cross-host failover refused |
-| `FdbStore` | 900,000 bytes | `Shared` | `SharedCommit` | `StoreAuthority` | Proposed, not qualified |
+| `FdbStore` | 900,000 bytes | `Shared` | `SharedCommit` | `StoreAuthority` | Feature-gated candidate; `NOT QUALIFIED` |
 | `HoltClusterStore` | not defined | `Replicated` | `QuorumCommit` | `StoreAuthority` | Proposed, not implemented |
 
 `RecoveryMode::LocalJournal` requires the command's local recovery receipt and

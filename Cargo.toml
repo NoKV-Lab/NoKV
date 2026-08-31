@@ -35,6 +35,7 @@ nokv-protocol = { path = "crates/nokv-protocol", version = "0.1.0" }
 nokv-meta-store = { path = "crates/nokv-meta-store", version = "0.1.0" }
 nokv-meta-holt = { path = "crates/nokv-meta-holt", version = "0.1.0" }
 nokv-fdb = { path = "crates/nokv-fdb", version = "0.1.0" }
+nokv-meta-fdb = { path = "crates/nokv-meta-fdb", version = "0.1.0" }
 nokv-meta = { path = "crates/nokv-meta", version = "0.1.0" }
 nokv-control = { path = "crates/nokv-control", version = "0.1.0" }
 nokv-control-fdb = { path = "crates/nokv-control-fdb", version = "0.1.0" }

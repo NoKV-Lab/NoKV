@@ -38,6 +38,14 @@ where
     }
 }
 
+/// Provider-specific ownership maintenance retained behind the server
+/// composition boundary. Implementations must stop registry admission before
+/// returning a renewal failure.
+pub(crate) trait OwnershipMaintenance: Send + Sync {
+    fn renew(&self) -> Result<(), ServerError>;
+    fn release(&self) -> Result<(), ServerError>;
+}
+
 #[derive(Default)]
 struct UnavailableRouteDiscovery;
 
@@ -171,6 +179,7 @@ pub struct WorkspaceServer {
     options: ServerOptions,
     registry: Arc<RootOwnerRegistry>,
     ownership: Vec<ShardOwner>,
+    maintenance: Option<Arc<dyn OwnershipMaintenance>>,
     owner_loss: OwnerLossSignal,
     discovery: Arc<dyn RouteDiscoverySource>,
 }
@@ -189,6 +198,7 @@ impl WorkspaceServer {
             owner_loss: registry.owner_loss_signal(),
             registry,
             ownership,
+            maintenance: None,
             discovery: Arc::new(UnavailableRouteDiscovery),
         })
     }
@@ -210,6 +220,41 @@ impl WorkspaceServer {
             owner_loss: registry.owner_loss_signal(),
             registry,
             ownership: Vec::new(),
+            maintenance: None,
+            discovery: Arc::new(UnavailableRouteDiscovery),
+        })
+    }
+
+    #[cfg(any(feature = "fdb", test))]
+    pub(crate) fn new_distributed(
+        options: ServerOptions,
+        registry: Arc<RootOwnerRegistry>,
+        maintenance: Arc<dyn OwnershipMaintenance>,
+    ) -> Result<Self, ServerError> {
+        let validation = (|| {
+            options.validate()?;
+            if registry.installed_root_count()? == 0 {
+                return Err(ServerError::InvalidOptions(
+                    "distributed serving requires at least one installed root route".to_owned(),
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(primary) = validation {
+            return match maintenance.release() {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(ServerError::BootstrapRollback {
+                    primary: primary.to_string(),
+                    rollback: cleanup.to_string(),
+                }),
+            };
+        }
+        Ok(Self {
+            options,
+            owner_loss: registry.owner_loss_signal(),
+            registry,
+            ownership: Vec::new(),
+            maintenance: Some(maintenance),
             discovery: Arc::new(UnavailableRouteDiscovery),
         })
     }
@@ -236,12 +281,31 @@ impl WorkspaceServer {
                 return Err(error);
             }
         }
+        if let Some(maintenance) = &self.maintenance {
+            if let Err(error) = maintenance.renew() {
+                self.owner_loss.mark_lost();
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
     /// Remove all routes and release every logical-shard lease once.
     pub fn release_ownership(self) -> Result<(), ServerError> {
-        release_ownership(self.ownership)
+        let maintenance = self
+            .maintenance
+            .as_ref()
+            .map(|maintenance| maintenance.release())
+            .transpose();
+        let legacy = release_ownership(self.ownership);
+        match (maintenance, legacy) {
+            (Ok(_), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(primary), Err(cleanup)) => Err(ServerError::BootstrapRollback {
+                primary: primary.to_string(),
+                rollback: cleanup.to_string(),
+            }),
+        }
     }
 
     pub fn owner_loss_signal(&self) -> OwnerLossSignal {
@@ -824,6 +888,31 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct CountingMaintenance {
+        renewals: AtomicUsize,
+        releases: AtomicUsize,
+        reject_renewal: AtomicBool,
+    }
+
+    impl OwnershipMaintenance for CountingMaintenance {
+        fn renew(&self) -> Result<(), ServerError> {
+            self.renewals.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.reject_renewal.load(AtomicOrdering::SeqCst) {
+                Err(ServerError::InvalidBootstrap(
+                    "test owner session was lost".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn release(&self) -> Result<(), ServerError> {
+            self.releases.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(())
+        }
+    }
+
     impl WorkspaceRequestExecutor for CountingExecutor {
         fn execute(&self, request: &WorkspaceRpcRequest) -> Result<ExecutedRequest, RpcFailure> {
             self.calls.fetch_add(1, AtomicOrdering::SeqCst);
@@ -1011,6 +1100,42 @@ mod tests {
         });
         registry.install(route(), executor.clone()).unwrap();
         (registry, executor)
+    }
+
+    #[test]
+    fn distributed_maintenance_renews_fails_closed_and_releases() {
+        let (registry, _) = registry();
+        let maintenance = Arc::new(CountingMaintenance::default());
+        let erased: Arc<dyn OwnershipMaintenance> = maintenance.clone();
+        let server = WorkspaceServer::new_distributed(options(), registry, erased).unwrap();
+
+        server.renew_ownership().unwrap();
+        assert_eq!(maintenance.renewals.load(AtomicOrdering::SeqCst), 1);
+        maintenance
+            .reject_renewal
+            .store(true, AtomicOrdering::SeqCst);
+        assert!(server.renew_ownership().is_err());
+        assert!(server.owner_loss_signal().is_lost());
+
+        server.release_ownership().unwrap();
+        assert_eq!(maintenance.releases.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rejected_distributed_server_releases_maintenance() {
+        let maintenance = Arc::new(CountingMaintenance::default());
+        let erased: Arc<dyn OwnershipMaintenance> = maintenance.clone();
+        let error = match WorkspaceServer::new_distributed(
+            options(),
+            Arc::new(RootOwnerRegistry::new()),
+            erased,
+        ) {
+            Ok(_) => panic!("empty distributed registry must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("at least one installed root"));
+        assert_eq!(maintenance.releases.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[test]

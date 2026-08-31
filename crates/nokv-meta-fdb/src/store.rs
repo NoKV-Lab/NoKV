@@ -20,7 +20,8 @@ use crate::{FdbMetadataSessionFence, FdbOptions};
 
 /// FoundationDB implementation of the storage-neutral metadata transaction contract.
 ///
-/// This characterization adapter is intentionally not wired into NoKV serving.
+/// It is selected only by the feature-gated FDB serving candidate; source
+/// wiring alone is not FoundationDB serving qualification.
 pub struct FdbStore {
     database: FdbDatabase,
     codec: KeyCodec,

@@ -3,12 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! FoundationDB characterization adapter for the NoKV metadata store contract.
+//! FoundationDB adapter for the NoKV metadata store contract.
 //!
 //! The default build exposes configuration and physical-envelope validation
 //! without importing or linking the FoundationDB client. Enable the `fdb`
-//! feature to construct an exact-session-fenced [`FdbStore`]. This adapter is
-//! not qualified for NoKV serving and is not wired into `nokv-server`.
+//! feature to construct an exact-session-fenced [`FdbStore`]. `nokv-server`
+//! selects it only in the non-default FDB runtime. That composition remains
+//! unqualified until the documented live serving gates pass.
 
 #[cfg(any(feature = "fdb", test))]
 mod affected_bytes;
