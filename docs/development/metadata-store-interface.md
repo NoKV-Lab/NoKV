@@ -231,7 +231,8 @@ candidate binary and FDB client/server versions:
    serving route; interruption after activation expires and hands off without
    accepting stale writes.
 7. **Seed discovery:** multiple seeds, one failed seed, stale hints, refresh,
-   and endpoint changes are exercised over the real wire protocol.
+   and endpoint changes are exercised over the real wire protocol according to
+   the [live seed-discovery qualification](./fdb-seed-discovery-qualification.md).
 8. **Lifecycle:** publication, restore, snapshot, commit retirement, and GC run
    through session-fenced FDB metadata with ambiguous deletes quarantined.
 9. **Limits:** the 900,000-byte logical plan stays below the measured FDB
