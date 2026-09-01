@@ -374,10 +374,17 @@ pub fn run(options: QualificationOptions) -> Result<PathBuf, String> {
         state.lost_delete = proxy_result.as_ref().ok().cloned();
     }
     let after = capture_health(&evidence, &health, "after");
-    let final_error = execution
-        .err()
-        .or_else(|| proxy_result.err())
-        .or_else(|| after.err());
+    let mut errors = Vec::new();
+    if let Err(error) = execution {
+        errors.push(error);
+    }
+    if let Err(error) = proxy_result {
+        errors.push(error);
+    }
+    if let Err(error) = after {
+        errors.push(error);
+    }
+    let final_error = (!errors.is_empty()).then(|| errors.join("; "));
     let status = if final_error.is_none() {
         "PASS"
     } else {

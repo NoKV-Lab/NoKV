@@ -16,7 +16,10 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
-const MAX_BUFFERED_BODY_BYTES: usize = 2 * 1024 * 1024;
+// Provider admission uploads one full default artifact block (4 MiB). Keep
+// the qualification proxy bounded, but large enough to be transparent to
+// that mandatory preflight and to one in-flight normal block.
+const MAX_BUFFERED_BODY_BYTES: usize = 8 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Serialize)]
@@ -455,6 +458,11 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_buffer_covers_the_provider_admission_block() {
+        assert!(MAX_BUFFERED_BODY_BYTES >= 4 * 1024 * 1024);
+    }
 
     #[test]
     fn delete_event_contains_digests_not_authorization_bytes() {
