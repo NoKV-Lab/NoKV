@@ -289,6 +289,7 @@ struct FdbOwnership {
     control: Arc<FdbControlStore>,
     registry: Arc<RootOwnerRegistry>,
     sessions: Vec<OwnerSession>,
+    lease_renew_interval: Duration,
     activated: AtomicBool,
     failed: AtomicBool,
     release_gate: Mutex<()>,
@@ -321,7 +322,11 @@ impl FdbOwnership {
 
     fn fail_closed_after(&self, primary: ServerError) -> ServerError {
         self.failed.store(true, Ordering::Release);
-        match self.fail_closed_all() {
+        let control_cause = match &primary {
+            ServerError::Control(error) => Some(error),
+            _ => None,
+        };
+        match self.fail_closed_all(control_cause) {
             Ok(()) => primary,
             Err(cleanup) => ServerError::BootstrapRollback {
                 primary: primary.to_string(),
@@ -330,13 +335,17 @@ impl FdbOwnership {
         }
     }
 
-    fn fail_closed_all(&self) -> Result<(), ServerError> {
+    fn fail_closed_all(&self, control_cause: Option<&ControlError>) -> Result<(), ServerError> {
         let mut failures = Vec::new();
         for session in &self.sessions {
-            if let Err(error) = self
-                .registry
-                .fail_closed_shard(LogicalShardIdentity::from(session.logical_shard_id()))
-            {
+            let shard = LogicalShardIdentity::from(session.logical_shard_id());
+            let result = match control_cause {
+                Some(cause) => self
+                    .registry
+                    .fail_closed_shard_with_control(shard, cause.clone()),
+                None => self.registry.fail_closed_shard(shard),
+            };
+            if let Err(error) = result {
                 failures.push(format!(
                     "remove shard {:?} routes: {error}",
                     session.logical_shard_id()
@@ -356,6 +365,10 @@ impl FdbOwnership {
 }
 
 impl OwnershipMaintenance for FdbOwnership {
+    fn required_renew_interval(&self) -> Option<Duration> {
+        Some(self.lease_renew_interval)
+    }
+
     fn renew(&self) -> Result<(), ServerError> {
         if self.released.load(Ordering::Acquire) {
             return Err(ServerError::InvalidBootstrap(
@@ -627,6 +640,7 @@ pub fn serve_fdb(
         control: Arc::clone(&control),
         registry: Arc::clone(&registry),
         sessions,
+        lease_renew_interval,
         activated: AtomicBool::new(false),
         failed: AtomicBool::new(false),
         release_gate: Mutex::new(()),

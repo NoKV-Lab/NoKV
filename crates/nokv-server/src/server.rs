@@ -6,7 +6,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,11 @@ where
 /// composition boundary. Implementations must stop registry admission before
 /// returning a renewal failure.
 pub(crate) trait OwnershipMaintenance: Send + Sync {
+    #[cfg(any(feature = "fdb", test))]
+    fn required_renew_interval(&self) -> Option<Duration> {
+        None
+    }
+
     fn renew(&self) -> Result<(), ServerError>;
     fn release(&self) -> Result<(), ServerError>;
 }
@@ -143,28 +148,55 @@ impl Drop for ConnectionPermit {
     }
 }
 
-/// Shared fail-closed owner-loss signal for the RPC runtime and future
-/// owner-fenced background workers.
+/// Shared fail-closed owner-loss state for RPC and background workers.
+#[derive(Default)]
+struct OwnerLossState {
+    lost: AtomicBool,
+    control_error: Mutex<Option<nokv_control::ControlError>>,
+}
+
+/// Shared fail-closed owner-loss signal for the RPC runtime and owner-fenced
+/// background workers.
 #[derive(Clone, Default)]
-pub struct OwnerLossSignal(Arc<AtomicBool>);
+pub struct OwnerLossSignal(Arc<OwnerLossState>);
 
 impl OwnerLossSignal {
     pub fn is_lost(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.lost.load(Ordering::Acquire)
     }
 
-    /// Fail the complete owner scope closed.
-    ///
-    /// The process supervisor uses this when any owner-fenced companion worker
-    /// encounters a terminal invariant failure. The RPC accept loop observes
-    /// the same signal, stops admitting requests, and returns an error instead
-    /// of continuing without lifecycle recovery.
+    pub(crate) fn control_error(&self) -> Option<nokv_control::ControlError> {
+        self.0
+            .control_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Fail the complete owner scope closed without a control-plane cause.
     pub fn fail_closed(&self) {
         self.mark_lost();
     }
 
+    /// Record the typed control-plane cause before publishing owner loss.
+    pub(crate) fn fail_closed_with_control(&self, error: nokv_control::ControlError) {
+        {
+            let mut current = self
+                .0
+                .control_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            if current.is_none() {
+                *current = Some(error);
+            }
+        }
+
+        self.mark_lost();
+    }
+
     fn mark_lost(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.lost.store(true, Ordering::Release);
     }
 }
 
@@ -189,17 +221,20 @@ impl WorkspaceServer {
         options: ServerOptions,
         registry: Arc<RootOwnerRegistry>,
     ) -> Result<Self, ServerError> {
+        let owner_loss = registry.owner_loss_signal();
+        require_owner_retained(&owner_loss)?;
         options.validate()?;
         if registry.installed_root_count()? == 0 {
             return Err(ServerError::InvalidOptions(
                 "standalone serving requires at least one installed root route".to_owned(),
             ));
         }
+
         Ok(Self {
             options,
-            owner_loss: registry.owner_loss_signal(),
             registry,
             maintenance: None,
+            owner_loss,
             discovery: Arc::new(UnavailableRouteDiscovery),
         })
     }
@@ -210,27 +245,36 @@ impl WorkspaceServer {
         registry: Arc<RootOwnerRegistry>,
         maintenance: Arc<dyn OwnershipMaintenance>,
     ) -> Result<Self, ServerError> {
+        let owner_loss = registry.owner_loss_signal();
         let validation = (|| {
+            require_owner_retained(&owner_loss)?;
             options.validate()?;
             if registry.installed_root_count()? == 0 {
                 return Err(ServerError::InvalidOptions(
                     "distributed serving requires at least one installed root route".to_owned(),
                 ));
             }
+            if let Some(required) = maintenance.required_renew_interval() {
+                if required.is_zero() {
+                    return Err(ServerError::InvalidOptions(
+                        "distributed ownership declares a zero lease renewal interval".to_owned(),
+                    ));
+                }
+                if options.lease_renew_interval != required {
+                    return Err(ServerError::InvalidOptions(format!(
+                        "distributed ownership requires lease renewal interval {required:?}, but ServerOptions configures {:?}",
+                        options.lease_renew_interval,
+                    )));
+                }
+            }
             Ok(())
         })();
         if let Err(primary) = validation {
-            return match maintenance.release() {
-                Ok(()) => Err(primary),
-                Err(cleanup) => Err(ServerError::BootstrapRollback {
-                    primary: primary.to_string(),
-                    rollback: cleanup.to_string(),
-                }),
-            };
+            return Err(release_rejected_maintenance(maintenance.as_ref(), primary));
         }
         Ok(Self {
             options,
-            owner_loss: registry.owner_loss_signal(),
+            owner_loss,
             registry,
             maintenance: Some(maintenance),
             discovery: Arc::new(UnavailableRouteDiscovery),
@@ -255,10 +299,16 @@ impl WorkspaceServer {
     pub fn renew_ownership(&self) -> Result<(), ServerError> {
         if let Some(maintenance) = &self.maintenance {
             if let Err(error) = maintenance.renew() {
-                self.owner_loss.mark_lost();
+                match &error {
+                    ServerError::Control(control) => {
+                        self.owner_loss.fail_closed_with_control(control.clone());
+                    }
+                    _ => self.owner_loss.mark_lost(),
+                }
                 return Err(error);
             }
         }
+
         Ok(())
     }
 
@@ -396,6 +446,10 @@ fn serve_socket_loop(
 }
 
 fn require_owner_retained(owner_loss: &OwnerLossSignal) -> Result<(), ServerError> {
+    if let Some(error) = owner_loss.control_error() {
+        return Err(ServerError::Control(error));
+    }
+
     if owner_loss.is_lost() {
         Err(ServerError::InvalidBootstrap(
             "control-plane owner was lost".to_owned(),
@@ -408,6 +462,23 @@ fn require_owner_retained(owner_loss: &OwnerLossSignal) -> Result<(), ServerErro
 fn sleep_until_runtime_event(next_renewal: Instant) {
     let until_renewal = next_renewal.saturating_duration_since(Instant::now());
     thread::sleep(until_renewal.min(Duration::from_millis(10)));
+}
+
+#[cfg(any(feature = "fdb", test))]
+fn release_rejected_maintenance(
+    maintenance: &dyn OwnershipMaintenance,
+    primary: ServerError,
+) -> ServerError {
+    let preserve_control = matches!(&primary, ServerError::Control(_));
+
+    match maintenance.release() {
+        Ok(()) => primary,
+        Err(_) if preserve_control => primary,
+        Err(cleanup) => ServerError::BootstrapRollback {
+            primary: primary.to_string(),
+            rollback: cleanup.to_string(),
+        },
+    }
 }
 
 fn serve_connection(
@@ -438,11 +509,7 @@ fn serve_connection(
                 drop(response);
             }
         }
-        if registry.owner_loss_signal().is_lost() {
-            return Err(ServerError::InvalidBootstrap(
-                "control-plane owner was lost".to_owned(),
-            ));
-        }
+        require_owner_retained(&registry.owner_loss_signal())?;
     }
     Ok(())
 }
