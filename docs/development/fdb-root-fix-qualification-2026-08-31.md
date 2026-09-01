@@ -7,11 +7,11 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Result
 
-The distributed-metadata root fixes and FDB serving Gates 1 through 9 pass
-their scoped acceptance checks. The FoundationDB serving mode remains
-**NOT QUALIFIED** because the complete live matrix in
-[Metadata Store Interface](./metadata-store-interface.md) has not reached ten
-of ten gates.
+The distributed-metadata root fixes and all ten FDB serving gates pass their
+scoped acceptance checks. The FoundationDB serving mode is **QUALIFIED** for
+the recorded FDB 7.3.79, three-process `double`-redundancy topology and pinned
+RustFS service. The performance result is a qualification of that exact
+workload and environment, not a universal product SLO.
 
 This distinction is intentional:
 
@@ -30,17 +30,21 @@ This distinction is intentional:
   matrix passed on the merged lease-safe candidate.
 - **Gate 8 lifecycle qualification: PASS.** Public publication, replacement,
   snapshot renewal and retirement, restore, revision GC, ambiguous-delete
-  quarantine, and zero-consumer commit retirement passed against real FDB and
-  RustFS under one serving session.
+  quarantine, zero-consumer commit retirement, and the resulting zero-row
+  revision GC passed against real FDB and RustFS under one serving session.
 - **Gate 9 limits qualification: PASS.** Real `FdbStore` transactions retained
   logical, conservative, and FDB-observed physical byte measurements through
   2,800,000 logical bytes. A 3,200,000-byte object round-tripped through the
   exact candidate while a full-prefix scan found no payload marker in FDB.
-- **FDB serving qualification: NOT QUALIFIED.** Commit-unknown injection,
-  exact reconciliation, session fencing, takeover, provisioning recovery,
-  serve-crash recovery, seed failover, and the complete lifecycle matrix have
-  passed. Controlled performance evidence remains incomplete. Gates 8 and 9
-  must also be rerun with Gate 10 on the final accepted source revision.
+- **Gate 10 performance qualification: PASS.** One persistent seed-discovered
+  client retained separate uncontended and pinned-generation contention
+  profiles with p50/p95/p99/max latency, throughput, retries, conflicts,
+  failures, topology, transaction-size reference, and available CPU controls.
+- **FDB serving qualification: PASS.** Commit-unknown reconciliation, session
+  fencing, takeover, provisioning and serve-crash recovery, seed failover,
+  lifecycle safety, measured limits, object separation, and controlled
+  performance have all passed. Gates 8 through 10 use one exact release
+  candidate from source `11994bdca9a235aac70c5a68dc2a41ec856493f9`.
 
 The normative runtime and package boundaries are the
 [metadata-store interface](./metadata-store-interface.md),
@@ -50,13 +54,12 @@ recoverable prepare/admit/finalize provisioning, immutable secondary-index
 stage replay, Ready-shard preservation, and retry of settled transient metadata
 reads. It does not expand the serving qualification boundary below.
 
-## Candidate And Topology
+## Final Candidate And Topology
 
 | Role | Exact candidate |
 | --- | --- |
-| Source | `6399006adae8ce54c0c4e06e44f222d85a2681fa` |
-| `nokv-fdb` SHA-256 | `f6ee02906a0ac5985ac501da402cd90d06bd8137e31b15356be4cf0093f83d91` |
-| `nokv` SHA-256 | `e139dcb21827d102211f322f7435e49718e21ab156c61e299b0021b319fc2eb2` |
+| Source | `11994bdca9a235aac70c5a68dc2a41ec856493f9` |
+| Release `nokv-fdb` SHA-256 | `983e096c663341ba891c73115490fc22c1505401baff245d24b5f2a5490c2e46` |
 | Rust | `rustc 1.97.1 (8bab26f4f 2026-07-14)` |
 | FDB server | `7.3.79`, protocol `fdb00b073000000` |
 | `libfdb_c.so` SHA-256 | `f677f883c30869e8d00dbc15ef8a38228070a723a600d7219f5a1b10c0d3d7d0` |
@@ -64,18 +67,21 @@ reads. It does not expand the serving qualification boundary below.
 | RustFS image | `sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab` |
 
 The live FDB topology was three storage processes, three coordinators, three
-logs, and `double` redundancy on Docker network `172.28.79.0/24`. Two NoKV
-servers advertised `172.28.79.31:7750` and `172.28.79.32:7750`. RustFS provided
-the durable object namespace. The retained bundle is:
+logs, and `double` redundancy on Docker network `172.28.79.0/24`. Final Gates
+8 through 10 ran the same release candidate from the builder at distinct owner
+ports. RustFS provided the durable object namespace. The retained bundles are:
+
+```text
+/target/fdb-lifecycle-gate8-11994bdc-release-run1/
+/target/fdb-limits-gate9-11994bdc-release-run1/
+/target/fdb-performance-gate10-11994bdc-release-run1/
+```
+
+The earlier root-fix, fresh-format, and deliberately failed object-admission
+evidence remains retained separately as historical acceptance evidence:
 
 ```text
 target/qualification/fdb-root-fix-6399006a-20260831T151806Z/
-```
-
-The earlier fresh-format and deliberately failed object-admission evidence is
-retained separately because it predates only the lifecycle retry change:
-
-```text
 target/qualification/fdb-root-fix-288a6c80-20260831T145502Z/
 ```
 
@@ -212,33 +218,32 @@ hashes, and the atomic terminal result.
 | Final mutation/read | PASS | The persistent client created and read back one workspace through B. |
 
 The qualification client used only the NoKV seed and workspace TCP protocol;
-only the candidate server processes connected to FDB. This result closes Gate
-7 only; the following sections record the independent Gate 8 and Gate 9
-results. The overall FDB serving profile remains **NOT QUALIFIED**.
+only the candidate server processes connected to FDB. The following sections
+record the independent final Gate 8 through 10 results.
 
 ## Gate 8 Lifecycle Qualification
 
 Gate 8 is **PASS**. The environment-gated workload described by
 [FDB Remaining Qualification Design](./fdb-remaining-qualification-design.md)
-ran one exact `nokv-fdb` candidate against the real three-node FDB 7.3.79
+ran one exact release `nokv-fdb` candidate against the real three-node FDB 7.3.79
 cluster and pinned RustFS service. Its external proxy forwarded the selected
 S3 `DELETE`, retained the successful upstream response digest, forwarded zero
 response bytes, and closed the candidate connection. No qualification-only
 fault surface entered a production crate. The retained bundle is:
 
 ```text
-/target/fdb-lifecycle-gate8-905e1193-run1/
+/target/fdb-lifecycle-gate8-11994bdc-release-run1/
 ```
 
 | Evidence identity | Exact value |
 | --- | --- |
-| Source | `905e1193a9a794a4446cb5c015a39187f2a90fee` |
-| `nokv-fdb` SHA-256 | `11a2cc5c2152e9a90d5e0edc8fe3eaa4b478a1ec91ec4ef02f90afcacac76af0` |
-| Qualification binary SHA-256 | `1807959858f8b5799502dcf4244c1722171492c73a16910ce117141b8f68f27c` |
+| Source | `11994bdca9a235aac70c5a68dc2a41ec856493f9` |
+| Release `nokv-fdb` SHA-256 | `983e096c663341ba891c73115490fc22c1505401baff245d24b5f2a5490c2e46` |
+| Qualification binary SHA-256 | `8405b0d214a7ec705bfb01fd8880916d212a6f4b64fbac05792b7c9c940be199` |
 | `libfdb_c.so` SHA-256 | `f677f883c30869e8d00dbc15ef8a38228070a723a600d7219f5a1b10c0d3d7d0` |
 | RustFS image | `rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab` |
-| Terminal result SHA-256 | `0e1591f45e61376555cdeb28bb93e2daf445db0cf758090b60357448b892fa22` |
-| Environment SHA-256 | `e2d50c3d251416289591c0bd15f64d869d54e07d9ef79ddacac08195159802b9` |
+| Terminal result SHA-256 | `f0fc0985699a06a0c150f07da7827dfecf53513cf2329523289fd285a357ef7a` |
+| Environment SHA-256 | `cf352d1d1f3df55b0707aa8ea5912380dc5194c10ecff802ec6c28949772ce67` |
 
 The atomic terminal result contains five passing scenarios and 81 retained
 files. Public CLI operations created and replaced an artifact, minted and
@@ -247,13 +252,11 @@ Exact-generation removal completed normal RustFS deletion. In the ambiguous
 case RustFS returned `204`, the proxy retained hashes for all 144 response
 bytes while forwarding zero, and FDB retained the required quarantine state.
 Finally, the exact candidate discovered and retired a codec-valid seeded
-zero-consumer commit. All transitions remained fenced by one exact serving
-owner session. Before/after FDB and RustFS health checks passed, and a scan of
-the complete evidence bundle found no access or secret key bytes.
-
-This result closes Gate 8 only. Gate 10 must still retain controlled
-client-visible latency and throughput evidence, after which Gates 8 and 9 must
-be rerun on that same final accepted source revision.
+zero-consumer commit, then completed the resulting zero-row revision GC with
+the revision `Deleted` and its candidate `Complete`. All transitions remained
+fenced by one exact serving owner session. Before/after FDB and RustFS health
+checks passed, and a scan of the complete evidence bundle found no access or
+secret key bytes.
 
 ## Gate 9 Limits Qualification
 
@@ -266,18 +269,18 @@ case used public `collect` and `materialize` commands through the exact
 `nokv-fdb` candidate. The retained bundle is:
 
 ```text
-/target/fdb-limits-gate9-fdc70710-run1/
+/target/fdb-limits-gate9-11994bdc-release-run1/
 ```
 
 | Evidence identity | Exact value |
 | --- | --- |
-| Source | `fdc70710aaee2524558b998e43edd8162e7d81ca` |
-| `nokv-fdb` SHA-256 | `5cc7c64f7eb27d9b8f7c0ba591fcb65e11139cd42ce1e304afdf2d86d82cbd4c` |
-| Qualification binary SHA-256 | `5430cb73b24fc3423eaab1753cdcfe1f6a363e49dd722c6c876c33cde69cdf6f` |
-| Terminal result SHA-256 | `99797319948b4b9612038753e9c162d176b879560c3e585e262ba4e1a78ea102` |
-| Environment SHA-256 | `502162ed25e41a9caeca2b0aeb59450bed81b29d324467c3cc77f27e18aecd24` |
-| Envelope SHA-256 | `eaaf82e6a52031b2ce6eb06668f6967544e283579b2c25f25ac36a10063644de` |
-| Object-separation SHA-256 | `b2f69abc16bb1bb43b4b94937df4f7a0feebae5b3767138ee0d45c33f54b53e5` |
+| Source | `11994bdca9a235aac70c5a68dc2a41ec856493f9` |
+| Release `nokv-fdb` SHA-256 | `983e096c663341ba891c73115490fc22c1505401baff245d24b5f2a5490c2e46` |
+| Qualification binary SHA-256 | `2fa6599307bfc485a793e3be8b7858e2a03f90b17dd9376418b245203270972c` |
+| Terminal result SHA-256 | `dab860393a4a4ee62d3edc1903b636a3fd22b35b42813c27a9526e1214663fb3` |
+| Environment SHA-256 | `aa6c1a4b143922404ff76fe0d2f4ef898479389c933adfb6de5bf132a4d56428` |
+| Envelope SHA-256 | `3499826a219ce90a402ac826007705bd3fb81218da3baffd4538047b3e3dcbe9` |
+| Object-separation SHA-256 | `dd12314dae51cd46e253485257464c8b04f80d19b7316e34be9685698720013e` |
 
 Five valid transactions applied with zero conflicts, errors, or physical-guard
 rejections. The exact logical, conservative, and FDB-observed approximate
@@ -285,27 +288,74 @@ physical byte triplets were:
 
 | Logical bytes | Conservative affected bytes | Observed physical bytes |
 | ---: | ---: | ---: |
-| 65,536 | 65,920 | 65,947 |
-| 262,144 | 263,104 | 263,335 |
-| 900,000 | 902,880 | 903,791 |
-| 1,800,000 | 1,805,568 | 1,807,431 |
-| 2,800,000 | 2,808,448 | 2,811,331 |
+| 65,536 | 65,945 | 65,972 |
+| 262,144 | 263,174 | 263,405 |
+| 900,000 | 903,100 | 904,011 |
+| 1,800,000 | 1,805,998 | 1,807,861 |
+| 2,800,000 | 2,809,103 | 2,811,986 |
 
 The required 900,000-byte planner point is therefore below the configured
-9,500,000-byte physical guard by 8,596,209 observed bytes. This measurement is
+9,500,000-byte physical guard by 8,595,989 observed bytes. This measurement is
 specific to the retained FDB 7.3.79 client/server, API 730, cluster topology,
 and candidate; it is not promoted to a universal FoundationDB limit.
 
 The 3,200,000-byte object exceeds the 2,900,000-byte logical metadata limit.
 Its input digest, candidate publication digest, and materialized digest were
-the same SHA-256 value. A consistent scan of all 150 retained rows under the
-FDB store prefix observed at most 65,535 bytes in one value, zero values at or
-above the payload length, and zero matches for three domain-separated 64-byte
-payload markers. The bundle contains 39 files, pre/post healthy FDB and RustFS
-observations, and no access or secret key bytes.
+the same SHA-256 value
+`631efd1f8587310f1b54c8e70d1f57b5574fd10cee1be1fd3ce2671c49187daa`.
+A consistent scan of all 150 retained rows under the FDB store prefix observed
+at most 65,535 bytes in one value, zero values at or above the payload length,
+and zero matches for three domain-separated 64-byte payload markers. The
+bundle contains 39 files, pre/post healthy FDB and RustFS observations, and no
+access or secret key bytes.
 
-This result closes Gate 9 only. Gate 10 remains `NOT QUALIFIED`, and final
-qualification still requires Gates 8-10 to pass on one accepted source.
+## Gate 10 Performance Qualification
+
+Gate 10 is **PASS**. The environment-gated release workload used one
+persistent `WorkspaceClient`, discovered the candidate through its NoKV seed
+endpoint, and retained separate uncontended and contended profiles. Gate 10
+refused to start unless the Gate 9 source revision and release candidate digest
+matched exactly. The retained bundle is:
+
+```text
+/target/fdb-performance-gate10-11994bdc-release-run1/
+```
+
+| Evidence identity | Exact value |
+| --- | --- |
+| Source | `11994bdca9a235aac70c5a68dc2a41ec856493f9` |
+| Release `nokv-fdb` SHA-256 | `983e096c663341ba891c73115490fc22c1505401baff245d24b5f2a5490c2e46` |
+| Qualification binary SHA-256 | `8638dc5ee0cb280eaf75650de6e2e99c1cf098dc2c06586a3ee4b3f2dedcbb70` |
+| Terminal result SHA-256 | `1f63ef3019fc496a8bc03240dff5913346c47e7cb3712da7934d1638ba0213a4` |
+| Environment SHA-256 | `a267ae03a7f9d838510d8e15597c4b662c659fa637393ce76ad27d1255dcd3a2` |
+| Uncontended profile SHA-256 | `f0455740ebd538c292af34d066d4646abade721735f84a14ac2410a78b85d2e5` |
+| Contended profile SHA-256 | `004423e990f7795f84a130917b7e316899cf4344235b0e5cd0e55eddcbe3027c` |
+
+Both profiles used 8 warmup operations, 64 measured operations, concurrency
+8, client maximum attempts 2, and nearest-rank percentiles. Thread creation
+was excluded from each fixed-size batch interval. The retained results are:
+
+| Profile | Success | Conflict | Extra transport attempts | Failure | p50 ms | p95 ms | p99/max ms | ops/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Independent Workbench creates | 64 | 0 | 45 | 0 | 369.882 | 442.160 | 462.818 | 19.218 |
+| Pinned-generation rename races | 8 | 56 | 26 | 0 | 238.838 | 332.836 | 339.669 | 24.018 |
+
+The contended workload created eight 256-byte source artifacts. Each group
+raced eight renames from one generation-1 `outputs/` path to distinct
+destinations; all eight groups produced exactly one success and seven typed
+`NotFound` precondition conflicts. The latency distributions retain every
+terminal outcome, including conflicts. The retry count is the number of
+transport round trips beyond measured logical operations after priming the
+seed cache.
+
+The run observed six logical CPUs, affinity and effective cpuset `0-5`, and no
+container CPU quota. CPU governor, frequency, thermal, and `/proc/cpuinfo`
+identity were unavailable inside this arm64 container and are explicitly
+recorded as such. FDB was healthy and available before and after the run, all
+three coordinators were reachable, RustFS returned HTTP `200`, and the 58-file
+bundle contained no access or secret key bytes. These numbers describe only
+this recorded topology and workload; they do not define a Holt comparison or
+a universal NoKV SLO.
 
 ## Root-Fix Acceptance Matrix
 
@@ -330,14 +380,15 @@ behavior, not a false availability failure.
 
 ## Repository Gates
 
-The repository gates below were rerun on source
-`52fd14a29dd344973c5cc06752c5a51bd440a0a3` after the latest `main` merge and
-the concurrent restore-finalizer fix.
+The aggregate Rust/Python gates and final Gates 8 through 10 below were rerun
+after final code source `11994bdca9a235aac70c5a68dc2a41ec856493f9`.
+Earlier environment-gated rows retain the exact candidate identities recorded
+in their sections above.
 
 | Command or check | Result |
 | --- | --- |
 | `cargo fmt --all -- --check` | PASS |
-| `cargo test --workspace` with `PYO3_PYTHON` bound to Homebrew Python 3.14 | PASS |
+| Earlier `cargo test --workspace` with `PYO3_PYTHON` bound to Homebrew Python 3.14 | PASS on the preceding root-fix candidate |
 | `cargo test --workspace --all-features --exclude nokv-python` in the FDB builder | PASS |
 | `cargo test -p nokv-python` with default features | PASS, 23 passed and 2 live S3 tests ignored |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` in the FDB builder | PASS |
@@ -349,6 +400,7 @@ the concurrent restore-finalizer fix.
 | Gate 7 seed-discovery qualification rerun | PASS, 8 scenarios and 35 retained evidence files |
 | Gate 8 lifecycle qualification | PASS, 5 scenarios and 81 retained evidence files |
 | Gate 9 limits qualification | PASS, 5 measured transaction points, one 3,200,000-byte object round-trip, and 39 retained evidence files |
+| Gate 10 performance qualification | PASS, 2 profiles, 128 measured outcomes, and 58 retained evidence files |
 | `python3 scripts/workbench/workbench_contract_test.py` | PASS, 8 passed |
 | `git diff --check` | PASS |
 | DCO trailers on every branch commit | PASS |
@@ -370,9 +422,9 @@ executable test configuration without weakening either check.
 | 5. Provision crashes | PASS | Preparation/finalization crash cuts and external admission retry converged. |
 | 6. Serve crashes | PASS | The approved live matrix retained an `Activating` owner kill, exact successor fence advancement, post-commit owner loss and read-back, stale raw metadata rejection, full-control-plane renewal failure with local fail-close, and recovery takeover mutation. |
 | 7. Seed discovery | PASS | One clean-head live bundle retained multiple seeds, failed-first fallback, A-to-B refresh, stale discovery and owner hints, same-generation endpoint drift, immutable identity drift, and final mutation/read through B. |
-| 8. Lifecycle | PASS | One exact-candidate live bundle retained public publication, replacement, snapshot renew/retire, restore/read, normal revision GC, one successful lost `DELETE` acknowledgement with quarantine, zero-consumer commit retirement, and one continuous serving fence. |
+| 8. Lifecycle | PASS | One exact-candidate live bundle retained public publication, replacement, snapshot renew/retire, restore/read, normal revision GC, one successful lost `DELETE` acknowledgement with quarantine, zero-consumer commit retirement plus terminal zero-row revision GC, and one continuous serving fence. |
 | 9. Limits | PASS | Real FDB diagnostics retained five logical/conservative/observed byte points through 2,800,000 bytes; a 3,200,000-byte object round-tripped while the complete retained FDB prefix contained no payload marker. |
-| 10. Performance | NOT QUALIFIED | Concurrency is a correctness stress result, not controlled latency/throughput qualification. |
+| 10. Performance | PASS | One persistent seed-discovered client retained separate 64-operation uncontended and contended distributions, exact outcomes and retries, environment controls, and the same-candidate Gate 9 transaction reference. |
 
 Therefore the accepted runtime direction remains:
 
@@ -382,6 +434,7 @@ fdb:///absolute/fdb.cluster?prefix=nokv-prod
 ```
 
 Holt is the standalone runtime. FDB is the distributed metadata authority and
-has passed Gates 1 through 9 in this record, but its public serving status
-remains **NOT QUALIFIED** until Gate 10 passes and Gates 8-10 are rerun on one
-accepted source revision.
+has passed all ten serving gates. Gates 8 through 10 were rerun on one exact
+release candidate, so the recorded distributed serving profile is
+**QUALIFIED**. This status does not turn the measured Gate 10 values into a
+cross-machine SLO or claim that Holt and FDB have equivalent durability.

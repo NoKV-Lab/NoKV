@@ -7,8 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 Date: 2026-09-01
 
-Status: approved continuation design; Gates 8 through 10 remain not qualified
-until their live evidence bundles pass.
+Status: implemented; Gates 8 through 10 passed on one exact release candidate.
 
 ## Decision
 
@@ -194,6 +193,7 @@ are forbidden.
 control, unobserved fault, incomplete identity, or missing evidence role is
 `NOT QUALIFIED`; a completed semantic or safety violation is `FAIL`.
 
-The user-facing FDB runtime remains **NOT QUALIFIED** until Gate 8, Gate 9, and
-Gate 10 have each produced a complete PASS bundle from the same accepted source
-revision, and the aggregate repository gates also pass.
+The qualification condition required Gate 8, Gate 9, and Gate 10 to produce
+complete PASS bundles from the same accepted source revision and candidate.
+That condition is satisfied by the retained release evidence recorded in
+[`fdb-root-fix-qualification-2026-08-31.md`](fdb-root-fix-qualification-2026-08-31.md).
