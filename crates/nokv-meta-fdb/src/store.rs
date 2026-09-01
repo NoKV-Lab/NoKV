@@ -13,9 +13,12 @@ use nokv_meta_store::{
     WriteTxn,
 };
 
-use crate::affected_bytes::{ensure_observed_transaction_size, validate_read, validate_write};
+use crate::affected_bytes::{
+    ensure_observed_transaction_size, validate_read, validate_write, write_affected_bytes,
+};
 use crate::codec::KeyCodec;
-use crate::profile::{FDB_LIMITS, FDB_PROFILE, PHYSICAL_AFFECTED_BYTES};
+use crate::diagnostics::{FdbStoreDiagnosticCounters, FdbStoreDiagnostics};
+use crate::profile::{FDB_LIMITS, FDB_PHYSICAL_TRANSACTION_GUARD_BYTES, FDB_PROFILE};
 use crate::{FdbMetadataSessionFence, FdbOptions};
 
 /// FoundationDB implementation of the storage-neutral metadata transaction contract.
@@ -26,6 +29,7 @@ pub struct FdbStore {
     database: FdbDatabase,
     codec: KeyCodec,
     session_fence: FdbMetadataSessionFence,
+    diagnostics: FdbStoreDiagnosticCounters,
 }
 
 impl FdbStore {
@@ -38,6 +42,7 @@ impl FdbStore {
             database,
             codec,
             session_fence: options.session_fence().clone(),
+            diagnostics: FdbStoreDiagnosticCounters::default(),
         };
         store.ready()?;
         Ok(store)
@@ -77,54 +82,63 @@ impl FdbStore {
     }
 
     fn commit_inner(&self, txn: &WriteTxn) -> Result<Commit, StoreError> {
-        let transaction = self.transaction()?;
-        self.require_current_session(&transaction)?;
-        for check in &txn.checks {
-            let matches = match check {
-                Check::Value { key, expected } => {
-                    let physical_key = self.codec.encode_key(key);
-                    transaction
-                        .get(&physical_key, false)
-                        .map_err(map_operation_error)?
-                        .as_deref()
-                        == Some(expected.as_slice())
-                }
-                Check::Absent { key } => {
-                    let physical_key = self.codec.encode_key(key);
-                    transaction
-                        .get(&physical_key, false)
-                        .map_err(map_operation_error)?
-                        .is_none()
-                }
-                Check::EmptyPrefix { keyspace, prefix } => {
-                    prefix_is_empty(&transaction, &self.codec, *keyspace, prefix)?
-                }
-            };
-            if !matches {
-                return Ok(Commit::Conflict);
-            }
-        }
-
-        for mutation in &txn.mutations {
-            match mutation {
-                Mutation::Put { key, value } => {
-                    transaction.set(&self.codec.encode_key(key), value);
-                }
-                Mutation::Delete { key } => {
-                    transaction.clear(&self.codec.encode_key(key));
+        self.diagnostics.record_attempt();
+        let result = (|| {
+            let transaction = self.transaction()?;
+            self.require_current_session(&transaction)?;
+            for check in &txn.checks {
+                let matches = match check {
+                    Check::Value { key, expected } => {
+                        let physical_key = self.codec.encode_key(key);
+                        transaction
+                            .get(&physical_key, false)
+                            .map_err(map_operation_error)?
+                            .as_deref()
+                            == Some(expected.as_slice())
+                    }
+                    Check::Absent { key } => {
+                        let physical_key = self.codec.encode_key(key);
+                        transaction
+                            .get(&physical_key, false)
+                            .map_err(map_operation_error)?
+                            .is_none()
+                    }
+                    Check::EmptyPrefix { keyspace, prefix } => {
+                        prefix_is_empty(&transaction, &self.codec, *keyspace, prefix)?
+                    }
+                };
+                if !matches {
+                    return Ok(Commit::Conflict);
                 }
             }
-        }
 
-        let observed_size = transaction
-            .approximate_size()
-            .map_err(map_operation_error)?;
-        ensure_observed_transaction_size(observed_size)?;
+            for mutation in &txn.mutations {
+                match mutation {
+                    Mutation::Put { key, value } => {
+                        transaction.set(&self.codec.encode_key(key), value);
+                    }
+                    Mutation::Delete { key } => {
+                        transaction.clear(&self.codec.encode_key(key));
+                    }
+                }
+            }
 
-        match transaction.commit() {
-            Ok(_) => Ok(Commit::Applied),
-            Err(error) => self.map_commit_error(error),
-        }
+            let observed_size = transaction
+                .approximate_size()
+                .map_err(map_operation_error)?;
+            self.diagnostics.record_approximate_size(observed_size);
+            if let Err(error) = ensure_observed_transaction_size(observed_size) {
+                self.diagnostics.record_physical_guard_rejection();
+                return Err(error);
+            }
+
+            match transaction.commit() {
+                Ok(_) => Ok(Commit::Applied),
+                Err(error) => self.map_commit_error(error),
+            }
+        })();
+        self.diagnostics.record_result(&result);
+        result
     }
 
     fn require_current_session(&self, transaction: &FdbTransaction) -> Result<(), StoreError> {
@@ -167,6 +181,18 @@ impl FdbStore {
             FdbErrorDisposition::Limit(kind) => Err(limit_error(kind)),
             FdbErrorDisposition::Unavailable => Err(StoreError::Unavailable(error.to_string())),
         }
+    }
+
+    /// Return a read-only snapshot of this handle's transaction diagnostics.
+    pub fn diagnostics(&self) -> FdbStoreDiagnostics {
+        self.diagnostics.snapshot()
+    }
+
+    /// Estimate the conservative physical affected-byte envelope used by the
+    /// adapter before a write transaction is dispatched.
+    pub fn conservative_affected_bytes(&self, txn: &WriteTxn) -> Result<usize, StoreError> {
+        txn.validate(&FDB_LIMITS)?;
+        write_affected_bytes(&self.codec, &self.session_fence, txn)
     }
 }
 
@@ -383,7 +409,10 @@ fn limit_error(fdb_kind: FdbLimit) -> StoreError {
     let (kind, maximum) = match fdb_kind {
         FdbLimit::KeyBytes => (LimitKind::KeyBytes, FDB_LIMITS.max_key_bytes),
         FdbLimit::ValueBytes => (LimitKind::ValueBytes, FDB_LIMITS.max_value_bytes),
-        FdbLimit::TransactionBytes => (LimitKind::TransactionBytes, PHYSICAL_AFFECTED_BYTES),
+        FdbLimit::TransactionBytes => (
+            LimitKind::TransactionBytes,
+            FDB_PHYSICAL_TRANSACTION_GUARD_BYTES,
+        ),
     };
     StoreError::LimitExceeded {
         kind,

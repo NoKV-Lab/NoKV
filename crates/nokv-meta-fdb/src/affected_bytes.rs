@@ -6,7 +6,7 @@
 use nokv_meta_store::{Check, LimitKind, Mutation, ReadBatch, ReadOp, StoreError, WriteTxn};
 
 use crate::codec::KeyCodec;
-use crate::profile::{FDB_LIMITS, FDB_SESSION_FENCE_READS, PHYSICAL_AFFECTED_BYTES};
+use crate::profile::{FDB_LIMITS, FDB_PHYSICAL_TRANSACTION_GUARD_BYTES, FDB_SESSION_FENCE_READS};
 use crate::FdbMetadataSessionFence;
 
 pub(crate) fn validate_read(
@@ -39,6 +39,17 @@ pub(crate) fn validate_write(
     session_fence: &FdbMetadataSessionFence,
     txn: &WriteTxn,
 ) -> Result<(), StoreError> {
+    ensure_budget(
+        LimitKind::TransactionBytes,
+        write_affected_bytes(codec, session_fence, txn)?,
+    )
+}
+
+pub(crate) fn write_affected_bytes(
+    codec: &KeyCodec,
+    session_fence: &FdbMetadataSessionFence,
+    txn: &WriteTxn,
+) -> Result<usize, StoreError> {
     let mut bytes = session_fence_affected_bytes(session_fence)?;
     for check in &txn.checks {
         match check {
@@ -75,7 +86,7 @@ pub(crate) fn validate_write(
             }
         }
     }
-    ensure_budget(LimitKind::TransactionBytes, bytes)
+    Ok(bytes)
 }
 
 pub(crate) fn ensure_observed_transaction_size(bytes: i64) -> Result<(), StoreError> {
@@ -108,13 +119,13 @@ fn write_range_bytes(encoded: usize) -> Result<usize, StoreError> {
 }
 
 fn ensure_budget(kind: LimitKind, actual: usize) -> Result<(), StoreError> {
-    if actual <= PHYSICAL_AFFECTED_BYTES {
+    if actual <= FDB_PHYSICAL_TRANSACTION_GUARD_BYTES {
         Ok(())
     } else {
         Err(StoreError::LimitExceeded {
             kind,
             actual,
-            maximum: PHYSICAL_AFFECTED_BYTES,
+            maximum: FDB_PHYSICAL_TRANSACTION_GUARD_BYTES,
         })
     }
 }

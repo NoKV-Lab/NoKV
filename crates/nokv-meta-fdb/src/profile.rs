@@ -5,7 +5,10 @@
 
 use nokv_meta_store::{AckBoundary, Authority, RecoveryMode, StoreLimits, StoreProfile};
 
-pub(crate) const PHYSICAL_AFFECTED_BYTES: usize = 9_500_000;
+/// Adapter guard below FoundationDB's version-specific physical transaction
+/// limit. Qualification records the observed approximate size below this
+/// conservative ceiling; the value is not a claim about every FDB version.
+pub const FDB_PHYSICAL_TRANSACTION_GUARD_BYTES: usize = 9_500_000;
 /// One adapter-owned non-snapshot read reserves the stable owner-session key.
 /// It is additional to the caller-visible `StoreLimits::max_reads` budget.
 pub(crate) const FDB_SESSION_FENCE_READS: usize = 1;

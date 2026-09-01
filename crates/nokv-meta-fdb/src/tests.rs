@@ -20,7 +20,9 @@ use crate::affected_bytes::{
 };
 use crate::codec::KeyCodec;
 use crate::options::MAX_NAMESPACE_BYTES;
-use crate::profile::{FDB_LIMITS, FDB_PROFILE, FDB_SESSION_FENCE_READS, PHYSICAL_AFFECTED_BYTES};
+use crate::profile::{
+    FDB_LIMITS, FDB_PHYSICAL_TRANSACTION_GUARD_BYTES, FDB_PROFILE, FDB_SESSION_FENCE_READS,
+};
 use crate::{FdbMetadataSessionFence, FdbOptions};
 
 const FIRST: Keyspace = Keyspace::new(0x0102);
@@ -244,7 +246,7 @@ fn affected_byte_budget_accounts_for_encoded_ranges_and_mutations() {
     validate_write(&codec, &fence, &write).unwrap();
 
     assert!(matches!(
-        ensure_observed_transaction_size((PHYSICAL_AFFECTED_BYTES + 1) as i64),
+        ensure_observed_transaction_size((FDB_PHYSICAL_TRANSACTION_GUARD_BYTES + 1) as i64),
         Err(StoreError::LimitExceeded {
             kind: LimitKind::TransactionBytes,
             ..

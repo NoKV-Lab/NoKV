@@ -15,6 +15,8 @@
 mod affected_bytes;
 #[cfg(any(feature = "fdb", test))]
 mod codec;
+#[cfg(any(feature = "fdb", test))]
+mod diagnostics;
 mod options;
 #[cfg(any(feature = "fdb", test))]
 mod profile;
@@ -22,8 +24,12 @@ mod profile;
 mod store;
 
 #[cfg(feature = "fdb")]
+pub use diagnostics::FdbStoreDiagnostics;
+#[cfg(feature = "fdb")]
 pub use nokv_fdb::{FdbRuntime, FdbRuntimeError};
 pub use options::{FdbMetadataSessionFence, FdbOptions};
+#[cfg(feature = "fdb")]
+pub use profile::FDB_PHYSICAL_TRANSACTION_GUARD_BYTES;
 #[cfg(feature = "fdb")]
 pub use store::FdbStore;
 
