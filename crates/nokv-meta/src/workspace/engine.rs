@@ -4361,6 +4361,7 @@ mod tests {
     struct AppliedThenLostAckStore {
         inner: Arc<dyn TxnStore>,
         lose_next_ack: AtomicBool,
+        commit_calls: AtomicUsize,
     }
 
     impl TxnStore for AppliedThenLostAckStore {
@@ -4373,6 +4374,7 @@ mod tests {
         }
 
         fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            self.commit_calls.fetch_add(1, Ordering::AcqRel);
             let lose_ack = self.lose_next_ack.swap(false, Ordering::AcqRel);
             let outcome = self.inner.commit(txn)?;
             if lose_ack && outcome == Commit::Applied {
@@ -4392,6 +4394,7 @@ mod tests {
     struct UnknownWithoutApplyStore {
         inner: Arc<dyn TxnStore>,
         fail_next_commit: AtomicBool,
+        commit_calls: AtomicUsize,
     }
 
     impl TxnStore for UnknownWithoutApplyStore {
@@ -4404,6 +4407,7 @@ mod tests {
         }
 
         fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            self.commit_calls.fetch_add(1, Ordering::AcqRel);
             if self.fail_next_commit.swap(false, Ordering::AcqRel) {
                 return Err(StoreError::OutcomeUnknown {
                     state: UnknownCommit::MayCommit,
@@ -4411,6 +4415,47 @@ mod tests {
                 });
             }
             self.inner.commit(txn)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
+
+    struct AppliedThenLostAckAndReadHookStore {
+        inner: Arc<dyn TxnStore>,
+        controller: MetaShard,
+        hook: fn(&MetaShard),
+        lose_next_ack: AtomicBool,
+        run_hook_before_next_read: AtomicBool,
+        commit_calls: AtomicUsize,
+    }
+
+    impl TxnStore for AppliedThenLostAckAndReadHookStore {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            if self.run_hook_before_next_read.swap(false, Ordering::AcqRel) {
+                (self.hook)(&self.controller);
+            }
+            self.inner.read(batch)
+        }
+
+        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            self.commit_calls.fetch_add(1, Ordering::AcqRel);
+            let lose_ack = self.lose_next_ack.swap(false, Ordering::AcqRel);
+            let outcome = self.inner.commit(txn)?;
+            if lose_ack && outcome == Commit::Applied {
+                self.run_hook_before_next_read
+                    .store(true, Ordering::Release);
+                return Err(StoreError::OutcomeUnknown {
+                    state: UnknownCommit::Settled,
+                    reason: "injected acknowledgement loss before readback hook".to_owned(),
+                });
+            }
+            Ok(outcome)
         }
 
         fn ready(&self) -> Result<(), StoreError> {
@@ -4768,9 +4813,56 @@ mod tests {
         }
     }
 
+    fn advance_clock_before_unknown_readback(store: &MetaShard) {
+        assert_eq!(
+            store
+                .observe_lease_clock(root(2), generation(7), epoch(1), 200)
+                .unwrap(),
+            200
+        );
+    }
+
+    fn advance_owner_before_unknown_readback(store: &MetaShard) {
+        store.advance_owner_epoch(Some(epoch(1)), epoch(2)).unwrap();
+    }
+
+    fn advance_owner_again_before_unknown_readback(store: &MetaShard) {
+        store.advance_owner_epoch(Some(epoch(2)), epoch(3)).unwrap();
+    }
+
+    fn drain_root_before_unknown_readback(store: &MetaShard) {
+        let command = base_command(
+            store,
+            request(200),
+            RootFenceAction::Transition {
+                expected: RootActivationState::Active,
+                next: RootActivationState::Draining,
+            },
+        )
+        .seal();
+        store.execute(&command).unwrap();
+    }
+
     fn ready_store() -> MetaShard {
         let store = crate::workspace::test_support::memory(shard(1)).unwrap();
         make_store_ready(store)
+    }
+
+    fn ready_store_with_unknown_readback_hook(
+        hook: fn(&MetaShard),
+    ) -> (MetaShard, Arc<AppliedThenLostAckAndReadHookStore>) {
+        let mut store = ready_store();
+        let controller = MetaShard::open(Arc::clone(&store.store), shard(1)).unwrap();
+        let wrapper = Arc::new(AppliedThenLostAckAndReadHookStore {
+            inner: Arc::clone(&store.store),
+            controller,
+            hook,
+            lose_next_ack: AtomicBool::new(false),
+            run_hook_before_next_read: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
+        });
+        store.store = wrapper.clone();
+        (store, wrapper)
     }
 
     fn ready_shared_store() -> MetaShard {
@@ -5446,6 +5538,7 @@ mod tests {
         let wrapper = Arc::new(AppliedThenLostAckStore {
             inner: Arc::clone(&store.store),
             lose_next_ack: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
         });
         store.store = wrapper.clone();
         let command = create_command(
@@ -5489,6 +5582,7 @@ mod tests {
         let wrapper = Arc::new(AppliedThenLostAckStore {
             inner: Arc::clone(&store.store),
             lose_next_ack: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
         });
         store.store = wrapper.clone();
         let command = create_command(
@@ -6566,6 +6660,7 @@ mod tests {
         let wrapper = Arc::new(AppliedThenLostAckStore {
             inner: Arc::clone(&store.store),
             lose_next_ack: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
         });
         store.store = wrapper.clone();
         let before = store.recovery_state().unwrap();
@@ -6588,6 +6683,7 @@ mod tests {
             100
         );
         assert_eq!(store.recovery_state().unwrap(), after);
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -6596,6 +6692,7 @@ mod tests {
         let wrapper = Arc::new(UnknownWithoutApplyStore {
             inner: Arc::clone(&store.store),
             fail_next_commit: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
         });
         store.store = wrapper.clone();
         let before = store.recovery_state().unwrap();
@@ -6613,6 +6710,7 @@ mod tests {
         ));
         assert_eq!(store.lease_clock_high_water().unwrap(), 0);
         assert_eq!(store.recovery_state().unwrap(), before);
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -6621,6 +6719,7 @@ mod tests {
         let wrapper = Arc::new(AppliedThenLostAckStore {
             inner: Arc::clone(&store.store),
             lose_next_ack: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
         });
         store.store = wrapper.clone();
         let before = store.recovery_state().unwrap();
@@ -6633,6 +6732,7 @@ mod tests {
         assert_eq!(after.applied_recovery_lsn, before.applied_recovery_lsn + 1);
         store.advance_owner_epoch(Some(epoch(1)), epoch(2)).unwrap();
         assert_eq!(store.recovery_state().unwrap(), after);
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -6641,6 +6741,7 @@ mod tests {
         let wrapper = Arc::new(UnknownWithoutApplyStore {
             inner: Arc::clone(&store.store),
             fail_next_commit: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
         });
         store.store = wrapper.clone();
         let before = store.recovery_state().unwrap();
@@ -6658,6 +6759,97 @@ mod tests {
         ));
         assert_eq!(store.current_owner_epoch().unwrap(), Some(epoch(1)));
         assert_eq!(store.recovery_state().unwrap(), before);
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn lease_clock_accepts_a_larger_legal_value_under_the_same_fence() {
+        let (store, wrapper) =
+            ready_store_with_unknown_readback_hook(advance_clock_before_unknown_readback);
+        let before = store.recovery_state().unwrap();
+
+        wrapper.lose_next_ack.store(true, Ordering::Release);
+        assert_eq!(
+            store
+                .observe_lease_clock(root(2), generation(7), epoch(1), 100)
+                .unwrap(),
+            200
+        );
+
+        assert_eq!(store.lease_clock_high_water().unwrap(), 200);
+        assert_eq!(
+            store.recovery_state().unwrap().applied_recovery_lsn,
+            before.applied_recovery_lsn + 2
+        );
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn lease_clock_unknown_readback_rejects_a_changed_owner_fence() {
+        let (store, wrapper) =
+            ready_store_with_unknown_readback_hook(advance_owner_before_unknown_readback);
+
+        wrapper.lose_next_ack.store(true, Ordering::Release);
+        assert!(matches!(
+            store.observe_lease_clock(root(2), generation(7), epoch(1), 100),
+            Err(MetaError::Store {
+                operation: "advance lease clock",
+                source: StoreError::OutcomeUnknown {
+                    state: UnknownCommit::Settled,
+                    ..
+                },
+            })
+        ));
+
+        assert_eq!(store.lease_clock_high_water().unwrap(), 100);
+        assert_eq!(store.current_owner_epoch().unwrap(), Some(epoch(2)));
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn lease_clock_unknown_readback_rejects_a_changed_root_fence() {
+        let (store, wrapper) =
+            ready_store_with_unknown_readback_hook(drain_root_before_unknown_readback);
+
+        wrapper.lose_next_ack.store(true, Ordering::Release);
+        assert!(matches!(
+            store.observe_lease_clock(root(2), generation(7), epoch(1), 100),
+            Err(MetaError::Store {
+                operation: "advance lease clock",
+                source: StoreError::OutcomeUnknown {
+                    state: UnknownCommit::Settled,
+                    ..
+                },
+            })
+        ));
+
+        assert_eq!(store.lease_clock_high_water().unwrap(), 100);
+        assert_eq!(
+            store.root_fence(root(2)).unwrap().unwrap().activation_state,
+            RootActivationState::Draining
+        );
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn owner_epoch_unknown_readback_rejects_an_ahead_epoch() {
+        let (store, wrapper) =
+            ready_store_with_unknown_readback_hook(advance_owner_again_before_unknown_readback);
+
+        wrapper.lose_next_ack.store(true, Ordering::Release);
+        assert!(matches!(
+            store.advance_owner_epoch(Some(epoch(1)), epoch(2)),
+            Err(MetaError::Store {
+                operation: "advance owner epoch",
+                source: StoreError::OutcomeUnknown {
+                    state: UnknownCommit::Settled,
+                    ..
+                },
+            })
+        ));
+
+        assert_eq!(store.current_owner_epoch().unwrap(), Some(epoch(3)));
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -7232,6 +7424,7 @@ mod tests {
         let wrapper = Arc::new(AppliedThenLostAckStore {
             inner: Arc::clone(&target.store),
             lose_next_ack: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
         });
         target.store = wrapper.clone();
         target.replay_recovery_record(&source_rows[0]).unwrap();
