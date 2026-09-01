@@ -324,6 +324,8 @@ pub struct LifecycleRunner {
     durability: Arc<dyn LifecycleDurabilityBarrier>,
     options: LifecycleRunnerOptions,
     cursors: Mutex<LifecycleCursors>,
+    #[cfg(test)]
+    before_provider_delete_test_hook: Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
 }
 
 impl LifecycleRunner {
@@ -348,9 +350,46 @@ impl LifecycleRunner {
             durability,
             options: options.validate()?,
             cursors: Mutex::new(LifecycleCursors::default()),
+            #[cfg(test)]
+            before_provider_delete_test_hook: Mutex::new(None),
         };
+
         runner.require_current_owner()?;
         Ok(runner)
+    }
+
+    #[cfg(test)]
+    fn install_before_provider_delete_test_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        let mut current = self
+            .before_provider_delete_test_hook
+            .lock()
+            .expect("provider-delete test-hook lock must remain available");
+
+        assert!(
+            current.replace(Box::new(hook)).is_none(),
+            "provider-delete test hook is already installed"
+        );
+    }
+
+    #[cfg(test)]
+    fn run_before_provider_delete_test_hook(&self) {
+        let hook = self
+            .before_provider_delete_test_hook
+            .lock()
+            .expect("provider-delete test-hook lock must remain available")
+            .take();
+
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn enter_destructive_operation(
+        &self,
+    ) -> Result<crate::registry::ShardOperationPermit, LifecycleError> {
+        self.registry
+            .enter_shard_operation(self.route)
+            .map_err(|error| LifecycleError::OwnerLost(error.to_string()))
     }
 
     /// Execute one bounded recovery pass over every lifecycle family.
@@ -656,6 +695,9 @@ impl LifecycleRunner {
                 ) {
                     self.require_current_owner()?;
                     self.publish_current()?;
+                    #[cfg(test)]
+                    self.run_before_provider_delete_test_hook();
+                    let _operation_permit = self.enter_destructive_operation()?;
                     let request = LifecycleDeleteRequest {
                         purpose: LifecycleDeletePurpose::AbortedPublication,
                         object_key: expected.object_key.clone(),
@@ -1356,6 +1398,9 @@ impl LifecycleRunner {
             let absence_digest = if entry.delete_required {
                 self.require_current_owner()?;
                 self.publish_current()?;
+                #[cfg(test)]
+                self.run_before_provider_delete_test_hook();
+                let _operation_permit = self.enter_destructive_operation()?;
                 let request = LifecycleDeleteRequest {
                     purpose: LifecycleDeletePurpose::RevisionGarbageCollection,
                     object_key: entry.row.object_key.clone(),
@@ -1696,6 +1741,7 @@ fn gc_concurrent(error: &meta::GcError) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
 
     use nokv_object::{
         ArtifactStoreCapabilities, ImmutableCreateOutcome, ObjectError, ObjectInfo, ObjectRange,
@@ -2586,6 +2632,417 @@ mod tests {
         assert_eq!(deleter.calls.load(Ordering::SeqCst), 2);
         assert_eq!(candidate(&fixture).claim_state, GcClaimState::Complete);
         assert_eq!(operation(&fixture).phase, GcPhase::Deleted);
+    }
+
+    struct BlockingDeleter {
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        resume: Mutex<mpsc::Receiver<()>>,
+        calls: AtomicUsize,
+    }
+
+    impl LifecycleObjectDeleter for BlockingDeleter {
+        fn delete(
+            &self,
+            request: &LifecycleDeleteRequest,
+        ) -> Result<LifecycleAbsenceProof, LifecycleDeleteError> {
+            assert_eq!(
+                request.purpose,
+                LifecycleDeletePurpose::RevisionGarbageCollection,
+            );
+
+            if let Some(entered) = self
+                .entered
+                .lock()
+                .expect("blocking-deleter entered lock must remain available")
+                .take()
+            {
+                entered
+                    .send(())
+                    .expect("blocking deleter must signal entry");
+            }
+
+            self.resume
+                .lock()
+                .expect("blocking-deleter resume lock must remain available")
+                .recv()
+                .expect("blocking deleter must be released");
+
+            self.calls.fetch_add(1, Ordering::SeqCst);
+
+            Ok(LifecycleAbsenceProof::from_delete_request(
+                request,
+                LifecycleDeleteDisposition::Deleted,
+            ))
+        }
+    }
+
+    #[test]
+    fn shared_fail_close_wins_check_to_provider_dispatch_race() {
+        let fixture = fixture();
+
+        let deleter = Arc::new(FakeDeleter {
+            ambiguous: false,
+            calls: AtomicUsize::new(0),
+            object_keys: Mutex::new(Vec::new()),
+        });
+
+        let owner_loss = fixture.registry.owner_loss_signal();
+
+        let runner = Arc::new(
+            LifecycleRunner::new(
+                Arc::clone(&fixture.store),
+                Arc::clone(&fixture.registry),
+                fixture.route,
+                owner_loss.clone(),
+                deleter.clone(),
+                test_durability(),
+                LifecycleRunnerOptions {
+                    scan_page_size: 8,
+                    mutation_batch_size: 8,
+                    ..LifecycleRunnerOptions::default()
+                },
+            )
+            .unwrap(),
+        );
+
+        // Advance the real candidate to provider deletion.
+        runner.run_once(100_000).unwrap();
+        runner.run_once(100_000).unwrap();
+
+        let (reached_tx, reached_rx) = mpsc::channel();
+
+        let (resume_tx, resume_rx) = mpsc::channel();
+
+        runner.install_before_provider_delete_test_hook(move || {
+            reached_tx
+                .send(())
+                .expect("test must signal the pre-dispatch boundary");
+
+            resume_rx
+                .recv()
+                .expect("test must release provider dispatch");
+        });
+
+        let worker_runner = Arc::clone(&runner);
+
+        let worker = thread::spawn(move || worker_runner.run_once(100_000));
+
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("lifecycle worker did not reach the provider boundary");
+
+        // No operation permit has been admitted yet. Fail-close must return
+        // and make subsequent provider dispatch impossible.
+        fixture
+            .registry
+            .fail_closed_shard(fixture.route.logical_shard_id)
+            .unwrap();
+
+        assert!(owner_loss.is_lost());
+
+        resume_tx
+            .send(())
+            .expect("test must resume the lifecycle worker");
+
+        let result = worker.join().expect("lifecycle worker must not panic");
+
+        assert!(matches!(result, Err(LifecycleError::OwnerLost(_)),));
+
+        assert_eq!(
+            deleter.calls.load(Ordering::SeqCst),
+            0,
+            "provider deletion crossed the shared fail-close fence",
+        );
+    }
+
+    #[test]
+    fn shared_fail_close_waits_for_admitted_provider_delete() {
+        let fixture = fixture();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+
+        let (resume_tx, resume_rx) = mpsc::channel();
+
+        let deleter = Arc::new(BlockingDeleter {
+            entered: Mutex::new(Some(entered_tx)),
+            resume: Mutex::new(resume_rx),
+            calls: AtomicUsize::new(0),
+        });
+
+        let owner_loss = fixture.registry.owner_loss_signal();
+
+        let runner = Arc::new(
+            LifecycleRunner::new(
+                Arc::clone(&fixture.store),
+                Arc::clone(&fixture.registry),
+                fixture.route,
+                owner_loss.clone(),
+                deleter.clone(),
+                test_durability(),
+                LifecycleRunnerOptions {
+                    scan_page_size: 8,
+                    mutation_batch_size: 8,
+                    ..LifecycleRunnerOptions::default()
+                },
+            )
+            .unwrap(),
+        );
+
+        runner.run_once(100_000).unwrap();
+        runner.run_once(100_000).unwrap();
+
+        let worker_runner = Arc::clone(&runner);
+
+        let worker = thread::spawn(move || worker_runner.run_once(100_000));
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("provider delete was not entered");
+
+        let registry = Arc::clone(&fixture.registry);
+
+        let logical_shard_id = fixture.route.logical_shard_id;
+
+        let (closed_tx, closed_rx) = mpsc::channel();
+
+        let closer = thread::spawn(move || {
+            registry.fail_closed_shard(logical_shard_id).unwrap();
+
+            closed_tx
+                .send(())
+                .expect("test must signal completed fail-close");
+        });
+
+        assert!(matches!(
+            closed_rx.recv_timeout(Duration::from_millis(200),),
+            Err(mpsc::RecvTimeoutError::Timeout),
+        ));
+
+        assert_eq!(
+            deleter.calls.load(Ordering::SeqCst),
+            0,
+            "blocked provider operation completed before release",
+        );
+
+        resume_tx
+            .send(())
+            .expect("test must release provider deletion");
+
+        closed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("fail-close did not drain the admitted operation");
+
+        closer.join().expect("fail-close thread must not panic");
+
+        let _cycle_result = worker.join().expect("lifecycle worker must not panic");
+
+        assert!(owner_loss.is_lost());
+
+        assert_eq!(
+            deleter.calls.load(Ordering::SeqCst),
+            1,
+            "the operation admitted before the fence must drain exactly once",
+        );
+    }
+
+    struct AbortedCleanupRaceDeleter {
+        calls: AtomicUsize,
+    }
+
+    impl LifecycleObjectDeleter for AbortedCleanupRaceDeleter {
+        fn delete(
+            &self,
+            request: &LifecycleDeleteRequest,
+        ) -> Result<LifecycleAbsenceProof, LifecycleDeleteError> {
+            assert_eq!(request.purpose, LifecycleDeletePurpose::AbortedPublication);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(LifecycleAbsenceProof::from_delete_request(
+                request,
+                LifecycleDeleteDisposition::Deleted,
+            ))
+        }
+    }
+
+    #[test]
+    fn shared_fail_close_wins_aborted_publication_delete_dispatch_race() {
+        // Same check-to-dispatch race as the revision-GC variant, but through
+        // the OTHER provider-delete path: aborted-publication staged-object
+        // cleanup. Fail-close lands between the owner check and provider
+        // dispatch; the operation permit must make the delete impossible.
+        let store = crate::test_support::meta_shard(shard());
+        store.advance_owner_epoch(None, owner()).unwrap();
+        store
+            .execute(&command(
+                &store,
+                1,
+                meta::RootFenceAction::Install,
+                Vec::new(),
+            ))
+            .unwrap();
+        store
+            .execute(&command(
+                &store,
+                2,
+                meta::RootFenceAction::Transition {
+                    expected: RootActivationState::Installing,
+                    next: RootActivationState::Active,
+                },
+                Vec::new(),
+            ))
+            .unwrap();
+        let workbench = WorkbenchId::new("aborted-cleanup-race").unwrap();
+        let incarnation = WorkspaceIncarnationId::from_bytes([0x71; FIXED_ID_BYTES]);
+        meta::create_visible_workspace(
+            &store,
+            meta::RootWriteContext::current(
+                &store,
+                root(),
+                shard(),
+                nokv_types::ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
+                placement(),
+                owner(),
+                RequestId::from_bytes([3; FIXED_ID_BYTES]),
+            )
+            .unwrap(),
+            &workbench,
+            incarnation,
+        )
+        .unwrap();
+
+        let revision = ArtifactRevisionId::from_bytes([0x72; FIXED_ID_BYTES]);
+        let staged_planned = vec![meta::StagedObjectRecord {
+            artifact_revision_id: revision,
+            object_sequence: 0,
+            object_key: meta::object_block_key(shard(), root(), revision, 0),
+            multipart_upload_id: None,
+            expected_length: 8,
+            expected_digest_uri: sha256_uri([0x73; SHA256_BYTES]),
+            provider_state: StagedProviderState::Planned,
+            cleanup_state: StagedCleanupState::Owned,
+        }];
+        let mut operation = meta::PublishOperationRecord {
+            operation_id: OperationId::from_bytes([0x74; FIXED_ID_BYTES]),
+            identity_digest: [0; SHA256_BYTES],
+            initialization_digest: [0; SHA256_BYTES],
+            initiating_owner_epoch: owner(),
+            activity_deadline_ms: 1_000,
+            authority: meta::PublishAuthority::Visible,
+            workbench_id: workbench,
+            workspace_incarnation_id: incarnation,
+            path: NormalizedRelativePath::new("outputs/aborted-race.bin").unwrap(),
+            artifact_revision_id: revision,
+            claim: meta::PublishClaim::CreateOnly,
+            phase: PublishPhase::Uploading,
+            staged_object_count: 1,
+            staged_object_seal: meta::staged_object_ledger_digest(&staged_planned).unwrap(),
+            staged_object_cursor: 0,
+            staged_object_rolling_digest: [0; SHA256_BYTES],
+            uploaded_object_cursor: 0,
+            uploaded_object_rolling_digest: [0; SHA256_BYTES],
+            manifest_row_count: 0,
+            manifest_seal: meta::manifest_rows_digest(&[]).unwrap(),
+            manifest_cursor: 0,
+            manifest_rolling_digest: [0; SHA256_BYTES],
+            manifest_last_position: None,
+            dependency_count: 0,
+            dependency_depth: 0,
+            dependency_digest: meta::dependency_owner_digest(&[]).unwrap(),
+            cleanup_staged_object_cursor: 0,
+            cleanup_manifest_cursor: 0,
+            publication_absence_proof: None,
+            result: None,
+            terminal_error: None,
+        };
+        meta::seal_publish_operation(&mut operation);
+
+        let service = meta::PublicationService::new(&store);
+        let publication_context = |request: u8| meta::PublicationContext {
+            root_id: root(),
+            logical_shard_id: shard(),
+            object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
+            placement_generation: placement(),
+            owner_epoch: owner(),
+            request_id: RequestId::from_bytes([request; FIXED_ID_BYTES]),
+            read_version: store.current_read_version().unwrap(),
+        };
+        let operation = service
+            .begin_publish(meta::BeginPublishRequest {
+                context: publication_context(10),
+                operation,
+            })
+            .expect("operation begins")
+            .operation;
+        service
+            .stage_objects_batch(meta::StageObjectsBatchRequest {
+                context: publication_context(11),
+                expected_operation: operation,
+                staged_objects: staged_planned,
+            })
+            .expect("operation stages its row");
+
+        let registry = Arc::new(RootOwnerRegistry::new());
+        registry.install(route(), Arc::new(UnusedExecutor)).unwrap();
+        let owner_loss = registry.owner_loss_signal();
+        let deleter = Arc::new(AbortedCleanupRaceDeleter {
+            calls: AtomicUsize::new(0),
+        });
+        let runner = Arc::new(
+            LifecycleRunner::new(
+                Arc::clone(&store),
+                Arc::clone(&registry),
+                route(),
+                owner_loss.clone(),
+                deleter.clone(),
+                test_durability(),
+                LifecycleRunnerOptions {
+                    scan_page_size: 8,
+                    mutation_batch_size: 8,
+                    ..LifecycleRunnerOptions::default()
+                },
+            )
+            .unwrap(),
+        );
+
+        // Expire the orphaned upload into Aborting, then into Cleaning.
+        let report = runner.run_once(10_000_000).unwrap();
+        assert_eq!(report.metadata_transitions, 1, "orphan takeover");
+        let report = runner.run_once(10_000_000).unwrap();
+        assert_eq!(report.metadata_transitions, 1, "begin cleaning");
+
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        runner.install_before_provider_delete_test_hook(move || {
+            reached_tx
+                .send(())
+                .expect("test must signal the pre-dispatch boundary");
+            resume_rx
+                .recv()
+                .expect("test must release provider dispatch");
+        });
+
+        let worker_runner = Arc::clone(&runner);
+        let worker = thread::spawn(move || worker_runner.run_once(10_000_000));
+
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cleanup did not reach the provider boundary");
+
+        registry
+            .fail_closed_shard(route().logical_shard_id)
+            .unwrap();
+        assert!(owner_loss.is_lost());
+
+        resume_tx
+            .send(())
+            .expect("test must resume the cleanup worker");
+
+        let result = worker.join().expect("cleanup worker must not panic");
+        assert!(matches!(result, Err(LifecycleError::OwnerLost(_))));
+        assert_eq!(
+            deleter.calls.load(Ordering::SeqCst),
+            0,
+            "aborted-publication deletion crossed the shared fail-close fence",
+        );
     }
 
     #[test]

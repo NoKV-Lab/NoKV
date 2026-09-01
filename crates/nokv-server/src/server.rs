@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -105,28 +105,55 @@ impl Drop for ConnectionPermit {
     }
 }
 
-/// Shared fail-closed owner-loss signal for the RPC runtime and future
-/// owner-fenced background workers.
+/// Shared fail-closed owner-loss state for RPC and background workers.
+#[derive(Default)]
+struct OwnerLossState {
+    lost: AtomicBool,
+    control_error: Mutex<Option<nokv_control::ControlError>>,
+}
+
+/// Shared fail-closed owner-loss signal for the RPC runtime and owner-fenced
+/// background workers.
 #[derive(Clone, Default)]
-pub struct OwnerLossSignal(Arc<AtomicBool>);
+pub struct OwnerLossSignal(Arc<OwnerLossState>);
 
 impl OwnerLossSignal {
     pub fn is_lost(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.lost.load(Ordering::Acquire)
     }
 
-    /// Fail the complete owner scope closed.
-    ///
-    /// The process supervisor uses this when any owner-fenced companion worker
-    /// encounters a terminal invariant failure. The RPC accept loop observes
-    /// the same signal, stops admitting requests, and returns an error instead
-    /// of continuing without lifecycle recovery.
+    pub(crate) fn control_error(&self) -> Option<nokv_control::ControlError> {
+        self.0
+            .control_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Fail the complete owner scope closed without a control-plane cause.
     pub fn fail_closed(&self) {
         self.mark_lost();
     }
 
+    /// Record the typed control-plane cause before publishing owner loss.
+    pub(crate) fn fail_closed_with_control(&self, error: nokv_control::ControlError) {
+        {
+            let mut current = self
+                .0
+                .control_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            if current.is_none() {
+                *current = Some(error);
+            }
+        }
+
+        self.mark_lost();
+    }
+
     fn mark_lost(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.lost.store(true, Ordering::Release);
     }
 }
 
@@ -149,14 +176,21 @@ impl WorkspaceServer {
         registry: Arc<RootOwnerRegistry>,
         ownership: Vec<ShardOwner>,
     ) -> Result<Self, ServerError> {
+        let owner_loss = registry.owner_loss_signal();
+
+        if let Err(error) = require_owner_retained(&owner_loss) {
+            return Err(release_rejected_ownership(ownership, error));
+        }
+
         if let Err(error) = validate_ownership(options, &registry, &ownership) {
             return Err(release_rejected_ownership(ownership, error));
         }
+
         Ok(Self {
             options,
-            owner_loss: registry.owner_loss_signal(),
             registry,
             ownership,
+            owner_loss,
         })
     }
 
@@ -172,10 +206,17 @@ impl WorkspaceServer {
     pub fn renew_ownership(&self) -> Result<(), ServerError> {
         for owner in &self.ownership {
             if let Err(error) = owner.renew_or_uninstall() {
-                self.owner_loss.mark_lost();
+                match &error {
+                    ServerError::Control(control) => {
+                        self.owner_loss.fail_closed_with_control(control.clone());
+                    }
+                    _ => self.owner_loss.mark_lost(),
+                }
+
                 return Err(error);
             }
         }
+
         Ok(())
     }
 
@@ -296,6 +337,10 @@ fn serve_socket_loop(
 }
 
 fn require_owner_retained(owner_loss: &OwnerLossSignal) -> Result<(), ServerError> {
+    if let Some(error) = owner_loss.control_error() {
+        return Err(ServerError::Control(error));
+    }
+
     if owner_loss.is_lost() {
         Err(ServerError::InvalidBootstrap(
             "control-plane owner was lost".to_owned(),
@@ -329,6 +374,24 @@ fn validate_ownership(
                 "ownership entry {index} belongs to another registry"
             )));
         }
+
+        if let Some(required) = owner.owner_lease_renew_interval() {
+            if required.is_zero() {
+                return Err(ServerError::InvalidOptions(format!(
+                    "ownership entry {index} declares a zero lease renewal interval"
+                )));
+            }
+
+            if options.lease_renew_interval != required {
+                return Err(ServerError::InvalidOptions(
+                    format!(
+                        "ownership entry {index} requires lease renewal interval {required:?}, but ServerOptions configures {:?}",
+                        options.lease_renew_interval,
+                    ),
+                ));
+            }
+        }
+
         if !shards.insert(owner.shard_id()) {
             return Err(ServerError::InvalidOptions(format!(
                 "ownership entry {index} duplicates logical shard {:?}",
@@ -365,8 +428,11 @@ fn validate_ownership(
 }
 
 fn release_rejected_ownership(ownership: Vec<ShardOwner>, primary: ServerError) -> ServerError {
+    let preserve_control = matches!(&primary, ServerError::Control(_));
+
     match release_ownership(ownership) {
         Ok(()) => primary,
+        Err(_) if preserve_control => primary,
         Err(cleanup) => ServerError::BootstrapRollback {
             primary: primary.to_string(),
             rollback: cleanup.to_string(),
@@ -409,11 +475,7 @@ fn serve_connection(
         let encoded = encode_response_or_internal_failure(response.response())?;
         write_frame(&mut stream, &encoded)?;
         drop(response);
-        if registry.owner_loss_signal().is_lost() {
-            return Err(ServerError::InvalidBootstrap(
-                "control-plane owner was lost".to_owned(),
-            ));
-        }
+        require_owner_retained(&registry.owner_loss_signal())?;
     }
     Ok(())
 }

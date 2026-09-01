@@ -26,7 +26,7 @@ struct ShardRuntime {
 }
 
 impl ShardRuntime {
-    fn enter(self: &Arc<Self>) -> Option<ResponsePermit> {
+    fn enter(self: &Arc<Self>) -> Option<ShardOperationPermit> {
         let mut state = self
             .state
             .lock()
@@ -35,7 +35,7 @@ impl ShardRuntime {
             return None;
         }
         state.in_flight += 1;
-        Some(ResponsePermit {
+        Some(ShardOperationPermit {
             runtime: Arc::clone(self),
         })
     }
@@ -61,11 +61,11 @@ impl ShardRuntime {
     }
 }
 
-struct ResponsePermit {
+pub(crate) struct ShardOperationPermit {
     runtime: Arc<ShardRuntime>,
 }
 
-impl Drop for ResponsePermit {
+impl Drop for ShardOperationPermit {
     fn drop(&mut self) {
         let mut state = self
             .runtime
@@ -82,7 +82,7 @@ impl Drop for ResponsePermit {
 
 pub(crate) struct GuardedResponse {
     response: WorkspaceRpcResponse,
-    _permit: Option<ResponsePermit>,
+    _permit: Option<ShardOperationPermit>,
 }
 
 impl GuardedResponse {
@@ -221,12 +221,30 @@ impl RootOwnerRegistry {
         logical_shard_id: nokv_protocol::LogicalShardIdentity,
     ) -> Result<(), ServerError> {
         self.owner_loss.fail_closed();
+        self.fail_closed_shard_after_signal(logical_shard_id)
+    }
+
+    pub(crate) fn fail_closed_shard_with_control(
+        &self,
+        logical_shard_id: nokv_protocol::LogicalShardIdentity,
+        error: nokv_control::ControlError,
+    ) -> Result<(), ServerError> {
+        self.owner_loss.fail_closed_with_control(error);
+        self.fail_closed_shard_after_signal(logical_shard_id)
+    }
+
+    fn fail_closed_shard_after_signal(
+        &self,
+        logical_shard_id: nokv_protocol::LogicalShardIdentity,
+    ) -> Result<(), ServerError> {
         let runtime = {
             let mut runtimes = self.runtimes.write().map_err(|_| {
                 ServerError::InvalidRoute("shard runtime registry lock is poisoned".to_owned())
             })?;
+
             Arc::clone(runtimes.entry(logical_shard_id).or_default())
         };
+
         self.fail_closed_runtime(logical_shard_id, &runtime)
     }
 
@@ -246,6 +264,51 @@ impl RootOwnerRegistry {
             });
         runtime.wait_until_drained();
         route_removal
+    }
+
+    /// Admit one owner-fenced shard operation and hold the shard drain
+    /// barrier until the returned permit is dropped.
+    pub(crate) fn enter_shard_operation(
+        &self,
+        route: RootRoute,
+    ) -> Result<ShardOperationPermit, ServerError> {
+        route
+            .validate()
+            .map_err(|error| ServerError::InvalidRoute(error.to_string()))?;
+
+        if let Some(error) = self.owner_loss.control_error() {
+            return Err(ServerError::Control(error));
+        }
+
+        if self.owner_loss.is_lost() {
+            return Err(ServerError::InvalidRoute(
+                "owner scope is fail-closed".to_owned(),
+            ));
+        }
+
+        let owners = self
+            .owners
+            .read()
+            .map_err(|_| ServerError::InvalidRoute("owner registry lock is poisoned".to_owned()))?;
+
+        let owner = owners.get(&route.root_id).ok_or_else(|| {
+            ServerError::InvalidRoute("this server no longer owns the requested root".to_owned())
+        })?;
+
+        if owner.route != route {
+            return Err(ServerError::InvalidRoute(
+                "the requested root route is stale".to_owned(),
+            ));
+        }
+
+        let runtime = Arc::clone(&owner.runtime);
+
+        let permit = runtime.enter().ok_or_else(|| {
+            ServerError::InvalidRoute("the requested logical shard is fail-closed".to_owned())
+        })?;
+
+        drop(owners);
+        Ok(permit)
     }
 
     #[cfg(test)]

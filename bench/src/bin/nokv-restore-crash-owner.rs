@@ -844,17 +844,17 @@ fn run_server(config: ServeConfig) -> Result<(), String> {
         .install(target_route, executor)
         .map_err(|error| error.to_string())?;
 
-    let renew_seconds = u64::try_from(config.lease_ttl_seconds)
-        .map_err(|_| "etcd lease TTL must be positive".to_owned())?
-        .saturating_div(3)
-        .max(1);
+    let lease_renew_interval = owner.owner_lease_renew_interval().ok_or_else(|| {
+        "etcd-backed benchmark server requires an expiring owner-lease renewal policy".to_owned()
+    })?;
+
     let server = WorkspaceServer::new(
         ServerOptions {
             bind: config.bind,
             handshake_timeout: Duration::from_millis(config.handshake_timeout_millis),
             read_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),
-            lease_renew_interval: Duration::from_secs(renew_seconds),
+            lease_renew_interval,
             max_inflight_connections: config.max_inflight_connections,
         },
         registry,

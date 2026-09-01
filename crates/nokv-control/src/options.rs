@@ -45,6 +45,16 @@ impl EtcdControlStoreOptions {
     pub fn lease_ttl_seconds(&self) -> i64 {
         self.lease_ttl_seconds
     }
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn owner_lease_renew_interval(&self) -> Option<std::time::Duration> {
+        let ttl_seconds = u64::try_from(self.lease_ttl_seconds).ok()?;
+        if ttl_seconds == 0 {
+            return None;
+        }
+        Some(std::time::Duration::from_secs(
+            ttl_seconds.saturating_div(3).max(1),
+        ))
+    }
 
     pub fn validate(&self) -> Result<(), ControlError> {
         if self.endpoints.is_empty() {
@@ -226,6 +236,30 @@ mod tests {
         assert_eq!(
             String::from_utf8(options.logical_shard_session_key(&shard_id(0x02))).unwrap(),
             "/nokv/test/sessions/02020202020202020202020202020202"
+        );
+    }
+
+    #[test]
+    fn owner_lease_renew_interval_tracks_ttl_third_with_floor() {
+        let endpoint = ["http://127.0.0.1:2379"];
+
+        assert_eq!(
+            EtcdControlStoreOptions::new(endpoint)
+                .with_lease_ttl_seconds(1)
+                .owner_lease_renew_interval(),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            EtcdControlStoreOptions::new(endpoint)
+                .with_lease_ttl_seconds(10)
+                .owner_lease_renew_interval(),
+            Some(std::time::Duration::from_secs(3))
+        );
+        assert_eq!(
+            EtcdControlStoreOptions::new(endpoint)
+                .with_lease_ttl_seconds(60)
+                .owner_lease_renew_interval(),
+            Some(std::time::Duration::from_secs(20))
         );
     }
 }
