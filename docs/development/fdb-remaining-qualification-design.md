@@ -71,9 +71,10 @@ A Workbench head intentionally retains its parent commits. There is no public
 operation that creates a sealed zero-consumer commit solely for retirement.
 For the commit-retirement case, the qualification executable opens the current
 session-fenced `FdbStore`, constructs one codec-valid sealed commit plus its
-exact revision reference through `nokv-meta`, and commits that precondition as
-one normal `MetadataCommand`. The production candidate must discover, claim,
-release, and complete retirement. The qualification process only observes the
+exact revision reference and zero-row publication closure through `nokv-meta`,
+and commits that precondition as one normal `MetadataCommand`. The production
+candidate must discover, claim, release, and complete retirement, then finish
+the resulting revision GC. The qualification process only observes the
 terminal records; it never calls `LifecycleRunner`.
 
 The ambiguous-delete injector is a separate TCP proxy owned by the Gate 8

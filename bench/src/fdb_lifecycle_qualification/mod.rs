@@ -23,8 +23,9 @@ use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use self::inspection::{
-    completed_gc_count, has_commit_state, has_operation_phase, quarantined_candidate_count,
-    retired_snapshot_count, LifecycleInspector, LifecycleSnapshot,
+    completed_gc_count, has_commit_state, has_gc_candidate_state, has_operation_phase,
+    has_revision_state, quarantined_candidate_count, retired_snapshot_count, LifecycleInspector,
+    LifecycleSnapshot,
 };
 use self::lost_delete_proxy::{LostDeleteEvent, LostDeleteProxy};
 use crate::fdb_live_runtime::{
@@ -522,11 +523,14 @@ fn execute(
     let retired = wait_for_snapshot(&inspector, options.lifecycle_timeout, |snapshot| {
         has_commit_state(snapshot, commit_id, nokv_types::CommitState::Retired)
             && has_operation_phase(snapshot, "CommitRetire", "Complete")
+            && has_revision_state(snapshot, revision_id, nokv_types::RevisionState::Deleted)
+            && has_gc_candidate_state(snapshot, revision_id, nokv_types::GcClaimState::Complete)
     })?;
+    state.processes.require_running("owner")?;
     evidence.write_json("snapshots/commit-retirement.json", &retired)?;
     state.pass(
         "commit_retirement",
-        "the exact candidate discovered and completed a session-fenced zero-consumer commit retirement",
+        "the exact candidate completed a session-fenced zero-consumer commit retirement and its zero-row revision GC",
     );
 
     let final_ownership = control.observe()?;

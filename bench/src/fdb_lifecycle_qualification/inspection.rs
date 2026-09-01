@@ -262,9 +262,10 @@ impl LifecycleInspector {
                 body_digest_uri:
                     "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
                         .to_owned(),
-                manifest_digest_uri:
-                    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-                        .to_owned(),
+                // Publication closure digests are rolling protocol digests,
+                // so a zero-row manifest uses the all-zero closure rather
+                // than SHA-256(empty).
+                manifest_digest_uri: format!("sha256:{}", "00".repeat(SHA256_BYTES)),
                 block_count: 0,
                 dependency_count: 0,
                 dependency_depth: 0,
@@ -415,6 +416,32 @@ pub(crate) fn has_commit_state(
         .commits
         .iter()
         .any(|commit| commit.commit_id == commit_id && commit.state == state)
+}
+
+pub(crate) fn has_revision_state(
+    snapshot: &LifecycleSnapshot,
+    revision_id: ArtifactRevisionId,
+    state: RevisionState,
+) -> bool {
+    let revision_id = hex(revision_id.as_bytes());
+    let state = format!("{state:?}");
+    snapshot
+        .revisions
+        .iter()
+        .any(|revision| revision.revision_id == revision_id && revision.state == state)
+}
+
+pub(crate) fn has_gc_candidate_state(
+    snapshot: &LifecycleSnapshot,
+    revision_id: ArtifactRevisionId,
+    state: GcClaimState,
+) -> bool {
+    let revision_id = hex(revision_id.as_bytes());
+    let state = format!("{state:?}");
+    snapshot
+        .gc_candidates
+        .iter()
+        .any(|candidate| candidate.revision_id == revision_id && candidate.claim_state == state)
 }
 
 pub(crate) fn quarantined_candidate_count(snapshot: &LifecycleSnapshot) -> usize {
