@@ -290,41 +290,6 @@ RootId is the only storage and routing identity. A Workbench presentation root
 shapes Agent-facing paths and manifests but never enters canonical metadata
 keys.
 
-## Stable Workbench
-
-The native CLI accepts exactly these 18 Workbench operation names:
-
-```text
-workbench_create
-workbench_put_file
-workbench_append
-workbench_edit
-workbench_list
-workbench_stat
-workbench_read
-workbench_grep
-workbench_search
-workbench_aggregate
-workbench_catalog
-workbench_find
-workbench_commit
-workbench_snapshot
-workbench_snapshot_renew
-workbench_snapshot_retire
-workbench_snapshot_list
-workbench_restore
-```
-
-Tool names, normalized input schemas, create/replace semantics, generation and
-digest relationships, commit identity, snapshot lifecycle, and restore
-idempotency form the stable contract. Workbench result shaping remains an
-adapter concern and does not dictate durable metadata families.
-
-The 18 names define behavior, not a transport. The native CLI exposes them
-directly, and the Python SDK provides the underlying programmatic operations.
-
-See the [Workbench Contract](docs/workbench-contract.md).
-
 ## Integration Model
 
 The Workbench contract is runtime-neutral. A downstream Agent runtime exposes
