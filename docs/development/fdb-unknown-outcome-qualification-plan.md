@@ -8,7 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 Date: 2026-09-01
 
 Status: completed; Gate 2 passed on source
-`4f33c6fca4c099d49d91d5a575d58669dc3d6c10`.
+`52fd14a29dd344973c5cc06752c5a51bd440a0a3`.
 
 Qualification record:
 [FoundationDB Metadata Root-Fix Qualification, 2026-08-31](./fdb-root-fix-qualification-2026-08-31.md#gate-2-unknown-outcome-qualification)

@@ -79,22 +79,22 @@ ran one clean Linux candidate against a real three-node FDB 7.3.79 cluster and
 the pinned RustFS service. The retained bundle is in the builder target volume:
 
 ```text
-/target/gate2-4f33c6fc-run1/
+/target/gate2-52fd14a2-run1/
 ```
 
 | Evidence identity | Exact value |
 | --- | --- |
-| Source | `4f33c6fca4c099d49d91d5a575d58669dc3d6c10` |
-| `nokv-fdb` SHA-256 | `8e125b96a41052612698ee89766c3b677885c3238f16b1ef9aecddf9b353ec3c` |
+| Source | `52fd14a29dd344973c5cc06752c5a51bd440a0a3` |
+| `nokv-fdb` SHA-256 | `287efde4dd3841d36da715cca6d64731d9fbe51b7ed340275eb67140cfc834b9` |
 | Qualification binary SHA-256 | `7ccbee0b1f3b28eef74fd357ca1f401069ecb3ae082c1614ffca3c74ffe8682f` |
 | Lost-ACK shim SHA-256 | `8a984761c8955560a91354b5458b8190695f36cc5920d6f299fcf6a80aef3401` |
 | `libfdb_c.so` SHA-256 | `f677f883c30869e8d00dbc15ef8a38228070a723a600d7219f5a1b10c0d3d7d0` |
 | FDB | `7.3.79`, protocol `0fdb00b073000000`, three coordinators, `double` redundancy |
 | FDB image | `foundationdb/foundationdb@sha256:d3530c3066f94abffb61facac527c9c3517f6553ee0e75efa69d54296290156a` |
 | RustFS image | `rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab` |
-| Environment SHA-256 | `e8efc65d9b4364d48da4541e0b780143273bb477d2ebd801feb46ce841605501` |
-| Terminal result SHA-256 | `11c13f412d6a1a768556c7261853afe3d2771bdbacfb2992abc17b2a84ce29b3` |
-| Inventory SHA-256 | `2047a174bccdc4cd226fdefc701a160f983d2187df16f97540582d731428fd05` |
+| Environment SHA-256 | `516100ad934308b5a7cd30cfed426caa6934b3e25dd7ba0ac50477224b5fdb86` |
+| Terminal result SHA-256 | `a1e3d7c8652712de5f4aabd792cba6e05a11f51111b45a1d5b4d9552b71a57b3` |
+| Inventory SHA-256 | `2b5f238d7544c321c01709dc3a922f21f726f55add1e75dc91dcbfd5b68ba422` |
 
 The atomic terminal result is `PASS`: 64 of 64 required scenarios completed.
 Those scenarios comprise one no-injection control, one injected smoke case,
@@ -121,6 +121,10 @@ HTTP `200` before and after qualification. The bundle contains no credentials.
 `readelf` shows that the production candidate depends on `libfdb_c`, libc,
 libm, and libgcc only, with no dynamic dependency on the qualification shim;
 production crates expose no lost-ACK selector or fault-injection surface.
+This exact source also preserves typed FDB keepalive failures through a
+poisoned failure slot and converges concurrent restore finalizers only after
+an exact monotonic durable readback. Both regressions passed in the repository
+gates below.
 
 ## Gate 6 Serve-Crash Qualification
 
@@ -226,6 +230,10 @@ successor must take over. That observed failover is the required safety
 behavior, not a false availability failure.
 
 ## Repository Gates
+
+The repository gates below were rerun on source
+`52fd14a29dd344973c5cc06752c5a51bd440a0a3` after the latest `main` merge and
+the concurrent restore-finalizer fix.
 
 | Command or check | Result |
 | --- | --- |
