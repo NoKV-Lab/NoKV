@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 Date: 2026-09-01
 
-Status: design approved; written-spec review pending.
+Status: implemented; Gate 6 and Gate 7 clean-candidate evidence passed.
 
 ## Decision
 

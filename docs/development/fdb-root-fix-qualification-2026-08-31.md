@@ -19,10 +19,12 @@ This distinction is intentional:
   concurrent publication, owner/seed failover, and one-node FDB loss were
   exercised without a stranded catalog, semantic replay mismatch, or stale
   write.
+- **Gate 6 serve-crash qualification: PASS.** The approved pre-activation,
+  post-activation, stale-session, renewal-failure, and successor-recovery
+  matrix passed on the merged lease-safe candidate.
 - **FDB serving qualification: NOT QUALIFIED.** Commit-unknown injection,
-  every serve crash cut, the complete lifecycle matrix, a measured maximum
-  physical transaction envelope, and controlled performance evidence remain
-  incomplete.
+  the complete lifecycle matrix, a measured maximum physical transaction
+  envelope, and controlled performance evidence remain incomplete.
 
 The normative runtime and package boundaries are the
 [metadata-store interface](./metadata-store-interface.md),
@@ -61,6 +63,49 @@ retained separately because it predates only the lifecycle retry change:
 target/qualification/fdb-root-fix-288a6c80-20260831T145502Z/
 ```
 
+## Gate 6 Serve-Crash Qualification
+
+Gate 6 is **PASS** for the matrix approved in
+[FDB Main Synchronization And Lease-Safety Design](./fdb-main-sync-lease-safety-design.md).
+The environment-gated workload used the exact `nokv-fdb` candidate, a real
+three-node FDB cluster, and the pinned RustFS service. The retained bundle is:
+
+```text
+target/qualification/fdb-serve-gate6-4ba27f23-20260901/
+```
+
+| Evidence identity | Exact value |
+| --- | --- |
+| Source | `4ba27f237b59497cffd3b0753430f607a8d495a8` |
+| `nokv-fdb` SHA-256 | `f465deaf522e61705de1ef4be679fea4dc25f2c32853743bdc9b8dcb118eefe2` |
+| Qualification binary SHA-256 | `edd6902ea09a1f126aab574265ab6e52972464e1596559b8f2446ba2133c5809` |
+| `libfdb_c.so` SHA-256 | `f677f883c30869e8d00dbc15ef8a38228070a723a600d7219f5a1b10c0d3d7d0` |
+| FDB | `7.3.79`, protocol `fdb00b073000000`, API `730` |
+| RustFS image | `rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab` |
+| Terminal result SHA-256 | `13e8ec0e0a27d3fb977fc19946123cabf47298b3c378a5c48de97f524d62b75b` |
+| Environment SHA-256 | `15cb6fffcd8b7782ac87b003344b9f45db5ab0c857aba5c387f01dfc9ffdd3ce` |
+
+The controller stopped all three FDB containers while leaving RustFS online,
+then restarted the exact containers. It was external to product code; no
+benchmark-only failure hook entered the server API. The bundle contains 132
+files, an atomic `PASS` result, 33 successful recorded commands, 29 FDB/RustFS
+health or outage observations, process exits, route/session/heartbeat
+snapshots, and typed workspace protocol evidence. It contains no credentials.
+
+| Scenario | Result | Retained oracle |
+| --- | --- | --- |
+| Pre-activation crash | PASS | Owner A was killed while `Activating`; epoch/generation `3/3` and heartbeat sequence `5` remained unchanged, and the dead session never became `Serving`. |
+| Pre-activation successor | PASS | Owner B took over at `4/4`; its heartbeat advanced `6 -> 7` before the first retained mutation. |
+| Post-activation owner loss | PASS | After B committed workspace version `5` and died, owner C took over at `5/5` and read back B's exact workspace incarnation. |
+| Stale-session write | PASS | A retained raw B metadata handle returned exact `StoreError::Fenced { expected_owner_epoch: 4, expected_session_generation: 4 }`. |
+| Renewal failure | PASS | During complete FDB outage, RustFS stayed HTTP `200`; C exited with the typed FDB `1031` control-plane failure, did not accept another mutation, and its heartbeat stopped at `9`. |
+| Final successor | PASS | After FDB recovery, owner D took over at `6/6` and completed a new workspace mutation and read-back. |
+
+This closes Gate 6 only. A dead route may remain durably `Serving` while FDB
+is unavailable because fail-close cannot commit to the unavailable control
+store; local admission closes immediately, the endpoint exits, and takeover
+still requires monotonic lease expiry plus both fence advances after recovery.
+
 ## Gate 7 Seed Discovery Qualification
 
 Gate 7 is **PASS**. The environment-gated Rust workload described by the
@@ -69,9 +114,15 @@ ran from one clean source revision against the exact `nokv-fdb` candidate, a
 fresh FDB prefix, and a fresh RustFS object root. The retained bundle is:
 
 ```text
-target/qualification/fdb-seed-gate7-final-20260901/
+target/qualification/fdb-seed-gate7-4ba27f23-20260901/
 ```
 
+The rerun used source `4ba27f237b59497cffd3b0753430f607a8d495a8`
+and the same `nokv-fdb` SHA-256 as Gate 6. Its atomic result and environment
+SHA-256 values are respectively
+`4dc4bae4fa6d0d860b3e6deea279ea85c5b3051970d0f9428855acfdd8e68351`
+and
+`3951a61b1248be96295fd364d02507df851ce08ff7ac94219047e07519cfd2f5`.
 The bundle contains the candidate and cluster-file digests, FDB 7.3.79 status
 before and after the run, pinned RustFS service identity and HTTP health before
 and after the run, complete A/B route tuples, process PIDs and takeover
@@ -91,7 +142,7 @@ hashes, and the atomic terminal result.
 
 The qualification client used only the NoKV seed and workspace TCP protocol;
 only the candidate server processes connected to FDB. This result closes Gate
-7 only. Gates 2, 6, 8, 9, and 10 remain `NOT QUALIFIED`, so the overall FDB
+7 only. Gates 2, 8, 9, and 10 remain `NOT QUALIFIED`, so the overall FDB
 serving profile remains **NOT QUALIFIED**.
 
 ## Root-Fix Acceptance Matrix
@@ -124,6 +175,11 @@ behavior, not a false availability failure.
 | `cargo test --workspace --all-features --exclude nokv-python` in the FDB builder | PASS |
 | `cargo test -p nokv-python` with default features | PASS, 23 passed and 2 live S3 tests ignored |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` in the FDB builder | PASS |
+| Real FDB metadata conformance and exact session fencing | PASS, 1 environment-gated integration test |
+| Real FDB concurrent control contenders and takeover fencing | PASS, 1 environment-gated integration test |
+| Real FDB provision release and catalog crash recovery | PASS, 1 environment-gated integration test |
+| Gate 6 serve-crash qualification | PASS, 6 scenarios and 132 retained evidence files |
+| Gate 7 seed-discovery qualification rerun | PASS, 8 scenarios and 35 retained evidence files |
 | `python3 scripts/workbench/workbench_contract_test.py` | PASS, 8 passed |
 | `git diff --check` | PASS |
 | DCO trailers on every branch commit | PASS |
@@ -143,7 +199,7 @@ executable test configuration without weakening either check.
 | 3. Session fencing | PASS | Real control and metadata tests rejected stale renew, read, write, and release behavior. |
 | 4. Takeover | PASS | Concurrent contenders, monotonic expiry observation, generation advance, owner kill, and live takeover ran. |
 | 5. Provision crashes | PASS | Preparation/finalization crash cuts and external admission retry converged. |
-| 6. Serve crashes | NOT QUALIFIED | Active-owner loss passed, but every pre-activation and post-activation crash cut has not been retained. |
+| 6. Serve crashes | PASS | The approved live matrix retained an `Activating` owner kill, exact successor fence advancement, post-commit owner loss and read-back, stale raw metadata rejection, full-control-plane renewal failure with local fail-close, and recovery takeover mutation. |
 | 7. Seed discovery | PASS | One clean-head live bundle retained multiple seeds, failed-first fallback, A-to-B refresh, stale discovery and owner hints, same-generation endpoint drift, immutable identity drift, and final mutation/read through B. |
 | 8. Lifecycle | NOT QUALIFIED | Live publication ran through FDB, but restore, snapshot, retirement, GC, and ambiguous-delete quarantine have not all run live. |
 | 9. Limits | NOT QUALIFIED | Deterministic 900,000-byte planning tests pass, but the maximum physical affected-byte envelope is not yet measured and retained against the live cluster. |
