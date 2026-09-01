@@ -50,7 +50,6 @@ const OWNERSHIP_OBSERVATION_POLL: Duration = Duration::from_millis(100);
 const OWNERSHIP_CONFLICT_BACKOFF: Duration = Duration::from_millis(5);
 
 static STORE_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FdbFormatState {
@@ -121,8 +120,7 @@ impl FdbPreparedProvision {
             shard.state(),
             provision_owner(self.manifest.store_id(), root.root_id())?,
             RpcEndpoint::new(PROVISION_ENDPOINT)?,
-            false,
-            &NEVER_SHUTDOWN,
+            OwnerAcquisitionMode::Immediate,
         )?;
         let result = (|| {
             let meta = open_provisioning_meta(
@@ -285,19 +283,250 @@ fn discovery_unavailable(message: &str, retryable: bool) -> RpcFailure {
     }
 }
 
+trait FdbLeaseControl: Send + Sync {
+    fn renew_owner(&self, session: &OwnerSession) -> Result<(), ControlError>;
+    fn fail_closed(&self, session: &OwnerSession) -> Result<(), ControlError>;
+}
+
+impl FdbLeaseControl for FdbControlStore {
+    fn renew_owner(&self, session: &OwnerSession) -> Result<(), ControlError> {
+        DistributedControlStore::renew_owner(self, session).map(|_| ())
+    }
+
+    fn fail_closed(&self, session: &OwnerSession) -> Result<(), ControlError> {
+        DistributedControlStore::fail_closed(self, session).map(|_| ())
+    }
+}
+
+#[derive(Default)]
+struct FdbBootstrapKeepaliveState {
+    stop: AtomicBool,
+    failure: Mutex<Option<ControlError>>,
+    sessions: Mutex<Vec<OwnerSession>>,
+}
+
+impl FdbBootstrapKeepaliveState {
+    fn record_failure(&self, error: ControlError) -> ControlError {
+        let mut failure = self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if failure.is_none() {
+            *failure = Some(error);
+        }
+        failure
+            .as_ref()
+            .expect("failure was just installed")
+            .clone()
+    }
+
+    fn current_failure(&self) -> Option<ControlError> {
+        self.failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn current_sessions(&self) -> Vec<OwnerSession> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+struct FdbKeepalivePanicFailClose {
+    state: Arc<FdbBootstrapKeepaliveState>,
+    control: Arc<dyn FdbLeaseControl>,
+    registry: Arc<RootOwnerRegistry>,
+}
+
+impl Drop for FdbKeepalivePanicFailClose {
+    fn drop(&mut self) {
+        if !thread::panicking() {
+            return;
+        }
+        let error = self.state.record_failure(ControlError::Backend(
+            "FoundationDB bootstrap keepalive worker panicked; owner scope fail-closed".to_owned(),
+        ));
+        fail_close_bootstrap_sessions(
+            self.control.as_ref(),
+            self.registry.as_ref(),
+            &self.state.current_sessions(),
+            &error,
+        );
+    }
+}
+
+struct FdbBootstrapKeepalive {
+    state: Arc<FdbBootstrapKeepaliveState>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl FdbBootstrapKeepalive {
+    fn start(
+        control: Arc<dyn FdbLeaseControl>,
+        registry: Arc<RootOwnerRegistry>,
+        interval: Duration,
+    ) -> Result<Self, ServerError> {
+        if interval.is_zero() {
+            return Err(ServerError::InvalidBootstrap(
+                "FoundationDB bootstrap renewal interval must be nonzero".to_owned(),
+            ));
+        }
+        let state = Arc::new(FdbBootstrapKeepaliveState::default());
+        let worker_state = Arc::clone(&state);
+        let worker = thread::Builder::new()
+            .name("nokv-fdb-bootstrap-keepalive".to_owned())
+            .spawn(move || {
+                let _panic_guard = FdbKeepalivePanicFailClose {
+                    state: Arc::clone(&worker_state),
+                    control: Arc::clone(&control),
+                    registry: Arc::clone(&registry),
+                };
+                loop {
+                    thread::park_timeout(interval);
+                    if worker_state.stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    for session in worker_state.current_sessions() {
+                        if let Err(error) = control.renew_owner(&session) {
+                            let error = worker_state.record_failure(error);
+                            fail_close_bootstrap_sessions(
+                                control.as_ref(),
+                                registry.as_ref(),
+                                &worker_state.current_sessions(),
+                                &error,
+                            );
+                            return;
+                        }
+                    }
+                }
+            })
+            .map_err(ServerError::Connection)?;
+        Ok(Self {
+            state,
+            worker: Mutex::new(Some(worker)),
+        })
+    }
+
+    fn register(&self, session: OwnerSession) -> Result<(), ServerError> {
+        if self.state.stop.load(Ordering::Acquire) {
+            return Err(ServerError::InvalidBootstrap(
+                "FoundationDB bootstrap keepalive is already stopped".to_owned(),
+            ));
+        }
+        self.ensure_healthy()?;
+        let mut sessions = self.state.sessions.lock().map_err(|_| {
+            ServerError::InvalidBootstrap(
+                "FoundationDB bootstrap session registry lock is poisoned".to_owned(),
+            )
+        })?;
+        if let Some(current) = sessions
+            .iter()
+            .find(|current| current.logical_shard_id() == session.logical_shard_id())
+        {
+            return if current == &session {
+                Ok(())
+            } else {
+                Err(ServerError::InvalidBootstrap(format!(
+                    "FoundationDB bootstrap registered two sessions for shard {:?}",
+                    session.logical_shard_id()
+                )))
+            };
+        }
+        sessions.push(session);
+        drop(sessions);
+        self.ensure_healthy()
+    }
+
+    fn ensure_healthy(&self) -> Result<(), ServerError> {
+        if let Some(error) = self.state.current_failure() {
+            return Err(ServerError::Control(error));
+        }
+        let worker = self.worker.lock().map_err(|_| {
+            ServerError::InvalidBootstrap(
+                "FoundationDB bootstrap keepalive worker lock is poisoned".to_owned(),
+            )
+        })?;
+        if worker.as_ref().is_some_and(thread::JoinHandle::is_finished)
+            && !self.state.stop.load(Ordering::Acquire)
+        {
+            return Err(ServerError::InvalidBootstrap(
+                "FoundationDB bootstrap keepalive exited without recording a failure".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn stop(&self) -> Result<(), ServerError> {
+        self.state.stop.store(true, Ordering::Release);
+        let worker = self
+            .worker
+            .lock()
+            .map_err(|_| {
+                ServerError::InvalidBootstrap(
+                    "FoundationDB bootstrap keepalive worker lock is poisoned".to_owned(),
+                )
+            })?
+            .take();
+        let panicked = if let Some(worker) = worker {
+            worker.thread().unpark();
+            worker.join().is_err()
+        } else {
+            false
+        };
+        match self.ensure_healthy() {
+            Err(error) => Err(error),
+            Ok(()) if panicked => Err(ServerError::InvalidBootstrap(
+                "FoundationDB bootstrap keepalive worker panicked".to_owned(),
+            )),
+            Ok(()) => Ok(()),
+        }
+    }
+}
+
+impl Drop for FdbBootstrapKeepalive {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+fn fail_close_bootstrap_sessions(
+    control: &dyn FdbLeaseControl,
+    registry: &RootOwnerRegistry,
+    sessions: &[OwnerSession],
+    error: &ControlError,
+) {
+    for session in sessions {
+        let _ = registry.fail_closed_shard_with_control(
+            LogicalShardIdentity::from(session.logical_shard_id()),
+            error.clone(),
+        );
+    }
+    for session in sessions {
+        let _ = control.fail_closed(session);
+    }
+}
+
 struct FdbOwnership {
     control: Arc<FdbControlStore>,
     registry: Arc<RootOwnerRegistry>,
     sessions: Vec<OwnerSession>,
     lease_renew_interval: Duration,
+    bootstrap_keepalive: FdbBootstrapKeepalive,
     activated: AtomicBool,
     failed: AtomicBool,
-    release_gate: Mutex<()>,
+    maintenance_gate: Mutex<()>,
     released: AtomicBool,
 }
 
 impl FdbOwnership {
     fn activate(&self) -> Result<(), ServerError> {
+        let _maintenance_guard = self
+            .maintenance_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.released.load(Ordering::Acquire) {
             return Err(ServerError::InvalidBootstrap(
                 "FoundationDB ownership was already released".to_owned(),
@@ -308,35 +537,76 @@ impl FdbOwnership {
                 "FoundationDB ownership is fail-closed".to_owned(),
             ));
         }
+        if let Err(error) = self.bootstrap_keepalive.ensure_healthy() {
+            return Err(self.fail_closed_after(error));
+        }
         if self.activated.load(Ordering::Acquire) {
             return Ok(());
         }
         for session in &self.sessions {
+            if let Err(error) = self.bootstrap_keepalive.ensure_healthy() {
+                return Err(self.fail_closed_after(error));
+            }
             if let Err(primary) = activate_route_exact(self.control.as_ref(), session) {
                 return Err(self.fail_closed_after(primary));
             }
+            if let Err(error) = self.bootstrap_keepalive.ensure_healthy() {
+                return Err(self.fail_closed_after(error));
+            }
         }
         self.activated.store(true, Ordering::Release);
-        Ok(())
+        self.bootstrap_keepalive
+            .ensure_healthy()
+            .map_err(|error| self.fail_closed_after(error))
     }
 
     fn fail_closed_after(&self, primary: ServerError) -> ServerError {
         self.failed.store(true, Ordering::Release);
-        let control_cause = match &primary {
-            ServerError::Control(error) => Some(error),
+        let primary_cause = match &primary {
+            ServerError::Control(error) => Some(error.clone()),
             _ => None,
         };
-        match self.fail_closed_all(control_cause) {
-            Ok(()) => primary,
-            Err(cleanup) => ServerError::BootstrapRollback {
+        let mut failures = Vec::new();
+
+        self.fail_closed_registry(primary_cause.as_ref(), &mut failures);
+        self.fail_closed_control(&mut failures);
+
+        let keepalive_failure = self.bootstrap_keepalive.stop().err();
+        if let Some(ServerError::Control(error)) = &keepalive_failure {
+            // A generic failure may have closed admission before the worker's
+            // typed failure became visible. Publish that typed cause now; the
+            // owner-loss state retains whichever typed cause arrived first.
+            self.fail_closed_registry(Some(error), &mut failures);
+        }
+
+        if let Some(error) = self.registry.owner_loss_signal().control_error() {
+            return ServerError::Control(error);
+        }
+        if let Some(error) = primary_cause {
+            return ServerError::Control(error);
+        }
+        if let Some(ServerError::Control(error)) = &keepalive_failure {
+            return ServerError::Control(error.clone());
+        }
+        if let Some(error) = keepalive_failure {
+            failures.push(format!("stop FoundationDB bootstrap keepalive: {error}"));
+        }
+
+        if failures.is_empty() {
+            primary
+        } else {
+            ServerError::BootstrapRollback {
                 primary: primary.to_string(),
-                rollback: cleanup.to_string(),
-            },
+                rollback: failures.join("; "),
+            }
         }
     }
 
-    fn fail_closed_all(&self, control_cause: Option<&ControlError>) -> Result<(), ServerError> {
-        let mut failures = Vec::new();
+    fn fail_closed_registry(
+        &self,
+        control_cause: Option<&ControlError>,
+        failures: &mut Vec<String>,
+    ) {
         for session in &self.sessions {
             let shard = LogicalShardIdentity::from(session.logical_shard_id());
             let result = match control_cause {
@@ -352,15 +622,18 @@ impl FdbOwnership {
                 ));
             }
         }
+    }
+
+    fn fail_closed_control(&self, failures: &mut Vec<String>) {
         for session in &self.sessions {
-            if let Err(error) = self.control.fail_closed(session) {
+            if let Err(error) = DistributedControlStore::fail_closed(self.control.as_ref(), session)
+            {
                 failures.push(format!(
                     "fail-close shard {:?} control route: {error}",
                     session.logical_shard_id()
                 ));
             }
         }
-        combine_failures("fail-close FoundationDB ownership", failures)
     }
 }
 
@@ -370,6 +643,10 @@ impl OwnershipMaintenance for FdbOwnership {
     }
 
     fn renew(&self) -> Result<(), ServerError> {
+        let _maintenance_guard = self
+            .maintenance_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.released.load(Ordering::Acquire) {
             return Err(ServerError::InvalidBootstrap(
                 "FoundationDB ownership was released".to_owned(),
@@ -385,8 +662,12 @@ impl OwnershipMaintenance for FdbOwnership {
                 "FoundationDB routes were not activated".to_owned(),
             ));
         }
+        if let Err(error) = self.bootstrap_keepalive.stop() {
+            return Err(self.fail_closed_after(error));
+        }
         for session in &self.sessions {
-            if let Err(error) = self.control.renew_owner(session) {
+            if let Err(error) = DistributedControlStore::renew_owner(self.control.as_ref(), session)
+            {
                 return Err(self.fail_closed_after(ServerError::Control(error)));
             }
         }
@@ -394,23 +675,18 @@ impl OwnershipMaintenance for FdbOwnership {
     }
 
     fn release(&self) -> Result<(), ServerError> {
-        let _release_guard = self.release_gate.lock().map_err(|_| {
-            ServerError::InvalidBootstrap("FoundationDB owner release lock is poisoned".to_owned())
-        })?;
+        let _maintenance_guard = self
+            .maintenance_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.released.load(Ordering::Acquire) {
             return Ok(());
         }
         let mut failures = Vec::new();
-        for session in &self.sessions {
-            if let Err(error) = self
-                .registry
-                .fail_closed_shard(LogicalShardIdentity::from(session.logical_shard_id()))
-            {
-                failures.push(format!(
-                    "remove shard {:?} routes: {error}",
-                    session.logical_shard_id()
-                ));
-            }
+        self.fail_closed_registry(None, &mut failures);
+        let keepalive_failure = self.bootstrap_keepalive.stop().err();
+        if let Some(ServerError::Control(error)) = &keepalive_failure {
+            self.fail_closed_registry(Some(error), &mut failures);
         }
         for session in &self.sessions {
             if let Err(error) = release_owner_exact(self.control.as_ref(), session) {
@@ -420,9 +696,20 @@ impl OwnershipMaintenance for FdbOwnership {
                 ));
             }
         }
-        combine_failures("release FoundationDB ownership", failures)?;
-        self.released.store(true, Ordering::Release);
-        Ok(())
+        if failures.is_empty() {
+            self.released.store(true, Ordering::Release);
+        }
+
+        if let Some(error) = self.registry.owner_loss_signal().control_error() {
+            return Err(ServerError::Control(error));
+        }
+        if let Some(ServerError::Control(error)) = &keepalive_failure {
+            return Err(ServerError::Control(error.clone()));
+        }
+        if let Some(error) = keepalive_failure {
+            failures.push(format!("stop FoundationDB bootstrap keepalive: {error}"));
+        }
+        combine_failures("release FoundationDB ownership", failures)
     }
 }
 
@@ -528,8 +815,7 @@ pub fn prepare_fdb_provision(
         shard.state(),
         provision_owner(manifest.store_id(), root_id)?,
         RpcEndpoint::new(PROVISION_ENDPOINT)?,
-        false,
-        &NEVER_SHUTDOWN,
+        OwnerAcquisitionMode::Immediate,
     )?;
     let result = (|| {
         let meta =
@@ -585,10 +871,14 @@ pub fn serve_fdb(
     }
     let endpoint = RpcEndpoint::new(endpoint.to_string())?;
     let registry = Arc::new(RootOwnerRegistry::new());
+    let lease_control: Arc<dyn FdbLeaseControl> = control.clone();
+    let bootstrap_keepalive =
+        FdbBootstrapKeepalive::start(lease_control, Arc::clone(&registry), lease_renew_interval)?;
     let mut sessions = Vec::with_capacity(roots_by_shard.len());
     let mut served_roots = Vec::new();
     let prepared = (|| {
         for (logical_shard_id, mut roots) in roots_by_shard {
+            bootstrap_keepalive.ensure_healthy()?;
             roots.sort_by_key(RootCatalogEntry::root_id);
             let shard = control
                 .get_shard_catalog(&logical_shard_id)?
@@ -605,15 +895,21 @@ pub fn serve_fdb(
                 CatalogEntryState::Ready,
                 node_id.clone(),
                 endpoint.clone(),
-                true,
-                shutdown,
+                OwnerAcquisitionMode::Takeover {
+                    shutdown,
+                    keepalive: &bootstrap_keepalive,
+                },
             )?;
             sessions.push(session.clone());
+            bootstrap_keepalive.register(session.clone())?;
             let meta = open_fenced_meta(&runtime, url, control.as_ref(), &session)?;
+            bootstrap_keepalive.ensure_healthy()?;
             advance_shared_owner(meta.as_ref(), &session)?;
+            bootstrap_keepalive.ensure_healthy()?;
             let executor: Arc<dyn WorkspaceRequestExecutor> =
                 Arc::new(MetadataWorkspaceRequestExecutor::new(Arc::clone(&meta)));
             for root in roots {
+                bootstrap_keepalive.ensure_healthy()?;
                 validate_ready_root_fence(meta.as_ref(), logical_shard_id, root)?;
                 let route = root_route(&session, root);
                 registry.install(route, Arc::clone(&executor))?;
@@ -621,19 +917,20 @@ pub fn serve_fdb(
                     route,
                     meta: Arc::clone(&meta),
                 });
+                bootstrap_keepalive.ensure_healthy()?;
             }
         }
+        bootstrap_keepalive.ensure_healthy()?;
         Ok::<(), ServerError>(())
     })();
     if let Err(primary) = prepared {
-        let cleanup = rollback_prepared(control.as_ref(), &registry, &sessions);
-        return match cleanup {
-            Ok(()) => Err(primary),
-            Err(cleanup) => Err(ServerError::BootstrapRollback {
-                primary: primary.to_string(),
-                rollback: cleanup.to_string(),
-            }),
-        };
+        return Err(rollback_prepared_with_keepalive(
+            &bootstrap_keepalive,
+            primary,
+            control.as_ref(),
+            &registry,
+            &sessions,
+        ));
     }
     served_roots.sort_by_key(|root| root.route.root_id);
     let ownership = Arc::new(FdbOwnership {
@@ -641,9 +938,10 @@ pub fn serve_fdb(
         registry: Arc::clone(&registry),
         sessions,
         lease_renew_interval,
+        bootstrap_keepalive,
         activated: AtomicBool::new(false),
         failed: AtomicBool::new(false),
-        release_gate: Mutex::new(()),
+        maintenance_gate: Mutex::new(()),
         released: AtomicBool::new(false),
     });
     Ok(FdbServingRuntime {
@@ -812,21 +1110,48 @@ fn cas_shard_ready(
     }
 }
 
+#[derive(Clone, Copy)]
+enum OwnerAcquisitionMode<'a> {
+    Immediate,
+    Takeover {
+        shutdown: &'a AtomicBool,
+        keepalive: &'a FdbBootstrapKeepalive,
+    },
+}
+
+impl OwnerAcquisitionMode<'_> {
+    fn ensure_available(self) -> Result<(), ServerError> {
+        let Self::Takeover {
+            shutdown,
+            keepalive,
+        } = self
+        else {
+            return Ok(());
+        };
+        keepalive.ensure_healthy()?;
+        if shutdown.load(Ordering::Acquire) {
+            return Err(ServerError::InvalidBootstrap(
+                "FoundationDB owner acquisition was cancelled by shutdown".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    const fn waits_for_takeover(self) -> bool {
+        matches!(self, Self::Takeover { .. })
+    }
+}
+
 fn acquire_exact_session(
     control: &FdbControlStore,
     logical_shard_id: LogicalShardId,
     state: CatalogEntryState,
     owner: NodeId,
     endpoint: RpcEndpoint,
-    wait_for_takeover: bool,
-    shutdown: &AtomicBool,
+    mode: OwnerAcquisitionMode<'_>,
 ) -> Result<OwnerSession, ServerError> {
     loop {
-        if shutdown.load(Ordering::Acquire) {
-            return Err(ServerError::InvalidBootstrap(
-                "FoundationDB owner acquisition was cancelled by shutdown".to_owned(),
-            ));
-        }
+        mode.ensure_available()?;
         let observed = control.observe_ownership(&logical_shard_id)?;
         let expected = plan_owner_acquisition(&observed, owner.clone(), endpoint.clone())?
             .session()
@@ -864,11 +1189,11 @@ fn acquire_exact_session(
             }
             Err(ControlError::OwnershipObservationPending {
                 remaining_millis, ..
-            }) if wait_for_takeover => {
+            }) if mode.waits_for_takeover() => {
                 let remaining = Duration::from_millis(remaining_millis.max(1));
                 thread::sleep(remaining.min(OWNERSHIP_OBSERVATION_POLL));
             }
-            Err(ControlError::TransactionConflict { .. }) if wait_for_takeover => {
+            Err(ControlError::TransactionConflict { .. }) if mode.waits_for_takeover() => {
                 // This is a new high-level observation/acquisition attempt,
                 // not an automatic retry of the conflicted raw commit.
                 thread::sleep(OWNERSHIP_CONFLICT_BACKOFF);
@@ -1185,23 +1510,86 @@ fn finish_exact_session<T>(
     }
 }
 
-fn rollback_prepared(
+fn rollback_prepared_with_keepalive(
+    keepalive: &FdbBootstrapKeepalive,
+    primary: ServerError,
     control: &FdbControlStore,
     registry: &RootOwnerRegistry,
     sessions: &[OwnerSession],
-) -> Result<(), ServerError> {
+) -> ServerError {
+    let primary_cause = match &primary {
+        ServerError::Control(error) => Some(error.clone()),
+        _ => None,
+    };
     let mut failures = Vec::new();
+
     for session in sessions {
-        if let Err(error) =
-            registry.fail_closed_shard(LogicalShardIdentity::from(session.logical_shard_id()))
-        {
-            failures.push(error.to_string());
-        }
-        if let Err(error) = release_owner_exact(control, session) {
-            failures.push(error.to_string());
+        let shard = LogicalShardIdentity::from(session.logical_shard_id());
+        let result = match primary_cause.as_ref() {
+            Some(error) => registry.fail_closed_shard_with_control(shard, error.clone()),
+            None => registry.fail_closed_shard(shard),
+        };
+        if let Err(error) = result {
+            failures.push(format!(
+                "remove shard {:?} routes: {error}",
+                session.logical_shard_id()
+            ));
         }
     }
-    combine_failures("rollback prepared FoundationDB owners", failures)
+    for session in sessions {
+        if let Err(error) = DistributedControlStore::fail_closed(control, session) {
+            failures.push(format!(
+                "fail-close shard {:?} control route: {error}",
+                session.logical_shard_id()
+            ));
+        }
+    }
+
+    let keepalive_failure = keepalive.stop().err();
+    if let Some(ServerError::Control(error)) = &keepalive_failure {
+        for session in sessions {
+            if let Err(cleanup) = registry.fail_closed_shard_with_control(
+                LogicalShardIdentity::from(session.logical_shard_id()),
+                error.clone(),
+            ) {
+                failures.push(format!(
+                    "publish typed owner loss for shard {:?}: {cleanup}",
+                    session.logical_shard_id()
+                ));
+            }
+        }
+    }
+
+    for session in sessions {
+        if let Err(error) = release_owner_exact(control, session) {
+            failures.push(format!(
+                "release shard {:?}: {error}",
+                session.logical_shard_id()
+            ));
+        }
+    }
+
+    if let Some(error) = registry.owner_loss_signal().control_error() {
+        return ServerError::Control(error);
+    }
+    if let Some(error) = primary_cause {
+        return ServerError::Control(error);
+    }
+    if let Some(ServerError::Control(error)) = &keepalive_failure {
+        return ServerError::Control(error.clone());
+    }
+    if let Some(error) = keepalive_failure {
+        failures.push(format!("stop FoundationDB bootstrap keepalive: {error}"));
+    }
+
+    if failures.is_empty() {
+        primary
+    } else {
+        ServerError::BootstrapRollback {
+            primary: primary.to_string(),
+            rollback: failures.join("; "),
+        }
+    }
 }
 
 fn provision_owner(store_id: StoreId, root_id: RootId) -> Result<NodeId, ServerError> {
@@ -1287,6 +1675,204 @@ fn lower_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    #[derive(Default)]
+    struct FakeLeaseControl {
+        renewals: Mutex<Vec<LogicalShardId>>,
+        fail_closes: Mutex<Vec<LogicalShardId>>,
+        next_failure: Mutex<Option<ControlError>>,
+        panic_next: AtomicBool,
+    }
+
+    impl FakeLeaseControl {
+        fn fail_next_renewal(&self, error: ControlError) {
+            *self
+                .next_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+        }
+
+        fn panic_next_renewal(&self) {
+            self.panic_next.store(true, Ordering::Release);
+        }
+
+        fn renewal_count(&self, shard: LogicalShardId) -> usize {
+            self.renewals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|observed| **observed == shard)
+                .count()
+        }
+
+        fn total_renewals(&self) -> usize {
+            self.renewals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        }
+
+        fn fail_close_count(&self, shard: LogicalShardId) -> usize {
+            self.fail_closes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|observed| **observed == shard)
+                .count()
+        }
+    }
+
+    impl FdbLeaseControl for FakeLeaseControl {
+        fn renew_owner(&self, session: &OwnerSession) -> Result<(), ControlError> {
+            if self.panic_next.swap(false, Ordering::AcqRel) {
+                panic!("injected FoundationDB keepalive panic");
+            }
+            self.renewals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(session.logical_shard_id());
+            if let Some(error) = self
+                .next_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                Err(error)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn fail_closed(&self, session: &OwnerSession) -> Result<(), ControlError> {
+            self.fail_closes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(session.logical_shard_id());
+            Ok(())
+        }
+    }
+
+    fn owner_session(value: u8) -> OwnerSession {
+        OwnerSession::new(
+            LogicalShardId::from_bytes([value; 16]),
+            NodeId::new(format!("node-{value}")).unwrap(),
+            nokv_types::OwnerEpoch::new(1).unwrap(),
+            nokv_control::SessionGeneration::new(1).unwrap(),
+        )
+    }
+
+    fn wait_until(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !predicate() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for FoundationDB keepalive test condition"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn bootstrap_keepalive_renews_every_session_until_synchronous_handoff() {
+        let control = Arc::new(FakeLeaseControl::default());
+        let erased: Arc<dyn FdbLeaseControl> = control.clone();
+        let registry = Arc::new(RootOwnerRegistry::new());
+        let keepalive =
+            FdbBootstrapKeepalive::start(erased, registry, Duration::from_millis(4)).unwrap();
+        let first = owner_session(1);
+        let second = owner_session(2);
+        keepalive.register(first.clone()).unwrap();
+        keepalive.register(second.clone()).unwrap();
+
+        // Four complete renewal rounds exceed a simulated three-interval TTL.
+        wait_until(|| {
+            control.renewal_count(first.logical_shard_id()) >= 4
+                && control.renewal_count(second.logical_shard_id()) >= 4
+        });
+        keepalive.stop().unwrap();
+        let after_stop = control.total_renewals();
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(control.total_renewals(), after_stop);
+
+        FdbLeaseControl::renew_owner(control.as_ref(), &first).unwrap();
+        thread::sleep(Duration::from_millis(12));
+        assert_eq!(control.total_renewals(), after_stop + 1);
+    }
+
+    #[test]
+    fn bootstrap_keepalive_registers_one_exact_session_per_shard() {
+        let control = Arc::new(FakeLeaseControl::default());
+        let erased: Arc<dyn FdbLeaseControl> = control;
+        let keepalive = FdbBootstrapKeepalive::start(
+            erased,
+            Arc::new(RootOwnerRegistry::new()),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let first = owner_session(7);
+        let successor = OwnerSession::new(
+            first.logical_shard_id(),
+            NodeId::new("node-successor").unwrap(),
+            nokv_types::OwnerEpoch::new(2).unwrap(),
+            nokv_control::SessionGeneration::new(2).unwrap(),
+        );
+
+        keepalive.register(first.clone()).unwrap();
+        keepalive.register(first).unwrap();
+        let error = keepalive.register(successor).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("registered two sessions for shard"));
+        keepalive.stop().unwrap();
+    }
+
+    #[test]
+    fn bootstrap_keepalive_typed_failure_fail_closes_every_registered_session() {
+        let control = Arc::new(FakeLeaseControl::default());
+        let erased: Arc<dyn FdbLeaseControl> = control.clone();
+        let registry = Arc::new(RootOwnerRegistry::new());
+        let keepalive =
+            FdbBootstrapKeepalive::start(erased, Arc::clone(&registry), Duration::from_millis(4))
+                .unwrap();
+        let first = owner_session(3);
+        let second = owner_session(4);
+        keepalive.register(first.clone()).unwrap();
+        keepalive.register(second.clone()).unwrap();
+        let expected = ControlError::Backend("injected FDB renewal failure".to_owned());
+        control.fail_next_renewal(expected.clone());
+
+        wait_until(|| registry.owner_loss_signal().is_lost());
+        let error = keepalive.stop().unwrap_err();
+        assert!(matches!(error, ServerError::Control(ref actual) if actual == &expected));
+        assert_eq!(registry.owner_loss_signal().control_error(), Some(expected));
+        assert_eq!(control.fail_close_count(first.logical_shard_id()), 1);
+        assert_eq!(control.fail_close_count(second.logical_shard_id()), 1);
+    }
+
+    #[test]
+    fn bootstrap_keepalive_panic_records_typed_cause_and_fails_closed() {
+        let control = Arc::new(FakeLeaseControl::default());
+        let erased: Arc<dyn FdbLeaseControl> = control.clone();
+        let registry = Arc::new(RootOwnerRegistry::new());
+        let keepalive =
+            FdbBootstrapKeepalive::start(erased, Arc::clone(&registry), Duration::from_millis(4))
+                .unwrap();
+        let first = owner_session(5);
+        let second = owner_session(6);
+        keepalive.register(first.clone()).unwrap();
+        keepalive.register(second.clone()).unwrap();
+        control.panic_next_renewal();
+
+        wait_until(|| registry.owner_loss_signal().is_lost());
+        let error = keepalive.stop().unwrap_err();
+        let ServerError::Control(ControlError::Backend(message)) = error else {
+            panic!("keepalive panic must surface as a typed backend error");
+        };
+        assert!(message.contains("keepalive worker panicked"));
+        assert_eq!(control.fail_close_count(first.logical_shard_id()), 1);
+        assert_eq!(control.fail_close_count(second.logical_shard_id()), 1);
+    }
 
     fn catalog_pair(
         root_state: CatalogEntryState,

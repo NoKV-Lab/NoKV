@@ -844,9 +844,14 @@ mod tests {
         renewals: AtomicUsize,
         releases: AtomicUsize,
         reject_renewal: AtomicBool,
+        required_renew_interval: Option<Duration>,
     }
 
     impl OwnershipMaintenance for CountingMaintenance {
+        fn required_renew_interval(&self) -> Option<Duration> {
+            self.required_renew_interval
+        }
+
         fn renew(&self) -> Result<(), ServerError> {
             self.renewals.fetch_add(1, AtomicOrdering::SeqCst);
             if self.reject_renewal.load(AtomicOrdering::SeqCst) {
@@ -1086,6 +1091,25 @@ mod tests {
         };
 
         assert!(error.to_string().contains("at least one installed root"));
+        assert_eq!(maintenance.releases.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn distributed_server_rejects_ownership_renewal_cadence_drift() {
+        let (registry, _) = registry();
+        let maintenance = Arc::new(CountingMaintenance {
+            required_renew_interval: Some(Duration::from_secs(2)),
+            ..CountingMaintenance::default()
+        });
+        let erased: Arc<dyn OwnershipMaintenance> = maintenance.clone();
+        let error = match WorkspaceServer::new_distributed(options(), registry, erased) {
+            Ok(_) => panic!("mismatching ownership cadence must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("requires lease renewal interval 2s"));
         assert_eq!(maintenance.releases.load(AtomicOrdering::SeqCst), 1);
     }
 
