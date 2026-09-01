@@ -709,10 +709,12 @@ impl CandidateBootstrapTarget {
             | Self::RootCreate
             | Self::RootReadyCas
             | Self::ShardReadyCas
-            | Self::MetadataOwnerEpoch
+            | Self::ProvisioningAcquire
+            | Self::OwnerRelease
             | Self::RootFenceInstall
             | Self::RootFenceActivate => 2,
-            Self::ProvisioningAcquire | Self::MetadataInitialize | Self::OwnerRelease => 1,
+            Self::MetadataOwnerEpoch => 3,
+            Self::MetadataInitialize => 1,
         }
     }
 }
@@ -890,14 +892,23 @@ fn candidate_provision_readback(
         .map_err(|error| error.to_string())?;
     if released.route().state() != ShardRouteState::Unassigned
         || released.session().is_some()
-        || released.route().owner_epoch().map(OwnerEpoch::get) != Some(1)
+        || released.route().owner_epoch().map(OwnerEpoch::get) != Some(2)
         || released
             .route()
             .session_generation()
             .map(nokv_control::SessionGeneration::get)
-            != Some(1)
+            != Some(2)
     {
-        return Err("candidate provision did not release the exact bootstrap session".to_owned());
+        return Err(format!(
+            "candidate provision did not release both exact bootstrap sessions: state={:?}, live_session={}, owner_epoch={:?}, session_generation={:?}",
+            released.route().state(),
+            released.session().is_some(),
+            released.route().owner_epoch().map(OwnerEpoch::get),
+            released
+                .route()
+                .session_generation()
+                .map(nokv_control::SessionGeneration::get),
+        ));
     }
     let successor = control
         .acquire_owner(
@@ -912,7 +923,7 @@ fn candidate_provision_readback(
     )
     .map_err(|error| error.to_string())?;
     shard
-        .advance_owner_epoch(Some(owner_epoch(1)), owner_epoch(2))
+        .advance_owner_epoch(Some(owner_epoch(2)), owner_epoch(3))
         .map_err(|error| error.to_string())?;
     let expected_fence = RootFence {
         logical_shard_id: shard_id,
@@ -928,7 +939,7 @@ fn candidate_provision_readback(
         return Err("candidate provision root fence is not the exact Active record".to_owned());
     }
     Ok(
-        "candidate catalogs Ready, bootstrap session released, exact Active root fence reopened"
+        "candidate catalogs Ready, both bootstrap sessions released, successor epoch 3 reopened the exact Active root fence"
             .to_owned(),
     )
 }
@@ -2489,5 +2500,22 @@ mod tests {
     fn candidate_json_accepts_pretty_cli_output() {
         let parsed = candidate_json(b"{\n  \"created\": true\n}\n", "format").unwrap();
         assert_eq!(parsed.get("created"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn candidate_provision_selector_counts_cover_both_bootstrap_sessions() {
+        assert_eq!(
+            CandidateBootstrapTarget::ProvisioningAcquire.expected_matches(),
+            2
+        );
+        assert_eq!(CandidateBootstrapTarget::OwnerRelease.expected_matches(), 2);
+        assert_eq!(
+            CandidateBootstrapTarget::MetadataOwnerEpoch.expected_matches(),
+            3
+        );
+        assert_eq!(
+            CandidateBootstrapTarget::RootFenceActivate.expected_matches(),
+            2
+        );
     }
 }
