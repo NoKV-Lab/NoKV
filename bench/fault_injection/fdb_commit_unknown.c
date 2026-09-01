@@ -32,6 +32,7 @@ typedef int FDBMutationType;
  *   NOKV_FDB_UNKNOWN_MUTATION=set|clear|clear_range|atomic
  *   NOKV_FDB_UNKNOWN_MODE=ordinal|armed
  *   NOKV_FDB_UNKNOWN_ORDINAL=<one-based match>       (ordinal mode)
+ *   NOKV_FDB_UNKNOWN_EXPECTED_MATCHES=<positive total exact-key matches>
  *   NOKV_FDB_UNKNOWN_ARM_FD=<private read descriptor> (armed mode)
  *   NOKV_FDB_UNKNOWN_EVENT_FD=<private write descriptor>
  */
@@ -84,8 +85,10 @@ typedef struct InjectorState {
     char selector_sha256[65];
     char target_key_sha256[65];
     uint64_t ordinal;
+    uint64_t expected_matches;
     uint64_t matching_mutations;
     uint64_t prearm_matches;
+    uint64_t postselection_matches;
     uint64_t selected_transactions;
     uint64_t target_commits;
     uint64_t substitutions;
@@ -105,8 +108,10 @@ typedef struct EventSnapshot {
     char target_key_sha256[65];
     const char *kind;
     const char *mode;
+    uint64_t expected_matches;
     uint64_t matching_mutations;
     uint64_t prearm_matches;
+    uint64_t postselection_matches;
     uint64_t selected_transactions;
     uint64_t target_commits;
     uint64_t substitutions;
@@ -450,10 +455,17 @@ static void initialize(void) {
     if (!parse_fd(getenv("NOKV_FDB_UNKNOWN_EVENT_FD"), &g_state.event_fd)) {
         g_state.invalid = true;
     }
+    if (!parse_u64(getenv("NOKV_FDB_UNKNOWN_EXPECTED_MATCHES"),
+                   &g_state.expected_matches) ||
+        g_state.expected_matches == 0 ||
+        g_state.expected_matches > 1000000U) {
+        g_state.invalid = true;
+    }
 
     if (g_state.mode == SELECTION_ORDINAL) {
         if (!parse_u64(getenv("NOKV_FDB_UNKNOWN_ORDINAL"), &g_state.ordinal) ||
-            g_state.ordinal == 0 || g_state.ordinal > 1000000U) {
+            g_state.ordinal == 0 || g_state.ordinal > 1000000U ||
+            g_state.ordinal > g_state.expected_matches) {
             g_state.invalid = true;
         }
     } else if (g_state.mode == SELECTION_ARMED) {
@@ -472,12 +484,13 @@ static void initialize(void) {
     char canonical[MAX_TARGET_KEY_HEX_BYTES + 512];
     int canonical_length = snprintf(
         canonical, sizeof(canonical),
-        "nokv-fdb-unknown-selector-v1\nnonce=%s\nkind=%s\nkey=%s\nmode=%s\nordinal=%llu\n",
+        "nokv-fdb-unknown-selector-v2\nnonce=%s\nkind=%s\nkey=%s\nmode=%s\nordinal=%llu\nexpected_matches=%llu\n",
         g_state.nonce, kind_name(g_state.kind),
         getenv("NOKV_FDB_UNKNOWN_TARGET_KEY_HEX") != NULL
             ? getenv("NOKV_FDB_UNKNOWN_TARGET_KEY_HEX")
             : "",
-        mode_name(g_state.mode), (unsigned long long)g_state.ordinal);
+        mode_name(g_state.mode), (unsigned long long)g_state.ordinal,
+        (unsigned long long)g_state.expected_matches);
     if (canonical_length < 0 || (size_t)canonical_length >= sizeof(canonical)) {
         g_state.invalid = true;
     } else {
@@ -578,6 +591,11 @@ static void consume_arm_messages_locked(void) {
 
 static void record_match_locked(FDBTransaction *transaction) {
     ++g_state.matching_mutations;
+    if (g_state.matching_mutations > g_state.expected_matches) {
+        ++g_state.duplicate_matches;
+        g_state.invalid = true;
+        return;
+    }
     bool select = false;
     if (g_state.mode == SELECTION_ORDINAL) {
         select = g_state.matching_mutations == g_state.ordinal;
@@ -600,9 +618,11 @@ static void record_match_locked(FDBTransaction *transaction) {
             g_state.target_transaction = transaction;
             ++g_state.selected_transactions;
         }
-    } else if (g_state.selection_closed || g_state.target_transaction != NULL) {
+    } else if (g_state.target_transaction != NULL) {
         ++g_state.duplicate_matches;
         g_state.invalid = true;
+    } else if (g_state.selection_closed) {
+        ++g_state.postselection_matches;
     }
 }
 
@@ -636,8 +656,10 @@ static void capture_event_locked(EventSnapshot *snapshot, const char *event,
            sizeof(snapshot->target_key_sha256));
     snapshot->kind = kind_name(g_state.kind);
     snapshot->mode = mode_name(g_state.mode);
+    snapshot->expected_matches = g_state.expected_matches;
     snapshot->matching_mutations = g_state.matching_mutations;
     snapshot->prearm_matches = g_state.prearm_matches;
+    snapshot->postselection_matches = g_state.postselection_matches;
     snapshot->selected_transactions = g_state.selected_transactions;
     snapshot->target_commits = g_state.target_commits;
     snapshot->substitutions = g_state.substitutions;
@@ -672,16 +694,19 @@ static void emit_event(const EventSnapshot *snapshot) {
         buffer, sizeof(buffer),
         "{\"version\":1,\"event\":\"%s\",\"nonce\":\"%s\",\"pid\":%ld,\"tid\":%ld,"
         "\"selector_sha256\":\"%s\",\"target_key_sha256\":\"%s\","
-        "\"kind\":\"%s\",\"mode\":\"%s\",\"matching_mutations\":%llu,"
-        "\"prearm_matches\":%llu,\"selected_transactions\":%llu,"
+        "\"kind\":\"%s\",\"mode\":\"%s\",\"expected_matches\":%llu,"
+        "\"matching_mutations\":%llu,\"prearm_matches\":%llu,"
+        "\"postselection_matches\":%llu,\"selected_transactions\":%llu,"
         "\"target_commits\":%llu,\"substitutions\":%llu,"
         "\"duplicate_matches\":%llu,\"arm_messages\":%llu,"
         "\"event_writes_before\":%llu,\"real_result\":%d,"
         "\"substituted_result\":%d,\"invalid\":%s}\n",
         snapshot->event, snapshot->nonce, (long)getpid(), thread_id,
         snapshot->selector_sha256, snapshot->target_key_sha256, snapshot->kind,
-        snapshot->mode, (unsigned long long)snapshot->matching_mutations,
+        snapshot->mode, (unsigned long long)snapshot->expected_matches,
+        (unsigned long long)snapshot->matching_mutations,
         (unsigned long long)snapshot->prearm_matches,
+        (unsigned long long)snapshot->postselection_matches,
         (unsigned long long)snapshot->selected_transactions,
         (unsigned long long)snapshot->target_commits,
         (unsigned long long)snapshot->substitutions,
@@ -760,6 +785,7 @@ FDBFuture *fdb_transaction_commit(FDBTransaction *transaction) {
         if (transaction == g_state.target_transaction) {
             target = true;
             g_state.selection_closed = true;
+            g_state.target_transaction = NULL;
             ++g_state.target_commits;
             if (g_state.target_commits != 1) {
                 g_state.invalid = true;
@@ -847,7 +873,8 @@ __attribute__((destructor)) static void finalize_injector(void) {
     }
     EventSnapshot summary;
     pthread_mutex_lock(&g_state.mutex);
-    if (g_state.selected_transactions != 1 || g_state.target_commits != 1 ||
+    if (g_state.matching_mutations != g_state.expected_matches ||
+        g_state.selected_transactions != 1 || g_state.target_commits != 1 ||
         g_state.substitutions != 1 || g_state.duplicate_matches != 0 ||
         g_state.target_future != NULL ||
         (g_state.mode == SELECTION_ARMED && g_state.arm_messages != 1)) {

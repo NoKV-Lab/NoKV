@@ -181,8 +181,10 @@ pub(crate) struct InjectorEvent {
     pub(crate) target_key_sha256: String,
     pub(crate) kind: String,
     pub(crate) mode: String,
+    pub(crate) expected_matches: u64,
     pub(crate) matching_mutations: u64,
     pub(crate) prearm_matches: u64,
+    pub(crate) postselection_matches: u64,
     pub(crate) selected_transactions: u64,
     pub(crate) target_commits: u64,
     pub(crate) substitutions: u64,
@@ -206,6 +208,8 @@ pub(crate) fn validate_injector_events(
         target_key_sha256,
         scenario.mutation_kind().as_str(),
         scenario.selector().as_str(),
+        1,
+        1,
     )
 }
 
@@ -215,7 +219,12 @@ pub(crate) fn validate_injector_events_exact(
     target_key_sha256: &str,
     mutation_kind: &str,
     selector_mode: &str,
+    selected_ordinal: u64,
+    expected_matches: u64,
 ) -> Result<(), String> {
+    if selected_ordinal == 0 || selected_ordinal > expected_matches {
+        return Err("injector match bounds are invalid".to_owned());
+    }
     if events.len() != 2 {
         return Err(format!(
             "injector must emit one substitution and one summary, observed {} events",
@@ -236,6 +245,7 @@ pub(crate) fn validate_injector_events_exact(
             || event.target_key_sha256 != target_key_sha256
             || event.kind != mutation_kind
             || event.mode != selector_mode
+            || event.expected_matches != expected_matches
             || event.invalid
         {
             return Err(format!("injector event failed exact validation: {event:?}"));
@@ -243,6 +253,15 @@ pub(crate) fn validate_injector_events_exact(
     }
     if substitution.real_result != 0
         || substitution.substituted_result != 1021
+        || substitution.matching_mutations != selected_ordinal
+        || summary.matching_mutations != expected_matches
+        || summary.prearm_matches
+            != if selector_mode == "armed" {
+                selected_ordinal - 1
+            } else {
+                0
+            }
+        || summary.postselection_matches != expected_matches - selected_ordinal
         || summary.selected_transactions != 1
         || summary.target_commits != 1
         || summary.substitutions != 1
@@ -301,6 +320,7 @@ pub(crate) struct CandidateEvidence {
     pub(crate) target_key_sha256: String,
     pub(crate) mutation_kind: String,
     pub(crate) ordinal: u64,
+    pub(crate) expected_matches: u64,
     pub(crate) candidate_outcome: String,
     pub(crate) exact_readback: String,
     pub(crate) cleanup_verified: bool,
@@ -339,6 +359,33 @@ pub(crate) struct TerminalResult {
 mod tests {
     use super::*;
 
+    fn injector_event(event: &str, matching: u64, postselection: u64) -> InjectorEvent {
+        InjectorEvent {
+            version: 1,
+            event: event.to_owned(),
+            nonce: "nonce".to_owned(),
+            pid: 1,
+            tid: 1,
+            selector_sha256: "selector".to_owned(),
+            target_key_sha256: "target".to_owned(),
+            kind: "set".to_owned(),
+            mode: "ordinal".to_owned(),
+            expected_matches: 2,
+            matching_mutations: matching,
+            prearm_matches: 0,
+            postselection_matches: postselection,
+            selected_transactions: 1,
+            target_commits: 1,
+            substitutions: 1,
+            duplicate_matches: 0,
+            arm_messages: 0,
+            event_writes_before: u64::from(event == "summary"),
+            real_result: 0,
+            substituted_result: if event == "substitution" { 1021 } else { 0 },
+            invalid: false,
+        }
+    }
+
     #[test]
     fn scenario_catalog_is_complete_and_round_trips() {
         assert_eq!(Scenario::ALL.len(), 17);
@@ -359,5 +406,34 @@ mod tests {
         ] {
             assert_eq!(scenario.selector(), Selector::Armed);
         }
+    }
+
+    #[test]
+    fn exact_validator_accepts_declared_postselection_matches_only() {
+        let substitution = injector_event("substitution", 1, 0);
+        let summary = injector_event("summary", 2, 1);
+        validate_injector_events_exact(
+            &[substitution.clone(), summary.clone()],
+            "nonce",
+            "target",
+            "set",
+            "ordinal",
+            1,
+            2,
+        )
+        .unwrap();
+
+        let mut unexpected = summary;
+        unexpected.expected_matches = 3;
+        assert!(validate_injector_events_exact(
+            &[substitution, unexpected],
+            "nonce",
+            "target",
+            "set",
+            "ordinal",
+            1,
+            2,
+        )
+        .is_err());
     }
 }

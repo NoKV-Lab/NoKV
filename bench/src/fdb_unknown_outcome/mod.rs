@@ -595,7 +595,7 @@ fn run_candidate_format(
     ];
     let output = if injected {
         run_injected_candidate(
-            evidence, options, directory, "format", &arguments, target_key, "set", 1,
+            evidence, options, directory, "format", &arguments, target_key, "set", 1, 1,
         )?
     } else {
         run_plain_candidate(evidence, options, directory, "format", &arguments)?
@@ -702,6 +702,19 @@ impl CandidateBootstrapTarget {
             _ => 1,
         }
     }
+
+    const fn expected_matches(self) -> u64 {
+        match self {
+            Self::ShardCreate
+            | Self::RootCreate
+            | Self::RootReadyCas
+            | Self::ShardReadyCas
+            | Self::MetadataOwnerEpoch
+            | Self::RootFenceInstall
+            | Self::RootFenceActivate => 2,
+            Self::ProvisioningAcquire | Self::MetadataInitialize | Self::OwnerRelease => 1,
+        }
+    }
 }
 
 fn run_candidate_bootstrap_matrix(
@@ -763,6 +776,7 @@ fn run_candidate_bootstrap_case(
             &target_key,
             target.mutation_kind(),
             target.ordinal(),
+            target.expected_matches(),
         )?;
         let provision = candidate_json(&provision.stdout, "candidate bootstrap provision")?;
         let expected_root_id = lowercase_hex(context.identity.root_id.as_bytes());
@@ -789,6 +803,7 @@ fn run_candidate_bootstrap_case(
                 target_key_sha256: sha256_bytes(&target_key),
                 mutation_kind: target.mutation_kind().to_owned(),
                 ordinal: target.ordinal(),
+                expected_matches: target.expected_matches(),
                 candidate_outcome: "provision_completed_after_exact_reconciliation".to_owned(),
                 exact_readback,
                 cleanup_verified: true,
@@ -1080,6 +1095,8 @@ fn run_candidate_ordinary_failover(
             &sha256_bytes(&target_key),
             "set",
             "armed",
+            1,
+            1,
         )?;
         require_endpoint_closed(options.owner_a_endpoint)?;
 
@@ -1352,6 +1369,7 @@ fn spawn_injected_candidate_owner(
         .env("NOKV_FDB_UNKNOWN_TARGET_KEY_HEX", lowercase_hex(target_key))
         .env("NOKV_FDB_UNKNOWN_MUTATION", "set")
         .env("NOKV_FDB_UNKNOWN_MODE", "armed")
+        .env("NOKV_FDB_UNKNOWN_EXPECTED_MATCHES", "1")
         .env("NOKV_FDB_UNKNOWN_ARM_FD", "8")
         .env("NOKV_FDB_UNKNOWN_EVENT_FD", "9");
     let process = spawn_candidate_process(evidence, directory, name, &mut command)?;
@@ -1692,6 +1710,7 @@ fn run_injected_candidate(
     target_key: &[u8],
     mutation_kind: &str,
     ordinal: u64,
+    expected_matches: u64,
 ) -> Result<std::process::Output, String> {
     let absolute_directory = evidence.root().join(directory);
     fs::create_dir_all(&absolute_directory).map_err(|error| {
@@ -1723,6 +1742,10 @@ fn run_injected_candidate(
         .env("NOKV_FDB_UNKNOWN_MUTATION", mutation_kind)
         .env("NOKV_FDB_UNKNOWN_MODE", "ordinal")
         .env("NOKV_FDB_UNKNOWN_ORDINAL", ordinal.to_string())
+        .env(
+            "NOKV_FDB_UNKNOWN_EXPECTED_MATCHES",
+            expected_matches.to_string(),
+        )
         .env("NOKV_FDB_UNKNOWN_EVENT_FD", "9");
     let output = command
         .output()
@@ -1741,6 +1764,8 @@ fn run_injected_candidate(
         &sha256_bytes(target_key),
         mutation_kind,
         "ordinal",
+        ordinal,
+        expected_matches,
     )?;
     Ok(output)
 }
@@ -1946,6 +1971,7 @@ fn run_injected_child(
             scenario.mutation_kind().as_str(),
         )
         .env("NOKV_FDB_UNKNOWN_MODE", scenario.selector().as_str())
+        .env("NOKV_FDB_UNKNOWN_EXPECTED_MATCHES", "1")
         .env("NOKV_FDB_UNKNOWN_EVENT_FD", "9");
     match scenario.selector() {
         evidence::Selector::Ordinal => {

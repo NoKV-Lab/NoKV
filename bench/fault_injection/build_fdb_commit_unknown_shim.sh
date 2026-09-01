@@ -63,6 +63,7 @@ run_enabled() {
     local scenario="$2"
     local mutation="$3"
     local mode="$4"
+    local expected_matches="${5:-1}"
     local event_file="${fixture_dir}/${case_name}.jsonl"
     local nonce="fixture_${case_name}"
     : >"${event_file}"
@@ -79,6 +80,7 @@ run_enabled() {
                 NOKV_FDB_UNKNOWN_MUTATION="${mutation}" \
                 NOKV_FDB_UNKNOWN_MODE=ordinal \
                 NOKV_FDB_UNKNOWN_ORDINAL=1 \
+                NOKV_FDB_UNKNOWN_EXPECTED_MATCHES="${expected_matches}" \
                 NOKV_FDB_UNKNOWN_EVENT_FD=9 \
                 "${fixture}" "${scenario}"
         )
@@ -94,6 +96,7 @@ run_enabled() {
                 NOKV_FDB_UNKNOWN_TARGET_KEY_HEX="${target_key_hex}" \
                 NOKV_FDB_UNKNOWN_MUTATION="${mutation}" \
                 NOKV_FDB_UNKNOWN_MODE=armed \
+                NOKV_FDB_UNKNOWN_EXPECTED_MATCHES="${expected_matches}" \
                 NOKV_FDB_UNKNOWN_EVENT_FD=9 \
                 "${fixture}" "${scenario}"
         )
@@ -119,6 +122,7 @@ malformed_events="${fixture_dir}/malformed.jsonl"
         NOKV_FDB_UNKNOWN_MUTATION=set \
         NOKV_FDB_UNKNOWN_MODE=ordinal \
         NOKV_FDB_UNKNOWN_ORDINAL=1 \
+        NOKV_FDB_UNKNOWN_EXPECTED_MATCHES=1 \
         NOKV_FDB_UNKNOWN_EVENT_FD=9 \
         "${fixture}" transparent
 )
@@ -150,11 +154,18 @@ assert_event "${event_file}" '"event":"substitution"'
 assert_event "${event_file}" '"duplicate_matches":1'
 assert_event "${event_file}" '"invalid":true'
 
+event_file="$(run_enabled expected_postselection duplicate set ordinal 2)"
+assert_event "${event_file}" '"matching_mutations":2'
+assert_event "${event_file}" '"postselection_matches":1'
+assert_event "${event_file}" '"target_commits":1'
+assert_event "${event_file}" '"duplicate_matches":0'
+assert_event "${event_file}" '"invalid":false'
+
 event_file="$(run_enabled destroy destroy set ordinal)"
 assert_event "${event_file}" '"event":"destroyed_before_observation"'
 assert_event "${event_file}" '"invalid":true'
 
-event_file="$(run_enabled armed armed set armed)"
+event_file="$(run_enabled armed armed set armed 2)"
 assert_event "${event_file}" '"event":"substitution"'
 assert_event "${event_file}" '"matching_mutations":2'
 assert_event "${event_file}" '"prearm_matches":1'
