@@ -5,6 +5,8 @@
 
 //! Reproducible NoKV performance workloads and evidence reports.
 
+#[cfg(feature = "fdb-unknown-outcome-qualification")]
+pub mod fdb_unknown_outcome;
 #[cfg(feature = "metadata-read-stats")]
 pub mod metadata;
 mod qualification_runtime;
