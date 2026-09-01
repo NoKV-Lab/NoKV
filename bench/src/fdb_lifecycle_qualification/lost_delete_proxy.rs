@@ -189,12 +189,26 @@ fn proxy_connection(
         server
             .set_write_timeout(Some(IO_TIMEOUT))
             .map_err(|error| format!("cannot set proxy upstream write timeout: {error}"))?;
-        server
+        let request_forward_error = server
             .write_all(&request.bytes)
             .and_then(|()| server.flush())
-            .map_err(|error| format!("cannot forward proxy request: {error}"))?;
+            .err();
 
-        let response = read_response(&mut server, request.method == "HEAD")?;
+        // Conditional S3 writes may be rejected from their headers before
+        // RustFS consumes the whole body. In that valid HTTP exchange the
+        // request-side write can observe EPIPE while the authoritative 412
+        // response is still waiting on the read half of the connection.
+        let response = match read_response(&mut server, request.method == "HEAD") {
+            Ok(response) => response,
+            Err(response_error) => {
+                return Err(match request_forward_error {
+                    Some(request_error) => format!(
+                        "cannot complete proxy request ({request_error}) or response ({response_error})"
+                    ),
+                    None => response_error,
+                });
+            }
+        };
         if selected {
             let status = response.status;
             let successful = (200..300).contains(&status);
