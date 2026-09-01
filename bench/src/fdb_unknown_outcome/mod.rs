@@ -717,6 +717,10 @@ impl CandidateBootstrapTarget {
             Self::MetadataInitialize => 1,
         }
     }
+
+    const fn expected_preexisting(self) -> bool {
+        matches!(self, Self::RootCreate)
+    }
 }
 
 fn run_candidate_bootstrap_matrix(
@@ -782,7 +786,7 @@ fn run_candidate_bootstrap_case(
         )?;
         let provision = candidate_json(&provision.stdout, "candidate bootstrap provision")?;
         let expected_root_id = lowercase_hex(context.identity.root_id.as_bytes());
-        if provision.get("preexisting") != Some(&Value::Bool(false))
+        if provision.get("preexisting") != Some(&Value::Bool(target.expected_preexisting()))
             || provision.get("provider").and_then(Value::as_str) != Some("foundationdb")
             || provision.get("lifecycle").and_then(Value::as_str) != Some("ready")
             || provision.get("root_id").and_then(Value::as_str) != Some(expected_root_id.as_str())
@@ -806,7 +810,13 @@ fn run_candidate_bootstrap_case(
                 mutation_kind: target.mutation_kind().to_owned(),
                 ordinal: target.ordinal(),
                 expected_matches: target.expected_matches(),
-                candidate_outcome: "provision_completed_after_exact_reconciliation".to_owned(),
+                preexisting: target.expected_preexisting(),
+                candidate_outcome: if target.expected_preexisting() {
+                    "provision_completed_with_conservative_existing_readback"
+                } else {
+                    "provision_completed_after_exact_reconciliation"
+                }
+                .to_owned(),
                 exact_readback,
                 cleanup_verified: true,
                 status: "PASS",
@@ -2517,5 +2527,7 @@ mod tests {
             CandidateBootstrapTarget::RootFenceActivate.expected_matches(),
             2
         );
+        assert!(CandidateBootstrapTarget::RootCreate.expected_preexisting());
+        assert!(!CandidateBootstrapTarget::ShardCreate.expected_preexisting());
     }
 }

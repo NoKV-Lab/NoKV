@@ -321,6 +321,7 @@ pub(crate) struct CandidateEvidence {
     pub(crate) mutation_kind: String,
     pub(crate) ordinal: u64,
     pub(crate) expected_matches: u64,
+    pub(crate) preexisting: bool,
     pub(crate) candidate_outcome: String,
     pub(crate) exact_readback: String,
     pub(crate) cleanup_verified: bool,
