@@ -1405,10 +1405,42 @@ impl MetaShard {
             }],
         };
         enqueue_recovery(&mut txn, recovery.as_ref());
-        match self.commit("advance lease clock", txn)? {
-            Commit::Applied => Ok(observed_ms),
-            Commit::Conflict => Err(MetaError::WriteConflict),
+        match self.commit("advance lease clock", txn) {
+            Ok(Commit::Applied) => Ok(observed_ms),
+            Ok(Commit::Conflict) => Err(MetaError::WriteConflict),
+            Err(
+                primary @ MetaError::Store {
+                    source: StoreError::OutcomeUnknown { .. },
+                    ..
+                },
+            ) => match self.lease_clock_readback(root_id, placement_generation, owner_epoch) {
+                Ok(current) if current >= observed_ms => Ok(current),
+                Ok(_) | Err(_) => Err(primary),
+            },
+            Err(error) => Err(error),
         }
+    }
+
+    fn lease_clock_readback(
+        &self,
+        root_id: RootId,
+        placement_generation: PlacementGeneration,
+        owner_epoch: OwnerEpoch,
+    ) -> Result<u64, MetaError> {
+        let (_, mut results) = self.read_batch_at_fence(
+            ReadFenceContext {
+                root_id,
+                placement_generation,
+                owner_epoch,
+            },
+            vec![ReadOp::Get(Key::new(
+                SYSTEM.id,
+                SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
+            ))],
+            "reconcile unknown lease-clock outcome",
+        )?;
+        let clock = required_get_result(results.pop(), "System(lease_clock_high_water)")?;
+        decode_system_u64(&clock, "System(lease_clock_high_water)")
     }
 
     /// Advance the durable physical-owner epoch against one exact predecessor.
@@ -1482,9 +1514,19 @@ impl MetaShard {
             }],
         };
         enqueue_recovery(&mut txn, recovery.as_ref());
-        match self.commit("advance owner epoch", txn)? {
-            Commit::Applied => Ok(()),
-            Commit::Conflict => Err(MetaError::WriteConflict),
+        match self.commit("advance owner epoch", txn) {
+            Ok(Commit::Applied) => Ok(()),
+            Ok(Commit::Conflict) => Err(MetaError::WriteConflict),
+            Err(
+                primary @ MetaError::Store {
+                    source: StoreError::OutcomeUnknown { .. },
+                    ..
+                },
+            ) => match self.current_owner_epoch() {
+                Ok(Some(current)) if current == next => Ok(()),
+                Ok(_) | Err(_) => Err(primary),
+            },
+            Err(error) => Err(error),
         }
     }
 
@@ -4347,6 +4389,35 @@ mod tests {
         }
     }
 
+    struct UnknownWithoutApplyStore {
+        inner: Arc<dyn TxnStore>,
+        fail_next_commit: AtomicBool,
+    }
+
+    impl TxnStore for UnknownWithoutApplyStore {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            self.inner.read(batch)
+        }
+
+        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            if self.fail_next_commit.swap(false, Ordering::AcqRel) {
+                return Err(StoreError::OutcomeUnknown {
+                    state: UnknownCommit::MayCommit,
+                    reason: "injected unknown outcome without apply".to_owned(),
+                });
+            }
+            self.inner.commit(txn)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
+
     struct AdvanceOwnerBeforeDataRead {
         inner: Arc<dyn TxnStore>,
         controller: MetaShard,
@@ -6487,6 +6558,106 @@ mod tests {
             .unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.commit_version, applied.commit_version);
+    }
+
+    #[test]
+    fn lease_clock_reconciles_an_applied_unknown_outcome_without_a_second_commit() {
+        let mut store = ready_store();
+        let wrapper = Arc::new(AppliedThenLostAckStore {
+            inner: Arc::clone(&store.store),
+            lose_next_ack: AtomicBool::new(false),
+        });
+        store.store = wrapper.clone();
+        let before = store.recovery_state().unwrap();
+
+        wrapper.lose_next_ack.store(true, Ordering::Release);
+        assert_eq!(
+            store
+                .observe_lease_clock(root(2), generation(7), epoch(1), 100)
+                .unwrap(),
+            100
+        );
+
+        assert_eq!(store.lease_clock_high_water().unwrap(), 100);
+        let after = store.recovery_state().unwrap();
+        assert_eq!(after.applied_recovery_lsn, before.applied_recovery_lsn + 1);
+        assert_eq!(
+            store
+                .observe_lease_clock(root(2), generation(7), epoch(1), 100)
+                .unwrap(),
+            100
+        );
+        assert_eq!(store.recovery_state().unwrap(), after);
+    }
+
+    #[test]
+    fn lease_clock_keeps_an_unproved_unknown_outcome_typed() {
+        let mut store = ready_store();
+        let wrapper = Arc::new(UnknownWithoutApplyStore {
+            inner: Arc::clone(&store.store),
+            fail_next_commit: AtomicBool::new(false),
+        });
+        store.store = wrapper.clone();
+        let before = store.recovery_state().unwrap();
+
+        wrapper.fail_next_commit.store(true, Ordering::Release);
+        assert!(matches!(
+            store.observe_lease_clock(root(2), generation(7), epoch(1), 100),
+            Err(MetaError::Store {
+                operation: "advance lease clock",
+                source: StoreError::OutcomeUnknown {
+                    state: UnknownCommit::MayCommit,
+                    ..
+                },
+            })
+        ));
+        assert_eq!(store.lease_clock_high_water().unwrap(), 0);
+        assert_eq!(store.recovery_state().unwrap(), before);
+    }
+
+    #[test]
+    fn owner_epoch_reconciles_an_applied_unknown_outcome_without_a_second_commit() {
+        let mut store = ready_store();
+        let wrapper = Arc::new(AppliedThenLostAckStore {
+            inner: Arc::clone(&store.store),
+            lose_next_ack: AtomicBool::new(false),
+        });
+        store.store = wrapper.clone();
+        let before = store.recovery_state().unwrap();
+
+        wrapper.lose_next_ack.store(true, Ordering::Release);
+        store.advance_owner_epoch(Some(epoch(1)), epoch(2)).unwrap();
+
+        assert_eq!(store.current_owner_epoch().unwrap(), Some(epoch(2)));
+        let after = store.recovery_state().unwrap();
+        assert_eq!(after.applied_recovery_lsn, before.applied_recovery_lsn + 1);
+        store.advance_owner_epoch(Some(epoch(1)), epoch(2)).unwrap();
+        assert_eq!(store.recovery_state().unwrap(), after);
+    }
+
+    #[test]
+    fn owner_epoch_keeps_an_unproved_unknown_outcome_typed() {
+        let mut store = ready_store();
+        let wrapper = Arc::new(UnknownWithoutApplyStore {
+            inner: Arc::clone(&store.store),
+            fail_next_commit: AtomicBool::new(false),
+        });
+        store.store = wrapper.clone();
+        let before = store.recovery_state().unwrap();
+
+        wrapper.fail_next_commit.store(true, Ordering::Release);
+        assert!(matches!(
+            store.advance_owner_epoch(Some(epoch(1)), epoch(2)),
+            Err(MetaError::Store {
+                operation: "advance owner epoch",
+                source: StoreError::OutcomeUnknown {
+                    state: UnknownCommit::MayCommit,
+                    ..
+                },
+            })
+        ));
+        assert_eq!(store.current_owner_epoch().unwrap(), Some(epoch(1)));
+        assert_eq!(store.recovery_state().unwrap(), before);
     }
 
     #[test]
