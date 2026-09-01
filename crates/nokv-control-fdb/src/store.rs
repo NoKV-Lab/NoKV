@@ -685,14 +685,18 @@ fn validate_catalog_ownership(
             "shard catalog and ownership state name different shards".to_owned(),
         ));
     }
-    if ownership.route().state() != ShardRouteState::Unassigned
-        && catalog.state() != CatalogEntryState::Ready
-    {
+    let route_state = ownership.route().state();
+    let invalid = match catalog.state() {
+        CatalogEntryState::Provisioning => route_state == ShardRouteState::Serving,
+        CatalogEntryState::Ready => false,
+        CatalogEntryState::Retired => route_state != ShardRouteState::Unassigned,
+    };
+    if invalid {
         return Err(ControlError::OwnershipStateConflict {
             logical_shard_id: catalog.logical_shard_id(),
             reason: format!(
                 "route is {:?} while shard catalog is {:?}",
-                ownership.route().state(),
+                route_state,
                 catalog.state()
             ),
         });
@@ -764,6 +768,59 @@ fn map_commit_error(operation: &'static str, error: FdbOperationError) -> Contro
         },
         FdbErrorDisposition::Limit(_) | FdbErrorDisposition::Unavailable => {
             ControlError::Backend(error.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nokv_control::{
+        plan_fail_closed, plan_owner_acquisition, plan_route_activation, CatalogEntryState,
+    };
+
+    fn shard() -> LogicalShardId {
+        LogicalShardId::from_bytes([7; 16])
+    }
+
+    fn unassigned() -> OwnershipSnapshot {
+        OwnershipSnapshot::new(ShardRoute::unassigned(shard()), None, None).unwrap()
+    }
+
+    fn acquired() -> OwnershipSnapshot {
+        plan_owner_acquisition(
+            &unassigned(),
+            NodeId::new("node-a").unwrap(),
+            RpcEndpoint::new("node-a.example:7750").unwrap(),
+        )
+        .and_then(|update| update.snapshot())
+        .unwrap()
+    }
+
+    #[test]
+    fn catalog_ownership_matrix_allows_provisioning_reconciliation() {
+        let provisioning = ShardCatalogEntry::new(shard(), CatalogEntryState::Provisioning);
+        let ready = provisioning.with_state(CatalogEntryState::Ready);
+        let retired = provisioning.with_state(CatalogEntryState::Retired);
+        let activating = acquired();
+        let session = activating.session().unwrap();
+        let fail_closed = plan_fail_closed(&activating, session)
+            .and_then(|update| update.snapshot())
+            .unwrap();
+        let serving = plan_route_activation(&activating, session)
+            .and_then(|update| update.snapshot())
+            .unwrap();
+
+        for ownership in [&unassigned(), &activating, &fail_closed] {
+            validate_catalog_ownership(&provisioning, ownership).unwrap();
+        }
+        assert!(validate_catalog_ownership(&provisioning, &serving).is_err());
+        for ownership in [&unassigned(), &activating, &fail_closed, &serving] {
+            validate_catalog_ownership(&ready, ownership).unwrap();
+        }
+        validate_catalog_ownership(&retired, &unassigned()).unwrap();
+        for ownership in [&activating, &fail_closed, &serving] {
+            assert!(validate_catalog_ownership(&retired, ownership).is_err());
         }
     }
 }
