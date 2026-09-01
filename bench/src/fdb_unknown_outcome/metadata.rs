@@ -15,8 +15,8 @@ use nokv_control::{
 use nokv_control_fdb::{FdbControlStore, FdbSessionFence};
 use nokv_fdb::{FdbRuntime, FdbStorePrefix, FdbSubspaceKind};
 use nokv_meta::workspace::{
-    CommandMutation, MetaError, MetaShard, MetadataCommand, MetadataFamily, RootFence,
-    RootFenceAction, SCHEMA_ID,
+    CommandMutation, CommandPredicate, MetaError, MetaShard, MetadataCommand, MetadataFamily,
+    RootFence, RootFenceAction, SCHEMA_ID,
 };
 use nokv_meta_fdb::{FdbMetadataSessionFence, FdbOptions, FdbStore};
 use nokv_meta_store::StoreError;
@@ -342,18 +342,25 @@ fn ordinary_command_at(
     context: &ScenarioContext,
     read_version: ReadVersion,
 ) -> Result<MetadataCommand, String> {
-    base_command(
+    let key = ordinary_key(context);
+    let mut command = base_command(
         context,
         tagged_request(context.identity.request_id, 3),
         read_version,
         RootFenceAction::RequireActive,
         vec![CommandMutation::Put {
             family: MetadataFamily::WorkspaceCurrent,
-            key: ordinary_key(context),
+            key: key.clone(),
             value: ORDINARY_VALUE.to_vec(),
         }],
         ORDINARY_RESULT.to_vec(),
-    )
+    )?;
+    command.predicates.push(CommandPredicate::Value {
+        family: MetadataFamily::WorkspaceCurrent,
+        key,
+        expected: None,
+    });
+    Ok(command.seal())
 }
 
 fn base_command(
