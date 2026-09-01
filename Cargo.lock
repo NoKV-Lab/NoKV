@@ -1320,7 +1320,11 @@ name = "nokv-bench"
 version = "0.1.0"
 dependencies = [
  "nokv-client",
+ "nokv-control",
+ "nokv-control-fdb",
+ "nokv-fdb",
  "nokv-meta",
+ "nokv-meta-fdb",
  "nokv-meta-holt",
  "nokv-meta-store",
  "nokv-protocol",

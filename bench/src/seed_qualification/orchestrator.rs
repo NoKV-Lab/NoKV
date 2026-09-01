@@ -3,10 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::fs::File;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,12 +23,14 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use url::Url;
 
-use super::evidence::{lowercase_hex, sha256_bytes, sha256_file, EvidenceBundle};
 use super::peer::{DiscoveryControl, QualificationPeer, RecordingTransport, TransportEvent};
 use super::scenario::{
     endpoint_drift, immutable_identity_drift, require_takeover, RouteEvidence, ScenarioResult,
 };
 use super::QualificationOptions;
+use crate::qualification_runtime::{
+    lowercase_hex, sha256_bytes, sha256_file, unix_millis, EvidenceBundle, ProcessExit, ProcessSet,
+};
 
 const RESULT_SCHEMA: &str = "nokv.fdb.seed-qualification.result.v1";
 const ENVIRONMENT_SCHEMA: &str = "nokv.fdb.seed-qualification.environment.v1";
@@ -868,15 +869,6 @@ fn run_id(options: &QualificationOptions) -> String {
     lowercase_hex(&digest.finalize()[..8])
 }
 
-fn unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
 fn identity_bytes(run_id: &str, domain: &str) -> [u8; 16] {
     let mut digest = Sha256::new();
     digest.update(b"nokv/fdb-seed-qualification/identity/v1\0");
@@ -887,159 +879,6 @@ fn identity_bytes(run_id: &str, domain: &str) -> [u8; 16] {
     let mut identity = [0_u8; 16];
     identity.copy_from_slice(&digest[..16]);
     identity
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct ProcessExit {
-    name: String,
-    pid: u32,
-    started_unix_millis: u64,
-    ended_unix_millis: Option<u64>,
-    killed_by_harness: bool,
-    success: bool,
-    code: Option<i32>,
-}
-
-struct ManagedProcess {
-    name: String,
-    child: Child,
-    started_unix_millis: u64,
-    ended_unix_millis: Option<u64>,
-    killed_by_harness: bool,
-    exit: Option<ExitStatus>,
-}
-
-#[derive(Default)]
-struct ProcessSet {
-    children: Vec<ManagedProcess>,
-}
-
-impl ProcessSet {
-    fn spawn(
-        &mut self,
-        name: &str,
-        command: &mut Command,
-        evidence: &EvidenceBundle,
-    ) -> Result<(), String> {
-        if self.children.iter().any(|child| child.name == name) {
-            return Err(format!("qualification process {name:?} already exists"));
-        }
-        let stdout_path = evidence.root().join(format!("owners/{name}.stdout"));
-        let stderr_path = evidence.root().join(format!("owners/{name}.stderr"));
-        let stdout = File::create(&stdout_path)
-            .map_err(|error| format!("cannot create {}: {error}", stdout_path.display()))?;
-        let stderr = File::create(&stderr_path)
-            .map_err(|error| format!("cannot create {}: {error}", stderr_path.display()))?;
-        let started_unix_millis = unix_millis();
-        let child = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .map_err(|error| format!("cannot start qualification process {name:?}: {error}"))?;
-        self.children.push(ManagedProcess {
-            name: name.to_owned(),
-            child,
-            started_unix_millis,
-            ended_unix_millis: None,
-            killed_by_harness: false,
-            exit: None,
-        });
-        Ok(())
-    }
-
-    fn require_running(&mut self, name: &str) -> Result<(), String> {
-        let child = self.child_mut(name)?;
-        if child.exit.is_none() {
-            child.exit = child
-                .child
-                .try_wait()
-                .map_err(|error| format!("cannot inspect process {name:?}: {error}"))?;
-            if child.exit.is_some() {
-                child.ended_unix_millis = Some(unix_millis());
-            }
-        }
-        match child.exit {
-            None => Ok(()),
-            Some(status) => Err(format!(
-                "qualification process {name:?} exited early with {:?}",
-                status.code()
-            )),
-        }
-    }
-
-    fn terminate(&mut self, name: &str) -> Result<(), String> {
-        let child = self.child_mut(name)?;
-        if child.exit.is_none() {
-            child.exit = child
-                .child
-                .try_wait()
-                .map_err(|error| format!("cannot inspect process {name:?}: {error}"))?;
-            if child.exit.is_some() {
-                child.ended_unix_millis = Some(unix_millis());
-            }
-        }
-        if child.exit.is_none() {
-            child.killed_by_harness = true;
-            child
-                .child
-                .kill()
-                .map_err(|error| format!("cannot terminate process {name:?}: {error}"))?;
-            child.exit = Some(
-                child
-                    .child
-                    .wait()
-                    .map_err(|error| format!("cannot reap process {name:?}: {error}"))?,
-            );
-            child.ended_unix_millis = Some(unix_millis());
-        }
-        Ok(())
-    }
-
-    fn reap_all(&mut self) -> Vec<ProcessExit> {
-        for child in &mut self.children {
-            if child.exit.is_none() {
-                child.exit = child.child.try_wait().ok().flatten();
-                if child.exit.is_some() {
-                    child.ended_unix_millis = Some(unix_millis());
-                }
-            }
-            if child.exit.is_none() {
-                child.killed_by_harness = true;
-                let _ = child.child.kill();
-                child.exit = child.child.wait().ok();
-                child.ended_unix_millis = Some(unix_millis());
-            }
-        }
-        self.children
-            .iter()
-            .map(|child| {
-                let status = child.exit.as_ref();
-                ProcessExit {
-                    name: child.name.clone(),
-                    pid: child.child.id(),
-                    started_unix_millis: child.started_unix_millis,
-                    ended_unix_millis: child.ended_unix_millis,
-                    killed_by_harness: child.killed_by_harness,
-                    success: status.is_some_and(ExitStatus::success),
-                    code: status.and_then(ExitStatus::code),
-                }
-            })
-            .collect()
-    }
-
-    fn child_mut(&mut self, name: &str) -> Result<&mut ManagedProcess, String> {
-        self.children
-            .iter_mut()
-            .find(|child| child.name == name)
-            .ok_or_else(|| format!("qualification process {name:?} does not exist"))
-    }
-}
-
-impl Drop for ProcessSet {
-    fn drop(&mut self) {
-        let _ = self.reap_all();
-    }
 }
 
 #[cfg(test)]

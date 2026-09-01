@@ -7,5 +7,8 @@
 
 #[cfg(feature = "metadata-read-stats")]
 pub mod metadata;
+mod qualification_runtime;
 pub mod report;
 pub mod seed_qualification;
+#[cfg(feature = "fdb-serve-qualification")]
+pub mod serve_qualification;

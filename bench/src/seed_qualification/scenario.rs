@@ -94,7 +94,7 @@ pub(super) fn immutable_identity_drift(authoritative: &DiscoveredRoute) -> Disco
 }
 
 fn encode(value: &[u8]) -> String {
-    super::evidence::lowercase_hex(value)
+    crate::qualification_runtime::lowercase_hex(value)
 }
 
 #[cfg(test)]

@@ -20,8 +20,8 @@ use nokv_protocol::{
 };
 use serde::Serialize;
 
-use super::evidence::sha256_bytes;
 use super::scenario::RouteEvidence;
+use crate::qualification_runtime::sha256_bytes;
 
 const PEER_IO_TIMEOUT: Duration = Duration::from_secs(5);
 

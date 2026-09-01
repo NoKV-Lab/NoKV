@@ -12,10 +12,20 @@ homepage.workspace = true
 
 [features]
 metadata-read-stats = ["nokv-meta/metadata-read-stats", "nokv-meta-holt/read-stats"]
+fdb-serve-qualification = [
+    "dep:nokv-control",
+    "dep:nokv-control-fdb",
+    "dep:nokv-fdb",
+    "dep:nokv-meta-fdb",
+]
 
 [dependencies]
 nokv-client.workspace = true
+nokv-control = { workspace = true, optional = true }
+nokv-control-fdb = { workspace = true, optional = true, features = ["fdb"] }
+nokv-fdb = { workspace = true, optional = true, features = ["fdb"] }
 nokv-meta.workspace = true
+nokv-meta-fdb = { workspace = true, optional = true, features = ["fdb"] }
 nokv-meta-holt = { workspace = true, features = ["test-support"] }
 nokv-meta-store.workspace = true
 nokv-protocol.workspace = true
@@ -41,3 +51,8 @@ required-features = ["metadata-read-stats"]
 [[bin]]
 name = "nokv-fdb-seed-qualification"
 path = "src/bin/nokv-fdb-seed-qualification.rs"
+
+[[bin]]
+name = "nokv-fdb-serve-qualification"
+path = "src/bin/nokv-fdb-serve-qualification.rs"
+required-features = ["fdb-serve-qualification"]
