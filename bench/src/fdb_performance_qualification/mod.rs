@@ -541,12 +541,13 @@ fn prepare_contention_fixture(
     let body = "x".repeat(options.artifact_payload_bytes);
     let mut sources = Vec::with_capacity(groups);
     for group in 0..groups {
-        let source = RelativePath::new(format!("source-{group:04}.txt"))
+        let source_name = format!("source-{group:04}.txt");
+        let source = RelativePath::new(format!("outputs/{source_name}"))
             .map_err(|error| error.to_string())?;
         let arguments = json!({
             "id": CONTENDED_WORKBENCH,
             "section": "outputs",
-            "path": source.as_str(),
+            "path": source_name,
             "text": body,
             "content_type": "text/plain",
             "replace": false,

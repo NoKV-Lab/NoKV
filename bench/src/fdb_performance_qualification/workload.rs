@@ -246,10 +246,11 @@ fn rename_path(
             Some(group),
         );
     };
-    let destination = match RelativePath::new(format!("destination-{group:04}-{slot:04}.txt")) {
-        Ok(path) => path,
-        Err(error) => return failed(error.to_string(), Some(group)),
-    };
+    let destination =
+        match RelativePath::new(format!("outputs/destination-{group:04}-{slot:04}.txt")) {
+            Ok(path) => path,
+            Err(error) => return failed(error.to_string(), Some(group)),
+        };
     let source = WorkspacePath {
         workbench: fixture.workbench.clone(),
         path: source,
@@ -485,9 +486,19 @@ fn require_contention_shape(
             .filter(|terminal| terminal.outcome == ClassifiedOutcome::Conflicted)
             .count();
         if terminals.len() != concurrency || successes != 1 || conflicts != concurrency - 1 {
+            let mut codes = BTreeMap::new();
+            for terminal in &terminals {
+                *codes.entry(terminal.code.as_str()).or_insert(0_usize) += 1;
+            }
+            let failures = terminals
+                .iter()
+                .filter_map(|terminal| terminal.error.as_deref())
+                .take(8)
+                .collect::<Vec<_>>();
             return Err(format!(
-                "contended warmup group {group} did not produce one success and {} conflicts",
-                concurrency - 1
+                "contended warmup group {group} expected one success and {} conflicts; observed {} terminals, {successes} successes, {conflicts} conflicts, codes {codes:?}, failures {failures:?}",
+                concurrency - 1,
+                terminals.len(),
             ));
         }
     }
