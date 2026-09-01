@@ -5,6 +5,10 @@
 
 //! Reproducible NoKV performance workloads and evidence reports.
 
+#[cfg(feature = "fdb-lifecycle-qualification")]
+pub mod fdb_lifecycle_qualification;
+#[cfg(feature = "fdb-lifecycle-qualification")]
+mod fdb_live_runtime;
 #[cfg(feature = "fdb-unknown-outcome-qualification")]
 pub mod fdb_unknown_outcome;
 #[cfg(feature = "metadata-read-stats")]
