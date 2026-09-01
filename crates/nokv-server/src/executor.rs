@@ -109,6 +109,20 @@ struct RestorePreparationKey {
     destination_workspace_incarnation_id: types::WorkspaceIncarnationId,
 }
 
+enum ConcurrentRestoreStep {
+    Advanced {
+        operation: Box<meta::RestoreOperationRecord>,
+        read_version: u64,
+    },
+    Completed(Box<ExecutedRequest>),
+}
+
+struct ConcurrentRestoreReadback {
+    request_domain: &'static [u8],
+    sequence: u64,
+    step: &'static str,
+}
+
 /// Serializes only competing drivers for one destination incarnation.
 ///
 /// This owner-local gate is a scheduling optimization, not restore authority:
@@ -1139,52 +1153,87 @@ impl MetadataWorkspaceRequestExecutor {
             return restored_response(&operation, None, true);
         }
         if operation.phase == types::RestorePhase::SourceSealed {
-            let initialized = meta::apply_restore_initialization(
+            match meta::apply_restore_initialization(
                 &self.meta,
                 self.write_context(
                     rpc.route,
                     derived_request_id(rpc.request_id, b"restore-apply-initialization", 0),
                 )?,
                 meta::RestoreOperationRequest { operation_id },
-            )
-            .map_err(restore_failure)?;
-            if let Some(failure) = restore_terminal_failure(&initialized.operation) {
-                return Err(failure);
-            }
-            if initialized.operation.phase != types::RestorePhase::DestinationBuilding
-                || !restore_step_advances(
+            ) {
+                Ok(initialized) => {
+                    if let Some(failure) = restore_terminal_failure(&initialized.operation) {
+                        return Err(failure);
+                    }
+                    if initialized.operation.phase != types::RestorePhase::DestinationBuilding
+                        || !restore_step_advances(
+                            &operation,
+                            &initialized.operation,
+                            initialized.replayed,
+                            "restore destination initialization",
+                        )?
+                    {
+                        return Err(internal(
+                            "restore initialization did not reach DestinationBuilding",
+                        ));
+                    }
+                    #[cfg(feature = "restore-crash-test-support")]
+                    {
+                        let initialization_read_version = types::ReadVersion::new(
+                            initialized.commit_version.get(),
+                        )
+                        .map_err(|error| {
+                            internal(format!(
+                                "restore initialization commit version is not readable: {error}"
+                            ))
+                        })?;
+                        let mut readback_context = self.write_context(
+                            rpc.route,
+                            derived_request_id(
+                                rpc.request_id,
+                                b"restore-initialization-readback",
+                                0,
+                            ),
+                        )?;
+                        readback_context.read_version = initialization_read_version;
+                        let durable = meta::get_restore(&self.meta, readback_context, operation_id)
+                            .map_err(restore_failure)?;
+                        operation = authoritative_restore_initialization_readback(
+                            &initialized.operation,
+                            durable,
+                        )?;
+                        durable_read_version = initialized.commit_version.get();
+                    }
+                    #[cfg(not(feature = "restore-crash-test-support"))]
+                    {
+                        operation = initialized.operation;
+                    }
+                }
+                Err(error) => match self.reconcile_concurrent_restore_step(
+                    rpc,
+                    operation_id,
                     &operation,
-                    &initialized.operation,
-                    initialized.replayed,
-                    "restore destination initialization",
-                )?
-            {
-                return Err(internal(
-                    "restore initialization did not reach DestinationBuilding",
-                ));
-            }
-            #[cfg(feature = "restore-crash-test-support")]
-            {
-                let initialization_read_version =
-                    types::ReadVersion::new(initialized.commit_version.get()).map_err(|error| {
-                        internal(format!(
-                            "restore initialization commit version is not readable: {error}"
-                        ))
-                    })?;
-                let mut readback_context = self.write_context(
-                    rpc.route,
-                    derived_request_id(rpc.request_id, b"restore-initialization-readback", 0),
-                )?;
-                readback_context.read_version = initialization_read_version;
-                let durable = meta::get_restore(&self.meta, readback_context, operation_id)
-                    .map_err(restore_failure)?;
-                operation =
-                    authoritative_restore_initialization_readback(&initialized.operation, durable)?;
-                durable_read_version = initialized.commit_version.get();
-            }
-            #[cfg(not(feature = "restore-crash-test-support"))]
-            {
-                operation = initialized.operation;
+                    error,
+                    ConcurrentRestoreReadback {
+                        request_domain: b"restore-initialization-concurrent-readback",
+                        sequence: 0,
+                        step: "restore destination initialization",
+                    },
+                )? {
+                    ConcurrentRestoreStep::Advanced {
+                        operation: durable,
+                        read_version,
+                    } => {
+                        operation = *durable;
+                        #[cfg(feature = "restore-crash-test-support")]
+                        {
+                            durable_read_version = read_version;
+                        }
+                        #[cfg(not(feature = "restore-crash-test-support"))]
+                        let _ = read_version;
+                    }
+                    ConcurrentRestoreStep::Completed(response) => return Ok(*response),
+                },
             }
         }
 
@@ -1206,7 +1255,7 @@ impl MetadataWorkspaceRequestExecutor {
         let mut batch = 0_u64;
         while operation.phase == types::RestorePhase::DestinationBuilding {
             let before = restore_commit_member_progress(&operation)?;
-            let built = meta::build_restore_commit_members(
+            let built = match meta::build_restore_commit_members(
                 &self.meta,
                 self.write_context(
                     rpc.route,
@@ -1216,8 +1265,31 @@ impl MetadataWorkspaceRequestExecutor {
                     operation_id,
                     limit: meta::MAX_RESTORE_BATCH_MEMBERS,
                 },
-            )
-            .map_err(restore_failure)?;
+            ) {
+                Ok(built) => built,
+                Err(error) => match self.reconcile_concurrent_restore_step(
+                    rpc,
+                    operation_id,
+                    &operation,
+                    error,
+                    ConcurrentRestoreReadback {
+                        request_domain: b"restore-build-concurrent-readback",
+                        sequence: batch,
+                        step: "restore destination commit-member builder",
+                    },
+                )? {
+                    ConcurrentRestoreStep::Advanced {
+                        operation: durable, ..
+                    } => {
+                        operation = *durable;
+                        batch = batch.checked_add(1).ok_or_else(|| {
+                            internal("restore commit-member batch counter overflow")
+                        })?;
+                        continue;
+                    }
+                    ConcurrentRestoreStep::Completed(response) => return Ok(*response),
+                },
+            };
             if let Some(failure) = restore_terminal_failure(&built.command.operation) {
                 return Err(failure);
             }
@@ -1260,7 +1332,7 @@ impl MetadataWorkspaceRequestExecutor {
         batch = 0;
         while operation.phase == types::RestorePhase::DestinationSealing {
             let before = restore_revision_seal_progress(&operation)?;
-            let sealed = meta::seal_restore_commit_revisions(
+            let sealed = match meta::seal_restore_commit_revisions(
                 &self.meta,
                 self.write_context(
                     rpc.route,
@@ -1270,8 +1342,31 @@ impl MetadataWorkspaceRequestExecutor {
                     operation_id,
                     limit: meta::MAX_RESTORE_BATCH_MEMBERS,
                 },
-            )
-            .map_err(restore_failure)?;
+            ) {
+                Ok(sealed) => sealed,
+                Err(error) => match self.reconcile_concurrent_restore_step(
+                    rpc,
+                    operation_id,
+                    &operation,
+                    error,
+                    ConcurrentRestoreReadback {
+                        request_domain: b"restore-seal-concurrent-readback",
+                        sequence: batch,
+                        step: "restore destination revision sealer",
+                    },
+                )? {
+                    ConcurrentRestoreStep::Advanced {
+                        operation: durable, ..
+                    } => {
+                        operation = *durable;
+                        batch = batch.checked_add(1).ok_or_else(|| {
+                            internal("restore revision-seal batch counter overflow")
+                        })?;
+                        continue;
+                    }
+                    ConcurrentRestoreStep::Completed(response) => return Ok(*response),
+                },
+            };
             if let Some(failure) = restore_terminal_failure(&sealed.command.operation) {
                 return Err(failure);
             }
@@ -1360,6 +1455,51 @@ impl MetadataWorkspaceRequestExecutor {
             return Ok(None);
         }
         restored_response(&operation, None, true).map(Some)
+    }
+
+    fn reconcile_concurrent_restore_step(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        operation_id: types::OperationId,
+        current: &meta::RestoreOperationRecord,
+        original_error: meta::RestoreError,
+        readback: ConcurrentRestoreReadback,
+    ) -> Result<ConcurrentRestoreStep, protocol::RpcFailure> {
+        // The failed step is not success evidence. Only a fresh durable row
+        // from the same immutable lineage may supersede it, and only when that
+        // row is a strictly monotonic successor or the exact terminal result.
+        let context = self.write_context(
+            rpc.route,
+            derived_request_id(rpc.request_id, readback.request_domain, readback.sequence),
+        )?;
+        let read_version = context.read_version.get();
+        let Some(durable) =
+            meta::get_restore(&self.meta, context, operation_id).map_err(restore_failure)?
+        else {
+            return Err(restore_failure(original_error));
+        };
+        restore_replay_lineage_matches(current, &durable)?;
+        if let Some(failure) = restore_terminal_failure(&durable) {
+            return Err(failure);
+        }
+        if durable.phase == types::RestorePhase::Complete {
+            return restored_response(&durable, None, true)
+                .map(Box::new)
+                .map(ConcurrentRestoreStep::Completed);
+        }
+        if durable == *current {
+            return Err(restore_failure(original_error));
+        }
+        if !restore_step_advances(current, &durable, false, readback.step)? {
+            return Err(internal(format!(
+                "{} concurrent readback did not advance",
+                readback.step
+            )));
+        }
+        Ok(ConcurrentRestoreStep::Advanced {
+            operation: Box::new(durable),
+            read_version,
+        })
     }
 
     fn begin_generic_index_registration(
