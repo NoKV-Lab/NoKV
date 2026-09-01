@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use nokv_control::{
     CatalogEntryState, ControlError, DistributedControlStore, LogicalShardId, NodeId, RpcEndpoint,
-    ShardRouteState, StoreId, StoreManifest, StoreProvider,
+    ShardRouteState, StoreId, StoreManifest, StoreProvider, SUPPORTED_WORKSPACE_FORMAT_VERSION,
 };
 use nokv_control_fdb::{FdbControlOptions, FdbControlStore};
 use nokv_fdb::{
@@ -36,7 +36,7 @@ fn live_concurrent_contenders_and_takeover_fencing() {
     let manifest = StoreManifest::new(
         StoreId::from_bytes(*Uuid::new_v4().as_bytes()),
         StoreProvider::FoundationDb,
-        11,
+        SUPPORTED_WORKSPACE_FORMAT_VERSION,
         FDB_PHYSICAL_ENCODING_VERSION,
         options.provider_namespace_digest(),
         "live-test",

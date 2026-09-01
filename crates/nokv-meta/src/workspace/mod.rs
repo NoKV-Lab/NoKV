@@ -66,6 +66,7 @@ pub use codec::{
     staged_object_prefix, tag_commit_consumer_key, tag_key, workbench_commit_head_key,
     workbench_head_commit_consumer_key, workspace_current_key, workspace_current_prefix,
     PATH_COMPONENT_DELIMITER, PATH_EXACT_TERMINATOR, SCHEMA_ID, VALUE_FORMAT_VERSION,
+    WORKSPACE_FORMAT_VERSION,
 };
 pub use commit::{
     AbortBuildCommitRequest, BeginBuildCommitRequest, BeginCommitRetirementRequest,

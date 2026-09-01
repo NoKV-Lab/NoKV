@@ -24,7 +24,7 @@ const GENERIC_INDEX_APPEND_RECEIPT_DISCRIMINATOR: u8 = 3;
 
 const FIXED_ID_BYTES: usize = 16;
 pub(crate) const SYSTEM_SCHEMA_KEY: &[u8] = b"schema";
-const SYSTEM_FORMAT_VERSION: u32 = 12;
+pub const WORKSPACE_FORMAT_VERSION: u32 = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SchemaMarkerVersion {
@@ -816,7 +816,7 @@ pub fn object_block_key(
 }
 
 pub(crate) fn encode_schema_marker() -> Vec<u8> {
-    encode_schema_marker_version(SYSTEM_FORMAT_VERSION)
+    encode_schema_marker_version(WORKSPACE_FORMAT_VERSION)
 }
 
 fn encode_schema_marker_version(format_version: u32) -> Vec<u8> {
@@ -1308,12 +1308,12 @@ mod tests {
 
     #[test]
     fn schema_marker_is_exact_and_versioned() {
-        assert_eq!(SYSTEM_FORMAT_VERSION, 12);
+        assert_eq!(WORKSPACE_FORMAT_VERSION, 12);
         let marker = encode_schema_marker();
         assert_eq!(marker[0], VALUE_FORMAT_VERSION);
         assert_eq!(
             &marker[marker.len() - std::mem::size_of::<u32>()..],
-            &SYSTEM_FORMAT_VERSION.to_be_bytes()
+            &WORKSPACE_FORMAT_VERSION.to_be_bytes()
         );
         validate_schema_marker(&marker).unwrap();
         assert_eq!(

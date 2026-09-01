@@ -43,6 +43,7 @@ const MAX_HEADER_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LOCAL_ROOTS: usize = 65_536;
 const PATH_DIGEST_DOMAIN: &[u8] = b"nokv/holt/provider-namespace/v1\0";
 const STORE_ID_DOMAIN: &[u8] = b"nokv/holt/store-id/v1\0";
+const _: () = assert!(SUPPORTED_WORKSPACE_FORMAT_VERSION == meta::WORKSPACE_FORMAT_VERSION);
 const SHARD_ID_DOMAIN: &[u8] = b"nokv/holt/logical-shard-id/v1\0";
 const NAMESPACE_ID_DOMAIN: &[u8] = b"nokv/holt/object-namespace-id/v1\0";
 const REQUEST_ID_DOMAIN: &[u8] = b"nokv/holt/provision-request-id/v1\0";

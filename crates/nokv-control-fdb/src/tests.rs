@@ -10,6 +10,7 @@ use nokv_control::{
     LogicalShardId, NodeId, ObjectNamespaceId, OwnershipSnapshot, PlacementGeneration,
     RootCatalogEntry, RootId, RpcEndpoint, ShardCatalogEntry, ShardRoute, StoreId, StoreManifest,
     StoreProvider, PROVIDER_NAMESPACE_DIGEST_BYTES, STORE_ID_BYTES,
+    SUPPORTED_WORKSPACE_FORMAT_VERSION,
 };
 use nokv_fdb::{FdbStorePrefix, FDB_PHYSICAL_ENCODING_VERSION};
 
@@ -29,7 +30,7 @@ fn manifest(digest: [u8; PROVIDER_NAMESPACE_DIGEST_BYTES]) -> StoreManifest {
     StoreManifest::new(
         StoreId::from_bytes([1; STORE_ID_BYTES]),
         StoreProvider::FoundationDb,
-        11,
+        SUPPORTED_WORKSPACE_FORMAT_VERSION,
         FDB_PHYSICAL_ENCODING_VERSION,
         digest,
         "0.11.0",
@@ -57,7 +58,7 @@ fn options_bind_the_exact_prefix_and_bounded_monotonic_ttl() {
             &StoreManifest::new(
                 StoreId::from_bytes([1; STORE_ID_BYTES]),
                 StoreProvider::FoundationDb,
-                10,
+                SUPPORTED_WORKSPACE_FORMAT_VERSION - 1,
                 FDB_PHYSICAL_ENCODING_VERSION,
                 first.provider_namespace_digest(),
                 "0.10.0",

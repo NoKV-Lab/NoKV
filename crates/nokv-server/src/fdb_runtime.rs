@@ -50,6 +50,7 @@ const PROVISION_ENDPOINT: &str = "127.0.0.1:1";
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(10);
 const OWNERSHIP_OBSERVATION_POLL: Duration = Duration::from_millis(100);
 const OWNERSHIP_CONFLICT_BACKOFF: Duration = Duration::from_millis(5);
+const _: () = assert!(SUPPORTED_WORKSPACE_FORMAT_VERSION == meta::WORKSPACE_FORMAT_VERSION);
 
 static STORE_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 

@@ -10,7 +10,7 @@ use crate::{
 pub const STORE_ID_BYTES: usize = 16;
 pub const PROVIDER_NAMESPACE_DIGEST_BYTES: usize = 32;
 pub const MAX_CREATED_BY_VERSION_BYTES: usize = 128;
-pub const SUPPORTED_WORKSPACE_FORMAT_VERSION: u32 = 11;
+pub const SUPPORTED_WORKSPACE_FORMAT_VERSION: u32 = 12;
 
 /// Stable identity generated once when a metadata store is formatted.
 #[repr(transparent)]
@@ -325,7 +325,7 @@ mod tests {
         assert!(StoreManifest::new(
             StoreId::from_bytes([1; STORE_ID_BYTES]),
             StoreProvider::FoundationDb,
-            11,
+            SUPPORTED_WORKSPACE_FORMAT_VERSION,
             1,
             [2; PROVIDER_NAMESPACE_DIGEST_BYTES],
             "0.11.0",
@@ -343,7 +343,7 @@ mod tests {
         assert!(StoreManifest::new(
             StoreId::from_bytes([0; STORE_ID_BYTES]),
             StoreProvider::FoundationDb,
-            11,
+            SUPPORTED_WORKSPACE_FORMAT_VERSION,
             1,
             [2; PROVIDER_NAMESPACE_DIGEST_BYTES],
             "0.11.0",
