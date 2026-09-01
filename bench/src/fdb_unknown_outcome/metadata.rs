@@ -96,29 +96,13 @@ pub(crate) fn execute_child(
         MetaShard::open(store, context.identity.shard_id).map_err(|error| error.to_string())?;
     let result = match scenario {
         Scenario::MetadataOwnerEpoch => shard.advance_owner_epoch(None, owner_epoch(1)).map(|_| ()),
-        Scenario::MetadataRootFenceInstall => fence_command(&shard, context, FenceCommand::Install)
-            .and_then(|command| {
-                shard
-                    .execute(&command)
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
-            })
-            .map_err(|error| MetaError::Internal {
-                operation: "build qualification install command",
-                message: error,
-            }),
+        Scenario::MetadataRootFenceInstall => {
+            let command = fence_command(&shard, context, FenceCommand::Install)?;
+            shard.execute(&command).map(|_| ())
+        }
         Scenario::MetadataRootFenceActivate => {
-            fence_command(&shard, context, FenceCommand::Activate)
-                .and_then(|command| {
-                    shard
-                        .execute(&command)
-                        .map(|_| ())
-                        .map_err(|error| error.to_string())
-                })
-                .map_err(|error| MetaError::Internal {
-                    operation: "build qualification activation command",
-                    message: error,
-                })
+            let command = fence_command(&shard, context, FenceCommand::Activate)?;
+            shard.execute(&command).map(|_| ())
         }
         Scenario::MetadataOrdinaryCommand => {
             let command = ordinary_command(&shard, context)?;
