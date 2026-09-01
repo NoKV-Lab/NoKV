@@ -400,6 +400,14 @@ fn read_chunked_body(stream: &mut TcpStream, bytes: &mut Vec<u8>) -> Result<(), 
             .ok_or_else(|| "chunk header has no length".to_owned())?;
         let length = usize::from_str_radix(length.trim(), 16)
             .map_err(|error| format!("chunk length is invalid: {error}"))?;
+        if length == 0 {
+            loop {
+                let trailer = read_crlf_line(stream, bytes)?;
+                if trailer.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
         if bytes.len().saturating_add(length) > MAX_BUFFERED_BODY_BYTES + MAX_HEADER_BYTES {
             return Err("chunked HTTP body exceeds qualification proxy limit".to_owned());
         }
@@ -410,14 +418,6 @@ fn read_chunked_body(stream: &mut TcpStream, bytes: &mut Vec<u8>) -> Result<(), 
             .map_err(|error| format!("cannot read HTTP chunk: {error}"))?;
         if &bytes[bytes.len() - 2..] != b"\r\n" {
             return Err("HTTP chunk lacks its trailing CRLF".to_owned());
-        }
-        if length == 0 {
-            loop {
-                let trailer = read_crlf_line(stream, bytes)?;
-                if trailer.is_empty() {
-                    return Ok(());
-                }
-            }
         }
     }
 }
