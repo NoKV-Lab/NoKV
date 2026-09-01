@@ -7,10 +7,11 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Result
 
-The distributed-metadata root fixes pass their scoped acceptance checks. The
-FoundationDB serving mode remains **NOT QUALIFIED** because the complete live
-matrix in [Metadata Store Interface](./metadata-store-interface.md) has not
-reached ten of ten gates.
+The distributed-metadata root fixes and FDB serving Gates 1 through 7 pass
+their scoped acceptance checks. The FoundationDB serving mode remains
+**NOT QUALIFIED** because the complete live matrix in
+[Metadata Store Interface](./metadata-store-interface.md) has not reached ten
+of ten gates.
 
 This distinction is intentional:
 
@@ -19,12 +20,19 @@ This distinction is intentional:
   concurrent publication, owner/seed failover, and one-node FDB loss were
   exercised without a stranded catalog, semantic replay mismatch, or stale
   write.
+- **Gate 2 unknown-outcome qualification: PASS.** One clean candidate passed
+  the no-injection control, injected smoke case, production bootstrap cases,
+  ordinary cross-owner request replay, and all 17 required mutation families
+  for three clean repetitions under deterministic real-commit lost-ACK
+  injection.
 - **Gate 6 serve-crash qualification: PASS.** The approved pre-activation,
   post-activation, stale-session, renewal-failure, and successor-recovery
   matrix passed on the merged lease-safe candidate.
 - **FDB serving qualification: NOT QUALIFIED.** Commit-unknown injection,
-  the complete lifecycle matrix, a measured maximum physical transaction
-  envelope, and controlled performance evidence remain incomplete.
+  exact reconciliation, session fencing, takeover, provisioning recovery,
+  serve-crash recovery, and seed failover have passed. The complete lifecycle
+  matrix, a measured maximum physical transaction envelope, and controlled
+  performance evidence remain incomplete.
 
 The normative runtime and package boundaries are the
 [metadata-store interface](./metadata-store-interface.md),
@@ -62,6 +70,57 @@ retained separately because it predates only the lifecycle retry change:
 ```text
 target/qualification/fdb-root-fix-288a6c80-20260831T145502Z/
 ```
+
+## Gate 2 Unknown-Outcome Qualification
+
+Gate 2 is **PASS**. The approved
+[unknown-outcome qualification plan](./fdb-unknown-outcome-qualification-plan.md)
+ran one clean Linux candidate against a real three-node FDB 7.3.79 cluster and
+the pinned RustFS service. The retained bundle is in the builder target volume:
+
+```text
+/target/gate2-4f33c6fc-run1/
+```
+
+| Evidence identity | Exact value |
+| --- | --- |
+| Source | `4f33c6fca4c099d49d91d5a575d58669dc3d6c10` |
+| `nokv-fdb` SHA-256 | `8e125b96a41052612698ee89766c3b677885c3238f16b1ef9aecddf9b353ec3c` |
+| Qualification binary SHA-256 | `7ccbee0b1f3b28eef74fd357ca1f401069ecb3ae082c1614ffca3c74ffe8682f` |
+| Lost-ACK shim SHA-256 | `8a984761c8955560a91354b5458b8190695f36cc5920d6f299fcf6a80aef3401` |
+| `libfdb_c.so` SHA-256 | `f677f883c30869e8d00dbc15ef8a38228070a723a600d7219f5a1b10c0d3d7d0` |
+| FDB | `7.3.79`, protocol `0fdb00b073000000`, three coordinators, `double` redundancy |
+| FDB image | `foundationdb/foundationdb@sha256:d3530c3066f94abffb61facac527c9c3517f6553ee0e75efa69d54296290156a` |
+| RustFS image | `rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab` |
+| Environment SHA-256 | `e8efc65d9b4364d48da4541e0b780143273bb477d2ebd801feb46ce841605501` |
+| Terminal result SHA-256 | `11c13f412d6a1a768556c7261853afe3d2771bdbacfb2992abc17b2a84ce29b3` |
+| Inventory SHA-256 | `2047a174bccdc4cd226fdefc701a160f983d2187df16f97540582d731428fd05` |
+
+The atomic terminal result is `PASS`: 64 of 64 required scenarios completed.
+Those scenarios comprise one no-injection control, one injected smoke case,
+ten production format/provision bootstrap cases, one production ordinary
+workspace-command failover case, and all 17 mutation families repeated three
+times. The bundle contains 419 files, 64 scenario results, and 63 injector
+event streams. Every injector stream ends with exactly one target commit,
+exactly one successful-result substitution, and `invalid=false`.
+
+The ordinary production path proved the cross-owner boundary directly. Owner
+A held epoch/generation `3/3`; its metadata create committed but returned the
+injected retryable lost-ACK outcome. Owner B took over at `4/4`, the client
+tried the now-closed A seed before B, and byte-identical logical replay returned
+the original result at commit version `5` without a second logical apply.
+Changed business input remains a replay mismatch. The physical command digest
+continues to bind the exact owner fence while the durable logical replay digest
+normalizes only the superseded owner epoch.
+
+The candidate uses workspace format `12`. Control manifests and both Holt and
+FDB runtimes compile-time bind to that same metadata format. Format `11` is
+rejected without rewriting its schema marker or recovery tail. FDB was healthy,
+available, and quorum-reachable before and after qualification; RustFS returned
+HTTP `200` before and after qualification. The bundle contains no credentials.
+`readelf` shows that the production candidate depends on `libfdb_c`, libc,
+libm, and libgcc only, with no dynamic dependency on the qualification shim;
+production crates expose no lost-ACK selector or fault-injection surface.
 
 ## Gate 6 Serve-Crash Qualification
 
@@ -142,8 +201,8 @@ hashes, and the atomic terminal result.
 
 The qualification client used only the NoKV seed and workspace TCP protocol;
 only the candidate server processes connected to FDB. This result closes Gate
-7 only. Gates 2, 8, 9, and 10 remain `NOT QUALIFIED`, so the overall FDB
-serving profile remains **NOT QUALIFIED**.
+7 only. Gates 8, 9, and 10 remain `NOT QUALIFIED`, so the overall FDB serving
+profile remains **NOT QUALIFIED**.
 
 ## Root-Fix Acceptance Matrix
 
@@ -178,6 +237,7 @@ behavior, not a false availability failure.
 | Real FDB metadata conformance and exact session fencing | PASS, 1 environment-gated integration test |
 | Real FDB concurrent control contenders and takeover fencing | PASS, 1 environment-gated integration test |
 | Real FDB provision release and catalog crash recovery | PASS, 1 environment-gated integration test |
+| Gate 2 deterministic lost-ACK qualification | PASS, 64 of 64 scenarios, 63 exact one-shot injections, and 419 retained evidence files |
 | Gate 6 serve-crash qualification | PASS, 6 scenarios and 132 retained evidence files |
 | Gate 7 seed-discovery qualification rerun | PASS, 8 scenarios and 35 retained evidence files |
 | `python3 scripts/workbench/workbench_contract_test.py` | PASS, 8 passed |
@@ -195,7 +255,7 @@ executable test configuration without weakening either check.
 | Gate | Status | Qualification boundary |
 | --- | --- | --- |
 | 1. Conformance | PASS | Real FDB point reads, scans, stable versions, predicates, conflicts, bounds, namespace isolation, and reopen ran. |
-| 2. Unknown outcomes | NOT QUALIFIED | Code-level mapping and observed fail-closed control behavior exist, but injected metadata commit-unknown readback across every mutation family is incomplete. |
+| 2. Unknown outcomes | PASS | One clean candidate passed deterministic real-commit lost-ACK injection for all 17 mutation families across three repetitions, plus production bootstrap and cross-owner ordinary request replay. |
 | 3. Session fencing | PASS | Real control and metadata tests rejected stale renew, read, write, and release behavior. |
 | 4. Takeover | PASS | Concurrent contenders, monotonic expiry observation, generation advance, owner kill, and live takeover ran. |
 | 5. Provision crashes | PASS | Preparation/finalization crash cuts and external admission retry converged. |
@@ -213,5 +273,6 @@ fdb:///absolute/fdb.cluster?prefix=nokv-prod
 ```
 
 Holt is the standalone runtime. FDB is the distributed metadata authority and
-has passed the root fixes in this record, but its public serving status remains
-**NOT QUALIFIED** until the remaining live gates are complete.
+has passed Gates 1 through 7 in this record, but its public serving status
+remains **NOT QUALIFIED** until lifecycle, physical-limit, and performance
+Gates 8 through 10 are complete.
