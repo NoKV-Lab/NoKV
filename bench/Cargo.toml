@@ -30,6 +30,12 @@ fdb-limits-qualification = [
     "dep:nokv-fdb",
     "dep:nokv-meta-fdb",
 ]
+fdb-performance-qualification = [
+    "dep:nokv-control",
+    "dep:nokv-control-fdb",
+    "dep:nokv-fdb",
+    "dep:nokv-meta-fdb",
+]
 fdb-unknown-outcome-qualification = [
     "dep:nokv-control",
     "dep:nokv-control-fdb",
@@ -84,6 +90,11 @@ required-features = ["fdb-lifecycle-qualification"]
 name = "nokv-fdb-limits-qualification"
 path = "src/bin/nokv-fdb-limits-qualification.rs"
 required-features = ["fdb-limits-qualification"]
+
+[[bin]]
+name = "nokv-fdb-performance-qualification"
+path = "src/bin/nokv-fdb-performance-qualification.rs"
+required-features = ["fdb-performance-qualification"]
 
 [[bin]]
 name = "nokv-fdb-unknown-outcome-qualification"

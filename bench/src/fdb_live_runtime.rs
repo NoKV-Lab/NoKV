@@ -14,10 +14,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nokv_control::{DistributedControlStore, OwnershipSnapshot, ShardRouteState};
-use nokv_control_fdb::{FdbControlOptions, FdbControlStore, FdbSessionFence};
+#[cfg(any(
+    feature = "fdb-lifecycle-qualification",
+    feature = "fdb-limits-qualification"
+))]
+use nokv_control_fdb::FdbSessionFence;
+use nokv_control_fdb::{FdbControlOptions, FdbControlStore};
 use nokv_fdb::FdbRuntime;
 #[cfg(feature = "fdb-lifecycle-qualification")]
 use nokv_meta::workspace::MetaShard;
+#[cfg(any(
+    feature = "fdb-lifecycle-qualification",
+    feature = "fdb-limits-qualification"
+))]
 use nokv_meta_fdb::{FdbMetadataSessionFence, FdbOptions, FdbStore};
 use nokv_protocol::RootIdentity;
 #[cfg(feature = "fdb-lifecycle-qualification")]
@@ -183,11 +192,11 @@ pub(crate) fn require_unused_endpoint(endpoint: SocketAddr) -> Result<(), String
 }
 
 pub(crate) struct LiveControl {
-    runtime: FdbRuntime,
+    _runtime: FdbRuntime,
     store: FdbControlStore,
     root: nokv_control::RootCatalogEntry,
-    cluster_file: PathBuf,
-    prefix: String,
+    _cluster_file: PathBuf,
+    _prefix: String,
 }
 
 impl LiveControl {
@@ -208,11 +217,11 @@ impl LiveControl {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "provisioned root is absent from the FDB catalog".to_owned())?;
         Ok(Self {
-            runtime,
+            _runtime: runtime,
             store,
             root,
-            cluster_file: cluster_file.to_path_buf(),
-            prefix: prefix.to_owned(),
+            _cluster_file: cluster_file.to_path_buf(),
+            _prefix: prefix.to_owned(),
         })
     }
 
@@ -278,6 +287,10 @@ impl LiveControl {
             .map_err(|error| error.to_string())
     }
 
+    #[cfg(any(
+        feature = "fdb-lifecycle-qualification",
+        feature = "fdb-limits-qualification"
+    ))]
     pub(crate) fn open_store(&self) -> Result<FdbStore, String> {
         let snapshot = self.observe()?;
         let session = snapshot
@@ -294,8 +307,8 @@ impl LiveControl {
         )
         .map_err(|error| error.to_string())?;
         let store = FdbStore::open(
-            &self.runtime,
-            FdbOptions::new(&self.cluster_file, self.prefix.as_bytes().to_vec(), fence),
+            &self._runtime,
+            FdbOptions::new(&self._cluster_file, self._prefix.as_bytes().to_vec(), fence),
         )
         .map_err(|error| error.to_string())?;
         Ok(store)

@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn proxy_buffer_covers_the_provider_admission_block() {
-        assert!(MAX_BUFFERED_BODY_BYTES >= 4 * 1024 * 1024);
+        const { assert!(MAX_BUFFERED_BODY_BYTES >= 4 * 1024 * 1024) };
     }
 
     #[test]

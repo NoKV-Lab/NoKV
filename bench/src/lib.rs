@@ -11,9 +11,12 @@ pub mod fdb_lifecycle_qualification;
 pub mod fdb_limits_qualification;
 #[cfg(any(
     feature = "fdb-lifecycle-qualification",
-    feature = "fdb-limits-qualification"
+    feature = "fdb-limits-qualification",
+    feature = "fdb-performance-qualification"
 ))]
 mod fdb_live_runtime;
+#[cfg(feature = "fdb-performance-qualification")]
+pub mod fdb_performance_qualification;
 #[cfg(feature = "fdb-unknown-outcome-qualification")]
 pub mod fdb_unknown_outcome;
 #[cfg(feature = "metadata-read-stats")]

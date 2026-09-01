@@ -144,10 +144,12 @@ Each profile records:
   observations, or an explicit statement that a control is unavailable.
 
 The uncontended profile uses independent workspace identities so its conflict
-rate is expected to be zero. The contended profile pins one generation and
-races replacements so conflict rate is measured rather than inferred. A failed
-operation is retained and prevents PASS; retries are counted at the layer that
-actually performs them.
+rate is expected to be zero. The contended profile creates one generation-1
+source path per group, then races renames to distinct destinations while every
+request pins that source generation. This isolates metadata contention from
+object upload while making the winner and losing preconditions auditable. A
+failed operation is retained and prevents PASS; retries are counted at the
+layer that actually performs them.
 
 Performance evidence describes this topology and workload only. It does not set
 a product SLO, compare Holt and FDB as equivalent durability profiles, or turn a
