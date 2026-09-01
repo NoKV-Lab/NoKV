@@ -7,7 +7,12 @@
 
 #[cfg(feature = "fdb-lifecycle-qualification")]
 pub mod fdb_lifecycle_qualification;
-#[cfg(feature = "fdb-lifecycle-qualification")]
+#[cfg(feature = "fdb-limits-qualification")]
+pub mod fdb_limits_qualification;
+#[cfg(any(
+    feature = "fdb-lifecycle-qualification",
+    feature = "fdb-limits-qualification"
+))]
 mod fdb_live_runtime;
 #[cfg(feature = "fdb-unknown-outcome-qualification")]
 pub mod fdb_unknown_outcome;

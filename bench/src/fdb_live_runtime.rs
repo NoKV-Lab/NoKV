@@ -8,6 +8,7 @@
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(feature = "fdb-lifecycle-qualification")]
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,9 +16,12 @@ use std::time::{Duration, Instant};
 use nokv_control::{DistributedControlStore, OwnershipSnapshot, ShardRouteState};
 use nokv_control_fdb::{FdbControlOptions, FdbControlStore, FdbSessionFence};
 use nokv_fdb::FdbRuntime;
+#[cfg(feature = "fdb-lifecycle-qualification")]
 use nokv_meta::workspace::MetaShard;
 use nokv_meta_fdb::{FdbMetadataSessionFence, FdbOptions, FdbStore};
-use nokv_protocol::{RootIdentity, RootRoute};
+use nokv_protocol::RootIdentity;
+#[cfg(feature = "fdb-lifecycle-qualification")]
+use nokv_protocol::RootRoute;
 use nokv_types::RootId;
 use serde::Serialize;
 use serde_json::Value;
@@ -247,6 +251,7 @@ impl LiveControl {
         Err(format!("timed out waiting for Serving route: {last}"))
     }
 
+    #[cfg(feature = "fdb-lifecycle-qualification")]
     pub(crate) fn root_route(
         &self,
         root_id: RootIdentity,
@@ -265,7 +270,15 @@ impl LiveControl {
         })
     }
 
+    #[cfg(feature = "fdb-lifecycle-qualification")]
     pub(crate) fn open_meta(&self) -> Result<Arc<MetaShard>, String> {
+        let store = self.open_store()?;
+        MetaShard::open(Arc::new(store), self.root.logical_shard_id())
+            .map(Arc::new)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn open_store(&self) -> Result<FdbStore, String> {
         let snapshot = self.observe()?;
         let session = snapshot
             .session()
@@ -285,9 +298,7 @@ impl LiveControl {
             FdbOptions::new(&self.cluster_file, self.prefix.as_bytes().to_vec(), fence),
         )
         .map_err(|error| error.to_string())?;
-        MetaShard::open(Arc::new(store), self.root.logical_shard_id())
-            .map(Arc::new)
-            .map_err(|error| error.to_string())
+        Ok(store)
     }
 }
 
