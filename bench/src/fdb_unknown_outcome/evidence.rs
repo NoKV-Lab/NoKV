@@ -6,6 +6,7 @@
 //! Gate 2 scenario names and retained-evidence schemas.
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -199,6 +200,22 @@ pub(crate) fn validate_injector_events(
     target_key_sha256: &str,
     scenario: Scenario,
 ) -> Result<(), String> {
+    validate_injector_events_exact(
+        events,
+        nonce,
+        target_key_sha256,
+        scenario.mutation_kind().as_str(),
+        scenario.selector().as_str(),
+    )
+}
+
+pub(crate) fn validate_injector_events_exact(
+    events: &[InjectorEvent],
+    nonce: &str,
+    target_key_sha256: &str,
+    mutation_kind: &str,
+    selector_mode: &str,
+) -> Result<(), String> {
     if events.len() != 2 {
         return Err(format!(
             "injector must emit one substitution and one summary, observed {} events",
@@ -217,8 +234,8 @@ pub(crate) fn validate_injector_events(
         if event.version != 1
             || event.nonce != nonce
             || event.target_key_sha256 != target_key_sha256
-            || event.kind != scenario.mutation_kind().as_str()
-            || event.mode != scenario.selector().as_str()
+            || event.kind != mutation_kind
+            || event.mode != selector_mode
             || event.invalid
         {
             return Err(format!("injector event failed exact validation: {event:?}"));
@@ -230,7 +247,7 @@ pub(crate) fn validate_injector_events(
         || summary.target_commits != 1
         || summary.substitutions != 1
         || summary.duplicate_matches != 0
-        || (scenario.selector() == Selector::Armed && summary.arm_messages != 1)
+        || (selector_mode == "armed" && summary.arm_messages != 1)
     {
         return Err(format!(
             "injector did not prove one successful commit acknowledgement substitution: {summary:?}"
@@ -272,7 +289,39 @@ pub(crate) struct EnvironmentEvidence {
     pub(crate) fdb_client_sha256: String,
     pub(crate) rustfs_service_identity: String,
     pub(crate) rustfs_health_url: String,
+    pub(crate) object_binding_sha256: String,
+    pub(crate) owner_endpoints: [SocketAddr; 2],
     pub(crate) required_repetitions: u8,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct CandidateEvidence {
+    pub(crate) case: String,
+    pub(crate) prefix_sha256: String,
+    pub(crate) target_key_sha256: String,
+    pub(crate) mutation_kind: String,
+    pub(crate) ordinal: u64,
+    pub(crate) candidate_outcome: String,
+    pub(crate) exact_readback: String,
+    pub(crate) cleanup_verified: bool,
+    pub(crate) status: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct CandidateOrdinaryEvidence {
+    pub(crate) prefix_sha256: String,
+    pub(crate) request_sha256: String,
+    pub(crate) target_key_sha256: String,
+    pub(crate) owner_a_epoch: u64,
+    pub(crate) owner_a_generation: u64,
+    pub(crate) owner_b_epoch: u64,
+    pub(crate) owner_b_generation: u64,
+    pub(crate) first_outcome: String,
+    pub(crate) replayed: bool,
+    pub(crate) commit_version: u64,
+    pub(crate) seed_failover: String,
+    pub(crate) cleanup_verified: bool,
+    pub(crate) status: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -281,6 +330,7 @@ pub(crate) struct TerminalResult {
     pub(crate) source_revision: String,
     pub(crate) completed_scenarios: usize,
     pub(crate) required_scenarios: usize,
+    pub(crate) candidate_cases_complete: bool,
     pub(crate) failure: Option<String>,
     pub(crate) inventory_sha256: Option<String>,
 }

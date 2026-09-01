@@ -261,7 +261,7 @@ fn initialize_metadata(
     .map_err(|error| error.to_string())
 }
 
-fn metadata_store(
+pub(crate) fn metadata_store(
     runtime: &FdbRuntime,
     context: &ScenarioContext,
     control: &FdbControlStore,
