@@ -158,7 +158,7 @@ pub fn run(options: MetadataOptions) -> Result<MetadataBenchmarkReport, String> 
             architecture: env::consts::ARCH,
             metadata_device,
             metadata_store,
-            metadata_engine: "holt-0.8.5",
+            metadata_engine: "holt-0.8.6",
             object_provider: "not_applicable",
             object_endpoint_class: "not_applicable",
             durability_profile,
@@ -200,7 +200,7 @@ pub fn run(options: MetadataOptions) -> Result<MetadataBenchmarkReport, String> 
             cursor_scan_work: "measured_from_holt_range_iter_scan_stats",
             materialized_bytes: "measured_for_values_and_keys_emitted_by_holt",
             holt_storage_io: "measured_as_shared_db_counter_delta",
-            holt_internal_seek_count: "unavailable_in_holt_0.8.5",
+            holt_internal_seek_count: "unavailable_in_holt_0.8.6",
             metadata_decoded_bytes:
                 "unavailable_materialized_bytes_are_reported_without_claiming_decode_cost",
             host_cpu_memory_device_io: "not_measured",

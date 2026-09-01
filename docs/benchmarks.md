@@ -139,7 +139,7 @@ The report separates three different quantities:
 
 `visited` is a Holt cursor work unit, not a physical row or device read.
 Emitted value bytes are materialized bytes, not device bytes or a claim about
-decoder CPU cost. Holt 0.8.5 does not expose an exact internal seek count, so
+decoder CPU cost. Holt 0.8.6 does not expose an exact internal seek count, so
 the report leaves that metric unavailable rather than inferring it from scan
 calls. Logical counters exclude reads performed concurrently on other threads
 and by other stores. Their coverage is the fenced query paths used by these
