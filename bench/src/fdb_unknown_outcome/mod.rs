@@ -1772,12 +1772,11 @@ fn record_named_output(
 fn candidate_json(bytes: &[u8], operation: &str) -> Result<Value, String> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| format!("{operation} stdout is not UTF-8"))?;
-    let line = text
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .ok_or_else(|| format!("{operation} emitted no JSON"))?;
-    serde_json::from_str(line).map_err(|error| format!("{operation} JSON is invalid: {error}"))
+    let document = text.trim();
+    if document.is_empty() {
+        return Err(format!("{operation} emitted no JSON"));
+    }
+    serde_json::from_str(document).map_err(|error| format!("{operation} JSON is invalid: {error}"))
 }
 
 fn candidate_provision_arguments(
@@ -2458,5 +2457,11 @@ mod tests {
         assert!(!usage().contains("\n+"));
         assert!(usage().contains("--object-secret-access-key"));
         assert!(usage().contains("--owner-b-endpoint"));
+    }
+
+    #[test]
+    fn candidate_json_accepts_pretty_cli_output() {
+        let parsed = candidate_json(b"{\n  \"created\": true\n}\n", "format").unwrap();
+        assert_eq!(parsed.get("created"), Some(&Value::Bool(true)));
     }
 }
