@@ -202,11 +202,21 @@ impl BootstrapLeaseKeepalive {
     }
 
     fn ensure_healthy(&self) -> Result<(), ServerError> {
-        let failure = self.failure.lock().map_err(|_| {
-            ServerError::InvalidBootstrap(
-                "bootstrap owner keepalive failure lock was poisoned".to_owned(),
-            )
-        })?;
+        // The unwind sentinel can deliberately recover this lock after a
+        // worker panic. Preserve a typed cause that was recorded before the
+        // poison, but never treat a poisoned empty slot as healthy.
+        let failure = match self.failure.lock() {
+            Ok(failure) => failure,
+            Err(poisoned) => {
+                let failure = poisoned.into_inner();
+                return match failure.as_ref() {
+                    Some(error) => Err(ServerError::Control(error.clone())),
+                    None => Err(ServerError::InvalidBootstrap(
+                        "bootstrap owner keepalive failure lock was poisoned".to_owned(),
+                    )),
+                };
+            }
+        };
 
         if let Some(error) = failure.as_ref() {
             return Err(ServerError::Control(error.clone()));
@@ -245,16 +255,23 @@ impl BootstrapLeaseKeepalive {
             worker.take()
         };
 
-        if let Some(worker) = worker {
+        let worker_panicked = if let Some(worker) = worker {
             worker.thread().unpark();
-            worker.join().map_err(|_| {
-                ServerError::InvalidBootstrap(
-                    "bootstrap owner keepalive worker panicked".to_owned(),
-                )
-            })?;
-        }
+            worker.join().is_err()
+        } else {
+            false
+        };
 
-        self.ensure_healthy()
+        // A recorded control failure is the state-machine outcome. The join
+        // result only diagnoses a panic for which the sentinel could not
+        // publish a more precise cause.
+        match self.ensure_healthy() {
+            Err(error) => Err(error),
+            Ok(()) if worker_panicked => Err(ServerError::InvalidBootstrap(
+                "bootstrap owner keepalive worker panicked without recording a failure".to_owned(),
+            )),
+            Ok(()) => Ok(()),
+        }
     }
 }
 
@@ -4449,6 +4466,61 @@ mod tests {
         assert!(owner_loss.is_lost());
     }
 
+    fn keepalive_with_poisoned_failure_slot(
+        recorded: Option<ControlError>,
+    ) -> BootstrapLeaseKeepalive {
+        let failure = Arc::new(Mutex::new(None));
+        let worker_failure = Arc::clone(&failure);
+
+        let worker = std::thread::spawn(move || {
+            let mut failure = worker_failure
+                .lock()
+                .expect("fresh test failure slot must be available");
+            *failure = recorded;
+            panic!("inject keepalive failure-slot poison");
+        });
+
+        assert!(
+            worker.join().is_err(),
+            "poison worker unexpectedly returned"
+        );
+        assert!(failure.is_poisoned(), "failure slot was not poisoned");
+
+        BootstrapLeaseKeepalive {
+            stop: Arc::new(AtomicBool::new(true)),
+            failure,
+            worker: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn poisoned_empty_keepalive_failure_slot_remains_fail_closed() {
+        let keepalive = keepalive_with_poisoned_failure_slot(None);
+
+        match keepalive.stop().unwrap_err() {
+            ServerError::InvalidBootstrap(message) => {
+                assert!(
+                    message.contains("failure lock was poisoned"),
+                    "poison diagnostic lost its cause: {message}"
+                );
+            }
+            other => panic!("empty poisoned failure slot was not fail-closed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poisoned_keepalive_failure_slot_preserves_recorded_control_error() {
+        let expected = ControlError::Backend(
+            "recorded keepalive failure survived failure-slot poison".to_owned(),
+        );
+        let keepalive = keepalive_with_poisoned_failure_slot(Some(expected.clone()));
+
+        match keepalive.stop().unwrap_err() {
+            ServerError::Control(actual) => assert_eq!(actual, expected),
+            other => panic!("poisoned failure slot hid its typed cause: {other:?}"),
+        }
+    }
+
     #[test]
     fn terminal_keepalive_failure_before_bootstrap_return_preserves_control_error() {
         let probe = Arc::new(BootstrapLeaseProbe::new(
@@ -4698,6 +4770,57 @@ mod tests {
 
         // The probe returns StaleLease before calling the in-memory backend,
         // so the test removes the retained backend session explicitly.
+        control.release_owner(&lease).unwrap();
+    }
+
+    #[test]
+    fn steady_state_keepalive_panic_handoff_preserves_typed_control_error() {
+        let probe = Arc::new(BootstrapLeaseProbe::new(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Duration::from_millis(25),
+        ));
+
+        let SuccessorProbeFixture {
+            _temporary,
+            control,
+            registry,
+            delayed_control,
+            boot,
+            first_epoch: _,
+        } = successor_probe_fixture(Arc::clone(&probe));
+
+        let successor = bootstrap_shard(delayed_control, Arc::clone(&registry), boot).unwrap();
+
+        let lease = successor.lease().clone();
+        let route = successor.routes()[0];
+        let owner_loss = registry.owner_loss_signal();
+
+        probe.panic_one_renewal.store(true, Ordering::SeqCst);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        while !owner_loss.is_lost() || registry.contains_exact(route).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "keepalive panic did not fail-close the shared owner scope"
+            );
+
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        match successor.renew_or_uninstall().unwrap_err() {
+            ServerError::Control(ControlError::Backend(message)) => {
+                assert!(
+                    message.contains("panicked"),
+                    "keepalive handoff lost the panic cause: {message}"
+                );
+            }
+            other => panic!("keepalive handoff lost its typed panic cause: {other:?}"),
+        }
+
+        // The injected panic occurs before the delayed control store delegates
+        // renewal, so remove its still-live in-memory session explicitly.
         control.release_owner(&lease).unwrap();
     }
 
