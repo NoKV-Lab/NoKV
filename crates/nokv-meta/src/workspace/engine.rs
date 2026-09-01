@@ -218,8 +218,27 @@ impl MetadataCommand {
     }
 
     pub fn canonical_digest(&self) -> CommandDigest {
+        self.canonical_digest_with_owner_epoch(true)
+    }
+
+    /// Stable exact-replay digest for one logical command across owner takeover.
+    ///
+    /// The physical command digest above continues to bind the owner epoch for
+    /// recovery and transaction integrity. This replay digest excludes only
+    /// that replaceable physical-owner field; read version, routing identity,
+    /// predicates, mutations, projections, and the deterministic result remain
+    /// exact-bound.
+    fn canonical_replay_digest(&self) -> CommandDigest {
+        self.canonical_digest_with_owner_epoch(false)
+    }
+
+    fn canonical_digest_with_owner_epoch(&self, include_owner_epoch: bool) -> CommandDigest {
         let mut hasher = Sha256::new();
-        hasher.update(b"nokv.metadata.command.v1\0");
+        if include_owner_epoch {
+            hasher.update(b"nokv.metadata.command.v1\0");
+        } else {
+            hasher.update(b"nokv.metadata.command-replay.v1\0");
+        }
         hash_bytes(&mut hasher, self.schema_id.as_bytes());
         hasher.update(self.root_id.as_bytes());
         hasher.update(self.logical_shard_id.as_bytes());
@@ -227,7 +246,9 @@ impl MetadataCommand {
             hasher.update(object_namespace_id.as_bytes());
         }
         hasher.update(self.placement_generation.get().to_be_bytes());
-        hasher.update(self.owner_epoch.get().to_be_bytes());
+        if include_owner_epoch {
+            hasher.update(self.owner_epoch.get().to_be_bytes());
+        }
         hasher.update(self.request_id.as_bytes());
         hasher.update(self.read_version.get().to_be_bytes());
         match self.root_fence_action {
@@ -1646,7 +1667,11 @@ impl MetaShard {
         lease_deadline_ms: Option<u64>,
     ) -> Result<MetadataCommandResult, MetaError> {
         let dedupe_key = command_dedupe_key(command.root_id, command.request_id);
-        if let Some(result) = self.replayed_result(&dedupe_key, command.command_digest)? {
+        if let Some(result) = self.replayed_result(
+            &dedupe_key,
+            command.command_digest,
+            command.canonical_replay_digest(),
+        )? {
             return Ok(result);
         }
 
@@ -1738,7 +1763,11 @@ impl MetaShard {
                 replayed: false,
             }),
             Commit::Conflict => {
-                if let Some(result) = self.replayed_result(&dedupe_key, command.command_digest)? {
+                if let Some(result) = self.replayed_result(
+                    &dedupe_key,
+                    command.command_digest,
+                    command.canonical_replay_digest(),
+                )? {
                     Ok(result)
                 } else {
                     Err(MetaError::WriteConflict)
@@ -2921,7 +2950,8 @@ impl MetaShard {
     fn replayed_result(
         &self,
         key: &[u8],
-        digest: CommandDigest,
+        command_digest: CommandDigest,
+        replay_digest: CommandDigest,
     ) -> Result<Option<MetadataCommandResult>, MetaError> {
         let Some(value) = self.read_value(
             COMMAND_DEDUPE.id,
@@ -2934,7 +2964,7 @@ impl MetaShard {
         };
         let record =
             CommandDedupeRecord::decode(&value).map_err(|error| corrupt("CommandDedupe", error))?;
-        if record.command_digest != digest {
+        if record.command_digest != command_digest && record.replay_digest != replay_digest {
             return Err(MetaError::RequestIdReused);
         }
         self.validate_dedupe_recovery_binding(key, &record)?;
@@ -2986,6 +3016,7 @@ impl MetaShard {
         };
         if command_dedupe_key(command.root_id, command.request_id) != dedupe_key
             || command.command_digest != dedupe.command_digest
+            || command.canonical_replay_digest() != dedupe.replay_digest
             || commit_version != &dedupe.commit_version
             || deterministic_result != &dedupe.deterministic_result
             || row.chain_digest != receipt.chain_digest
@@ -3721,6 +3752,7 @@ fn build_command_txn(
     let dedupe_key = command_dedupe_key(command.root_id, command.request_id);
     let dedupe_record = CommandDedupeRecord {
         command_digest: command.command_digest,
+        replay_digest: command.canonical_replay_digest(),
         commit_version: state.next_version,
         recovery_receipt: state.recovery.as_ref().map(RecoveryPlan::receipt),
         deterministic_result: command.deterministic_result.clone(),
@@ -5719,6 +5751,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(durable.command_digest, command.command_digest);
+        assert_eq!(durable.replay_digest, command.canonical_replay_digest());
         assert_eq!(durable.commit_version, first.commit_version);
         assert_eq!(durable.deterministic_result, b"created");
         assert!(store
@@ -5732,6 +5765,49 @@ mod tests {
         assert_eq!(store.execute(&mismatch), Err(MetaError::RequestIdReused));
         assert_eq!(
             read_operation(&store, &key, first.commit_version),
+            Some(b"v1".to_vec())
+        );
+    }
+
+    #[test]
+    fn exact_replay_crosses_owner_epoch_without_weakening_command_identity() {
+        let store = ready_store();
+        let key = scoped_key(root(2), b"owner-replay");
+        let command = create_command(&store, request(6), key.clone(), b"v1");
+        let first = store.execute(&command).unwrap();
+
+        store.advance_owner_epoch(Some(epoch(1)), epoch(2)).unwrap();
+        let mut successor_replay = command.clone();
+        successor_replay.owner_epoch = epoch(2);
+        successor_replay = successor_replay.seal();
+        assert_ne!(successor_replay.command_digest, command.command_digest);
+        assert_eq!(
+            successor_replay.canonical_replay_digest(),
+            command.canonical_replay_digest()
+        );
+
+        let replay = store.execute(&successor_replay).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.commit_version, first.commit_version);
+        assert_eq!(replay.deterministic_result, first.deterministic_result);
+
+        successor_replay.deterministic_result = b"different".to_vec();
+        successor_replay = successor_replay.seal();
+        assert_eq!(
+            store.execute(&successor_replay),
+            Err(MetaError::RequestIdReused)
+        );
+        assert_eq!(
+            store
+                .read_at(
+                    root(2),
+                    generation(7),
+                    epoch(2),
+                    MetadataFamily::Operation,
+                    &key,
+                    ReadVersion::new(first.commit_version.get()).unwrap(),
+                )
+                .unwrap(),
             Some(b"v1".to_vec())
         );
     }
@@ -7226,21 +7302,21 @@ mod tests {
     }
 
     #[test]
-    fn format10_store_is_rejected_without_rewriting_its_marker_or_recovery_tail() {
+    fn format11_store_is_rejected_without_rewriting_its_marker_or_recovery_tail() {
         let temporary = tempdir().unwrap();
         let database = temporary.path().join("metadata");
         let expected_recovery;
-        let format10_marker;
+        let format11_marker;
         {
             let store = ready_file_store(&database);
             expected_recovery = store.verify_recovery_chain().unwrap();
-            format10_marker = {
+            format11_marker = {
                 let mut marker = encode_schema_marker();
                 let version_start = marker.len() - std::mem::size_of::<u32>();
-                marker[version_start..].copy_from_slice(&10_u32.to_be_bytes());
+                marker[version_start..].copy_from_slice(&11_u32.to_be_bytes());
                 marker
             };
-            raw_put(&store, SYSTEM.id, SYSTEM_SCHEMA_KEY, &format10_marker);
+            raw_put(&store, SYSTEM.id, SYSTEM_SCHEMA_KEY, &format11_marker);
         }
 
         assert!(matches!(
@@ -7261,7 +7337,7 @@ mod tests {
         let ReadResult::Get(marker) = &snapshot.results[0] else {
             panic!("schema marker read must return a point value");
         };
-        assert_eq!(marker.as_deref(), Some(format10_marker.as_slice()));
+        assert_eq!(marker.as_deref(), Some(format11_marker.as_slice()));
         let ReadResult::Get(lsn) = &snapshot.results[1] else {
             panic!("recovery LSN read must return a point value");
         };

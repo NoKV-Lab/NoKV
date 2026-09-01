@@ -19,16 +19,16 @@ Every logical-shard store has one authoritative marker:
 System("schema")
   -> value_format_version = 1
      schema_id = "nokv_workspace"
-     format_version = 11
+     format_version = 12
 ```
 
 Startup is fail-closed:
 
 - an empty store is initialized with the exact supported marker and logical
   keyspace catalog;
-- format-10 and older stores are rejected without writes; there is no
-  marker-only upgrade because format 11 changes command-dedupe recovery
-  authority and its durable codec;
+- format-11 and older stores are rejected without writes; there is no
+  marker-only upgrade because format 12 adds a logical replay digest to every
+  command-dedupe record while retaining the owner-bound physical digest;
 - a nonempty current store opens only when its marker, value format, and
   configured adapter catalog match this contract;
 - a missing, malformed, unknown-version, or inconsistent store is rejected.
@@ -86,7 +86,7 @@ exact key is a strict prefix of another valid path key. A child/subtree prefix
 appends NUL, so `a` cannot match `ab`. The empty path has no `PathCurrent`
 record; the workspace root is synthesized from `WorkspaceCurrent`. This path
 key layout was introduced by system format version 8 and is retained by
-version 11.
+version 12.
 
 The one shared normalizer enforces:
 
@@ -107,24 +107,22 @@ float, timestamp, bytes, and string values.
 
 ## Durable Format Registry
 
-`System.format_version` is `11`. Version 11 retains the format-10 path layout
-and fixed-width decimal RecoveryOutbox LSN keys. It adds
-`PathIndexLocator(0x021c)`, replaces path secondary-index rows with
-SecondaryIndexV2 generation identities, and changes `PathEntry` plus the other
-publication-owned records to value version `3`. It also changes
-`CommandDedupe` so one result contains an optional typed local recovery
-receipt. `RecoveryMode::LocalJournal` writes that receipt and the hash-chained
-RecoveryOutbox in the same transaction. `RecoveryMode::StoreAuthority` writes
-neither; its atomic dedupe result in the shared or replicated store is the
-recovery evidence. The system recovery tail remains at LSN zero and the
-logical-shard genesis digest in store-authority mode, and RecoveryOutbox must
-remain empty.
+`System.format_version` is `12`. Version 12 retains the format-11 path, index,
+recovery-authority, and fixed-width decimal RecoveryOutbox layouts. It adds a
+logical replay digest to `CommandDedupe` alongside the owner-bound physical
+command digest. The replay digest excludes only the replaceable owner epoch;
+read version, routing identity, predicates, mutations, projections, and the
+deterministic result remain exact-bound. `RecoveryMode::LocalJournal` writes
+the optional typed recovery receipt and hash-chained RecoveryOutbox in the same
+transaction. `RecoveryMode::StoreAuthority` writes neither; its atomic dedupe
+result in the shared or replicated store is the recovery evidence. The system
+recovery tail remains at LSN zero and the logical-shard genesis digest in
+store-authority mode, and RecoveryOutbox must remain empty.
 
-Ordinary open does not migrate a format-10 marker, even when its catalog is
-otherwise internally consistent. Format 10 requires a local recovery LSN in
-every command dedupe record and cannot be reinterpreted as shared-authority
-evidence. Migration remains not qualified; every older or unknown marker is
-fail-closed and unchanged.
+Ordinary open does not migrate a format-11 marker, even when its catalog is
+otherwise internally consistent. Format 11 has no logical replay digest and
+cannot prove an exact command replay after owner replacement. Migration remains
+not qualified; every older or unknown marker is fail-closed and unchanged.
 
 Durable codecs are independently versioned:
 publication-owned workspace/path/revision records use value version `3`;
@@ -133,8 +131,9 @@ consumer, head, and tag records remain version `2`; `ChangeEvent` uses value
 version `2`, and the logical recovery-outbox record uses version `3` with
 strict legacy-version-2 decoding; other ordinary workspace
 records and the recovery storage header/chunk records currently use value
-version `1`; `CommandDedupe` uses version `3` to bind its exact result to an
-optional local recovery receipt. `BuildCommitOperation` and
+version `1`; `CommandDedupe` uses version `4` to bind its owner-bound physical
+digest, cross-owner logical replay digest, exact result, and optional local
+recovery receipt. `BuildCommitOperation` and
 `CommitRetireOperation` use version `6`
 and dual-decode version `5`; the build record retains the complete exact commit
 request, opaque Agent projection-input digest, first owner-observed commit time,
@@ -474,7 +473,8 @@ StagedObject
 
 CommandDedupe
   key: root_id | request_id
-  val: command digest, deterministic result, commit_version,
+  val: owner-bound command digest, cross-owner replay digest,
+       deterministic result, commit_version,
        optional local recovery LSN and chain digest
 
 GcCandidate
@@ -681,8 +681,11 @@ Before any mutation, the shard validates:
 
 An unrelated intervening commit makes a write's read version stale and the
 caller must rebuild the command. An exact request-id replay is checked before
-that fence and returns the stored result. Reusing a request id with different
-inputs is an error. A failed predicate applies no mutation.
+that fence and returns the stored result. A serving successor first admits the
+RPC through its current ownership fence, then may match either the original
+physical command digest or the logical replay digest that differs only by owner
+epoch. Reusing a request id with any other changed command input is an error. A
+failed predicate applies no mutation.
 
 Ordinary put/replace/remove has a fixed upper bound on predicates and mutations
 apart from bounded manifest and index rows. It performs no namespace prefix

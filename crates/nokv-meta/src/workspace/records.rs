@@ -8,6 +8,7 @@ use nokv_types::{
 /// Initial value format for every durable workspace record.
 pub const VALUE_FORMAT_VERSION: u8 = 1;
 const ROOT_FENCE_VALUE_FORMAT_VERSION: u8 = 2;
+const COMMAND_DEDUPE_VALUE_FORMAT_VERSION: u8 = 4;
 
 /// Installed shard-local placement fence for one Agent root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +41,10 @@ pub struct HistoryValue {
 /// Exact replay result persisted for one metadata command request id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandDedupeRecord {
+    /// Exact physical command digest, including the owner epoch.
     pub command_digest: CommandDigest,
+    /// Logical command digest used only for exact replay across owner epochs.
+    pub replay_digest: CommandDigest,
     pub commit_version: CommitVersion,
     /// Local recovery evidence committed atomically with this result.
     ///
@@ -325,7 +329,6 @@ impl HistoryValue {
 
 impl CommandDedupeRecord {
     pub fn encode(&self) -> Result<Vec<u8>, RecordCodecError> {
-        const COMMAND_DEDUPE_VALUE_FORMAT_VERSION: u8 = 3;
         if matches!(
             self.recovery_receipt,
             Some(LocalRecoveryReceipt {
@@ -344,6 +347,7 @@ impl CommandDedupeRecord {
             .map_or(0, |_| std::mem::size_of::<u64>() + SHA256_BYTES);
         let mut encoded = Vec::with_capacity(
             1 + CommandDigest::BYTE_WIDTH
+                + CommandDigest::BYTE_WIDTH
                 + 8
                 + 1
                 + receipt_bytes
@@ -352,6 +356,7 @@ impl CommandDedupeRecord {
         );
         encoded.push(COMMAND_DEDUPE_VALUE_FORMAT_VERSION);
         encoded.extend_from_slice(self.command_digest.as_bytes());
+        encoded.extend_from_slice(self.replay_digest.as_bytes());
         encoded.extend_from_slice(&self.commit_version.get().to_be_bytes());
         match self.recovery_receipt {
             None => encoded.push(0),
@@ -367,7 +372,6 @@ impl CommandDedupeRecord {
     }
 
     pub fn decode(encoded: &[u8]) -> Result<Self, RecordCodecError> {
-        const COMMAND_DEDUPE_VALUE_FORMAT_VERSION: u8 = 3;
         let mut decoder = Decoder::new(encoded);
         let actual = decoder.u8("value_format_version")?;
         if actual != COMMAND_DEDUPE_VALUE_FORMAT_VERSION {
@@ -377,6 +381,7 @@ impl CommandDedupeRecord {
             });
         }
         let command_digest = CommandDigest::from_bytes(decoder.fixed("command_digest")?);
+        let replay_digest = CommandDigest::from_bytes(decoder.fixed("replay_digest")?);
         let commit_version = decoder.commit_version("commit_version")?;
         let recovery_receipt = match decoder.u8("recovery_receipt tag")? {
             0 => None,
@@ -403,6 +408,7 @@ impl CommandDedupeRecord {
         decoder.finish()?;
         Ok(Self {
             command_digest,
+            replay_digest,
             commit_version,
             recovery_receipt,
             deterministic_result,
@@ -626,6 +632,7 @@ mod tests {
     fn command_dedupe_codec_has_frozen_golden_bytes() {
         let record = CommandDedupeRecord {
             command_digest: CommandDigest::from_bytes([0xaa; 32]),
+            replay_digest: CommandDigest::from_bytes([0xab; 32]),
             commit_version: commit_version(11),
             recovery_receipt: Some(LocalRecoveryReceipt {
                 recovery_lsn: 17,
@@ -634,8 +641,9 @@ mod tests {
             deterministic_result: b"ok".to_vec(),
         };
         let expected = [
-            &[3][..],
+            &[COMMAND_DEDUPE_VALUE_FORMAT_VERSION][..],
             &[0xaa; 32],
+            &[0xab; 32],
             &11_u64.to_be_bytes(),
             &[1],
             &17_u64.to_be_bytes(),
@@ -655,13 +663,15 @@ mod tests {
     fn command_dedupe_codec_freezes_shared_authority_without_a_local_receipt() {
         let record = CommandDedupeRecord {
             command_digest: CommandDigest::from_bytes([0xcc; 32]),
+            replay_digest: CommandDigest::from_bytes([0xcd; 32]),
             commit_version: commit_version(12),
             recovery_receipt: None,
             deterministic_result: b"shared".to_vec(),
         };
         let expected = [
-            &[3][..],
+            &[COMMAND_DEDUPE_VALUE_FORMAT_VERSION][..],
             &[0xcc; 32],
+            &[0xcd; 32],
             &12_u64.to_be_bytes(),
             &[0],
             &6_u32.to_be_bytes(),
@@ -696,6 +706,7 @@ mod tests {
         };
         let dedupe = CommandDedupeRecord {
             command_digest: CommandDigest::from_bytes([2; 32]),
+            replay_digest: CommandDigest::from_bytes([4; 32]),
             commit_version: commit_version(1),
             recovery_receipt: Some(LocalRecoveryReceipt {
                 recovery_lsn: 1,
@@ -714,7 +725,7 @@ mod tests {
         for value in &mut values[1..] {
             value[0] = VALUE_FORMAT_VERSION + 1;
         }
-        values[3][0] = 4;
+        values[3][0] = COMMAND_DEDUPE_VALUE_FORMAT_VERSION + 1;
         assert!(matches!(
             RootFence::decode(&values[0]),
             Err(RecordCodecError::UnsupportedValueVersion { .. })
@@ -738,7 +749,7 @@ mod tests {
             CommandDedupeRecord::decode(&legacy_dedupe),
             Err(RecordCodecError::UnsupportedValueVersion {
                 actual: 2,
-                expected: 3,
+                expected: COMMAND_DEDUPE_VALUE_FORMAT_VERSION,
             })
         );
     }
@@ -790,12 +801,13 @@ mod tests {
 
         let dedupe = CommandDedupeRecord {
             command_digest: CommandDigest::from_bytes([2; 32]),
+            replay_digest: CommandDigest::from_bytes([4; 32]),
             commit_version: commit_version(1),
             recovery_receipt: None,
             deterministic_result: Vec::new(),
         };
         let mut invalid_receipt_tag = dedupe.encode().unwrap();
-        invalid_receipt_tag[1 + CommandDigest::BYTE_WIDTH + 8] = 2;
+        invalid_receipt_tag[1 + CommandDigest::BYTE_WIDTH * 2 + 8] = 2;
         assert_eq!(
             CommandDedupeRecord::decode(&invalid_receipt_tag),
             Err(RecordCodecError::InvalidOptionalTag {
@@ -806,6 +818,7 @@ mod tests {
 
         let zero_receipt = CommandDedupeRecord {
             command_digest: CommandDigest::from_bytes([2; 32]),
+            replay_digest: CommandDigest::from_bytes([4; 32]),
             commit_version: commit_version(1),
             recovery_receipt: Some(LocalRecoveryReceipt {
                 recovery_lsn: 0,
@@ -829,7 +842,7 @@ mod tests {
         }
         .encode()
         .unwrap();
-        let recovery_lsn_offset = 1 + CommandDigest::BYTE_WIDTH + 8 + 1;
+        let recovery_lsn_offset = 1 + CommandDigest::BYTE_WIDTH * 2 + 8 + 1;
         zero_receipt_bytes[recovery_lsn_offset..recovery_lsn_offset + 8].fill(0);
         assert_eq!(
             CommandDedupeRecord::decode(&zero_receipt_bytes),

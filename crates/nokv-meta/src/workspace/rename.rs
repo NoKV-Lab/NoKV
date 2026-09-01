@@ -1385,7 +1385,7 @@ mod tests {
                 .map(crate::workspace::test_support::transaction_bytes)
                 .collect::<Vec<_>>()
         });
-        assert_eq!(transaction_bytes, vec![397_058, 696_582]);
+        assert_eq!(transaction_bytes, vec![397_090, 696_614]);
         assert!(transaction_bytes.iter().all(|bytes| *bytes <= 900_000));
     }
 

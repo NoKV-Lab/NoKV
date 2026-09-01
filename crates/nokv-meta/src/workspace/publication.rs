@@ -6985,7 +6985,7 @@ mod tests {
                 .map(crate::workspace::test_support::transaction_bytes)
                 .collect::<Vec<_>>()
         });
-        assert_eq!(replace_bytes, vec![125_601, 318_292]);
+        assert_eq!(replace_bytes, vec![125_633, 318_324]);
         assert!(replace_bytes.iter().all(|bytes| *bytes <= 900_000));
 
         let removed = remove_path(
@@ -7010,7 +7010,7 @@ mod tests {
         assert_eq!(removed.removed_artifact_revision_id, revision(216));
         let remove_bytes =
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
-        assert_eq!(remove_bytes, 311_466);
+        assert_eq!(remove_bytes, 311_498);
         assert!(remove_bytes <= 900_000);
     }
 
@@ -7072,7 +7072,7 @@ mod tests {
                 .map(crate::workspace::test_support::transaction_bytes)
                 .collect::<Vec<_>>()
         });
-        assert_eq!(create_bytes, vec![283_025, 573_060]);
+        assert_eq!(create_bytes, vec![283_057, 573_092]);
         assert!(create_bytes.iter().all(|bytes| *bytes <= 900_000));
         let replaced = publish_with_dependencies_and_projection(
             &service,
@@ -7094,7 +7094,7 @@ mod tests {
                 .map(crate::workspace::test_support::transaction_bytes)
                 .collect::<Vec<_>>()
         });
-        assert_eq!(replace_bytes, vec![142_209, 433_036]);
+        assert_eq!(replace_bytes, vec![142_241, 433_068]);
         assert!(replace_bytes.iter().all(|bytes| *bytes <= 900_000));
         let removed = remove_path(
             &store,
@@ -7118,7 +7118,7 @@ mod tests {
         assert_eq!(removed.removed_artifact_revision_id, revision(40_001));
         assert_eq!(
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes),
-            357_070
+            357_102
         );
     }
 
@@ -7202,7 +7202,7 @@ mod tests {
                 .map(crate::workspace::test_support::transaction_bytes)
                 .collect::<Vec<_>>()
         });
-        assert_eq!(transaction_bytes, vec![213_813, 366_418]);
+        assert_eq!(transaction_bytes, vec![213_845, 366_450]);
         assert!(transaction_bytes.iter().all(|bytes| *bytes <= 900_000));
     }
 

@@ -2947,13 +2947,7 @@ impl MetadataWorkspaceRequestExecutor {
         &self,
         request: &protocol::WorkspaceRpcRequest,
     ) -> Result<bool, protocol::RpcFailure> {
-        let encoded =
-            protocol::encode_request(&protocol::RpcRequest::Workspace(Box::new(request.clone())))
-                .map_err(|error| invalid_argument(error.to_string()))?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"nokv.server.rpc-request.v1\0");
-        hasher.update(&encoded);
-        let request_digest: [u8; types::SHA256_BYTES] = hasher.finalize().into();
+        let request_digest = mutation_claim_digest(request)?;
         let request_id: types::RequestId = request.request_id.into();
         if let Some(existing) = self.lookup_request(request.route, request_id)? {
             if existing.deterministic_result == request_digest {
@@ -3237,6 +3231,22 @@ impl MetadataWorkspaceRequestExecutor {
         }
         run(self.write_context(rpc.route, request_id)?).map_err(commit_failure)
     }
+}
+
+fn mutation_claim_digest(
+    request: &protocol::WorkspaceRpcRequest,
+) -> Result<[u8; types::SHA256_BYTES], protocol::RpcFailure> {
+    let mut stable = request.clone();
+    // The successor owner must be able to validate the same logical RPC after
+    // seed discovery refreshes only the physical owner epoch. Every other
+    // route field and every operation input remain exact-bound.
+    stable.route.owner_epoch = 1;
+    let encoded = protocol::encode_request(&protocol::RpcRequest::Workspace(Box::new(stable)))
+        .map_err(|error| invalid_argument(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.server.rpc-mutation-claim.v2\0");
+    hasher.update(&encoded);
+    Ok(hasher.finalize().into())
 }
 
 impl WorkspaceRequestExecutor for MetadataWorkspaceRequestExecutor {
@@ -8677,6 +8687,27 @@ mod tests {
         let reused = create_request(10, "run-b", 12, 1);
         let failure = executor.execute(&reused).unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::RequestReplayMismatch);
+    }
+
+    #[test]
+    fn create_replays_exact_request_through_successor_owner() {
+        let (store, executor) = ready_executor();
+        let request = create_request(13, "owner-replay", 14, 1);
+        let created = executor.execute(&request).unwrap();
+        assert!(!created.replayed);
+
+        store.advance_owner_epoch(Some(owner(1)), owner(2)).unwrap();
+        let mut successor_replay = request.clone();
+        successor_replay.route = route(2);
+        let replayed = executor.execute(&successor_replay).unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.commit_version, created.commit_version);
+        assert_eq!(replayed.result, created.result);
+
+        let reused = create_request(13, "different-input", 15, 2);
+        let failure = executor.execute(&reused).unwrap_err();
+        assert_eq!(failure.code, protocol::ErrorCode::RequestReplayMismatch);
+        assert!(!failure.retryable);
     }
 
     #[test]
