@@ -323,11 +323,19 @@ impl FdbBootstrapKeepaliveState {
             .clone()
     }
 
-    fn current_failure(&self) -> Option<ControlError> {
-        self.failure
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    fn current_failure(&self) -> Result<Option<ControlError>, ServerError> {
+        match self.failure.lock() {
+            Ok(failure) => Ok(failure.clone()),
+            Err(poisoned) => {
+                let failure = poisoned.into_inner();
+                match failure.as_ref() {
+                    Some(error) => Err(ServerError::Control(error.clone())),
+                    None => Err(ServerError::InvalidBootstrap(
+                        "FoundationDB bootstrap keepalive failure lock is poisoned".to_owned(),
+                    )),
+                }
+            }
+        }
     }
 
     fn current_sessions(&self) -> Vec<OwnerSession> {
@@ -444,7 +452,7 @@ impl FdbBootstrapKeepalive {
     }
 
     fn ensure_healthy(&self) -> Result<(), ServerError> {
-        if let Some(error) = self.state.current_failure() {
+        if let Some(error) = self.state.current_failure()? {
             return Err(ServerError::Control(error));
         }
         let worker = self.worker.lock().map_err(|_| {
@@ -2086,6 +2094,53 @@ mod tests {
         assert!(message.contains("keepalive worker panicked"));
         assert_eq!(control.fail_close_count(first.logical_shard_id()), 1);
         assert_eq!(control.fail_close_count(second.logical_shard_id()), 1);
+    }
+
+    fn keepalive_with_poisoned_failure_slot(
+        recorded: Option<ControlError>,
+    ) -> FdbBootstrapKeepalive {
+        let state = Arc::new(FdbBootstrapKeepaliveState::default());
+        let worker_state = Arc::clone(&state);
+        let poisoner = thread::spawn(move || {
+            let mut failure = worker_state
+                .failure
+                .lock()
+                .expect("fresh FDB keepalive failure slot must be available");
+            *failure = recorded;
+            panic!("inject FDB keepalive failure-slot poison");
+        });
+
+        assert!(poisoner.join().is_err(), "poison worker returned");
+        assert!(state.failure.is_poisoned(), "failure slot was not poisoned");
+
+        FdbBootstrapKeepalive {
+            state,
+            worker: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn poisoned_empty_fdb_keepalive_failure_slot_remains_fail_closed() {
+        let keepalive = keepalive_with_poisoned_failure_slot(None);
+
+        match keepalive.stop().unwrap_err() {
+            ServerError::InvalidBootstrap(message) => {
+                assert!(message.contains("failure lock is poisoned"));
+            }
+            other => panic!("empty poisoned failure slot was not fail-closed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poisoned_fdb_keepalive_failure_slot_preserves_recorded_control_error() {
+        let expected =
+            ControlError::Backend("recorded FDB keepalive failure survived poison".to_owned());
+        let keepalive = keepalive_with_poisoned_failure_slot(Some(expected.clone()));
+
+        match keepalive.stop().unwrap_err() {
+            ServerError::Control(actual) => assert_eq!(actual, expected),
+            other => panic!("poisoned failure slot hid its typed cause: {other:?}"),
+        }
     }
 
     fn catalog_pair(
