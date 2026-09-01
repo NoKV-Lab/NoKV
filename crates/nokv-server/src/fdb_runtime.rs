@@ -13,10 +13,12 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nokv_control::{
-    plan_owner_acquisition, validate_root_catalog_transition, validate_shard_catalog_transition,
-    CatalogEntryState, ControlError, CreateOutcome, DistributedControlStore, NodeId, OwnerSession,
-    RootCatalogEntry, RpcEndpoint, ShardCatalogEntry, ShardRouteState, StoreId, StoreManifest,
-    StoreProvider, SUPPORTED_WORKSPACE_FORMAT_VERSION,
+    plan_fail_closed, plan_heartbeat_renewal, plan_owner_acquisition, plan_owner_release,
+    plan_route_activation, validate_root_catalog_transition, validate_shard_catalog_transition,
+    CatalogEntryState, ControlError, CreateOutcome, DistributedControlStore, NodeId,
+    OwnerHeartbeat, OwnerSession, OwnershipSnapshot, RootCatalogEntry, RpcEndpoint,
+    ShardCatalogEntry, ShardRoute, ShardRouteState, StoreId, StoreManifest, StoreProvider,
+    SUPPORTED_WORKSPACE_FORMAT_VERSION,
 };
 use nokv_control_fdb::{FdbControlOptions, FdbControlStore, FdbSessionFence};
 use nokv_fdb::{FdbRuntime, FDB_PHYSICAL_ENCODING_VERSION};
@@ -290,11 +292,11 @@ trait FdbLeaseControl: Send + Sync {
 
 impl FdbLeaseControl for FdbControlStore {
     fn renew_owner(&self, session: &OwnerSession) -> Result<(), ControlError> {
-        DistributedControlStore::renew_owner(self, session).map(|_| ())
+        renew_owner_exact(self, session).map(|_| ())
     }
 
     fn fail_closed(&self, session: &OwnerSession) -> Result<(), ControlError> {
-        DistributedControlStore::fail_closed(self, session).map(|_| ())
+        fail_closed_exact(self, session).map(|_| ())
     }
 }
 
@@ -626,8 +628,7 @@ impl FdbOwnership {
 
     fn fail_closed_control(&self, failures: &mut Vec<String>) {
         for session in &self.sessions {
-            if let Err(error) = DistributedControlStore::fail_closed(self.control.as_ref(), session)
-            {
+            if let Err(error) = fail_closed_exact(self.control.as_ref(), session) {
                 failures.push(format!(
                     "fail-close shard {:?} control route: {error}",
                     session.logical_shard_id()
@@ -666,8 +667,7 @@ impl OwnershipMaintenance for FdbOwnership {
             return Err(self.fail_closed_after(error));
         }
         for session in &self.sessions {
-            if let Err(error) = DistributedControlStore::renew_owner(self.control.as_ref(), session)
-            {
+            if let Err(error) = renew_owner_exact(self.control.as_ref(), session) {
                 return Err(self.fail_closed_after(ServerError::Control(error)));
             }
         }
@@ -972,16 +972,51 @@ fn create_or_load_shard(
     control: &FdbControlStore,
     logical_shard_id: LogicalShardId,
 ) -> Result<ShardCatalogEntry, ServerError> {
-    match control.create_shard_catalog(logical_shard_id) {
-        Ok(CreateOutcome::Created(entry) | CreateOutcome::Existing(entry)) => Ok(entry),
-        Err(
-            error @ (ControlError::TransactionConflict { .. }
-            | ControlError::CommitOutcomeUnknown { .. }),
-        ) => match control.get_shard_catalog(&logical_shard_id)? {
-            Some(entry) => Ok(entry),
-            None => Err(error.into()),
+    create_or_load_shard_with(
+        logical_shard_id,
+        || control.create_shard_catalog(logical_shard_id),
+        || {
+            let Some(entry) = control.get_shard_catalog(&logical_shard_id)? else {
+                return Ok(None);
+            };
+            let ownership = control.observe_ownership(&logical_shard_id)?;
+            Ok(Some((entry, ownership)))
         },
-        Err(error) => Err(error.into()),
+    )
+    .map_err(ServerError::Control)
+}
+
+fn create_or_load_shard_with(
+    logical_shard_id: LogicalShardId,
+    create: impl FnOnce() -> Result<CreateOutcome<ShardCatalogEntry>, ControlError>,
+    inspect: impl FnOnce() -> Result<Option<(ShardCatalogEntry, OwnershipSnapshot)>, ControlError>,
+) -> Result<ShardCatalogEntry, ControlError> {
+    let desired = ShardCatalogEntry::new(logical_shard_id, CatalogEntryState::Provisioning);
+    match create() {
+        Ok(CreateOutcome::Created(entry)) if entry == desired => Ok(entry),
+        Ok(CreateOutcome::Existing(entry))
+            if validate_shard_catalog_transition(&desired, &entry).is_ok() =>
+        {
+            Ok(entry)
+        }
+        Ok(_) => Err(ControlError::InvalidCatalogTransition {
+            record: "shard catalog",
+            reason: "create returned a record outside the requested immutable identity and legal state progression"
+                .to_owned(),
+        }),
+        Err(
+            primary @ (ControlError::TransactionConflict { .. }
+            | ControlError::CommitOutcomeUnknown { .. }),
+        ) => match inspect() {
+            Ok(Some((entry, ownership)))
+                if validate_shard_catalog_transition(&desired, &entry).is_ok()
+                    && ownership.route().logical_shard_id() == logical_shard_id =>
+            {
+                Ok(entry)
+            }
+            Ok(_) | Err(_) => Err(primary),
+        },
+        Err(error) => Err(error),
     }
 }
 
@@ -989,21 +1024,48 @@ fn create_or_load_root(
     control: &FdbControlStore,
     desired: RootCatalogEntry,
 ) -> Result<(RootCatalogEntry, bool), ServerError> {
-    match control.create_root_catalog(desired) {
-        Ok(CreateOutcome::Created(entry)) => Ok((entry, false)),
-        Ok(CreateOutcome::Existing(entry)) => Ok((entry, true)),
+    create_or_load_root_with(
+        desired,
+        || control.create_root_catalog(desired),
+        || control.get_root_catalog(&desired.root_id()),
+    )
+    .map_err(ServerError::Control)
+}
+
+fn create_or_load_root_with(
+    desired: RootCatalogEntry,
+    create: impl FnOnce() -> Result<CreateOutcome<RootCatalogEntry>, ControlError>,
+    inspect: impl FnOnce() -> Result<Option<RootCatalogEntry>, ControlError>,
+) -> Result<(RootCatalogEntry, bool), ControlError> {
+    match create() {
+        Ok(CreateOutcome::Created(entry)) if entry == desired => Ok((entry, false)),
+        Ok(CreateOutcome::Existing(entry))
+            if validate_root_catalog_transition(&desired, &entry).is_ok() =>
+        {
+            Ok((entry, true))
+        }
+        Ok(_) => Err(ControlError::InvalidCatalogTransition {
+            record: "root catalog",
+            reason: "create returned a record outside the requested immutable identity and legal state progression"
+                .to_owned(),
+        }),
         Err(
-            error @ (ControlError::RootCatalogAlreadyExists(_)
+            primary @ (ControlError::RootCatalogAlreadyExists(_)
             | ControlError::TransactionConflict { .. }
             | ControlError::CommitOutcomeUnknown { .. }),
         ) => {
-            let Some(current) = control.get_root_catalog(&desired.root_id())? else {
-                return Err(error.into());
+            let Ok(Some(current)) = inspect() else {
+                return Err(primary);
             };
-            validate_root_catalog_transition(&desired, &current)?;
-            Ok((current, true))
+            match validate_root_catalog_transition(&desired, &current) {
+                Ok(()) => Ok((current, true)),
+                Err(_) if matches!(primary, ControlError::CommitOutcomeUnknown { .. }) => {
+                    Err(primary)
+                }
+                Err(error) => Err(error),
+            }
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error),
     }
 }
 
@@ -1064,24 +1126,41 @@ fn cas_root_ready(
     control: &FdbControlStore,
     root: RootCatalogEntry,
 ) -> Result<RootCatalogEntry, ServerError> {
+    cas_root_ready_with(
+        root,
+        |current, ready| control.compare_and_set_root_catalog(current, ready),
+        || control.get_root_catalog(&root.root_id()),
+    )
+    .map_err(ServerError::Control)
+}
+
+fn cas_root_ready_with(
+    root: RootCatalogEntry,
+    compare_and_set: impl FnOnce(
+        &RootCatalogEntry,
+        RootCatalogEntry,
+    ) -> Result<RootCatalogEntry, ControlError>,
+    inspect: impl FnOnce() -> Result<Option<RootCatalogEntry>, ControlError>,
+) -> Result<RootCatalogEntry, ControlError> {
     if root.state() == CatalogEntryState::Ready {
         return Ok(root);
     }
     let ready = root.with_state(CatalogEntryState::Ready);
-    match control.compare_and_set_root_catalog(&root, ready) {
-        Ok(entry) => Ok(entry),
+    match compare_and_set(&root, ready) {
+        Ok(entry) if entry == ready => Ok(entry),
+        Ok(_) => Err(ControlError::InvalidCatalogTransition {
+            record: "root catalog",
+            reason: "CAS returned a record other than the exact requested successor".to_owned(),
+        }),
         Err(
-            error @ (ControlError::RootCatalogCasConflict { .. }
+            primary @ (ControlError::RootCatalogCasConflict { .. }
             | ControlError::TransactionConflict { .. }
             | ControlError::CommitOutcomeUnknown { .. }),
-        ) => {
-            if control.get_root_catalog(&root.root_id())? == Some(ready) {
-                Ok(ready)
-            } else {
-                Err(error.into())
-            }
-        }
-        Err(error) => Err(error.into()),
+        ) => match inspect() {
+            Ok(Some(current)) if current == ready => Ok(ready),
+            Ok(_) | Err(_) => Err(primary),
+        },
+        Err(error) => Err(error),
     }
 }
 
@@ -1089,24 +1168,41 @@ fn cas_shard_ready(
     control: &FdbControlStore,
     shard: ShardCatalogEntry,
 ) -> Result<ShardCatalogEntry, ServerError> {
+    cas_shard_ready_with(
+        shard,
+        |current, ready| control.compare_and_set_shard_catalog(current, ready),
+        || control.get_shard_catalog(&shard.logical_shard_id()),
+    )
+    .map_err(ServerError::Control)
+}
+
+fn cas_shard_ready_with(
+    shard: ShardCatalogEntry,
+    compare_and_set: impl FnOnce(
+        &ShardCatalogEntry,
+        ShardCatalogEntry,
+    ) -> Result<ShardCatalogEntry, ControlError>,
+    inspect: impl FnOnce() -> Result<Option<ShardCatalogEntry>, ControlError>,
+) -> Result<ShardCatalogEntry, ControlError> {
     if shard.state() == CatalogEntryState::Ready {
         return Ok(shard);
     }
     let ready = shard.with_state(CatalogEntryState::Ready);
-    match control.compare_and_set_shard_catalog(&shard, ready) {
-        Ok(entry) => Ok(entry),
+    match compare_and_set(&shard, ready) {
+        Ok(entry) if entry == ready => Ok(entry),
+        Ok(_) => Err(ControlError::InvalidCatalogTransition {
+            record: "shard catalog",
+            reason: "CAS returned a record other than the exact requested successor".to_owned(),
+        }),
         Err(
-            error @ (ControlError::ShardCatalogCasConflict { .. }
+            primary @ (ControlError::ShardCatalogCasConflict { .. }
             | ControlError::TransactionConflict { .. }
             | ControlError::CommitOutcomeUnknown { .. }),
-        ) => {
-            if control.get_shard_catalog(&shard.logical_shard_id())? == Some(ready) {
-                Ok(ready)
-            } else {
-                Err(error.into())
-            }
-        }
-        Err(error) => Err(error.into()),
+        ) => match inspect() {
+            Ok(Some(current)) if current == ready => Ok(ready),
+            Ok(_) | Err(_) => Err(primary),
+        },
+        Err(error) => Err(error),
     }
 }
 
@@ -1152,41 +1248,15 @@ fn acquire_exact_session(
 ) -> Result<OwnerSession, ServerError> {
     loop {
         mode.ensure_available()?;
-        let observed = control.observe_ownership(&logical_shard_id)?;
-        let expected = plan_owner_acquisition(&observed, owner.clone(), endpoint.clone())?
-            .session()
-            .expect("owner acquisition plan has a session")
-            .clone();
-        let result = match state {
-            CatalogEntryState::Provisioning => control.acquire_provisioning_owner(
-                &logical_shard_id,
-                owner.clone(),
-                endpoint.clone(),
-            ),
-            CatalogEntryState::Ready => {
-                control.acquire_owner(&logical_shard_id, owner.clone(), endpoint.clone())
-            }
-            CatalogEntryState::Retired => {
-                return Err(ServerError::InvalidBootstrap(format!(
-                    "retired shard {logical_shard_id:?} cannot acquire an owner"
-                )));
-            }
-        };
+        let result = acquire_owner_once_exact(
+            control,
+            logical_shard_id,
+            state,
+            owner.clone(),
+            endpoint.clone(),
+        );
         match result {
-            Ok(session) if session == expected => return Ok(session),
-            Ok(_) => {
-                return Err(ServerError::InvalidBootstrap(
-                    "FoundationDB owner acquisition returned an unexpected session".to_owned(),
-                ));
-            }
-            Err(error @ ControlError::CommitOutcomeUnknown { .. }) => {
-                let current = control.observe_ownership(&logical_shard_id)?;
-                return if current.session() == Some(&expected) {
-                    Ok(expected)
-                } else {
-                    Err(error.into())
-                };
-            }
+            Ok(session) => return Ok(session),
             Err(ControlError::OwnershipObservationPending {
                 remaining_millis, ..
             }) if mode.waits_for_takeover() => {
@@ -1200,6 +1270,59 @@ fn acquire_exact_session(
             }
             Err(error) => return Err(error.into()),
         }
+    }
+}
+
+fn acquire_owner_once_exact(
+    control: &FdbControlStore,
+    logical_shard_id: LogicalShardId,
+    state: CatalogEntryState,
+    owner: NodeId,
+    endpoint: RpcEndpoint,
+) -> Result<OwnerSession, ControlError> {
+    acquire_owner_once_exact_with(
+        logical_shard_id,
+        owner,
+        endpoint,
+        || control.observe_ownership(&logical_shard_id),
+        |owner, endpoint| match state {
+            CatalogEntryState::Provisioning => {
+                control.acquire_provisioning_owner(&logical_shard_id, owner, endpoint)
+            }
+            CatalogEntryState::Ready => control.acquire_owner(&logical_shard_id, owner, endpoint),
+            CatalogEntryState::Retired => Err(ControlError::InvalidCatalogTransition {
+                record: "shard catalog",
+                reason: format!("retired shard {logical_shard_id:?} cannot acquire an owner"),
+            }),
+        },
+    )
+}
+
+fn acquire_owner_once_exact_with(
+    logical_shard_id: LogicalShardId,
+    owner: NodeId,
+    endpoint: RpcEndpoint,
+    mut observe: impl FnMut() -> Result<OwnershipSnapshot, ControlError>,
+    acquire: impl FnOnce(NodeId, RpcEndpoint) -> Result<OwnerSession, ControlError>,
+) -> Result<OwnerSession, ControlError> {
+    let current = observe()?;
+    let expected_update = plan_owner_acquisition(&current, owner.clone(), endpoint.clone())?;
+    let expected_snapshot = expected_update.snapshot()?;
+    let expected_session = expected_update
+        .session()
+        .expect("owner acquisition plan has a session")
+        .clone();
+    match acquire(owner, endpoint) {
+        Ok(actual) if actual == expected_session => Ok(actual),
+        Ok(_) => Err(unexpected_ownership_result(
+            logical_shard_id,
+            "owner acquisition returned a session other than the planned exact session",
+        )),
+        Err(primary @ ControlError::CommitOutcomeUnknown { .. }) => match observe() {
+            Ok(actual) if actual == expected_snapshot => Ok(expected_session),
+            Ok(_) | Err(_) => Err(primary),
+        },
+        Err(error) => Err(error),
     }
 }
 
@@ -1435,30 +1558,103 @@ fn activate_route_exact(
     control: &FdbControlStore,
     session: &OwnerSession,
 ) -> Result<(), ServerError> {
-    match control.activate_route(session) {
-        Ok(route)
-            if route.state() == ShardRouteState::Serving
-                && route.owner_epoch() == Some(session.owner_epoch())
-                && route.session_generation() == Some(session.session_generation()) =>
-        {
-            Ok(())
-        }
-        Ok(_) => Err(ServerError::InvalidBootstrap(
-            "FoundationDB route activation returned a mismatching route".to_owned(),
+    activate_route_exact_with(
+        session,
+        || control.observe_ownership(&session.logical_shard_id()),
+        || control.activate_route(session),
+    )
+    .map(|_| ())
+    .map_err(ServerError::Control)
+}
+
+fn activate_route_exact_with(
+    session: &OwnerSession,
+    mut observe: impl FnMut() -> Result<OwnershipSnapshot, ControlError>,
+    activate: impl FnOnce() -> Result<ShardRoute, ControlError>,
+) -> Result<ShardRoute, ControlError> {
+    let current = observe()?;
+    let expected_update = plan_route_activation(&current, session)?;
+    let expected_snapshot = expected_update.snapshot()?;
+    let expected_route = expected_update.route().clone();
+    match activate() {
+        Ok(actual) if actual == expected_route => Ok(actual),
+        Ok(_) => Err(unexpected_ownership_result(
+            session.logical_shard_id(),
+            "route activation returned a route other than the planned exact route",
         )),
-        Err(error @ ControlError::CommitOutcomeUnknown { .. }) => {
-            let route = control.get_route(&session.logical_shard_id())?;
-            if route.as_ref().is_some_and(|route| {
-                route.state() == ShardRouteState::Serving
-                    && route.owner_epoch() == Some(session.owner_epoch())
-                    && route.session_generation() == Some(session.session_generation())
-            }) {
-                Ok(())
-            } else {
-                Err(error.into())
-            }
-        }
-        Err(error) => Err(error.into()),
+        Err(primary @ ControlError::CommitOutcomeUnknown { .. }) => match observe() {
+            Ok(actual) if actual == expected_snapshot => Ok(expected_route),
+            Ok(_) | Err(_) => Err(primary),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+fn renew_owner_exact(
+    control: &FdbControlStore,
+    session: &OwnerSession,
+) -> Result<OwnerHeartbeat, ControlError> {
+    renew_owner_exact_with(
+        session,
+        || control.observe_ownership(&session.logical_shard_id()),
+        || DistributedControlStore::renew_owner(control, session),
+    )
+}
+
+fn renew_owner_exact_with(
+    session: &OwnerSession,
+    mut observe: impl FnMut() -> Result<OwnershipSnapshot, ControlError>,
+    renew: impl FnOnce() -> Result<OwnerHeartbeat, ControlError>,
+) -> Result<OwnerHeartbeat, ControlError> {
+    let current = observe()?;
+    let expected_update = plan_heartbeat_renewal(&current, session)?;
+    let expected_snapshot = expected_update.snapshot()?;
+    let expected_heartbeat = expected_update.heartbeat().clone();
+    match renew() {
+        Ok(actual) if actual == expected_heartbeat => Ok(actual),
+        Ok(_) => Err(unexpected_ownership_result(
+            session.logical_shard_id(),
+            "owner renewal returned a heartbeat other than the planned exact heartbeat",
+        )),
+        Err(primary @ ControlError::CommitOutcomeUnknown { .. }) => match observe() {
+            Ok(actual) if actual == expected_snapshot => Ok(expected_heartbeat),
+            Ok(_) | Err(_) => Err(primary),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+fn fail_closed_exact(
+    control: &FdbControlStore,
+    session: &OwnerSession,
+) -> Result<ShardRoute, ControlError> {
+    fail_closed_exact_with(
+        session,
+        || control.observe_ownership(&session.logical_shard_id()),
+        || DistributedControlStore::fail_closed(control, session),
+    )
+}
+
+fn fail_closed_exact_with(
+    session: &OwnerSession,
+    mut observe: impl FnMut() -> Result<OwnershipSnapshot, ControlError>,
+    fail_closed: impl FnOnce() -> Result<ShardRoute, ControlError>,
+) -> Result<ShardRoute, ControlError> {
+    let current = observe()?;
+    let expected_update = plan_fail_closed(&current, session)?;
+    let expected_snapshot = expected_update.snapshot()?;
+    let expected_route = expected_update.route().clone();
+    match fail_closed() {
+        Ok(actual) if actual == expected_route => Ok(actual),
+        Ok(_) => Err(unexpected_ownership_result(
+            session.logical_shard_id(),
+            "route fail-close returned a route other than the planned exact route",
+        )),
+        Err(primary @ ControlError::CommitOutcomeUnknown { .. }) => match observe() {
+            Ok(actual) if actual == expected_snapshot => Ok(expected_route),
+            Ok(_) | Err(_) => Err(primary),
+        },
+        Err(error) => Err(error),
     }
 }
 
@@ -1466,30 +1662,45 @@ fn release_owner_exact(
     control: &FdbControlStore,
     session: &OwnerSession,
 ) -> Result<(), ServerError> {
-    match control.release_owner(session) {
-        Ok(route)
-            if route.state() == ShardRouteState::Unassigned
-                && route.owner_epoch() == Some(session.owner_epoch())
-                && route.session_generation() == Some(session.session_generation()) =>
-        {
-            Ok(())
-        }
-        Ok(_) => Err(ServerError::InvalidBootstrap(
-            "FoundationDB owner release returned a mismatching route".to_owned(),
+    release_owner_exact_with(
+        session,
+        || control.observe_ownership(&session.logical_shard_id()),
+        || control.release_owner(session),
+    )
+    .map(|_| ())
+    .map_err(ServerError::Control)
+}
+
+fn release_owner_exact_with(
+    session: &OwnerSession,
+    mut observe: impl FnMut() -> Result<OwnershipSnapshot, ControlError>,
+    release: impl FnOnce() -> Result<ShardRoute, ControlError>,
+) -> Result<ShardRoute, ControlError> {
+    let current = observe()?;
+    let expected_update = plan_owner_release(&current, session)?;
+    let expected_snapshot = expected_update.snapshot()?;
+    let expected_route = expected_update.route().clone();
+    match release() {
+        Ok(actual) if actual == expected_route => Ok(actual),
+        Ok(_) => Err(unexpected_ownership_result(
+            session.logical_shard_id(),
+            "owner release returned a route other than the planned exact route",
         )),
-        Err(error @ ControlError::CommitOutcomeUnknown { .. }) => {
-            let ownership = control.observe_ownership(&session.logical_shard_id())?;
-            if ownership.route().state() == ShardRouteState::Unassigned
-                && ownership.session().is_none()
-                && ownership.route().owner_epoch() == Some(session.owner_epoch())
-                && ownership.route().session_generation() == Some(session.session_generation())
-            {
-                Ok(())
-            } else {
-                Err(error.into())
-            }
-        }
-        Err(error) => Err(error.into()),
+        Err(primary @ ControlError::CommitOutcomeUnknown { .. }) => match observe() {
+            Ok(actual) if actual == expected_snapshot => Ok(expected_route),
+            Ok(_) | Err(_) => Err(primary),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+fn unexpected_ownership_result(
+    logical_shard_id: LogicalShardId,
+    reason: &'static str,
+) -> ControlError {
+    ControlError::OwnershipStateConflict {
+        logical_shard_id,
+        reason: reason.to_owned(),
     }
 }
 
@@ -1675,6 +1886,8 @@ fn lower_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
     use std::time::Instant;
 
     #[derive(Default)]
@@ -1890,6 +2103,628 @@ mod tests {
             ),
             ShardCatalogEntry::new(logical_shard_id, shard_state),
         )
+    }
+
+    fn unassigned_ownership(value: u8) -> OwnershipSnapshot {
+        OwnershipSnapshot::new(
+            ShardRoute::unassigned(LogicalShardId::from_bytes([value; 16])),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn ownership_observations(
+        snapshots: Vec<OwnershipSnapshot>,
+    ) -> impl FnMut() -> Result<OwnershipSnapshot, ControlError> {
+        let mut snapshots = VecDeque::from(snapshots);
+        move || Ok(snapshots.pop_front().expect("test observation is present"))
+    }
+
+    fn unknown(operation: &'static str) -> ControlError {
+        ControlError::CommitOutcomeUnknown {
+            operation,
+            reason: "injected applied commit with lost acknowledgement".to_owned(),
+        }
+    }
+
+    fn test_owner(name: &str) -> NodeId {
+        NodeId::new(name).unwrap()
+    }
+
+    fn test_endpoint(port: u16) -> RpcEndpoint {
+        RpcEndpoint::new(format!("127.0.0.1:{port}")).unwrap()
+    }
+
+    #[test]
+    fn exact_ownership_helpers_reconcile_one_applied_unknown_commit() {
+        let commits = Cell::new(0_usize);
+        let initial = unassigned_ownership(21);
+        let shard = initial.route().logical_shard_id();
+        let owner = test_owner("owner-a");
+        let endpoint = test_endpoint(2101);
+        let acquired_update =
+            plan_owner_acquisition(&initial, owner.clone(), endpoint.clone()).unwrap();
+        let acquired = acquired_update.snapshot().unwrap();
+        let session = acquired_update.session().unwrap().clone();
+
+        let actual = acquire_owner_once_exact_with(
+            shard,
+            owner.clone(),
+            endpoint.clone(),
+            ownership_observations(vec![initial.clone(), acquired.clone()]),
+            |actual_owner, actual_endpoint| {
+                assert_eq!(actual_owner, owner);
+                assert_eq!(actual_endpoint, endpoint);
+                commits.set(commits.get() + 1);
+                Err(unknown("acquire"))
+            },
+        )
+        .unwrap();
+        assert_eq!(actual, session);
+
+        let renewed = plan_heartbeat_renewal(&acquired, &session)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let heartbeat = renew_owner_exact_with(
+            &session,
+            ownership_observations(vec![acquired.clone(), renewed.clone()]),
+            || {
+                commits.set(commits.get() + 1);
+                Err(unknown("renew"))
+            },
+        )
+        .unwrap();
+        assert_eq!(Some(&heartbeat), renewed.heartbeat());
+
+        let serving = plan_route_activation(&acquired, &session)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let route = activate_route_exact_with(
+            &session,
+            ownership_observations(vec![acquired.clone(), serving.clone()]),
+            || {
+                commits.set(commits.get() + 1);
+                Err(unknown("activate"))
+            },
+        )
+        .unwrap();
+        assert_eq!(&route, serving.route());
+
+        let failed = plan_fail_closed(&serving, &session)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let route = fail_closed_exact_with(
+            &session,
+            ownership_observations(vec![serving.clone(), failed.clone()]),
+            || {
+                commits.set(commits.get() + 1);
+                Err(unknown("fail close"))
+            },
+        )
+        .unwrap();
+        assert_eq!(&route, failed.route());
+
+        let released = plan_owner_release(&failed, &session)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let route = release_owner_exact_with(
+            &session,
+            ownership_observations(vec![failed, released.clone()]),
+            || {
+                commits.set(commits.get() + 1);
+                Err(unknown("release"))
+            },
+        )
+        .unwrap();
+        assert_eq!(&route, released.route());
+        assert_eq!(commits.get(), 5);
+    }
+
+    #[test]
+    fn exact_ownership_helpers_keep_unapplied_unknown_outcomes_typed() {
+        let commits = Cell::new(0_usize);
+        let initial = unassigned_ownership(22);
+        let shard = initial.route().logical_shard_id();
+        let owner = test_owner("owner-a");
+        let endpoint = test_endpoint(2201);
+        let acquired_update =
+            plan_owner_acquisition(&initial, owner.clone(), endpoint.clone()).unwrap();
+        let acquired = acquired_update.snapshot().unwrap();
+        let session = acquired_update.session().unwrap().clone();
+        let serving = plan_route_activation(&acquired, &session)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let failed = plan_fail_closed(&serving, &session)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+
+        let expected = unknown("acquire");
+        assert_eq!(
+            acquire_owner_once_exact_with(
+                shard,
+                owner,
+                endpoint,
+                ownership_observations(vec![initial.clone(), initial]),
+                |_, _| {
+                    commits.set(commits.get() + 1);
+                    Err(expected.clone())
+                },
+            )
+            .unwrap_err(),
+            expected
+        );
+
+        for (actual, expected) in [
+            (
+                renew_owner_exact_with(
+                    &session,
+                    ownership_observations(vec![acquired.clone(), acquired.clone()]),
+                    || {
+                        commits.set(commits.get() + 1);
+                        Err(unknown("renew"))
+                    },
+                )
+                .map(|_| ()),
+                unknown("renew"),
+            ),
+            (
+                activate_route_exact_with(
+                    &session,
+                    ownership_observations(vec![acquired.clone(), acquired.clone()]),
+                    || {
+                        commits.set(commits.get() + 1);
+                        Err(unknown("activate"))
+                    },
+                )
+                .map(|_| ()),
+                unknown("activate"),
+            ),
+            (
+                fail_closed_exact_with(
+                    &session,
+                    ownership_observations(vec![serving.clone(), serving.clone()]),
+                    || {
+                        commits.set(commits.get() + 1);
+                        Err(unknown("fail close"))
+                    },
+                )
+                .map(|_| ()),
+                unknown("fail close"),
+            ),
+            (
+                release_owner_exact_with(
+                    &session,
+                    ownership_observations(vec![failed.clone(), failed]),
+                    || {
+                        commits.set(commits.get() + 1);
+                        Err(unknown("release"))
+                    },
+                )
+                .map(|_| ()),
+                unknown("release"),
+            ),
+        ] {
+            assert_eq!(actual.unwrap_err(), expected);
+        }
+        assert_eq!(commits.get(), 5);
+    }
+
+    #[test]
+    fn exact_ownership_helpers_reject_mismatching_unknown_readback() {
+        let initial = unassigned_ownership(23);
+        let shard = initial.route().logical_shard_id();
+        let owner = test_owner("owner-a");
+        let endpoint = test_endpoint(2301);
+        let acquired_update =
+            plan_owner_acquisition(&initial, owner.clone(), endpoint.clone()).unwrap();
+        let acquired = acquired_update.snapshot().unwrap();
+        let session = acquired_update.session().unwrap().clone();
+        let other_acquired =
+            plan_owner_acquisition(&initial, test_owner("owner-b"), test_endpoint(2302))
+                .unwrap()
+                .snapshot()
+                .unwrap();
+        let renewed = plan_heartbeat_renewal(&acquired, &session)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let serving = plan_route_activation(&acquired, &session)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let renewed_serving = plan_heartbeat_renewal(&serving, &session)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let failed = plan_fail_closed(&serving, &session)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let released = plan_owner_release(&failed, &session)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let successor = plan_owner_acquisition(
+            &released,
+            test_owner("owner-successor"),
+            test_endpoint(2303),
+        )
+        .unwrap()
+        .snapshot()
+        .unwrap();
+
+        let expected = unknown("acquire");
+        assert_eq!(
+            acquire_owner_once_exact_with(
+                shard,
+                owner,
+                endpoint,
+                ownership_observations(vec![initial, other_acquired]),
+                |_, _| Err(expected.clone()),
+            )
+            .unwrap_err(),
+            expected
+        );
+        for (actual, expected) in [
+            (
+                renew_owner_exact_with(
+                    &session,
+                    ownership_observations(vec![acquired.clone(), serving.clone()]),
+                    || Err(unknown("renew")),
+                )
+                .map(|_| ()),
+                unknown("renew"),
+            ),
+            (
+                activate_route_exact_with(
+                    &session,
+                    ownership_observations(vec![acquired, renewed]),
+                    || Err(unknown("activate")),
+                )
+                .map(|_| ()),
+                unknown("activate"),
+            ),
+            (
+                fail_closed_exact_with(
+                    &session,
+                    ownership_observations(vec![serving, renewed_serving]),
+                    || Err(unknown("fail close")),
+                )
+                .map(|_| ()),
+                unknown("fail close"),
+            ),
+            (
+                release_owner_exact_with(
+                    &session,
+                    ownership_observations(vec![failed, successor]),
+                    || Err(unknown("release")),
+                )
+                .map(|_| ()),
+                unknown("release"),
+            ),
+        ] {
+            assert_eq!(actual.unwrap_err(), expected);
+        }
+    }
+
+    #[test]
+    fn exact_ownership_helpers_reject_unexpected_success_values() {
+        let initial = unassigned_ownership(24);
+        let shard = initial.route().logical_shard_id();
+        let owner = test_owner("owner-a");
+        let endpoint = test_endpoint(2401);
+        let acquired_update =
+            plan_owner_acquisition(&initial, owner.clone(), endpoint.clone()).unwrap();
+        let acquired = acquired_update.snapshot().unwrap();
+        let session = acquired_update.session().unwrap().clone();
+        let serving = plan_route_activation(&acquired, &session)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let failed = plan_fail_closed(&serving, &session)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let other_session =
+            plan_owner_acquisition(&initial, test_owner("owner-b"), test_endpoint(2402))
+                .unwrap()
+                .session()
+                .unwrap()
+                .clone();
+
+        assert!(matches!(
+            acquire_owner_once_exact_with(
+                shard,
+                owner,
+                endpoint,
+                ownership_observations(vec![initial]),
+                |_, _| Ok(other_session),
+            ),
+            Err(ControlError::OwnershipStateConflict { .. })
+        ));
+        assert!(matches!(
+            renew_owner_exact_with(
+                &session,
+                ownership_observations(vec![acquired.clone()]),
+                || Ok(acquired.heartbeat().unwrap().clone()),
+            ),
+            Err(ControlError::OwnershipStateConflict { .. })
+        ));
+        assert!(matches!(
+            activate_route_exact_with(
+                &session,
+                ownership_observations(vec![acquired.clone()]),
+                || Ok(acquired.route().clone()),
+            ),
+            Err(ControlError::OwnershipStateConflict { .. })
+        ));
+        assert!(matches!(
+            fail_closed_exact_with(
+                &session,
+                ownership_observations(vec![serving.clone()]),
+                || Ok(serving.route().clone()),
+            ),
+            Err(ControlError::OwnershipStateConflict { .. })
+        ));
+        assert!(matches!(
+            release_owner_exact_with(
+                &session,
+                ownership_observations(vec![failed.clone()]),
+                || Ok(failed.route().clone()),
+            ),
+            Err(ControlError::OwnershipStateConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_session_cannot_mutate_a_second_ownership_generation() {
+        let initial = unassigned_ownership(25);
+        let first_update =
+            plan_owner_acquisition(&initial, test_owner("owner-first"), test_endpoint(2501))
+                .unwrap();
+        let first = first_update.snapshot().unwrap();
+        let stale = first_update.session().unwrap().clone();
+        let released = plan_owner_release(&first, &stale)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let successor =
+            plan_owner_acquisition(&released, test_owner("owner-second"), test_endpoint(2502))
+                .unwrap()
+                .snapshot()
+                .unwrap();
+        let mutations = Cell::new(0_usize);
+
+        assert!(matches!(
+            renew_owner_exact_with(
+                &stale,
+                ownership_observations(vec![successor.clone()]),
+                || {
+                    mutations.set(mutations.get() + 1);
+                    unreachable!("stale renewal must fail before mutation")
+                },
+            ),
+            Err(ControlError::NotOwner { .. })
+        ));
+        assert!(matches!(
+            fail_closed_exact_with(
+                &stale,
+                ownership_observations(vec![successor.clone()]),
+                || {
+                    mutations.set(mutations.get() + 1);
+                    unreachable!("stale fail-close must fail before mutation")
+                },
+            ),
+            Err(ControlError::NotOwner { .. })
+        ));
+        assert!(matches!(
+            release_owner_exact_with(&stale, ownership_observations(vec![successor]), || {
+                mutations.set(mutations.get() + 1);
+                unreachable!("stale release must fail before mutation")
+            },),
+            Err(ControlError::NotOwner { .. })
+        ));
+        assert_eq!(mutations.get(), 0);
+    }
+
+    #[test]
+    fn exact_catalog_helpers_reconcile_applied_unknown_commits() {
+        let mutations = Cell::new(0_usize);
+        let ownership = unassigned_ownership(31);
+        let logical_shard_id = ownership.route().logical_shard_id();
+        let shard = ShardCatalogEntry::new(logical_shard_id, CatalogEntryState::Provisioning);
+        let actual = create_or_load_shard_with(
+            logical_shard_id,
+            || {
+                mutations.set(mutations.get() + 1);
+                Err(unknown("create shard"))
+            },
+            || Ok(Some((shard, ownership))),
+        )
+        .unwrap();
+        assert_eq!(actual, shard);
+
+        let (root, _) = catalog_pair(
+            CatalogEntryState::Provisioning,
+            CatalogEntryState::Provisioning,
+        );
+        let actual = create_or_load_root_with(
+            root,
+            || {
+                mutations.set(mutations.get() + 1);
+                Err(unknown("create root"))
+            },
+            || Ok(Some(root)),
+        )
+        .unwrap();
+        assert_eq!(actual, (root, true));
+
+        let ready_root = root.with_state(CatalogEntryState::Ready);
+        let actual = cas_root_ready_with(
+            root,
+            |_, _| {
+                mutations.set(mutations.get() + 1);
+                Err(unknown("cas root"))
+            },
+            || Ok(Some(ready_root)),
+        )
+        .unwrap();
+        assert_eq!(actual, ready_root);
+
+        let ready_shard = shard.with_state(CatalogEntryState::Ready);
+        let actual = cas_shard_ready_with(
+            shard,
+            |_, _| {
+                mutations.set(mutations.get() + 1);
+                Err(unknown("cas shard"))
+            },
+            || Ok(Some(ready_shard)),
+        )
+        .unwrap();
+        assert_eq!(actual, ready_shard);
+        assert_eq!(mutations.get(), 4);
+    }
+
+    #[test]
+    fn exact_catalog_helpers_keep_unapplied_unknown_outcomes_typed() {
+        let ownership = unassigned_ownership(32);
+        let logical_shard_id = ownership.route().logical_shard_id();
+        let shard = ShardCatalogEntry::new(logical_shard_id, CatalogEntryState::Provisioning);
+        let (root, _) = catalog_pair(
+            CatalogEntryState::Provisioning,
+            CatalogEntryState::Provisioning,
+        );
+
+        let expected = unknown("create shard");
+        assert_eq!(
+            create_or_load_shard_with(logical_shard_id, || Err(expected.clone()), || Ok(None),)
+                .unwrap_err(),
+            expected
+        );
+        let expected = unknown("create root");
+        assert_eq!(
+            create_or_load_root_with(root, || Err(expected.clone()), || Ok(None)).unwrap_err(),
+            expected
+        );
+        let expected = unknown("cas root");
+        assert_eq!(
+            cas_root_ready_with(root, |_, _| Err(expected.clone()), || Ok(None)).unwrap_err(),
+            expected
+        );
+        let expected = unknown("cas shard");
+        assert_eq!(
+            cas_shard_ready_with(
+                shard,
+                |_, _| Err(expected.clone()),
+                || { Err(ControlError::Backend("readback unavailable".to_owned())) }
+            )
+            .unwrap_err(),
+            expected
+        );
+    }
+
+    #[test]
+    fn exact_catalog_helpers_reject_mismatching_unknown_readback() {
+        let ownership = unassigned_ownership(33);
+        let logical_shard_id = ownership.route().logical_shard_id();
+        let shard = ShardCatalogEntry::new(logical_shard_id, CatalogEntryState::Provisioning);
+        let unrelated_ownership = unassigned_ownership(34);
+        let (root, _) = catalog_pair(
+            CatalogEntryState::Provisioning,
+            CatalogEntryState::Provisioning,
+        );
+        let rebound_root = RootCatalogEntry::new(
+            root.root_id(),
+            AgentId::from_bytes([9; 16]),
+            root.object_namespace_id(),
+            root.logical_shard_id(),
+            root.placement_generation(),
+            CatalogEntryState::Provisioning,
+        );
+
+        let expected = unknown("create shard");
+        assert_eq!(
+            create_or_load_shard_with(
+                logical_shard_id,
+                || Err(expected.clone()),
+                || Ok(Some((shard, unrelated_ownership))),
+            )
+            .unwrap_err(),
+            expected
+        );
+        let expected = unknown("create root");
+        assert_eq!(
+            create_or_load_root_with(root, || Err(expected.clone()), || Ok(Some(rebound_root)),)
+                .unwrap_err(),
+            expected
+        );
+        let expected = unknown("cas root");
+        assert_eq!(
+            cas_root_ready_with(root, |_, _| Err(expected.clone()), || Ok(Some(root)),)
+                .unwrap_err(),
+            expected
+        );
+        let expected = unknown("cas shard");
+        assert_eq!(
+            cas_shard_ready_with(shard, |_, _| Err(expected.clone()), || Ok(Some(shard)),)
+                .unwrap_err(),
+            expected
+        );
+    }
+
+    #[test]
+    fn exact_catalog_helpers_reject_unexpected_success_values() {
+        let ownership = unassigned_ownership(35);
+        let logical_shard_id = ownership.route().logical_shard_id();
+        let shard = ShardCatalogEntry::new(logical_shard_id, CatalogEntryState::Provisioning);
+        let (root, _) = catalog_pair(
+            CatalogEntryState::Provisioning,
+            CatalogEntryState::Provisioning,
+        );
+
+        assert!(matches!(
+            create_or_load_shard_with(
+                logical_shard_id,
+                || Ok(CreateOutcome::Created(
+                    shard.with_state(CatalogEntryState::Ready)
+                )),
+                || unreachable!("successful create must not read back"),
+            ),
+            Err(ControlError::InvalidCatalogTransition { .. })
+        ));
+        assert!(matches!(
+            create_or_load_root_with(
+                root,
+                || Ok(CreateOutcome::Created(
+                    root.with_state(CatalogEntryState::Ready)
+                )),
+                || unreachable!("successful create must not read back"),
+            ),
+            Err(ControlError::InvalidCatalogTransition { .. })
+        ));
+        assert!(matches!(
+            cas_root_ready_with(
+                root,
+                |_, _| Ok(root),
+                || unreachable!("successful CAS must not read back"),
+            ),
+            Err(ControlError::InvalidCatalogTransition { .. })
+        ));
+        assert!(matches!(
+            cas_shard_ready_with(
+                shard,
+                |_, _| Ok(shard),
+                || unreachable!("successful CAS must not read back"),
+            ),
+            Err(ControlError::InvalidCatalogTransition { .. })
+        ));
     }
 
     #[test]
