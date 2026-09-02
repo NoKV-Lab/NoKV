@@ -2792,7 +2792,9 @@ fn map_client_error(error: ClientError) -> agent::BackendError {
             ClientError::ArtifactPublishFailed { .. } | ClientError::RetryExhausted { .. } => {
                 agent::BackendErrorKind::Other("ClientFailure".to_owned())
             }
-            ClientError::Rpc(_) => unreachable!("RPC failures returned above"),
+            ClientError::Discovery(_) | ClientError::Rpc(_) => {
+                unreachable!("RPC failures returned above")
+            }
         }
     };
     let message = if is_object_failure {
@@ -2934,6 +2936,8 @@ fn error_code_name(code: wire::ErrorCode) -> &'static str {
         wire::ErrorCode::PreconditionFailed => "PreconditionFailed",
         wire::ErrorCode::RequestReplayMismatch => "RequestReplayMismatch",
         wire::ErrorCode::NotOwner => "NotOwner",
+        wire::ErrorCode::RouteUnavailable => "RouteUnavailable",
+        wire::ErrorCode::RouteExpired => "RouteExpired",
         wire::ErrorCode::SnapshotExpired => "SnapshotExpired",
         wire::ErrorCode::SnapshotReaped => "SnapshotReaped",
         wire::ErrorCode::CommitRetiring => "CommitRetiring",
@@ -3158,7 +3162,11 @@ mod tests {
                 stream.read_exact(&mut length).unwrap();
                 let mut encoded = vec![0_u8; u32::from_be_bytes(length) as usize];
                 stream.read_exact(&mut encoded).unwrap();
-                let request = wire::decode_request(&encoded).unwrap();
+                let wire::RpcRequest::Workspace(request) = wire::decode_request(&encoded).unwrap()
+                else {
+                    panic!("workspace client sent a discovery request");
+                };
+                let request = *request;
                 let response = wire::WorkspaceRpcResponse {
                     route: request.route,
                     request_id: request.request_id,
@@ -3167,7 +3175,9 @@ mod tests {
                     outcome,
                 };
                 captured.lock().unwrap().push(request);
-                let encoded = wire::encode_response(&response).unwrap();
+                let encoded =
+                    wire::encode_response(&wire::RpcResponse::Workspace(Box::new(response)))
+                        .unwrap();
                 stream
                     .write_all(&u32::try_from(encoded.len()).unwrap().to_be_bytes())
                     .unwrap();

@@ -1,0 +1,23 @@
+/*
+ * Copyright 2024-2026 The NoKV Authors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+use nokv_bench::fdb_unknown_outcome::{dispatch, LIVE_GATE_ENV};
+
+fn main() {
+    if let Err(error) = main_result() {
+        eprintln!("nokv-fdb unknown-outcome qualification failed: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn main_result() -> Result<(), String> {
+    let child = std::env::args().nth(1).as_deref() == Some("--child-operation");
+    if !child && std::env::var(LIVE_GATE_ENV).as_deref() != Ok("1") {
+        return Err(format!(
+            "live qualification is disabled; set {LIVE_GATE_ENV}=1 explicitly"
+        ));
+    }
+    dispatch(std::env::args().skip(1))
+}

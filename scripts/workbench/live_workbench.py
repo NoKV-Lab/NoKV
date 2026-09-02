@@ -162,16 +162,12 @@ class Config:
     binary: Path
     evidence: Path
     metadata: Path
-    metadata_mode: str
     root_id: str
-    shard_id: str
     agent_name: str
     agent_id: str
     workbench: str
     restored: str
     snapshot: str
-    etcd: tuple[str, ...]
-    etcd_prefix: str
     bind: str
     advertise: str
     node: str
@@ -189,6 +185,10 @@ class Config:
     @property
     def workbench_root(self) -> str:
         return f"/agents/{self.agent_name}/wb"
+
+    @property
+    def metadata_url(self) -> str:
+        return "holt://" + urllib.parse.quote(str(self.metadata), safe="/")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -249,24 +249,18 @@ def phase_one_workbench_ids(config: Config) -> dict[str, str]:
     }
 
 
-def authority_configs(config: Config) -> tuple[Config, Config]:
-    """Build one legitimate peer and one wrong-principal replay for the same shard."""
+def authority_config(config: Config) -> Config:
+    """Build one independently provisioned peer root in the same Holt store."""
 
     def derived_id(domain: bytes, value: str) -> str:
         return digest(domain + b"\0" + value.encode())[:32]
 
-    peer = dataclasses.replace(
+    return dataclasses.replace(
         config,
         root_id=derived_id(b"nokv.workbench.authority.peer.root.v1", config.root_id),
         agent_id=derived_id(b"nokv.workbench.authority.peer.agent.v1", config.agent_id),
         agent_name="authority-peer",
     )
-    mismatch = dataclasses.replace(
-        peer,
-        root_id=config.root_id,
-        agent_name="authority-mismatch",
-    )
-    return peer, mismatch
 
 
 def tool_plan(config: Config) -> list[ToolStep]:
@@ -653,11 +647,8 @@ def planned_tool_coverage(steps: Iterable[ToolStep]) -> set[str]:
     return {step.name for step in steps}
 
 
-def control_args(config: Config) -> list[str]:
-    result = ["--root-id", config.root_id]
-    for endpoint in config.etcd:
-        result += ["--etcd-endpoint", endpoint]
-    return result + ["--etcd-key-prefix", config.etcd_prefix]
+def route_args(config: Config) -> list[str]:
+    return ["--root-id", config.root_id, "--seed", config.advertise]
 
 
 def object_args(config: Config) -> list[str]:
@@ -681,31 +672,34 @@ def object_args(config: Config) -> list[str]:
 def client_args(config: Config) -> list[str]:
     return [
         str(config.binary),
-        *control_args(config),
-        "--agent-id",
-        config.agent_id,
+        *route_args(config),
         "--workbench-root",
         config.workbench_root,
         *object_args(config),
     ]
 
 
+def format_command(config: Config) -> list[str]:
+    return [str(config.binary), "format", "--meta-url", config.metadata_url]
+
+
 def provision_command(config: Config) -> list[str]:
     return [
         str(config.binary),
-        *control_args(config),
+        "--root-id",
+        config.root_id,
         "--agent-id",
         config.agent_id,
         *object_args(config),
         "provision",
-        config.shard_id,
+        "--meta-url",
+        config.metadata_url,
     ]
 
 
 def server_command(config: Config) -> list[str]:
     return [
         str(config.binary),
-        *control_args(config),
         *object_args(config),
         "--bind",
         config.bind,
@@ -713,11 +707,11 @@ def server_command(config: Config) -> list[str]:
         config.advertise,
         "--node-id",
         config.node,
-        f"--metadata-{config.metadata_mode}",
-        str(config.metadata),
         "--lifecycle-interval-millis",
         "100",
         "serve",
+        "--meta-url",
+        config.metadata_url,
     ]
 
 
@@ -827,57 +821,6 @@ def completed_process(
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip() or "no output"
         raise WorkflowFailure(f"{label} failed ({result.returncode}): {detail}")
-    return result
-
-
-def expected_failure_process(
-    evidence: Evidence,
-    label: str,
-    command: list[str],
-    config: Config,
-    stdin: str,
-) -> subprocess.CompletedProcess[str]:
-    started = now()
-    try:
-        result = subprocess.run(
-            command,
-            cwd=config.repo,
-            input=stdin,
-            text=True,
-            capture_output=True,
-            timeout=config.timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as error:
-        evidence.line(
-            "processes.jsonl",
-            {
-                "schema": SCHEMA,
-                "label": label,
-                "argv": redact_argv(command),
-                "started_at": started,
-                "finished_at": now(),
-                "timed_out": True,
-                "stdout": error.stdout or "",
-                "stderr": error.stderr or "",
-            },
-        )
-        raise WorkflowFailure(f"{label} timed out instead of failing closed") from error
-    evidence.line(
-        "processes.jsonl",
-        {
-            "schema": SCHEMA,
-            "label": label,
-            "argv": redact_argv(command),
-            "started_at": started,
-            "finished_at": now(),
-            "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        },
-    )
-    if result.returncode == 0:
-        raise WorkflowFailure(f"{label} unexpectedly succeeded")
     return result
 
 
@@ -1185,9 +1128,7 @@ def assert_phase_one_results(
 
 def assert_authority_results(
     results: dict[str, dict[str, Any]],
-    mismatch: subprocess.CompletedProcess[str],
     config: Config,
-    peer: Config,
 ) -> dict[str, Any]:
     if results["peer-read-before-create"].get("code") != "NotFound":
         raise WorkflowFailure(
@@ -1210,7 +1151,7 @@ def assert_authority_results(
         results["primary-read-after-peer-write"], "primary authority read"
     )
     if peer_document != {"authority": "peer"} or reconnect_document != peer_document:
-        raise WorkflowFailure("peer Agent binding did not survive an exact reconnect")
+        raise WorkflowFailure("peer RootId did not survive an exact reconnect")
     if (
         primary_document.get("state") != "post-snapshot"
         or "authority" in primary_document
@@ -1219,20 +1160,6 @@ def assert_authority_results(
             "RootId isolation allowed a peer write into the primary Workbench"
         )
 
-    combined_error = f"{mismatch.stdout}\n{mismatch.stderr}"
-    if (
-        mismatch.returncode == 0
-        or mismatch.stdout.strip()
-        or "already bound to another Agent" not in combined_error
-        or "jsonrpc" in combined_error.lower()
-    ):
-        raise WorkflowFailure(
-            "wrong AgentId was not rejected before MCP initialization"
-        )
-    if config.agent_id in combined_error or peer.agent_id in combined_error:
-        raise WorkflowFailure(
-            "Agent binding mismatch disclosed a stable Agent identity"
-        )
     return {
         "schema": SCHEMA,
         "status": "PASS",
@@ -1241,7 +1168,7 @@ def assert_authority_results(
         "distinct_root_count": 2,
         "same_logical_shard": True,
         "peer_reconnect": "PASS",
-        "wrong_agent_admission": "rejected-before-initialize",
+        "root_isolation": "PASS",
     }
 
 
@@ -1360,10 +1287,8 @@ def endpoint(endpoint_value: str) -> tuple[str, int]:
 
 
 def validate(config: Config, live: bool) -> None:
-    if not HEX_ID.fullmatch(config.root_id) or not HEX_ID.fullmatch(config.shard_id):
-        raise NotQualified(
-            "root and logical shard ids must be 32 lowercase hex characters"
-        )
+    if not HEX_ID.fullmatch(config.root_id):
+        raise NotQualified("root id must be 32 lowercase hex characters")
     if not HEX_ID.fullmatch(config.agent_id):
         raise NotQualified("AgentId must be 32 lowercase hex characters")
     for value in (config.agent_name, config.workbench, config.restored):
@@ -1376,15 +1301,12 @@ def validate(config: Config, live: bool) -> None:
         raise NotQualified(
             "Phase 1 fixture ids must differ from configured Workbench ids"
         )
-    if not config.etcd or not config.bucket or not config.object_endpoint:
-        raise NotQualified("etcd endpoint, object endpoint, and bucket are required")
-    peer, mismatch = authority_configs(config)
+    if not config.bucket or not config.object_endpoint:
+        raise NotQualified("object endpoint and bucket are required")
+    peer = authority_config(config)
     if (
         peer.root_id == config.root_id
         or peer.agent_id == config.agent_id
-        or peer.shard_id != config.shard_id
-        or mismatch.root_id != config.root_id
-        or mismatch.agent_id != peer.agent_id
     ):
         raise NotQualified("authority probe identities do not form two isolated roots")
     if (config.access_key is None) != (config.secret_key is None):
@@ -1393,11 +1315,9 @@ def validate(config: Config, live: bool) -> None:
         return
     if not config.binary.is_file() or not os.access(config.binary, os.X_OK):
         raise NotQualified(f"nokv binary is missing or not executable: {config.binary}")
-    if config.metadata_mode == "create" and config.metadata.exists():
-        raise NotQualified(f"metadata create path already exists: {config.metadata}")
-    if config.metadata_mode == "reopen" and not config.metadata.exists():
-        raise NotQualified(f"metadata reopen path does not exist: {config.metadata}")
-    for dependency in (*config.etcd, config.object_endpoint):
+    if config.metadata.exists():
+        raise NotQualified(f"metadata format path already exists: {config.metadata}")
+    for dependency in (config.object_endpoint,):
         host, port = endpoint(dependency)
         try:
             with socket.create_connection((host, port), timeout=1.5):
@@ -1564,7 +1484,7 @@ def run_authority_probe(
     server: subprocess.Popen[str],
     primary: Mcp,
 ) -> dict[str, Any]:
-    peer, mismatch_config = authority_configs(config)
+    peer = authority_config(config)
     peer_stderr: TextIO | None = None
     peer_session: Mcp | None = None
     reconnect_stderr: TextIO | None = None
@@ -1635,43 +1555,24 @@ def run_authority_probe(
             {"id": config.workbench, "section": "input", "path": "scan.json"},
         )
     )
-    initialize = (
-        canonical_json(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {"name": "nokv-authority-negative", "version": "1"},
-                },
-            }
-        )
-        + "\n"
-    )
-    mismatch = expected_failure_process(
-        evidence,
-        "mcp-authority-mismatch",
-        mcp_command(mismatch_config),
-        mismatch_config,
-        initialize,
-    )
-    return assert_authority_results(results, mismatch, config, peer)
+    return assert_authority_results(results, config)
 
 
 def run_live(config: Config, evidence: Evidence, steps: list[ToolStep]) -> None:
+    formatted = completed_process(evidence, "format", format_command(config), config)
+    if json.loads(formatted.stdout).get("operation") != "format":
+        raise WorkflowFailure("format did not initialize the Holt metadata store")
     provision = completed_process(
         evidence, "provision", provision_command(config), config
     )
-    if json.loads(provision.stdout).get("lifecycle") != "active":
-        raise WorkflowFailure("provision did not activate root placement")
-    peer, _ = authority_configs(config)
+    if json.loads(provision.stdout).get("lifecycle") != "ready":
+        raise WorkflowFailure("provision did not make the root ready")
+    peer = authority_config(config)
     peer_provision = completed_process(
         evidence, "provision-authority-peer", provision_command(peer), peer
     )
-    if json.loads(peer_provision.stdout).get("lifecycle") != "active":
-        raise WorkflowFailure("peer provision did not activate root placement")
+    if json.loads(peer_provision.stdout).get("lifecycle") != "ready":
+        raise WorkflowFailure("peer provision did not make the root ready")
     serve_out = (evidence.root / "serve.stdout.log").open("w")
     serve_err = (evidence.root / "serve.stderr.log").open("w")
     server = subprocess.Popen(
@@ -1766,15 +1667,14 @@ def environment(config: Config) -> dict[str, Any]:
         },
         "config": {
             "root_id": config.root_id,
-            "logical_shard_id": config.shard_id,
             "agent_name": config.agent_name,
             "agent_id": config.agent_id,
             "workbench_root": config.workbench_root,
             "workbench": config.workbench,
             "restored_workbench": config.restored,
-            "etcd": config.etcd,
             "metadata": str(config.metadata),
-            "metadata_mode": config.metadata_mode,
+            "metadata_url": config.metadata_url,
+            "seed": config.advertise,
             "bind": config.bind,
             "object_endpoint": config.object_endpoint,
             "object_bucket": config.bucket,
@@ -1788,7 +1688,7 @@ def environment(config: Config) -> dict[str, Any]:
 def plan(config: Config, steps: list[ToolStep]) -> dict[str, Any]:
     sandbox = config.evidence / "sandbox"
     coverage = planned_tool_coverage(steps)
-    peer, mismatch = authority_configs(config)
+    peer = authority_config(config)
     return {
         "schema": SCHEMA,
         "mode": "dry-run" if config.dry_run else "live",
@@ -1796,12 +1696,12 @@ def plan(config: Config, steps: list[ToolStep]) -> dict[str, Any]:
             "build": ["cargo", "build", "-p", "nokv", "--bin", "nokv"]
             if config.build
             else None,
+            "format": redact_argv(format_command(config)),
             "provision": redact_argv(provision_command(config)),
             "provision_authority_peer": redact_argv(provision_command(peer)),
             "serve": redact_argv(server_command(config)),
             "mcp": redact_argv(mcp_command(config)),
             "mcp_authority_peer": redact_argv(mcp_command(peer)),
-            "mcp_authority_mismatch": redact_argv(mcp_command(mismatch)),
             "materialize": redact_argv(
                 materialize_command(config, sandbox / "scan.json")
             ),
@@ -1866,13 +1766,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     )
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument("--metadata-dir", type=Path)
-    parser.add_argument(
-        "--metadata-mode", choices=("create", "reopen"), default="create"
-    )
     parser.add_argument("--root-id", default=os.getenv("NOKV_LIVE_ROOT_ID", "11" * 16))
-    parser.add_argument(
-        "--logical-shard-id", default=os.getenv("NOKV_LIVE_LOGICAL_SHARD_ID", "22" * 16)
-    )
     parser.add_argument("--agent-name", default="research-agent")
     parser.add_argument(
         "--agent-id", default=os.getenv("NOKV_LIVE_AGENT_ID", "44" * 16)
@@ -1880,8 +1774,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--workbench-id", default="ptychography-run")
     parser.add_argument("--restored-workbench-id", default="ptychography-run-restored")
     parser.add_argument("--snapshot-name", default="ptychography-frozen")
-    parser.add_argument("--etcd-endpoint", action="append")
-    parser.add_argument("--etcd-key-prefix", default="/nokv/control")
     parser.add_argument("--server-bind", default="127.0.0.1:7750")
     parser.add_argument("--advertise-endpoint", default="127.0.0.1:7750")
     parser.add_argument("--node-id")
@@ -1900,11 +1792,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     )
     parser.add_argument("--command-timeout-seconds", type=float, default=30)
     args = parser.parse_args(argv)
-    etcd = args.etcd_endpoint or [
-        item for item in os.getenv("NOKV_LIVE_ETCD_ENDPOINTS", "").split(",") if item
-    ]
     if args.dry_run:
-        etcd = etcd or ["http://127.0.0.1:2379"]
         args.object_bucket = args.object_bucket or "nokv-live-dry-run"
         args.object_endpoint = args.object_endpoint or "http://127.0.0.1:9000"
     evidence = args.evidence_dir or (
@@ -1913,7 +1801,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         / f"gate0-{args.agent_name}-{args.workbench_id}-{args.root_id[:8]}"
     )
     metadata = args.metadata_dir or (
-        repo / "target/workbench-live/metadata" / f"{args.root_id}-{args.metadata_mode}"
+        repo / "target/workbench-live/metadata" / args.root_id
     )
     if args.qualification_result is not None and args.dry_run:
         parser.error("--qualification-result cannot be combined with --dry-run")
@@ -1922,16 +1810,12 @@ def parse_args(argv: list[str] | None = None) -> Config:
         args.nokv_bin.resolve(),
         evidence.resolve(),
         metadata.resolve(),
-        args.metadata_mode,
         args.root_id,
-        args.logical_shard_id,
         args.agent_name,
         args.agent_id,
         args.workbench_id,
         args.restored_workbench_id,
         args.snapshot_name,
-        tuple(etcd),
-        args.etcd_key_prefix,
         args.server_bind,
         args.advertise_endpoint,
         args.node_id or f"workbench-{args.root_id[:8]}",
@@ -1982,7 +1866,7 @@ def main(argv: list[str] | None = None) -> int:
             typed_context = load_live_context(
                 producer_id="live-workbench",
                 scenarios=TYPED_SCENARIOS,
-                dependency_names=("etcd", "object-store"),
+                dependency_names=("object-store",),
                 product_binary=config.binary,
                 evidence_roles=TYPED_EVIDENCE_ROLES,
             )

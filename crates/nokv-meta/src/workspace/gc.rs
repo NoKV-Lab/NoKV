@@ -3455,7 +3455,10 @@ mod tests {
             .unwrap();
         store
             .replace_recovery_header_for_test(
-                dedupe.recovery_lsn,
+                dedupe
+                    .recovery_receipt
+                    .expect("local dedupe must carry a recovery receipt")
+                    .recovery_lsn,
                 Some(b"tampered GC recovery header".to_vec()),
             )
             .unwrap();

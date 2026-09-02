@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use nokv_meta::workspace::{
     artifact_revision_key, create_visible_workspace, dependency_owner_digest, keyspaces,
-    path_current_key, path_revision_ref_key, store_limits, workspace_current_key,
-    ArtifactRevisionRecord, CommandMutation, CommandPredicate, HistoryProjection, MetaShard,
-    MetadataCommand, MetadataFamily, PathEntry, RevisionRefRecord, RootFenceAction,
-    RootWriteContext, TypedProjection, WorkspaceRecord, SCHEMA_ID,
+    path_current_key, path_index_digest, path_index_generation, path_revision_ref_key,
+    store_limits, workspace_current_key, ArtifactRevisionRecord, CommandMutation, CommandPredicate,
+    HistoryProjection, MetaShard, MetadataCommand, MetadataFamily, PathEntry, RevisionRefRecord,
+    RootFenceAction, RootWriteContext, TypedProjection, WorkspaceRecord, SCHEMA_ID,
 };
 use nokv_meta_holt::{HoltOptions, HoltStore, TreeBinding};
 use nokv_meta_store::TxnStore;
@@ -304,6 +304,8 @@ fn seed_paths(
             let manifest_digest_uri = EMPTY_SHA256_URI.to_owned();
             let entry = PathEntry {
                 generation: Generation::new(index).map_err(|error| error.to_string())?,
+                index_generation: path_index_generation(request_id(seed, index)),
+                path_digest: path_index_digest(&path),
                 artifact_revision_id: revision,
                 body_digest_uri: body_digest_uri.clone(),
                 manifest_digest_uri: manifest_digest_uri.clone(),

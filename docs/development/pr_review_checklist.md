@@ -83,9 +83,10 @@ boundaries, or Workbench behavior.
 - Are object blocks immutable, revision-owned, and uploaded/verified before
   metadata publication?
 - Can upload or metadata failure expose a partial artifact?
-- Does one bounded `MetadataCommand` atomically publish the revision, manifest,
-  path, workspace revision, indexes, event, old-revision candidacy, and dedupe
-  result?
+- Can derived secondary-index rows be staged invisibly in bounded work, and
+  does one final `MetadataCommand` atomically publish the revision, manifest,
+  path, workspace revision, exact index generation locator, event,
+  old-revision candidacy, and dedupe result while predicating every staged row?
 - Are all predicates checked before every mutation?
 - Does an exact request replay return the same result?
 - Does reuse of a request id with different inputs fail?
@@ -140,7 +141,9 @@ boundaries, or Workbench behavior.
   descendant EOF, and avoid per-entry fanout?
 - Does ordinary put/replace/remove avoid prefix scans and stay within its
   documented predicate/mutation bound?
-- Are index updates bounded and atomic with the authoritative entry?
+- Are index writes bounded, generation-fenced, and made visible atomically
+  with the authoritative entry? Are stale published generations cleaned with
+  exact current-row predicates while staged generations remain request-owned?
 - Does restore report metadata rows copied and object bytes copied?
 - Are metadata write amplification, history writes, event writes, index writes,
   and dedupe writes attributable?

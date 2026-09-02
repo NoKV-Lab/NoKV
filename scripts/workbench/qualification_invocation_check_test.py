@@ -29,6 +29,10 @@ def _valid_report() -> tuple[dict[str, object], dict[str, object], dict[str, obj
     ledger = pre423_contract_ledger.load_ledger()
     manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     expected = checker.derive_expected_scenarios(manifest=manifest, ledger=ledger)
+    product_producer_count = sum(
+        "product_binary" in ledger["producer_catalog"][producer]["required_subjects"]
+        for producer in manifest["typed_producers"]
+    )
     items = []
     for item in ledger["items"]:
         gates = []
@@ -93,7 +97,7 @@ def _valid_report() -> tuple[dict[str, object], dict[str, object], dict[str, obj
             "workflow_attempt": 1,
             "head_sha": "1" * 40,
             "manifest_sha256": "2" * 64,
-            "artifact_mapping_count": 5,
+            "artifact_mapping_count": product_producer_count,
         },
         "receipt_counts": manifest["aggregate_expectation"]["receipt_counts"],
         "item_status_counts": {
@@ -145,9 +149,9 @@ class QualificationInvocationCheckTests(unittest.TestCase):
             manifest=manifest, ledger=ledger, report=report
         )
 
-        self.assertEqual(summary.typed_scenarios, 172)
+        self.assertEqual(summary.typed_scenarios, 140)
         self.assertEqual(summary.pass_scenarios, 74)
-        self.assertEqual(summary.nq_scenarios, 98)
+        self.assertEqual(summary.nq_scenarios, 66)
 
     def test_deleted_pass_receipt_and_duplicate_keeps_count_but_fails(self) -> None:
         manifest, ledger, report = _valid_report()
@@ -163,7 +167,7 @@ class QualificationInvocationCheckTests(unittest.TestCase):
         duplicated["selected_receipts"].append(
             copy.deepcopy(duplicated["selected_receipts"][0])
         )
-        self.assertEqual(report["receipt_counts"]["discovered"], 137)
+        self.assertEqual(report["receipt_counts"]["discovered"], 124)
 
         with self.assertRaisesRegex(checker.InvocationCheckError, "selected receipt"):
             checker.validate_aggregate_report(
@@ -193,7 +197,7 @@ class QualificationInvocationCheckTests(unittest.TestCase):
         self,
     ) -> None:
         manifest, ledger, report = _valid_report()
-        report["product_artifact_manifest"]["artifact_mapping_count"] = 4
+        report["product_artifact_manifest"]["artifact_mapping_count"] -= 1
 
         with self.assertRaisesRegex(
             checker.InvocationCheckError, "product artifact binding"

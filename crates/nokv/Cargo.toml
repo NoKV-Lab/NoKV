@@ -10,8 +10,8 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["etcd"]
-etcd = ["nokv-client/etcd", "nokv-control/etcd", "nokv-server/etcd", "dep:signal-hook"]
+default = []
+fdb = ["nokv-server/fdb"]
 
 [dependencies]
 base64.workspace = true
@@ -24,7 +24,7 @@ nokv-agent.workspace = true
 nokv-workbench-projection.workspace = true
 nokv-types.workspace = true
 sha2.workspace = true
-signal-hook = { workspace = true, optional = true }
+signal-hook.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
@@ -34,6 +34,11 @@ sha2.workspace = true
 [[bin]]
 name = "nokv"
 path = "src/main.rs"
+
+[[bin]]
+name = "nokv-fdb"
+path = "src/fdb_main.rs"
+required-features = ["fdb"]
 
 [dev-dependencies]
 tempfile.workspace = true

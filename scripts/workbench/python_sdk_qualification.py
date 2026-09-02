@@ -39,7 +39,7 @@ SCENARIOS = {
 }
 REASON = (
     "The checked-in Python package has unit coverage, but no source-bound runner "
-    "currently installs the built wheel and exercises it against real NoKV, etcd, "
+    "currently installs the built wheel and exercises it against a real NoKV seed "
     "and object-store services; unit mocks cannot qualify these live scenarios."
 )
 
@@ -48,7 +48,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     return gap_main(
         producer_id="python-sdk",
         scenarios=SCENARIOS,
-        dependency_names=("etcd", "object-store", "python-sdk"),
+        dependency_names=("nokv-seed", "object-store", "python-sdk"),
         evidence_roles=("producer-result", "qualification"),
         reason=REASON,
         description=__doc__ or "Python SDK qualification",

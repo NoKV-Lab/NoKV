@@ -15,8 +15,7 @@ def test_versioned_workbench_surface():
         "WorkbenchFileSystem",
         "checkpoint",
     ]
-    assert hasattr(nokv.RoutingConfig, "static")
-    assert hasattr(nokv.RoutingConfig, "etcd")
+    assert hasattr(nokv.RoutingConfig, "seeds")
     assert hasattr(nokv.Client, "create_workspace")
     assert hasattr(nokv.Client, "stat")
     assert hasattr(nokv.Client, "list")

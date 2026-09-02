@@ -5,9 +5,9 @@
 
 //! Storage-neutral RPC contract for Agent workspaces.
 //!
-//! Every request is routed by an explicit [`RootRoute`]. Paths are validated by
-//! `nokv-types`, and the wire surface exposes neither Holt layout nor
-//! object-provider configuration.
+//! Seed discovery is route-neutral; every workspace request is routed by an
+//! explicit [`RootRoute`]. Paths are validated by `nokv-types`, and the wire
+//! surface exposes neither Holt layout nor object-provider configuration.
 
 mod artifact_publish;
 mod codec;
@@ -43,41 +43,41 @@ pub use request::{
     AggregateRequest, AggregateSpec, AppendGenericIndexRowsRequest, BeginArtifactPublishRequest,
     BeginGenericIndexRegistrationRequest, BindRestoreDestinationRequest, CatalogPathMatch,
     CatalogRequest, ChangePageRequest, CommitRequest, CompleteArtifactPublishRequest,
-    CreateWorkspaceRequest, FinalizeGenericIndexRegistrationRequest, FinalizeRestoreRequest,
-    FindWorkspacesRequest, GenericIndexFieldCapability, GenericIndexFieldValues, GenericIndexRow,
-    GetGenericIndexRegistrationRequest, GetOperationRequest, GetPathRequest, GetSnapshotRequest,
-    GetWorkspaceRequest, ListPathsRequest, ListSnapshotsRequest,
-    MarkArtifactObjectsUploadedRequest, MintSnapshotRequest, ObjectUploadProof,
-    PrepareRestoreRequest, QuarantineResolution, QueryOperand, QueryOperator, QueryPredicate,
-    QueryProfile, QueryScope, ReadRestoreSourceRunManifestRequest,
+    CreateWorkspaceRequest, DiscoverRouteRequest, FinalizeGenericIndexRegistrationRequest,
+    FinalizeRestoreRequest, FindWorkspacesRequest, GenericIndexFieldCapability,
+    GenericIndexFieldValues, GenericIndexRow, GetGenericIndexRegistrationRequest,
+    GetOperationRequest, GetPathRequest, GetSnapshotRequest, GetWorkspaceRequest, ListPathsRequest,
+    ListSnapshotsRequest, MarkArtifactObjectsUploadedRequest, MintSnapshotRequest,
+    ObjectUploadProof, PrepareRestoreRequest, QuarantineResolution, QueryOperand, QueryOperator,
+    QueryPredicate, QueryProfile, QueryScope, ReadRestoreSourceRunManifestRequest,
     ReconcileQuarantinedArtifactPublishRequest, RemovePathRequest, RenamePathRequest,
     RenewSnapshotRequest, RestoreManifestDescriptor, RestoreManifestIdentity, RestoreSource,
-    RetireSnapshotRequest, SearchRequest, SortDirection, SortField, StageArtifactManifestRequest,
-    StageArtifactObjectsRequest, WorkspaceContinuationFence, WorkspacePreflightRequest,
-    WorkspaceRequest, WorkspaceRpcRequest, MAX_GENERIC_INDEX_ABORT_ROWS,
+    RetireSnapshotRequest, RpcRequest, SearchRequest, SortDirection, SortField,
+    StageArtifactManifestRequest, StageArtifactObjectsRequest, WorkspaceContinuationFence,
+    WorkspacePreflightRequest, WorkspaceRequest, WorkspaceRpcRequest, MAX_GENERIC_INDEX_ABORT_ROWS,
     MAX_GENERIC_INDEX_APPEND_ROWS, MAX_GENERIC_INDEX_FIELDS, MAX_GENERIC_INDEX_ROW_BYTES,
     MAX_GENERIC_INDEX_ROW_FIELDS, MAX_GENERIC_INDEX_VALUES_PER_FIELD, MAX_QUERY_PAGE_LIMIT,
 };
 pub use response::{
     AggregateGroup, AggregateResult, CatalogField, CatalogResult, ChangeEvent, ChangeKind,
-    ChangePage, CommitManifestBinding, CommitPreparation, CommitResult, FacetBucket, FacetResult,
-    FindWorkspacesResult, GenericIndexAbortResult, GenericIndexAppendReceipt,
-    GenericIndexAppendResult, GenericIndexRegistrationPhase, GenericIndexRegistrationStatus,
-    GenericNamespaceArtifact, GenericNamespaceHit, GenericNamespaceKind, OperationProgress,
-    OperationResult, OperationState, OperationStatus, PathListEntry, PathPage, PathReadResult,
-    PublishResult, RemovePathResult, RenamePathResult, RestoreDestinationBinding,
-    RestoreDestinationManifestBindings, RestoreManifestBinding, RestoreOperationPreparation,
-    RestorePreparation, RestoreResult, RestoreSourceCommitBinding, SearchHit, SearchResult,
-    SearchRow, SnapshotPage, SnapshotResult, SnapshotStatus, WorkspacePreflightResult,
-    WorkspaceResult, WorkspaceRpcOutcome, WorkspaceRpcResponse, WorkspaceSummary,
-    WorkspaceSummaryWithCommit,
+    ChangePage, CommitManifestBinding, CommitPreparation, CommitResult, DiscoverRouteOutcome,
+    DiscoverRouteResponse, FacetBucket, FacetResult, FindWorkspacesResult, GenericIndexAbortResult,
+    GenericIndexAppendReceipt, GenericIndexAppendResult, GenericIndexRegistrationPhase,
+    GenericIndexRegistrationStatus, GenericNamespaceArtifact, GenericNamespaceHit,
+    GenericNamespaceKind, OperationProgress, OperationResult, OperationState, OperationStatus,
+    PathListEntry, PathPage, PathReadResult, PublishResult, RemovePathResult, RenamePathResult,
+    RestoreDestinationBinding, RestoreDestinationManifestBindings, RestoreManifestBinding,
+    RestoreOperationPreparation, RestorePreparation, RestoreResult, RestoreSourceCommitBinding,
+    RpcResponse, SearchHit, SearchResult, SearchRow, SnapshotPage, SnapshotResult, SnapshotStatus,
+    WorkspacePreflightResult, WorkspaceResult, WorkspaceRpcOutcome, WorkspaceRpcResponse,
+    WorkspaceSummary, WorkspaceSummaryWithCommit,
 };
 pub use types::{
     AppendSegment, ArtifactDescriptor, ArtifactManifestRow, ArtifactRevisionIdentity, ByteRange,
-    CommitIdentity, ContentType, Digest, DigestUri, FieldValue, GenericIndexGenerationIdentity,
-    LogicalShardIdentity, ObjectIdentity, ObjectNamespaceIdentity, OperationIdentity,
-    OperationKind, OperationToken, PageRequest, PathMetadata, PublicationAuthority,
-    PublishCondition, RelativePath, RequestIdentity, RootIdentity, RootRoute, ScalarValue,
-    SnapshotAlias, SnapshotSelector, StagedObject, Tag, WorkbenchName, WorkspaceCapability,
-    WorkspaceIdentity, WorkspacePath, WorkspaceReadView,
+    CommitIdentity, ContentType, Digest, DigestUri, DiscoveredRoute, FieldValue,
+    GenericIndexGenerationIdentity, LogicalShardIdentity, ObjectIdentity, ObjectNamespaceIdentity,
+    OperationIdentity, OperationKind, OperationToken, OwnerEndpoint, PageRequest, PathMetadata,
+    PublicationAuthority, PublishCondition, RelativePath, RequestIdentity, RootIdentity, RootRoute,
+    RouteState, ScalarValue, SnapshotAlias, SnapshotSelector, StagedObject, Tag, WorkbenchName,
+    WorkspaceCapability, WorkspaceIdentity, WorkspacePath, WorkspaceReadView,
 };

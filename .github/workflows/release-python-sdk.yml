@@ -100,18 +100,8 @@ jobs:
           fi
           python3 scripts/release/test_python_sdk_release.py
 
-      - name: Install protobuf compiler (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          brew install protobuf
-          protoc --version
-
       # Linux wheels are built inside the official manylinux_2_28 image so the
-      # native module only links glibc >= 2.28 symbols. The etcd client crate
-      # compiles its protobuf definitions at build time, so the image needs a
-      # protoc; the AlmaLinux 8 package is enough for these proto3 files.
+      # native module only links glibc >= 2.28 symbols.
       - name: Build manylinux wheel
         if: runner.os == 'Linux'
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
@@ -120,10 +110,6 @@ jobs:
           working-directory: crates/nokv-python
           args: --release --out ../../dist
           manylinux: ${{ matrix.manylinux }}
-          before-script-linux: |
-            set -euo pipefail
-            dnf install -y protobuf-compiler
-            protoc --version
 
       - name: Build macOS wheel
         if: runner.os == 'macOS'

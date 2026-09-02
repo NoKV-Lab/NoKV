@@ -18,7 +18,7 @@ use nokv_protocol::{
     PathReadResult, PrepareRestoreRequest, PublishResult, ReadRestoreSourceRunManifestRequest,
     RemovePathRequest, RemovePathResult, RenamePathRequest, RenamePathResult, RenewSnapshotRequest,
     RequestIdentity, RestorePreparation, RestoreResult, RetireSnapshotRequest, RootIdentity,
-    RootRoute, SearchRequest, SearchResult, SnapshotPage, SnapshotResult,
+    RootRoute, RpcRequest, RpcResponse, SearchRequest, SearchResult, SnapshotPage, SnapshotResult,
     StageArtifactManifestRequest, StageArtifactObjectsRequest, WorkspaceCapability,
     WorkspacePreflightRequest, WorkspacePreflightResult, WorkspaceRequest, WorkspaceResult,
     WorkspaceRpcOutcome, WorkspaceRpcRequest, WorkspaceSummary,
@@ -190,12 +190,22 @@ where
                 request_id,
                 operation: operation.clone(),
             };
-            let encoded = encode_request(&request)?;
+            let encoded = encode_request(&RpcRequest::Workspace(Box::new(request.clone())))?;
             let response_bytes = match self.transport.round_trip(resolved.endpoint, &encoded) {
                 Ok(response) => response,
                 Err(error) => {
                     let retryable = error.retryable();
                     if retryable && attempt < self.options.max_attempts {
+                        if refresh_mode == RouteRefreshMode::Authoritative {
+                            let refreshed = self.routes.resolve(self.root_id, true)?;
+                            validate_resolved_route(refreshed, self.root_id, expected_shard)?;
+                            validate_route_continuity(
+                                refreshed.route,
+                                resolved.route,
+                                "transport-failure refresh",
+                            )?;
+                            resolved = refreshed;
+                        }
                         continue;
                     }
                     return exhausted_or_last(
@@ -205,7 +215,14 @@ where
                     );
                 }
             };
-            let response = decode_response(&response_bytes)?;
+            let response = match decode_response(&response_bytes)? {
+                RpcResponse::Workspace(response) => *response,
+                RpcResponse::DiscoverRoute(_) => {
+                    return Err(ClientError::ResponseMismatch(
+                        "owner returned a discovery response to a workspace request".to_owned(),
+                    ));
+                }
+            };
             if response.request_id != request_id {
                 return Err(ClientError::ResponseMismatch(
                     "request identity does not match".to_owned(),
@@ -238,15 +255,31 @@ where
                     });
                 }
                 WorkspaceRpcOutcome::Failure(failure) => {
-                    let should_refresh = failure.code == ErrorCode::NotOwner;
+                    let hint = failure.route_hint.clone();
+                    let mut installed_hint = None;
+                    let hint_is_newer = if let Some(hint) = &hint {
+                        validate_route(hint.route(), self.root_id, expected_shard)?;
+                        validate_route_continuity(
+                            hint.route(),
+                            resolved.route,
+                            "owner route hint",
+                        )?;
+                        let newer = discovered_route_is_newer(hint, resolved);
+                        installed_hint = self.routes.observe_hint(self.root_id, hint)?;
+                        newer
+                    } else {
+                        false
+                    };
+                    let should_refresh =
+                        matches!(failure.code, ErrorCode::NotOwner | ErrorCode::RouteExpired)
+                            || hint_is_newer;
                     let retryable = failure.retryable || should_refresh;
                     if retryable && attempt < self.options.max_attempts {
                         if should_refresh {
-                            if let Some(hint) = failure.route_hint {
-                                validate_route(hint, self.root_id, expected_shard)?;
-                                validate_route_continuity(hint, resolved.route, "NotOwner hint")?;
-                            }
-                            let refreshed = self.routes.resolve(self.root_id, true)?;
+                            let refreshed = match installed_hint {
+                                Some(hinted) => hinted,
+                                None => self.routes.resolve(self.root_id, true)?,
+                            };
                             validate_resolved_route(refreshed, self.root_id, expected_shard)?;
                             validate_route_continuity(
                                 refreshed.route,
@@ -258,17 +291,15 @@ where
                             {
                                 return Err(unchanged_not_owner_route(
                                     resolved.route,
-                                    failure.route_hint,
+                                    hint.as_deref(),
                                 ));
                             }
-                            if let Some(hint) = failure.route_hint {
-                                validate_refreshed_route(refreshed.route, hint)?;
-                            }
-                            if refreshed == resolved {
-                                return Err(ClientError::InvalidRoute(
-                                    "NotOwner refresh returned the unchanged route and endpoint"
-                                        .to_owned(),
-                                ));
+                            if let Some(hint) = &hint {
+                                validate_refreshed_route(
+                                    refreshed,
+                                    hint,
+                                    self.routes.tracks_session_generation(),
+                                )?;
                             }
                             resolved = refreshed;
                         }
@@ -609,15 +640,22 @@ fn validate_resolved_route(
     validate_route(resolved.route, root_id, expected_shard)
 }
 
-fn validate_refreshed_route(refreshed: RootRoute, hint: RootRoute) -> Result<(), ClientError> {
-    if refreshed.root_id != hint.root_id || refreshed.logical_shard_id != hint.logical_shard_id {
+fn validate_refreshed_route(
+    refreshed: ResolvedRoute,
+    hint: &nokv_protocol::DiscoveredRoute,
+    require_session_generation: bool,
+) -> Result<(), ClientError> {
+    let hint_route = hint.route();
+    if refreshed.route.root_id != hint_route.root_id
+        || refreshed.route.logical_shard_id != hint_route.logical_shard_id
+    {
         return Err(ClientError::InvalidRoute(
             "refreshed route does not match the NotOwner placement hint".to_owned(),
         ));
     }
-    if refreshed.placement_generation < hint.placement_generation
-        || (refreshed.placement_generation == hint.placement_generation
-            && refreshed.owner_epoch < hint.owner_epoch)
+    if refreshed.route.placement_generation < hint_route.placement_generation
+        || refreshed.route.owner_epoch < hint_route.owner_epoch
+        || (require_session_generation && refreshed.session_generation < hint.session_generation)
     {
         return Err(ClientError::InvalidRoute(
             "refreshed route is older than the NotOwner placement hint".to_owned(),
@@ -626,7 +664,10 @@ fn validate_refreshed_route(refreshed: RootRoute, hint: RootRoute) -> Result<(),
     Ok(())
 }
 
-fn unchanged_not_owner_route(configured: RootRoute, hint: Option<RootRoute>) -> ClientError {
+fn unchanged_not_owner_route(
+    configured: RootRoute,
+    hint: Option<&nokv_protocol::DiscoveredRoute>,
+) -> ClientError {
     let mismatch = hint.map_or_else(String::new, |hint| {
         format!(
             "; configured placement_generation={} owner_epoch={}, owner hint requires \
@@ -639,8 +680,18 @@ fn unchanged_not_owner_route(configured: RootRoute, hint: Option<RootRoute>) -> 
     });
     ClientError::InvalidRoute(format!(
         "NotOwner refresh returned the unchanged caller-managed route and endpoint{mismatch}; \
-         replace the route snapshot or use an authoritative control-plane resolver"
+         replace the route snapshot or use a seed route resolver"
     ))
+}
+
+fn discovered_route_is_newer(
+    hint: &nokv_protocol::DiscoveredRoute,
+    current: ResolvedRoute,
+) -> bool {
+    hint.placement_generation > current.route.placement_generation
+        || (hint.placement_generation == current.route.placement_generation
+            && (hint.owner_epoch > current.route.owner_epoch
+                || hint.session_generation > current.session_generation))
 }
 
 fn validate_route_continuity(
@@ -737,17 +788,31 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use nokv_protocol::{
-        decode_request, encode_response, ArtifactDescriptor, ArtifactRevisionIdentity,
-        BindRestoreDestinationRequest, CommitIdentity, ConflictKind, ContentType, Digest,
-        DigestUri, ErrorCode, LogicalShardIdentity, OperationIdentity, PathMetadata,
-        PathReadResult, ReadRestoreSourceRunManifestRequest, RelativePath,
-        RestoreDestinationBinding, RestoreManifestIdentity, RestorePreparation,
-        RestoreSourceCommitBinding, RpcFailure, WorkbenchName, WorkspaceIdentity, WorkspacePath,
-        WorkspaceRpcResponse,
+        ArtifactDescriptor, ArtifactRevisionIdentity, BindRestoreDestinationRequest,
+        CommitIdentity, ConflictKind, ContentType, Digest, DigestUri, ErrorCode,
+        LogicalShardIdentity, OperationIdentity, PathMetadata, PathReadResult,
+        ReadRestoreSourceRunManifestRequest, RelativePath, RestoreDestinationBinding,
+        RestoreManifestIdentity, RestorePreparation, RestoreSourceCommitBinding, RpcFailure,
+        WorkbenchName, WorkspaceIdentity, WorkspacePath, WorkspaceRpcResponse,
     };
 
     use super::*;
     use crate::StaticRouteResolver;
+
+    fn decode_request(encoded: &[u8]) -> Result<WorkspaceRpcRequest, nokv_protocol::ProtocolError> {
+        match nokv_protocol::decode_request(encoded)? {
+            RpcRequest::Workspace(request) => Ok(*request),
+            RpcRequest::DiscoverRoute(_) => Err(nokv_protocol::ProtocolError::Decode(
+                "expected workspace request".to_owned(),
+            )),
+        }
+    }
+
+    fn encode_response(
+        response: &WorkspaceRpcResponse,
+    ) -> Result<Vec<u8>, nokv_protocol::ProtocolError> {
+        nokv_protocol::encode_response(&RpcResponse::Workspace(Box::new(response.clone())))
+    }
 
     #[derive(Debug)]
     struct ScriptedTransport {
@@ -919,6 +984,16 @@ mod tests {
 
     fn route(owner_epoch: u64) -> RootRoute {
         route_with_fences(3, owner_epoch)
+    }
+
+    fn discovered(route: RootRoute) -> nokv_protocol::DiscoveredRoute {
+        nokv_protocol::DiscoveredRoute::new(
+            route,
+            route.owner_epoch,
+            nokv_protocol::OwnerEndpoint::new("127.0.0.1:7751").unwrap(),
+            nokv_protocol::RouteState::Serving,
+        )
+        .unwrap()
     }
 
     fn resolved(owner_epoch: u64, port: u16) -> ResolvedRoute {
@@ -1235,7 +1310,7 @@ mod tests {
                 retryable: true,
                 conflict: Some(ConflictKind::RootPlacement),
                 current_generation: None,
-                route_hint: Some(route(8)),
+                route_hint: Some(Box::new(discovered(route(8)))),
             }),
         };
         let second = WorkspaceRpcResponse {
@@ -1290,7 +1365,7 @@ mod tests {
                 retryable: true,
                 conflict: Some(ConflictKind::RootPlacement),
                 current_generation: None,
-                route_hint: Some(route(8)),
+                route_hint: Some(Box::new(discovered(route(8)))),
             }),
         };
         let transport = ScriptedTransport::new(vec![response]);
@@ -1314,8 +1389,8 @@ mod tests {
                 "NotOwner refresh returned the unchanged caller-managed route and endpoint; \
                  configured \
                  placement_generation=3 owner_epoch=7, owner hint requires \
-                 placement_generation=3 owner_epoch=8; replace the route snapshot or use an \
-                 authoritative control-plane resolver"
+                 placement_generation=3 owner_epoch=8; replace the route snapshot or use \
+                 a seed route resolver"
                     .to_owned()
             )
         );
@@ -1339,7 +1414,7 @@ mod tests {
                 retryable: true,
                 conflict: Some(ConflictKind::RootPlacement),
                 current_generation: None,
-                route_hint: Some(hint),
+                route_hint: Some(Box::new(discovered(hint))),
             }),
         };
         let transport = ScriptedTransport::new(vec![response]);
@@ -1363,8 +1438,8 @@ mod tests {
                 "NotOwner refresh returned the unchanged caller-managed route and endpoint; \
                  configured \
                  placement_generation=1 owner_epoch=1, owner hint requires \
-                 placement_generation=2 owner_epoch=1; replace the route snapshot or use an \
-                 authoritative control-plane resolver"
+                 placement_generation=2 owner_epoch=1; replace the route snapshot or use \
+                 a seed route resolver"
                     .to_owned()
             )
         );
@@ -1385,7 +1460,7 @@ mod tests {
                 retryable: true,
                 conflict: Some(ConflictKind::RootPlacement),
                 current_generation: None,
-                route_hint: Some(route(8)),
+                route_hint: Some(Box::new(discovered(route(8)))),
             }),
         };
         let transport = ScriptedTransport::new(vec![response]);
@@ -1431,7 +1506,7 @@ mod tests {
                 retryable: true,
                 conflict: Some(ConflictKind::RootPlacement),
                 current_generation: None,
-                route_hint: Some(route(8)),
+                route_hint: Some(Box::new(discovered(route(8)))),
             }),
         };
         let second = WorkspaceRpcResponse {
@@ -1487,7 +1562,7 @@ mod tests {
                 retryable: true,
                 conflict: Some(ConflictKind::RootPlacement),
                 current_generation: None,
-                route_hint: Some(drifted),
+                route_hint: Some(Box::new(discovered(drifted))),
             }),
         };
         let second = WorkspaceRpcResponse {

@@ -7,7 +7,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::RootRoute;
+use crate::types::DiscoveredRoute;
 
 /// Failure to encode, decode, or validate one protocol frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +71,8 @@ pub enum ErrorCode {
     PreconditionFailed,
     RequestReplayMismatch,
     NotOwner,
+    RouteUnavailable,
+    RouteExpired,
     SnapshotExpired,
     SnapshotReaped,
     CommitRetiring,
@@ -104,7 +106,7 @@ pub struct RpcFailure {
     pub retryable: bool,
     pub conflict: Option<ConflictKind>,
     pub current_generation: Option<u64>,
-    pub route_hint: Option<RootRoute>,
+    pub route_hint: Option<Box<DiscoveredRoute>>,
 }
 
 impl RpcFailure {
@@ -124,7 +126,7 @@ impl RpcFailure {
         if self.message.contains('\0') {
             return Err(ProtocolError::invalid("failure.message", "contains NUL"));
         }
-        if let Some(route) = self.route_hint {
+        if let Some(route) = &self.route_hint {
             route.validate()?;
         }
         Ok(())

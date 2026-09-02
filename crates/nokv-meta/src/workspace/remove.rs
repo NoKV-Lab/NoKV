@@ -30,10 +30,7 @@ use super::publication_records::{
     ArtifactRevisionRecord, GcCandidateRecord, PathEntry, PublicationRecordCodecError,
     RevisionRefRecord, WorkspaceRecord,
 };
-use super::query_records::{
-    secondary_index_key, ChangeEventKind, ChangeEventRecord, QueryRecordError,
-    SecondaryIndexRecord, TypedProjection,
-};
+use super::query_records::{ChangeEventKind, ChangeEventRecord, QueryRecordError, TypedProjection};
 use super::restore::RESTORE_MANIFEST_PATH;
 
 const REMOVE_RESULT_VERSION: u8 = 1;
@@ -167,8 +164,10 @@ impl From<QueryRecordError> for RemovePathError {
 /// Delete one current path and release its strong artifact-revision reference.
 ///
 /// Path visibility, the path reference, the owner revision, a possible GC
-/// candidate, all secondary-index rows, the workspace revision, and the change
-/// event advance in one bounded metadata command.
+/// candidate, the workspace revision, and the change event advance in one
+/// bounded metadata command. Deleting PathCurrent makes the old index
+/// generation immediately stale and invisible; bounded asynchronous cleanup
+/// later reclaims its derived rows.
 pub fn remove_path(
     store: &MetaShard,
     request: RemovePathRequest,
@@ -338,29 +337,6 @@ pub fn remove_path(
         revision_payload,
         next_revision.encode()?,
     );
-
-    for (field, scalar) in projection.fields() {
-        let key = secondary_index_key(
-            request.context.root_id,
-            field,
-            scalar,
-            workspace.incarnation_id,
-            &request.path,
-        );
-        let value = SecondaryIndexRecord {
-            path_generation: path.generation,
-            compact_projection: projection.clone(),
-        }
-        .encode()?;
-        delete(
-            &mut predicates,
-            &mut mutations,
-            &mut history_projection,
-            MetadataFamily::SecondaryIndex,
-            key,
-            value,
-        );
-    }
 
     if next_reference_count == 0 {
         let key = gc_candidate_key(
@@ -582,9 +558,10 @@ mod tests {
 
     use super::*;
     use crate::workspace::{
-        create_visible_workspace, get_visible_path_at, get_visible_workspace_at, read_changes_at,
-        ChangePageRequest, QueryFieldId, QueryScalar, QueryScope, RootReadContext,
-        SecondaryIndexRecord,
+        create_visible_workspace, get_visible_path_at, get_visible_workspace_at,
+        path_index_locator_key, read_changes_at, secondary_index_key, ChangePageRequest,
+        PathIndexLocatorRecord, PathIndexLocatorState, QueryFieldId, QueryScalar, QueryScope,
+        RootReadContext, SecondaryIndexRecord,
     };
 
     fn root() -> RootId {
@@ -700,6 +677,8 @@ mod tests {
         .unwrap();
         let path_record = PathEntry {
             generation: Generation::new(7).unwrap(),
+            index_generation: nokv_types::PathIndexGenerationId::from_bytes([7; FIXED_ID_BYTES]),
+            path_digest: crate::workspace::query_records::path_index_digest(&path()),
             artifact_revision_id: revision(),
             body_digest_uri: format!("sha256:{}", "11".repeat(32)),
             manifest_digest_uri: format!("sha256:{}", "22".repeat(32)),
@@ -726,8 +705,8 @@ mod tests {
             last_zero_ref_version: None,
         };
         let index_value = SecondaryIndexRecord {
-            path_generation: path_record.generation,
-            compact_projection: projection.clone(),
+            path_digest: path_record.path_digest,
+            index_generation: path_record.index_generation,
         }
         .encode()
         .unwrap();
@@ -751,11 +730,33 @@ mod tests {
                 .encode()
                 .unwrap(),
             ),
+            (
+                MetadataFamily::PathIndexLocator,
+                path_index_locator_key(
+                    root(),
+                    incarnation(),
+                    path_record.path_digest,
+                    path_record.index_generation,
+                ),
+                PathIndexLocatorRecord {
+                    state: PathIndexLocatorState::Published,
+                    path: path(),
+                }
+                .encode()
+                .unwrap(),
+            ),
         ];
         for (field, scalar) in projection.fields() {
             records.push((
                 MetadataFamily::SecondaryIndex,
-                secondary_index_key(root(), field, scalar, incarnation(), &path()),
+                secondary_index_key(
+                    root(),
+                    field,
+                    scalar,
+                    incarnation(),
+                    path_record.path_digest,
+                    path_record.index_generation,
+                ),
                 index_value.clone(),
             ));
         }
@@ -886,11 +887,27 @@ mod tests {
                         placement(),
                         owner(),
                         MetadataFamily::SecondaryIndex,
-                        &secondary_index_key(root(), field, scalar, incarnation(), &path()),
+                        &secondary_index_key(
+                            root(),
+                            field,
+                            scalar,
+                            incarnation(),
+                            crate::workspace::path_index_digest(&path()),
+                            nokv_types::PathIndexGenerationId::from_bytes([7; FIXED_ID_BYTES]),
+                        ),
                         context.read_version,
                     )
                     .unwrap(),
-                None
+                Some(
+                    SecondaryIndexRecord {
+                        path_digest: crate::workspace::path_index_digest(&path()),
+                        index_generation: nokv_types::PathIndexGenerationId::from_bytes(
+                            [7; FIXED_ID_BYTES]
+                        ),
+                    }
+                    .encode()
+                    .unwrap()
+                )
             );
         }
 
@@ -925,7 +942,13 @@ mod tests {
             .unwrap()
             .unwrap();
         store
-            .replace_recovery_header_for_test(dedupe.recovery_lsn, None)
+            .replace_recovery_header_for_test(
+                dedupe
+                    .recovery_receipt
+                    .expect("local dedupe must carry a recovery receipt")
+                    .recovery_lsn,
+                None,
+            )
             .unwrap();
 
         assert!(matches!(

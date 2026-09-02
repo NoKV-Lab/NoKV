@@ -12,36 +12,60 @@ homepage.workspace = true
 
 [features]
 metadata-read-stats = ["nokv-meta/metadata-read-stats", "nokv-meta-holt/read-stats"]
-restore-crash-test-support = [
-    "nokv-server/restore-crash-test-support",
-    "dep:libc",
-    "dep:nokv-client",
-    "dep:nokv-object",
-    "dep:sha2",
+fdb-serve-qualification = [
+    "dep:nokv-control",
+    "dep:nokv-control-fdb",
+    "dep:nokv-fdb",
+    "dep:nokv-meta-fdb",
+]
+fdb-lifecycle-qualification = [
+    "dep:nokv-control",
+    "dep:nokv-control-fdb",
+    "dep:nokv-fdb",
+    "dep:nokv-meta-fdb",
+]
+fdb-limits-qualification = [
+    "dep:nokv-control",
+    "dep:nokv-control-fdb",
+    "dep:nokv-fdb",
+    "dep:nokv-meta-fdb",
+]
+fdb-performance-qualification = [
+    "dep:nokv-control",
+    "dep:nokv-control-fdb",
+    "dep:nokv-fdb",
+    "dep:nokv-meta-fdb",
+]
+fdb-unknown-outcome-qualification = [
+    "dep:nokv-control",
+    "dep:nokv-control-fdb",
+    "dep:nokv-fdb",
+    "dep:nokv-meta-fdb",
 ]
 
 [dependencies]
-libc = { version = "0.2", optional = true }
-nokv-client = { workspace = true, features = ["etcd"], optional = true }
-nokv-control = { workspace = true, features = ["etcd"] }
+nokv-client.workspace = true
+nokv-control = { workspace = true, optional = true }
+nokv-control-fdb = { workspace = true, optional = true, features = ["fdb"] }
+nokv-fdb = { workspace = true, optional = true, features = ["fdb"] }
 nokv-meta.workspace = true
+nokv-meta-fdb = { workspace = true, optional = true, features = ["fdb"] }
 nokv-meta-holt = { workspace = true, features = ["test-support"] }
 nokv-meta-store.workspace = true
-nokv-object = { workspace = true, optional = true }
 nokv-protocol.workspace = true
 nokv-server.workspace = true
 nokv-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = { workspace = true, optional = true }
+sha2.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [[bin]]
 name = "nokv-workspace-bench"
 path = "src/bin/nokv-workspace-bench.rs"
-
-[[bin]]
-name = "nokv-local-wal-recovery-fault"
-path = "src/bin/nokv-local-wal-recovery-fault.rs"
 
 [[bin]]
 name = "nokv-bench"
@@ -49,6 +73,30 @@ path = "src/bin/nokv-bench.rs"
 required-features = ["metadata-read-stats"]
 
 [[bin]]
-name = "nokv-restore-crash-owner"
-path = "src/bin/nokv-restore-crash-owner.rs"
-required-features = ["restore-crash-test-support"]
+name = "nokv-fdb-seed-qualification"
+path = "src/bin/nokv-fdb-seed-qualification.rs"
+
+[[bin]]
+name = "nokv-fdb-serve-qualification"
+path = "src/bin/nokv-fdb-serve-qualification.rs"
+required-features = ["fdb-serve-qualification"]
+
+[[bin]]
+name = "nokv-fdb-lifecycle-qualification"
+path = "src/bin/nokv-fdb-lifecycle-qualification.rs"
+required-features = ["fdb-lifecycle-qualification"]
+
+[[bin]]
+name = "nokv-fdb-limits-qualification"
+path = "src/bin/nokv-fdb-limits-qualification.rs"
+required-features = ["fdb-limits-qualification"]
+
+[[bin]]
+name = "nokv-fdb-performance-qualification"
+path = "src/bin/nokv-fdb-performance-qualification.rs"
+required-features = ["fdb-performance-qualification"]
+
+[[bin]]
+name = "nokv-fdb-unknown-outcome-qualification"
+path = "src/bin/nokv-fdb-unknown-outcome-qualification.rs"
+required-features = ["fdb-unknown-outcome-qualification"]

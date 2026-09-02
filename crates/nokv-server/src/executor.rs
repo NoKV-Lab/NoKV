@@ -109,6 +109,20 @@ struct RestorePreparationKey {
     destination_workspace_incarnation_id: types::WorkspaceIncarnationId,
 }
 
+enum ConcurrentRestoreStep {
+    Advanced {
+        operation: Box<meta::RestoreOperationRecord>,
+        read_version: u64,
+    },
+    Completed(Box<ExecutedRequest>),
+}
+
+struct ConcurrentRestoreReadback {
+    request_domain: &'static [u8],
+    sequence: u64,
+    step: &'static str,
+}
+
 /// Serializes only competing drivers for one destination incarnation.
 ///
 /// This owner-local gate is a scheduling optimization, not restore authority:
@@ -1139,52 +1153,87 @@ impl MetadataWorkspaceRequestExecutor {
             return restored_response(&operation, None, true);
         }
         if operation.phase == types::RestorePhase::SourceSealed {
-            let initialized = meta::apply_restore_initialization(
+            match meta::apply_restore_initialization(
                 &self.meta,
                 self.write_context(
                     rpc.route,
                     derived_request_id(rpc.request_id, b"restore-apply-initialization", 0),
                 )?,
                 meta::RestoreOperationRequest { operation_id },
-            )
-            .map_err(restore_failure)?;
-            if let Some(failure) = restore_terminal_failure(&initialized.operation) {
-                return Err(failure);
-            }
-            if initialized.operation.phase != types::RestorePhase::DestinationBuilding
-                || !restore_step_advances(
+            ) {
+                Ok(initialized) => {
+                    if let Some(failure) = restore_terminal_failure(&initialized.operation) {
+                        return Err(failure);
+                    }
+                    if initialized.operation.phase != types::RestorePhase::DestinationBuilding
+                        || !restore_step_advances(
+                            &operation,
+                            &initialized.operation,
+                            initialized.replayed,
+                            "restore destination initialization",
+                        )?
+                    {
+                        return Err(internal(
+                            "restore initialization did not reach DestinationBuilding",
+                        ));
+                    }
+                    #[cfg(feature = "restore-crash-test-support")]
+                    {
+                        let initialization_read_version = types::ReadVersion::new(
+                            initialized.commit_version.get(),
+                        )
+                        .map_err(|error| {
+                            internal(format!(
+                                "restore initialization commit version is not readable: {error}"
+                            ))
+                        })?;
+                        let mut readback_context = self.write_context(
+                            rpc.route,
+                            derived_request_id(
+                                rpc.request_id,
+                                b"restore-initialization-readback",
+                                0,
+                            ),
+                        )?;
+                        readback_context.read_version = initialization_read_version;
+                        let durable = meta::get_restore(&self.meta, readback_context, operation_id)
+                            .map_err(restore_failure)?;
+                        operation = authoritative_restore_initialization_readback(
+                            &initialized.operation,
+                            durable,
+                        )?;
+                        durable_read_version = initialized.commit_version.get();
+                    }
+                    #[cfg(not(feature = "restore-crash-test-support"))]
+                    {
+                        operation = initialized.operation;
+                    }
+                }
+                Err(error) => match self.reconcile_concurrent_restore_step(
+                    rpc,
+                    operation_id,
                     &operation,
-                    &initialized.operation,
-                    initialized.replayed,
-                    "restore destination initialization",
-                )?
-            {
-                return Err(internal(
-                    "restore initialization did not reach DestinationBuilding",
-                ));
-            }
-            #[cfg(feature = "restore-crash-test-support")]
-            {
-                let initialization_read_version =
-                    types::ReadVersion::new(initialized.commit_version.get()).map_err(|error| {
-                        internal(format!(
-                            "restore initialization commit version is not readable: {error}"
-                        ))
-                    })?;
-                let mut readback_context = self.write_context(
-                    rpc.route,
-                    derived_request_id(rpc.request_id, b"restore-initialization-readback", 0),
-                )?;
-                readback_context.read_version = initialization_read_version;
-                let durable = meta::get_restore(&self.meta, readback_context, operation_id)
-                    .map_err(restore_failure)?;
-                operation =
-                    authoritative_restore_initialization_readback(&initialized.operation, durable)?;
-                durable_read_version = initialized.commit_version.get();
-            }
-            #[cfg(not(feature = "restore-crash-test-support"))]
-            {
-                operation = initialized.operation;
+                    error,
+                    ConcurrentRestoreReadback {
+                        request_domain: b"restore-initialization-concurrent-readback",
+                        sequence: 0,
+                        step: "restore destination initialization",
+                    },
+                )? {
+                    ConcurrentRestoreStep::Advanced {
+                        operation: durable,
+                        read_version,
+                    } => {
+                        operation = *durable;
+                        #[cfg(feature = "restore-crash-test-support")]
+                        {
+                            durable_read_version = read_version;
+                        }
+                        #[cfg(not(feature = "restore-crash-test-support"))]
+                        let _ = read_version;
+                    }
+                    ConcurrentRestoreStep::Completed(response) => return Ok(*response),
+                },
             }
         }
 
@@ -1206,7 +1255,7 @@ impl MetadataWorkspaceRequestExecutor {
         let mut batch = 0_u64;
         while operation.phase == types::RestorePhase::DestinationBuilding {
             let before = restore_commit_member_progress(&operation)?;
-            let built = meta::build_restore_commit_members(
+            let built = match meta::build_restore_commit_members(
                 &self.meta,
                 self.write_context(
                     rpc.route,
@@ -1216,8 +1265,31 @@ impl MetadataWorkspaceRequestExecutor {
                     operation_id,
                     limit: meta::MAX_RESTORE_BATCH_MEMBERS,
                 },
-            )
-            .map_err(restore_failure)?;
+            ) {
+                Ok(built) => built,
+                Err(error) => match self.reconcile_concurrent_restore_step(
+                    rpc,
+                    operation_id,
+                    &operation,
+                    error,
+                    ConcurrentRestoreReadback {
+                        request_domain: b"restore-build-concurrent-readback",
+                        sequence: batch,
+                        step: "restore destination commit-member builder",
+                    },
+                )? {
+                    ConcurrentRestoreStep::Advanced {
+                        operation: durable, ..
+                    } => {
+                        operation = *durable;
+                        batch = batch.checked_add(1).ok_or_else(|| {
+                            internal("restore commit-member batch counter overflow")
+                        })?;
+                        continue;
+                    }
+                    ConcurrentRestoreStep::Completed(response) => return Ok(*response),
+                },
+            };
             if let Some(failure) = restore_terminal_failure(&built.command.operation) {
                 return Err(failure);
             }
@@ -1260,7 +1332,7 @@ impl MetadataWorkspaceRequestExecutor {
         batch = 0;
         while operation.phase == types::RestorePhase::DestinationSealing {
             let before = restore_revision_seal_progress(&operation)?;
-            let sealed = meta::seal_restore_commit_revisions(
+            let sealed = match meta::seal_restore_commit_revisions(
                 &self.meta,
                 self.write_context(
                     rpc.route,
@@ -1270,8 +1342,31 @@ impl MetadataWorkspaceRequestExecutor {
                     operation_id,
                     limit: meta::MAX_RESTORE_BATCH_MEMBERS,
                 },
-            )
-            .map_err(restore_failure)?;
+            ) {
+                Ok(sealed) => sealed,
+                Err(error) => match self.reconcile_concurrent_restore_step(
+                    rpc,
+                    operation_id,
+                    &operation,
+                    error,
+                    ConcurrentRestoreReadback {
+                        request_domain: b"restore-seal-concurrent-readback",
+                        sequence: batch,
+                        step: "restore destination revision sealer",
+                    },
+                )? {
+                    ConcurrentRestoreStep::Advanced {
+                        operation: durable, ..
+                    } => {
+                        operation = *durable;
+                        batch = batch.checked_add(1).ok_or_else(|| {
+                            internal("restore revision-seal batch counter overflow")
+                        })?;
+                        continue;
+                    }
+                    ConcurrentRestoreStep::Completed(response) => return Ok(*response),
+                },
+            };
             if let Some(failure) = restore_terminal_failure(&sealed.command.operation) {
                 return Err(failure);
             }
@@ -1360,6 +1455,51 @@ impl MetadataWorkspaceRequestExecutor {
             return Ok(None);
         }
         restored_response(&operation, None, true).map(Some)
+    }
+
+    fn reconcile_concurrent_restore_step(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        operation_id: types::OperationId,
+        current: &meta::RestoreOperationRecord,
+        original_error: meta::RestoreError,
+        readback: ConcurrentRestoreReadback,
+    ) -> Result<ConcurrentRestoreStep, protocol::RpcFailure> {
+        // The failed step is not success evidence. Only a fresh durable row
+        // from the same immutable lineage may supersede it, and only when that
+        // row is a strictly monotonic successor or the exact terminal result.
+        let context = self.write_context(
+            rpc.route,
+            derived_request_id(rpc.request_id, readback.request_domain, readback.sequence),
+        )?;
+        let read_version = context.read_version.get();
+        let Some(durable) =
+            meta::get_restore(&self.meta, context, operation_id).map_err(restore_failure)?
+        else {
+            return Err(restore_failure(original_error));
+        };
+        restore_replay_lineage_matches(current, &durable)?;
+        if let Some(failure) = restore_terminal_failure(&durable) {
+            return Err(failure);
+        }
+        if durable.phase == types::RestorePhase::Complete {
+            return restored_response(&durable, None, true)
+                .map(Box::new)
+                .map(ConcurrentRestoreStep::Completed);
+        }
+        if durable == *current {
+            return Err(restore_failure(original_error));
+        }
+        if !restore_step_advances(current, &durable, false, readback.step)? {
+            return Err(internal(format!(
+                "{} concurrent readback did not advance",
+                readback.step
+            )));
+        }
+        Ok(ConcurrentRestoreStep::Advanced {
+            operation: Box::new(durable),
+            read_version,
+        })
     }
 
     fn begin_generic_index_registration(
@@ -2947,12 +3087,7 @@ impl MetadataWorkspaceRequestExecutor {
         &self,
         request: &protocol::WorkspaceRpcRequest,
     ) -> Result<bool, protocol::RpcFailure> {
-        let encoded = protocol::encode_request(request)
-            .map_err(|error| invalid_argument(error.to_string()))?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"nokv.server.rpc-request.v1\0");
-        hasher.update(&encoded);
-        let request_digest: [u8; types::SHA256_BYTES] = hasher.finalize().into();
+        let request_digest = mutation_claim_digest(request)?;
         let request_id: types::RequestId = request.request_id.into();
         if let Some(existing) = self.lookup_request(request.route, request_id)? {
             if existing.deterministic_result == request_digest {
@@ -3236,6 +3371,22 @@ impl MetadataWorkspaceRequestExecutor {
         }
         run(self.write_context(rpc.route, request_id)?).map_err(commit_failure)
     }
+}
+
+fn mutation_claim_digest(
+    request: &protocol::WorkspaceRpcRequest,
+) -> Result<[u8; types::SHA256_BYTES], protocol::RpcFailure> {
+    let mut stable = request.clone();
+    // The successor owner must be able to validate the same logical RPC after
+    // seed discovery refreshes only the physical owner epoch. Every other
+    // route field and every operation input remain exact-bound.
+    stable.route.owner_epoch = 1;
+    let encoded = protocol::encode_request(&protocol::RpcRequest::Workspace(Box::new(stable)))
+        .map_err(|error| invalid_argument(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.server.rpc-mutation-claim.v2\0");
+    hasher.update(&encoded);
+    Ok(hasher.finalize().into())
 }
 
 impl WorkspaceRequestExecutor for MetadataWorkspaceRequestExecutor {
@@ -5634,6 +5785,10 @@ fn meta_failure(error: meta::MetaError) -> protocol::RpcFailure {
         error @ meta::MetaError::Store {
             source: nokv_meta_store::StoreError::OutcomeUnknown { .. },
             ..
+        }
+        | error @ meta::MetaError::Store {
+            source: nokv_meta_store::StoreError::Fenced { .. },
+            ..
         } => failure(
             protocol::ErrorCode::NotOwner,
             error.to_string(),
@@ -6612,6 +6767,8 @@ mod tests {
             index_value.clone(),
         )]))
         .unwrap();
+        let path_digest = meta::path_index_digest(&path);
+        let index_generation = types::PathIndexGenerationId::from_bytes([1; types::FIXED_ID_BYTES]);
         let revision_record = meta::ArtifactRevisionRecord {
             logical_size: 0,
             body_digest_uri: "sha256:body".to_owned(),
@@ -6628,6 +6785,8 @@ mod tests {
         };
         let path_record = meta::PathEntry {
             generation: types::Generation::new(1).unwrap(),
+            index_generation,
+            path_digest,
             artifact_revision_id: revision,
             body_digest_uri: "sha256:body".to_owned(),
             manifest_digest_uri: "sha256:manifest".to_owned(),
@@ -6643,12 +6802,19 @@ mod tests {
         let path_key = meta::path_current_key(root(), workbench_incarnation, &path);
         let reference_key =
             meta::path_revision_ref_key(root(), workbench_incarnation, &path, revision);
+        let locator_key = meta::path_index_locator_key(
+            root(),
+            workbench_incarnation,
+            path_digest,
+            index_generation,
+        );
         let index_key = meta::secondary_index_key(
             root(),
             &index_field,
             &index_value,
             workbench_incarnation,
-            &path,
+            path_digest,
+            index_generation,
         );
         let command = meta::MetadataCommand {
             schema_id: meta::SCHEMA_ID.to_owned(),
@@ -6680,6 +6846,11 @@ mod tests {
                     expected: None,
                 },
                 meta::CommandPredicate::Value {
+                    family: meta::MetadataFamily::PathIndexLocator,
+                    key: locator_key.clone(),
+                    expected: None,
+                },
+                meta::CommandPredicate::Value {
                     family: meta::MetadataFamily::SecondaryIndex,
                     key: index_key.clone(),
                     expected: None,
@@ -6706,11 +6877,21 @@ mod tests {
                     .unwrap(),
                 },
                 meta::CommandMutation::Put {
+                    family: meta::MetadataFamily::PathIndexLocator,
+                    key: locator_key,
+                    value: meta::PathIndexLocatorRecord {
+                        state: meta::PathIndexLocatorState::Published,
+                        path,
+                    }
+                    .encode()
+                    .unwrap(),
+                },
+                meta::CommandMutation::Put {
                     family: meta::MetadataFamily::SecondaryIndex,
                     key: index_key,
                     value: meta::SecondaryIndexRecord {
-                        path_generation: types::Generation::new(1).unwrap(),
-                        compact_projection: projection,
+                        path_digest,
+                        index_generation,
                     }
                     .encode()
                     .unwrap(),
@@ -6766,11 +6947,23 @@ mod tests {
         for index in 1..total_paths {
             let path = types::NormalizedRelativePath::new(format!("outputs/shared-{index:03}.bin"))
                 .unwrap();
+            let path_digest = meta::path_index_digest(&path);
+            let index_generation = types::PathIndexGenerationId::from_bytes(
+                u128::try_from(index + 1).unwrap().to_be_bytes(),
+            );
             let path_key = meta::path_current_key(root(), workbench_incarnation, &path);
+            let locator_key = meta::path_index_locator_key(
+                root(),
+                workbench_incarnation,
+                path_digest,
+                index_generation,
+            );
             let reference_key =
                 meta::path_revision_ref_key(root(), workbench_incarnation, &path, revision);
             let path_record = meta::PathEntry {
                 generation: types::Generation::new(1).unwrap(),
+                index_generation,
+                path_digest,
                 artifact_revision_id: revision,
                 body_digest_uri: "sha256:body".to_owned(),
                 manifest_digest_uri: "sha256:manifest".to_owned(),
@@ -6789,6 +6982,11 @@ mod tests {
                     expected: None,
                 },
                 meta::CommandPredicate::Value {
+                    family: meta::MetadataFamily::PathIndexLocator,
+                    key: locator_key.clone(),
+                    expected: None,
+                },
+                meta::CommandPredicate::Value {
                     family: meta::MetadataFamily::RevisionRef,
                     key: reference_key.clone(),
                     expected: None,
@@ -6799,6 +6997,16 @@ mod tests {
                     family: meta::MetadataFamily::PathCurrent,
                     key: path_key,
                     value: path_record.encode().unwrap(),
+                },
+                meta::CommandMutation::Put {
+                    family: meta::MetadataFamily::PathIndexLocator,
+                    key: locator_key,
+                    value: meta::PathIndexLocatorRecord {
+                        state: meta::PathIndexLocatorState::Published,
+                        path,
+                    }
+                    .encode()
+                    .unwrap(),
                 },
                 meta::CommandMutation::Put {
                     family: meta::MetadataFamily::RevisionRef,
@@ -6897,17 +7105,28 @@ mod tests {
         workbench_incarnation: types::WorkspaceIncarnationId,
         paths: &[&str],
     ) {
-        let mut predicates = Vec::with_capacity(paths.len());
-        let mut mutations = Vec::with_capacity(paths.len());
+        let mut predicates = Vec::with_capacity(paths.len() * 2);
+        let mut mutations = Vec::with_capacity(paths.len() * 2);
         for (index, raw_path) in paths.iter().enumerate() {
             let path = types::NormalizedRelativePath::new(*raw_path).unwrap();
             let key = meta::path_current_key(root(), workbench_incarnation, &path);
             let fill = u8::try_from(index + 1).unwrap();
+            let path_digest = meta::path_index_digest(&path);
+            let index_generation =
+                types::PathIndexGenerationId::from_bytes([fill; types::FIXED_ID_BYTES]);
+            let locator_key = meta::path_index_locator_key(
+                root(),
+                workbench_incarnation,
+                path_digest,
+                index_generation,
+            );
             let body_hex = format!("{fill:02x}").repeat(32);
             let manifest_fill = fill.saturating_add(0x40);
             let manifest_hex = format!("{manifest_fill:02x}").repeat(32);
             let entry = meta::PathEntry {
                 generation: types::Generation::new(u64::from(fill)).unwrap(),
+                index_generation,
+                path_digest,
                 artifact_revision_id: types::ArtifactRevisionId::from_bytes(
                     [fill; types::FIXED_ID_BYTES],
                 ),
@@ -6926,10 +7145,25 @@ mod tests {
                 key: key.clone(),
                 expected: None,
             });
+            predicates.push(meta::CommandPredicate::Value {
+                family: meta::MetadataFamily::PathIndexLocator,
+                key: locator_key.clone(),
+                expected: None,
+            });
             mutations.push(meta::CommandMutation::Put {
                 family: meta::MetadataFamily::PathCurrent,
                 key,
                 value: entry.encode().unwrap(),
+            });
+            mutations.push(meta::CommandMutation::Put {
+                family: meta::MetadataFamily::PathIndexLocator,
+                key: locator_key,
+                value: meta::PathIndexLocatorRecord {
+                    state: meta::PathIndexLocatorState::Published,
+                    path,
+                }
+                .encode()
+                .unwrap(),
             });
         }
         store
@@ -6965,6 +7199,8 @@ mod tests {
     ) -> protocol::WorkspacePath {
         let revision = types::ArtifactRevisionId::from_bytes([8; types::FIXED_ID_BYTES]);
         let path = types::NormalizedRelativePath::new("outputs/ranged.bin").unwrap();
+        let path_digest = meta::path_index_digest(&path);
+        let index_generation = types::PathIndexGenerationId::from_bytes([8; types::FIXED_ID_BYTES]);
         let revision_record = meta::ArtifactRevisionRecord {
             logical_size: row_count,
             body_digest_uri: "sha256:ranged-body".to_owned(),
@@ -6981,6 +7217,8 @@ mod tests {
         };
         let path_record = meta::PathEntry {
             generation: types::Generation::new(1).unwrap(),
+            index_generation,
+            path_digest,
             artifact_revision_id: revision,
             body_digest_uri: "sha256:ranged-body".to_owned(),
             manifest_digest_uri: "sha256:ranged-manifest".to_owned(),
@@ -6994,6 +7232,12 @@ mod tests {
         };
         let revision_key = meta::artifact_revision_key(root(), revision);
         let path_key = meta::path_current_key(root(), workbench_incarnation, &path);
+        let locator_key = meta::path_index_locator_key(
+            root(),
+            workbench_incarnation,
+            path_digest,
+            index_generation,
+        );
         store
             .execute(
                 &meta::MetadataCommand {
@@ -7020,6 +7264,11 @@ mod tests {
                             key: path_key.clone(),
                             expected: None,
                         },
+                        meta::CommandPredicate::Value {
+                            family: meta::MetadataFamily::PathIndexLocator,
+                            key: locator_key.clone(),
+                            expected: None,
+                        },
                     ],
                     mutations: vec![
                         meta::CommandMutation::Put {
@@ -7031,6 +7280,16 @@ mod tests {
                             family: meta::MetadataFamily::PathCurrent,
                             key: path_key,
                             value: path_record.encode().unwrap(),
+                        },
+                        meta::CommandMutation::Put {
+                            family: meta::MetadataFamily::PathIndexLocator,
+                            key: locator_key,
+                            value: meta::PathIndexLocatorRecord {
+                                state: meta::PathIndexLocatorState::Published,
+                                path: path.clone(),
+                            }
+                            .encode()
+                            .unwrap(),
                         },
                     ],
                     history_projection: Vec::new(),
@@ -8571,6 +8830,27 @@ mod tests {
     }
 
     #[test]
+    fn create_replays_exact_request_through_successor_owner() {
+        let (store, executor) = ready_executor();
+        let request = create_request(13, "owner-replay", 14, 1);
+        let created = executor.execute(&request).unwrap();
+        assert!(!created.replayed);
+
+        store.advance_owner_epoch(Some(owner(1)), owner(2)).unwrap();
+        let mut successor_replay = request.clone();
+        successor_replay.route = route(2);
+        let replayed = executor.execute(&successor_replay).unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.commit_version, created.commit_version);
+        assert_eq!(replayed.result, created.result);
+
+        let reused = create_request(13, "different-input", 15, 2);
+        let failure = executor.execute(&reused).unwrap_err();
+        assert_eq!(failure.code, protocol::ErrorCode::RequestReplayMismatch);
+        assert!(!failure.retryable);
+    }
+
+    #[test]
     fn create_incarnation_conflict_keeps_rpc_identity_and_message_provenance() {
         let (_store, executor) = ready_executor();
         executor
@@ -9924,15 +10204,17 @@ mod tests {
             .fields
             .iter()
             .all(|field| !field.generic_custom && field.scalar_types.is_empty()));
-        protocol::encode_response(&protocol::WorkspaceRpcResponse {
-            route: route(1),
-            request_id: protocol::RequestIdentity([0x5b; types::FIXED_ID_BYTES]),
-            commit_version: None,
-            replayed: false,
-            outcome: protocol::WorkspaceRpcOutcome::Success(Box::new(
-                protocol::WorkspaceResult::Catalog(full_page),
-            )),
-        })
+        protocol::encode_response(&protocol::RpcResponse::Workspace(Box::new(
+            protocol::WorkspaceRpcResponse {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x5b; types::FIXED_ID_BYTES]),
+                commit_version: None,
+                replayed: false,
+                outcome: protocol::WorkspaceRpcOutcome::Success(Box::new(
+                    protocol::WorkspaceResult::Catalog(full_page),
+                )),
+            },
+        )))
         .expect("ArtifactV1 catalog with custom index fields must encode on the wire");
 
         executor
@@ -10119,6 +10401,19 @@ mod tests {
         });
         assert_eq!(known_not_applied.code, protocol::ErrorCode::Internal);
         assert!(known_not_applied.retryable);
+
+        let fenced = meta_failure(meta::MetaError::Store {
+            operation: "commit",
+            source: nokv_meta_store::StoreError::Fenced {
+                expected_owner_epoch: 7,
+                expected_session_generation: 9,
+            },
+        });
+        assert!(!internal_metadata_conflict(&fenced));
+        assert_eq!(fenced.code, protocol::ErrorCode::NotOwner);
+        assert_eq!(fenced.conflict, Some(protocol::ConflictKind::RootPlacement));
+        assert!(fenced.retryable);
+        assert!(fenced.message.contains("7/9"));
 
         let limit = meta_failure(meta::MetaError::Store {
             operation: "commit",

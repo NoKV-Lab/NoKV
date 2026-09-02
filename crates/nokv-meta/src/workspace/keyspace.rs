@@ -62,10 +62,11 @@ pub enum MetadataFamily {
     GenericIndexCurrent = 0x19,
     GenericIndexGeneration = 0x1a,
     CommitGenericIndexMember = 0x1b,
+    PathIndexLocator = 0x1c,
 }
 
 impl MetadataFamily {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::WorkspaceCurrent,
         Self::PathCurrent,
         Self::ArtifactRevision,
@@ -89,6 +90,7 @@ impl MetadataFamily {
         Self::GenericIndexCurrent,
         Self::GenericIndexGeneration,
         Self::CommitGenericIndexMember,
+        Self::PathIndexLocator,
     ];
 
     /// Storage-neutral keyspace used by transaction-store requests.
@@ -127,6 +129,7 @@ impl MetadataFamily {
             0x19 => Some(Self::GenericIndexCurrent),
             0x1a => Some(Self::GenericIndexGeneration),
             0x1b => Some(Self::CommitGenericIndexMember),
+            0x1c => Some(Self::PathIndexLocator),
             _ => None,
         }
     }
@@ -157,11 +160,12 @@ impl MetadataFamily {
             Self::GenericIndexCurrent => "generic_index_current",
             Self::GenericIndexGeneration => "generic_index_generation",
             Self::CommitGenericIndexMember => "commit_generic_index_member",
+            Self::PathIndexLocator => "path_index_locator",
         }
     }
 }
 
-const KEYSPACES: [KeyspaceDef; 29] = [
+const KEYSPACES: [KeyspaceDef; 30] = [
     SYSTEM,
     ROOT_FENCE,
     COMMAND_DEDUPE,
@@ -191,6 +195,7 @@ const KEYSPACES: [KeyspaceDef; 29] = [
     KeyspaceDef::new(0x0219, "generic_index_current"),
     KeyspaceDef::new(0x021a, "generic_index_generation"),
     KeyspaceDef::new(0x021b, "commit_generic_index_member"),
+    KeyspaceDef::new(0x021c, "path_index_locator"),
 ];
 
 /// Exact logical keyspace catalog for the current workspace schema.
@@ -206,7 +211,7 @@ mod tests {
 
     #[test]
     fn catalog_has_unique_ids_and_names() {
-        assert_eq!(keyspaces().len(), 29);
+        assert_eq!(keyspaces().len(), 30);
         let ids = keyspaces()
             .iter()
             .map(|definition| definition.id)
@@ -257,6 +262,7 @@ mod tests {
                 (0x0219, "generic_index_current"),
                 (0x021a, "generic_index_generation"),
                 (0x021b, "commit_generic_index_member"),
+                (0x021c, "path_index_locator"),
             ]
         );
     }

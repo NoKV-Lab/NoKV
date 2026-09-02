@@ -3,21 +3,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Custom CLI, MCP adapter, and shard-owner process for NoKV Agent workspaces.
+// Custom CLI, MCP adapter, and shard-owner process for NoKV Agent workspaces.
 
 mod backend;
 mod build_info;
 mod cli;
 mod connection;
 mod object_store;
-mod provision;
 mod transfer;
 mod workbench_mcp;
 
 use std::io::{self, BufReader};
 use std::path::Path;
 use std::process::ExitCode;
-#[cfg(feature = "etcd")]
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD;
@@ -32,13 +30,11 @@ use serde_json::{json, Value};
 
 use backend::CliWorkbenchBackend;
 use cli::{Command, Invocation, McpProfile, WorkspacePathCommand};
-#[cfg(feature = "etcd")]
 use object_store::CliObjectStore;
 
 type CliHandler = SdkWorkbenchToolHandler<CliWorkbenchBackend>;
 type CliGenericAgentHandler = SdkGenericAgentToolHandler<CliWorkbenchBackend>;
 
-#[cfg(feature = "etcd")]
 const WORKBENCH_REQUIRED_RPC_CAPABILITIES: [nokv_protocol::WorkspaceCapability; 8] = [
     nokv_protocol::WorkspaceCapability::ArtifactPublishV1,
     nokv_protocol::WorkspaceCapability::ArtifactRangeReadV1,
@@ -77,16 +73,8 @@ fn run() -> Result<(), String> {
         }
         Command::Schema => print_schema(),
         Command::Version { json } => print_version(*json),
-        Command::Provision {
-            logical_shard_id,
-            adopt_legacy_object_namespace,
-            adopt_legacy_agent_binding,
-        } => run_provision(
-            &invocation,
-            logical_shard_id,
-            *adopt_legacy_object_namespace,
-            *adopt_legacy_agent_binding,
-        ),
+        Command::Format => run_format(&invocation),
+        Command::Provision => run_provision(&invocation),
         Command::Serve => run_server(&invocation),
         Command::Workbench { tool, arguments } => {
             let handler = build_handler(&invocation)?;
@@ -149,100 +137,7 @@ fn run() -> Result<(), String> {
     }
 }
 
-#[derive(Debug)]
-struct ConfiguredAgentAdmission<'a> {
-    route: &'a cli::EtcdRoutingConfig,
-    root_id: nokv_control::RootId,
-    agent_id: nokv_types::AgentId,
-}
-
-fn configured_agent_admission(
-    invocation: &Invocation,
-) -> Result<ConfiguredAgentAdmission<'_>, String> {
-    let cli::RoutingConfig::Etcd(route) = &invocation.client.routing else {
-        return Err(
-            "Agent-facing commands require durable etcd control routing; static routes cannot prove the RootId-to-AgentId binding"
-                .to_owned(),
-        );
-    };
-    let root_id = nokv_control::RootId::from(
-        connection::configured_root_id(&invocation.client).map_err(|error| error.to_string())?,
-    );
-    let agent_id = connection::parse_agent_id(
-        invocation
-            .agent_id
-            .as_deref()
-            .ok_or_else(|| "--agent-id is required for Agent-facing commands".to_owned())?,
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(ConfiguredAgentAdmission {
-        route,
-        root_id,
-        agent_id,
-    })
-}
-
-fn load_root_agent_binding(
-    control: &dyn nokv_control::ControlStore,
-    root_id: nokv_control::RootId,
-) -> Result<nokv_control::RootAgentBinding, String> {
-    let binding = control
-        .get_root_agent_binding(&root_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| {
-            format!(
-                "root {root_id:?} has no durable Agent binding; run provision with its stable --agent-id, adding --adopt-legacy-agent-binding only for a verified legacy root"
-            )
-        })?;
-    if binding.root_id != root_id {
-        return Err(format!(
-            "root {root_id:?} Agent binding key/value identity mismatch"
-        ));
-    }
-    Ok(binding)
-}
-
-fn after_agent_root_admission<T>(
-    control: &dyn nokv_control::ControlStore,
-    root_id: nokv_control::RootId,
-    agent_id: nokv_types::AgentId,
-    operation: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
-    let binding = load_root_agent_binding(control, root_id)?;
-    if binding.agent_id != agent_id {
-        return Err(nokv_control::ControlError::RootAgentAlreadyBound { root_id }.to_string());
-    }
-    operation()
-}
-
 fn build_backend(invocation: &Invocation) -> Result<CliWorkbenchBackend, String> {
-    let admission = configured_agent_admission(invocation)?;
-    #[cfg(feature = "etcd")]
-    {
-        let control = connect_control(admission.route)?;
-        after_agent_root_admission(
-            control.as_ref(),
-            admission.root_id,
-            admission.agent_id,
-            || build_backend_after_agent_admission(invocation),
-        )
-    }
-    #[cfg(not(feature = "etcd"))]
-    {
-        let ConfiguredAgentAdmission {
-            route,
-            root_id,
-            agent_id,
-        } = admission;
-        let _ = (route, root_id, agent_id);
-        Err("Agent-facing commands require the nokv etcd feature".to_owned())
-    }
-}
-
-#[cfg(feature = "etcd")]
-fn build_backend_after_agent_admission(
-    invocation: &Invocation,
-) -> Result<CliWorkbenchBackend, String> {
     let client = connection::connect(&invocation.client).map_err(|error| error.to_string())?;
     let preflight = client
         .preflight(WORKBENCH_REQUIRED_RPC_CAPABILITIES)
@@ -289,34 +184,11 @@ fn build_generic_agent_handler(invocation: &Invocation) -> Result<CliGenericAgen
 fn build_workspace_path_client(
     invocation: &Invocation,
 ) -> Result<connection::CliWorkspaceClient, String> {
-    let admission = configured_agent_admission(invocation)?;
-    #[cfg(feature = "etcd")]
-    {
-        let control = connect_control(admission.route)?;
-        after_agent_root_admission(
-            control.as_ref(),
-            admission.root_id,
-            admission.agent_id,
-            || {
-                let client =
-                    connection::connect(&invocation.client).map_err(|error| error.to_string())?;
-                client
-                    .preflight([nokv_protocol::WorkspaceCapability::WorkspacePathV1])
-                    .map_err(|error| format!("workspace preflight failed: {error}"))?;
-                Ok(client)
-            },
-        )
-    }
-    #[cfg(not(feature = "etcd"))]
-    {
-        let ConfiguredAgentAdmission {
-            route,
-            root_id,
-            agent_id,
-        } = admission;
-        let _ = (route, root_id, agent_id);
-        Err("workspace-path commands require the nokv etcd feature".to_owned())
-    }
+    let client = connection::connect(&invocation.client).map_err(|error| error.to_string())?;
+    client
+        .preflight([nokv_protocol::WorkspaceCapability::WorkspacePathV1])
+        .map_err(|error| format!("workspace preflight failed: {error}"))?;
+    Ok(client)
 }
 
 fn run_workspace_path(
@@ -584,98 +456,118 @@ fn print_help() {
         "\
 NoKV Agent-workspace CLI
 
-USAGE:
-  nokv [connection/object options] workbench <tool> '<json arguments>'
-  nokv [connection/object options] mcp [--profile workbench|agent]   (DEPRECATED)
-  nokv [connection/object options] materialize <workbench> <section> <path> <destination>
-  nokv [connection/object options] collect <workbench> <section> <source> <path> [--replace] [--expected-generation N] [--content-type TYPE]
-  nokv [route/agent options] workspace-path rename <workbench> <section> <source> <destination> --expected-generation N --request-id HEX32
-  nokv [route/agent options] workspace-path remove <workbench> <section> <path> --expected-generation N --request-id HEX32
-  nokv --root-id HEX32 --agent-id HEX32 --etcd-endpoint URL provision <logical-shard-id-hex32> [adoption options]
-  nokv [owner options] serve
-  nokv schema
-  nokv version [--json]
-  nokv --version
+CLIENT:
+  nokv --root-id HEX32 --seed HOST:PORT [--seed HOST:PORT ...] \\
+    --workbench-root /agents/NAME/wb workbench <tool> '<json arguments>'
+  nokv --root-id HEX32 --seed HOST:PORT [--seed HOST:PORT ...] \\
+    materialize <workbench> <section> <path> <destination>
+  nokv --root-id HEX32 --seed HOST:PORT [--seed HOST:PORT ...] \\
+    --workbench-root /agents/NAME/wb collect <workbench> <section> <source> <path> [--replace]
 
-AGENT CONTROL ROUTING:
-  --root-id HEX32
-  --agent-id HEX32 is required by provision, workbench, mcp, materialize, collect, and workspace-path
-  AgentId is a durable deployment identity used to prevent root misconfiguration; it is not an authentication credential
-  --metadata-address HOST:PORT --logical-shard-id HEX32 --object-namespace-id HEX32
-    --placement-generation N --owner-epoch N
-  static routing is a point-in-time pin and cannot refresh after placement changes or owner restarts
-  use --etcd-endpoint for self-refreshing routing
-  Agent-facing commands, provision, and serve require etcd routing so the RootId-to-AgentId binding can be verified;
-  a static pin is rejected there and remains a Rust SDK client option only
-  --etcd-endpoint URL [--etcd-endpoint URL ...]
+Clients discover the current owner only through NoKV seeds. Repeat --seed for
+failover; clients never connect to the metadata database directly.
 
-AGENT PRESENTATION:
-  --workbench-root /agents/AGENT_NAME/wb is required by workbench, collect, and mcp
-  keep this presentation root stable: it shapes responses and canonical v1 manifest paths
-  RootId remains the only storage/routing identity; the presentation root never enters Holt keys
-  mcp is DEPRECATED and is not a supported NoKV integration surface: use `nokv workbench <tool>`
-  or the direct Python SDK; it is retained only as the live qualification harness transport
-  mcp defaults to the 18-tool Workbench profile; --profile agent selects the seven path tools
-  workspace-path is a custom CLI surface; it does not add to the fixed 18 Workbench tools
-  workspace-path requires an explicit lowercase HEX32 request id for exact cross-process replay
+METADATA RUNTIMES:
+  nokv format --meta-url holt:///absolute/path
+  nokv --root-id HEX32 --agent-id HEX32 provision --meta-url holt:///absolute/path
+  nokv --advertise-endpoint HOST:PORT [owner options] serve --meta-url holt:///absolute/path
 
-OWNER:
-  provision first binds RootId to an explicit AgentId, then creates namespace, shard, and affinity
-  --adopt-legacy-agent-binding is a one-time explicit migration for a verified legacy root
-  --adopt-legacy-object-namespace is a one-time explicit migration after verifying bucket/prefix
-  serve validates every active root's Agent binding; it does not require or compare one shard-wide AgentId
-  --root-id HEX32 --etcd-endpoint URL --node-id ID
-  --advertise-endpoint HOST:PORT --bind HOST:PORT
-  --etcd-lease-ttl-seconds N (default 10; owner keepalive runs every max(1, N/3) seconds)
-  --handshake-timeout-millis N --max-inflight-connections N
-  --metadata-create PATH starts the first standalone local-WAL owner
-  --metadata-reopen PATH restarts the same exclusive local-WAL authority after lease loss
-  --metadata-recover-log PATH installs or resumes one exact receipt-directed shared-log frontier
-  --recovery-publication shared|local-only (default local-only; --metadata-recover-log implies shared)
-    local-only keeps the exclusive local WAL as the only recovery authority, publishes nothing,
-    and cannot combine with --metadata-recover-log
-    shared publishes every applied outbox tail as immutable log segments plus control references
-    before a response leaves the shard; without checkpoint compaction the chain is bounded by the
-    control record size, and a shard that reaches that bound stops accepting writes
+  nokv-fdb format --meta-url 'fdb:///absolute/fdb.cluster?prefix=nokv-prod'
+  nokv-fdb --root-id HEX32 --agent-id HEX32 provision \\
+    --meta-url 'fdb:///absolute/fdb.cluster?prefix=nokv-prod'
+  nokv-fdb --node-id ID --advertise-endpoint HOST:PORT [owner options] serve \\
+    --meta-url 'fdb:///absolute/fdb.cluster?prefix=nokv-prod'
+
+Holt is one exclusive standalone metadata store with no control plane. FDB is
+the shared metadata, catalog, route, session, and lease authority. FDB support
+is feature gated and remains NOT QUALIFIED until the live serving gates pass.
+
+OWNER OPTIONS:
+  --bind HOST:PORT --handshake-timeout-millis N
+  --max-inflight-connections N --lifecycle-interval-millis N
 
 OBJECT DATA:
   --object-bucket NAME [--object-endpoint URL] [--object-root PREFIX]
   [--hot-cache-dir PATH --hot-cache-bytes BYTES]
 
+OTHER:
+  nokv schema
+  nokv version [--json]
+  nokv --version
+
 NoKV exposes SDK and CLI operations. It does not expose FUSE or POSIX."
     );
 }
 
-#[cfg(feature = "etcd")]
-fn connect_control(
-    route: &cli::EtcdRoutingConfig,
-) -> Result<Arc<dyn nokv_control::ControlStore>, String> {
-    let options = nokv_control::EtcdControlStoreOptions::new(route.endpoints.clone())
-        .with_key_prefix(route.key_prefix.clone())
-        .with_lease_ttl_seconds(route.lease_ttl_seconds);
-    Ok(Arc::new(
-        nokv_control::EtcdControlStore::connect(options).map_err(|error| error.to_string())?,
-    ))
+fn configured_metadata_url(
+    invocation: &Invocation,
+) -> Result<Option<nokv_server::MetadataUrl>, String> {
+    invocation
+        .server
+        .metadata_url
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|error: nokv_server::MetadataUrlError| error.to_string())
 }
 
-#[cfg(feature = "etcd")]
-fn run_provision(
-    invocation: &Invocation,
-    logical_shard_id: &str,
-    adopt_legacy_object_namespace: bool,
-    adopt_legacy_agent_binding: bool,
-) -> Result<(), String> {
-    use nokv_control::{LogicalShardId, RootId};
-    use nokv_types::RootPlacementLifecycle;
+fn run_format(invocation: &Invocation) -> Result<(), String> {
+    let metadata = configured_metadata_url(invocation)?
+        .ok_or_else(|| "format requires --meta-url".to_owned())?;
+    match metadata {
+        nokv_server::MetadataUrl::Holt(url) => {
+            let outcome = nokv_server::format_holt(&url, build_info::VERSION)
+                .map_err(|error| error.to_string())?;
+            print_json(&json!({
+                "status": "success",
+                "operation": "format",
+                "provider": "holt",
+                "created": outcome.state == nokv_server::HoltFormatState::Created,
+                "store_id": encode_lowercase_hex(outcome.manifest.store_id().as_bytes()),
+                "logical_shard_id": encode_lowercase_hex(outcome.logical_shard_id.as_bytes()),
+                "workspace_format_version": outcome.manifest.workspace_format_version(),
+                "physical_encoding_version": outcome.manifest.physical_encoding_version(),
+            }))
+        }
+        nokv_server::MetadataUrl::FoundationDb(url) => {
+            #[cfg(feature = "fdb")]
+            {
+                let outcome = nokv_server::format_fdb(&url, build_info::VERSION)
+                    .map_err(|error| error.to_string())?;
+                print_json(&json!({
+                    "status": "success",
+                    "operation": "format",
+                    "provider": "foundationdb",
+                    "created": outcome.state == nokv_server::FdbFormatState::Created,
+                    "store_id": encode_lowercase_hex(outcome.manifest.store_id().as_bytes()),
+                    "workspace_format_version": outcome.manifest.workspace_format_version(),
+                    "physical_encoding_version": outcome.manifest.physical_encoding_version(),
+                }))
+            }
+            #[cfg(not(feature = "fdb"))]
+            {
+                let _ = url;
+                Err(
+                    "this binary has no FoundationDB runtime composition; use the feature-enabled nokv-fdb binary"
+                        .to_owned(),
+                )
+            }
+        }
+    }
+}
 
-    let cli::RoutingConfig::Etcd(route) = &invocation.client.routing else {
-        return Err("provision requires control-backed etcd routing".to_owned());
-    };
-    let root_id = RootId::from(
+fn run_provision(invocation: &Invocation) -> Result<(), String> {
+    let metadata = configured_metadata_url(invocation)?
+        .ok_or_else(|| "provision requires --meta-url".to_owned())?;
+    run_metadata_provision(invocation, metadata)
+}
+
+fn run_metadata_provision(
+    invocation: &Invocation,
+    metadata: nokv_server::MetadataUrl,
+) -> Result<(), String> {
+    let root_id = nokv_control::RootId::from(
         connection::configured_root_id(&invocation.client).map_err(|error| error.to_string())?,
-    );
-    let logical_shard_id = LogicalShardId::from(
-        connection::parse_logical_shard_id(logical_shard_id).map_err(|error| error.to_string())?,
     );
     let agent_id = connection::parse_agent_id(
         invocation
@@ -684,120 +576,65 @@ fn run_provision(
             .ok_or_else(|| "provision requires --agent-id".to_owned())?,
     )
     .map_err(|error| error.to_string())?;
-    let control = connect_control(route)?;
-    let existing_placement =
-        provision::preflight_provision(control.as_ref(), root_id, logical_shard_id)
-            .map_err(|error| error.to_string())?;
-    let binding_preexisting = provision::ensure_root_agent_binding(
-        control.as_ref(),
-        root_id,
-        agent_id,
-        adopt_legacy_agent_binding,
-    )
-    .map_err(|error| error.to_string())?;
-    let objects = CliObjectStore::build(&invocation.client.object)?;
-    objects.validate_agent_capabilities()?;
-    let namespace_id = match control
-        .get_root_object_namespace_binding(&root_id)
-        .map_err(|error| error.to_string())?
-    {
-        Some(binding) => {
-            objects.clone().bind(binding.object_namespace_id)?;
-            binding.object_namespace_id
+    match metadata {
+        nokv_server::MetadataUrl::Holt(url) => {
+            let outcome = nokv_server::provision_holt(&url, root_id, agent_id)
+                .map_err(|error| error.to_string())?;
+            let objects = CliObjectStore::build(&invocation.client.object)?;
+            objects.ensure_namespace(outcome.root.object_namespace_id)?;
+            let objects = objects.bind(outcome.root.object_namespace_id)?;
+            objects.validate_agent_capabilities()?;
+            print_json(&json!({
+                "status": "success",
+                "operation": "provision",
+                "provider": "holt",
+                "preexisting": outcome.preexisting,
+                "root_id": encode_lowercase_hex(outcome.root.root_id.as_bytes()),
+                "agent_id": encode_lowercase_hex(outcome.root.agent_id.as_bytes()),
+                "logical_shard_id": encode_lowercase_hex(outcome.logical_shard_id.as_bytes()),
+                "object_namespace_id": encode_lowercase_hex(outcome.root.object_namespace_id.as_bytes()),
+                "placement_generation": outcome.root.placement_generation.get(),
+                "lifecycle": "ready",
+            }))
         }
-        None => {
-            if existing_placement.is_some() && !adopt_legacy_object_namespace {
-                return Err(
-                    "legacy root has no durable object namespace binding; verify the configured bucket/prefix, then rerun provision with --adopt-legacy-object-namespace"
+        nokv_server::MetadataUrl::FoundationDb(url) => {
+            #[cfg(feature = "fdb")]
+            {
+                let objects = CliObjectStore::build(&invocation.client.object)?;
+                let prepared = nokv_server::prepare_fdb_provision(&url, root_id, agent_id)
+                    .map_err(|error| error.to_string())?;
+                let namespace_id = prepared.root().object_namespace_id();
+                objects.ensure_namespace(namespace_id)?;
+                let objects = objects.bind(namespace_id)?;
+                objects.validate_agent_capabilities()?;
+                let outcome = prepared
+                    .finalize_after_namespace_admission()
+                    .map_err(|error| error.to_string())?;
+                print_json(&json!({
+                    "status": "success",
+                    "operation": "provision",
+                    "provider": "foundationdb",
+                    "preexisting": outcome.preexisting,
+                    "root_id": encode_lowercase_hex(outcome.root.root_id().as_bytes()),
+                    "agent_id": encode_lowercase_hex(outcome.root.agent_id().as_bytes()),
+                    "logical_shard_id": encode_lowercase_hex(outcome.shard.logical_shard_id().as_bytes()),
+                    "object_namespace_id": encode_lowercase_hex(namespace_id.as_bytes()),
+                    "placement_generation": outcome.root.placement_generation().get(),
+                    "lifecycle": "ready",
+                }))
+            }
+            #[cfg(not(feature = "fdb"))]
+            {
+                let _ = (url, agent_id);
+                Err(
+                    "this binary has no FoundationDB runtime composition; use the feature-enabled nokv-fdb binary"
                         .to_owned(),
-                );
-            }
-            match objects.load_namespace()? {
-                Some(existing) => existing,
-                None => {
-                    let created = provision::new_object_namespace_id(root_id);
-                    objects.ensure_namespace(created)?;
-                    created
-                }
+                )
             }
         }
-    };
-    let outcome = provision::provision_and_activate(
-        control.as_ref(),
-        root_id,
-        logical_shard_id,
-        namespace_id,
-    )
-    .map_err(|error| error.to_string())?;
-    objects.bind(namespace_id)?;
-    let lifecycle = match outcome.placement.lifecycle {
-        RootPlacementLifecycle::Provisioning => "provisioning",
-        RootPlacementLifecycle::Active => "active",
-        RootPlacementLifecycle::Draining => "draining",
-        RootPlacementLifecycle::Retired => "retired",
-    };
-    print_json(&json!({
-        "status": "success",
-        "root_id": encode_lowercase_hex(root_id.as_bytes()),
-        "agent_id": encode_lowercase_hex(agent_id.as_bytes()),
-        "binding_preexisting": binding_preexisting,
-        "logical_shard_id": encode_lowercase_hex(logical_shard_id.as_bytes()),
-        "object_namespace_id": encode_lowercase_hex(namespace_id.as_bytes()),
-        "placement_generation": outcome.placement.placement_generation.get(),
-        "lifecycle": lifecycle,
-        "logical_shard_preexisting": outcome.logical_shard_preexisting,
-        "object_namespace_preexisting": outcome.object_namespace_preexisting,
-        "placement_preexisting": outcome.placement_preexisting,
-        "activation_required": outcome.activation_required,
-    }))
-}
-
-#[cfg(not(feature = "etcd"))]
-fn run_provision(
-    _invocation: &Invocation,
-    _logical_shard_id: &str,
-    _adopt_legacy_object_namespace: bool,
-    _adopt_legacy_agent_binding: bool,
-) -> Result<(), String> {
-    Err("provision requires the nokv etcd feature".to_owned())
-}
-
-#[cfg(feature = "etcd")]
-fn active_shard_placements(
-    control: &dyn nokv_control::ControlStore,
-    seed: &nokv_control::RootPlacement,
-) -> Result<Vec<nokv_control::RootPlacement>, String> {
-    let mut placements = control
-        .list_root_placements()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|placement| {
-            placement.logical_shard_id == seed.logical_shard_id
-                && placement.lifecycle == nokv_control::RootPlacementLifecycle::Active
-        })
-        .collect::<Vec<_>>();
-    placements.sort_by_key(|placement| placement.root_id);
-    if !placements
-        .iter()
-        .any(|placement| placement.root_id == seed.root_id)
-    {
-        return Err("configured root placement must be Active before serve".to_owned());
     }
-    Ok(placements)
 }
 
-#[cfg(feature = "etcd")]
-fn validate_served_root_agent_bindings(
-    control: &dyn nokv_control::ControlStore,
-    placements: &[nokv_control::RootPlacement],
-) -> Result<(), String> {
-    for placement in placements {
-        load_root_agent_binding(control, placement.root_id)?;
-    }
-    Ok(())
-}
-
-#[cfg(feature = "etcd")]
 fn join_lifecycle_workers(
     workers: Vec<std::thread::JoinHandle<Result<(), nokv_server::LifecycleError>>>,
     failures: &mut Vec<String>,
@@ -811,108 +648,66 @@ fn join_lifecycle_workers(
     }
 }
 
-#[cfg(feature = "etcd")]
+fn install_shutdown_signal() -> Result<Arc<std::sync::atomic::AtomicBool>, String> {
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for (name, signal) in [
+        ("SIGINT", signal_hook::consts::SIGINT),
+        ("SIGTERM", signal_hook::consts::SIGTERM),
+    ] {
+        signal_hook::flag::register(signal, Arc::clone(&shutdown))
+            .map_err(|error| format!("cannot install {name} shutdown handler: {error}"))?;
+    }
+    Ok(shutdown)
+}
+
 fn run_server(invocation: &Invocation) -> Result<(), String> {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    use nokv_control::{NodeId, RecoveryPublication, RootId};
-    use nokv_server::{
-        bootstrap_shard, ArtifactLifecycleDeleter, LeaseMode, LifecycleObjectDeleter,
-        LifecycleRunner, LifecycleRunnerOptions, OpenMode, RecoveryPublicationMode, RootAttach,
-        RootOwnerRegistry, ServerOptions, ShardBoot, WorkspaceServer,
-    };
-    use nokv_types::RequestId;
-    use sha2::{Digest, Sha256};
-
-    static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-    fn install_shutdown_signal() -> Result<Arc<AtomicBool>, String> {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        for (name, signal) in [
-            ("SIGINT", signal_hook::consts::SIGINT),
-            ("SIGTERM", signal_hook::consts::SIGTERM),
-        ] {
-            signal_hook::flag::register(signal, Arc::clone(&shutdown))
-                .map_err(|error| format!("cannot install {name} shutdown handler: {error}"))?;
+    match configured_metadata_url(invocation)?
+        .ok_or_else(|| "serve requires --meta-url".to_owned())?
+    {
+        nokv_server::MetadataUrl::Holt(url) => run_holt_server(invocation, &url),
+        nokv_server::MetadataUrl::FoundationDb(url) => {
+            #[cfg(feature = "fdb")]
+            {
+                run_fdb_server(invocation, &url)
+            }
+            #[cfg(not(feature = "fdb"))]
+            {
+                let _ = url;
+                Err(
+                    "this binary has no FoundationDB runtime composition; use the feature-enabled nokv-fdb binary"
+                        .to_owned(),
+                )
+            }
         }
-        Ok(shutdown)
     }
+}
 
-    fn request_id(domain: &[u8], root: RootId) -> RequestId {
-        let mut hasher = Sha256::new();
-        hasher.update(b"nokv.owner.bootstrap\0");
-        hasher.update(domain);
-        hasher.update(root.as_bytes());
-        hasher.update(std::process::id().to_be_bytes());
-        hasher.update(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                .to_be_bytes(),
-        );
-        hasher.update(
-            REQUEST_SEQUENCE
-                .fetch_add(1, Ordering::Relaxed)
-                .to_be_bytes(),
-        );
-        let digest: [u8; 32] = hasher.finalize().into();
-        let mut id = [0_u8; 16];
-        id.copy_from_slice(&digest[..16]);
-        RequestId::from_bytes(id)
+#[cfg(feature = "fdb")]
+fn release_fdb_runtime_after(
+    runtime: &nokv_server::FdbServingRuntime,
+    primary: impl Into<String>,
+) -> String {
+    let primary = primary.into();
+    match runtime.release_ownership() {
+        Ok(()) => primary,
+        Err(cleanup) => format!("{primary}; FoundationDB owner release failed: {cleanup}"),
     }
+}
 
-    let shutdown = install_shutdown_signal()?;
-    let cli::RoutingConfig::Etcd(route) = &invocation.client.routing else {
-        return Err("serve requires control-backed etcd routing".to_owned());
+#[cfg(feature = "fdb")]
+fn run_fdb_server(
+    invocation: &Invocation,
+    metadata: &nokv_server::FoundationDbMetadataUrl,
+) -> Result<(), String> {
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    use nokv_control::NodeId;
+    use nokv_server::{
+        ArtifactLifecycleDeleter, CommittedMetadataDurability, LifecycleObjectDeleter,
+        LifecycleRunner, LifecycleRunnerOptions, ServerOptions,
     };
-    let metadata = match invocation.server.metadata_store.clone().ok_or_else(|| {
-        "serve requires --metadata-create, --metadata-reopen, or --metadata-recover-log".to_owned()
-    })? {
-        cli::MetadataStoreConfig::Create(path) => OpenMode::New(path),
-        cli::MetadataStoreConfig::Reopen(path) => OpenMode::Existing(path),
-        cli::MetadataStoreConfig::RecoverLog(path) => OpenMode::RecoverLog(path),
-    };
-    let node_id = NodeId::new(
-        invocation
-            .server
-            .node_id
-            .clone()
-            .ok_or_else(|| "serve requires --node-id".to_owned())?,
-    )
-    .map_err(|error| format!("invalid --node-id: {error:?}"))?;
-    let endpoint = invocation
-        .server
-        .advertise_endpoint
-        .clone()
-        .ok_or_else(|| "serve requires --advertise-endpoint".to_owned())?;
-    let root_id = RootId::from(
-        connection::configured_root_id(&invocation.client).map_err(|error| error.to_string())?,
-    );
-    let control = connect_control(route)?;
-    let placement = control
-        .get_root_placement(&root_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "root placement does not exist; provision it before serve".to_owned())?;
-    let placements = active_shard_placements(control.as_ref(), &placement)?;
-    validate_served_root_agent_bindings(control.as_ref(), &placements)?;
-    let object_namespace = control
-        .get_root_object_namespace_binding(&root_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| {
-            "root object namespace is not bound; run provision after verifying the configured bucket/prefix"
-                .to_owned()
-        })?;
-    let shard = control
-        .get_logical_shard(&placement.logical_shard_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "logical shard does not exist; provision it before serve".to_owned())?;
-    let recovery = RecoveryPublication {
-        checkpoint: shard.checkpoint.clone(),
-        log: shard.log.clone(),
-        durable_lsn: shard.durable_lsn,
-    };
+
     if invocation.server.lifecycle_interval_millis == 0
         || invocation.server.lifecycle_interval_millis > 60_000
     {
@@ -928,96 +723,88 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     {
         return Err("--max-inflight-connections must be within 1..=4096".to_owned());
     }
-    let expected_namespace = object_namespace.object_namespace_id;
-    let namespace_bindings = placements
-        .iter()
-        .map(|placement| {
-            control
-                .get_root_object_namespace_binding(&placement.root_id)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| {
-                    "every root on a served shard must have an object namespace binding".to_owned()
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if namespace_bindings
-        .iter()
-        .any(|binding| binding.object_namespace_id != expected_namespace)
-    {
-        return Err(
-            "one shard owner cannot serve roots bound to different object namespaces".to_owned(),
-        );
-    }
-    let objects =
-        Arc::new(CliObjectStore::build(&invocation.client.object)?.bind(expected_namespace)?);
-    objects.validate_agent_capabilities()?;
-    let registry = Arc::new(RootOwnerRegistry::new());
-    let owner = bootstrap_shard(
-        Arc::clone(&control),
-        Arc::clone(&registry),
-        objects.clone(),
-        ShardBoot {
-            shard_id: placement.logical_shard_id,
-            open: metadata,
-            lease: LeaseMode::Acquire {
-                owner: node_id,
-                endpoint,
-                previous_epoch: shard.owner_epoch,
-            },
-            recovery,
-            recovery_publication: match invocation.server.recovery_publication {
-                cli::RecoveryPublicationConfig::Shared => RecoveryPublicationMode::Shared,
-                cli::RecoveryPublicationConfig::LocalOnly => RecoveryPublicationMode::LocalOnly,
-            },
-            roots: placements
-                .iter()
-                .map(|placement| RootAttach {
-                    root_id: placement.root_id,
-                    object_namespace_id: expected_namespace,
-                    install_id: request_id(b"install", placement.root_id),
-                    bind_object_namespace_id: request_id(
-                        b"bind-object-namespace",
-                        placement.root_id,
-                    ),
-                    activate_id: request_id(b"activate", placement.root_id),
-                })
-                .collect(),
-        },
+    let node_id = NodeId::new(
+        invocation
+            .server
+            .node_id
+            .clone()
+            .ok_or_else(|| "FoundationDB serve requires --node-id".to_owned())?,
     )
-    .map_err(|error| error.to_string())?;
-
-    let lease_renew_interval = owner.owner_lease_renew_interval().ok_or_else(|| {
-        "etcd-backed workspace server requires an expiring owner-lease renewal policy".to_owned()
-    })?;
-
-    let meta = Arc::clone(owner.meta());
-    let recovery = Arc::clone(owner.recovery_publisher());
-    let owner_routes = owner.routes().to_vec();
-    let server = WorkspaceServer::new(
-        ServerOptions {
+    .map_err(|error| format!("invalid --node-id: {error:?}"))?;
+    let endpoint = invocation
+        .server
+        .advertise_endpoint
+        .as_deref()
+        .ok_or_else(|| "serve requires --advertise-endpoint".to_owned())?
+        .parse::<std::net::SocketAddr>()
+        .map_err(|error| format!("invalid --advertise-endpoint: {error}"))?;
+    let shutdown = install_shutdown_signal()?;
+    let runtime = nokv_server::serve_fdb(metadata, node_id, endpoint, shutdown.as_ref())
+        .map_err(|error| error.to_string())?;
+    let namespace = runtime
+        .roots()
+        .first()
+        .expect("serve_fdb requires at least one Ready root")
+        .route()
+        .object_namespace_id;
+    if runtime
+        .roots()
+        .iter()
+        .any(|root| root.route().object_namespace_id != namespace)
+    {
+        return Err(release_fdb_runtime_after(
+            &runtime,
+            "FoundationDB roots do not share one object namespace",
+        ));
+    }
+    let namespace_id = nokv_types::ObjectNamespaceId::from(namespace);
+    let objects = match CliObjectStore::build(&invocation.client.object)
+        .and_then(|objects| objects.bind(namespace_id))
+        .and_then(|objects| {
+            objects.validate_agent_capabilities()?;
+            Ok(objects)
+        }) {
+        Ok(objects) => Arc::new(objects),
+        Err(primary) => return Err(release_fdb_runtime_after(&runtime, primary)),
+    };
+    let listener = match TcpListener::bind(invocation.server.bind) {
+        Ok(listener) => listener,
+        Err(error) => {
+            return Err(release_fdb_runtime_after(
+                &runtime,
+                format!("cannot bind RPC listener: {error}"),
+            ));
+        }
+    };
+    if let Err(error) = listener.set_nonblocking(true) {
+        return Err(release_fdb_runtime_after(
+            &runtime,
+            format!("cannot prepare RPC listener: {error}"),
+        ));
+    }
+    let server = runtime
+        .workspace_server(ServerOptions {
             bind: invocation.server.bind,
             handshake_timeout: Duration::from_millis(invocation.server.handshake_timeout_millis),
             read_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),
-            lease_renew_interval,
+            lease_renew_interval: runtime.lease_renew_interval(),
             max_inflight_connections: invocation.server.max_inflight_connections,
-        },
-        Arc::clone(&registry),
-        vec![owner],
-    )
-    .map_err(|error| error.to_string())?;
+        })
+        .map_err(|error| error.to_string())?;
     let owner_loss = server.owner_loss_signal();
     let lifecycle_objects: Arc<dyn LifecycleObjectDeleter> =
         Arc::new(ArtifactLifecycleDeleter::new(objects));
-    let mut lifecycles = Vec::with_capacity(owner_routes.len());
-    for route in owner_routes {
+    let durability = Arc::new(CommittedMetadataDurability);
+    let mut lifecycles = Vec::with_capacity(runtime.roots().len());
+    for root in runtime.roots() {
         match LifecycleRunner::new(
-            Arc::clone(&meta),
-            Arc::clone(&registry),
-            route,
+            Arc::clone(root.meta()),
+            Arc::clone(runtime.registry()),
+            root.route(),
             owner_loss.clone(),
             Arc::clone(&lifecycle_objects),
-            recovery.clone(),
+            durability.clone(),
             LifecycleRunnerOptions {
                 poll_interval: Duration::from_millis(invocation.server.lifecycle_interval_millis),
                 ..LifecycleRunnerOptions::default()
@@ -1026,10 +813,11 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
             Ok(lifecycle) => lifecycles.push(lifecycle),
             Err(error) => {
                 let primary = error.to_string();
-                let release = server.release_ownership();
-                return Err(match release {
+                return Err(match server.release_ownership() {
                     Ok(()) => primary,
-                    Err(release) => format!("{primary}; owner release failed: {release}"),
+                    Err(cleanup) => {
+                        format!("{primary}; FoundationDB owner release failed: {cleanup}")
+                    }
                 });
             }
         }
@@ -1039,7 +827,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         let worker_owner_loss = owner_loss.clone();
         let worker_shutdown = Arc::clone(&shutdown);
         let worker = std::thread::Builder::new()
-            .name(format!("nokv-workspace-lifecycle-{index}"))
+            .name(format!("nokv-fdb-lifecycle-{index}"))
             .spawn(move || {
                 let result = lifecycle.run_until_owner_loss_or_shutdown(worker_shutdown.as_ref());
                 if result.is_err() {
@@ -1054,7 +842,150 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
                 let mut failures = vec![format!("cannot start lifecycle worker: {error}")];
                 join_lifecycle_workers(lifecycle_workers, &mut failures);
                 if let Err(error) = server.release_ownership() {
-                    failures.push(format!("owner release failed: {error}"));
+                    failures.push(format!("FoundationDB owner release failed: {error}"));
+                }
+                return Err(failures.join("; "));
+            }
+        }
+    }
+    if let Err(error) = runtime.activate_routes() {
+        owner_loss.fail_closed();
+        let mut failures = vec![format!("cannot publish FoundationDB routes: {error}")];
+        join_lifecycle_workers(lifecycle_workers, &mut failures);
+        if let Err(error) = server.release_ownership() {
+            failures.push(format!("FoundationDB owner release failed: {error}"));
+        }
+        return Err(failures.join("; "));
+    }
+
+    let server_result = server.serve_until_shutdown(listener, shutdown.as_ref());
+    if server_result.is_err() {
+        owner_loss.fail_closed();
+    }
+    let mut failures = Vec::new();
+    join_lifecycle_workers(lifecycle_workers, &mut failures);
+    if let Err(error) = server.release_ownership() {
+        failures.push(format!("FoundationDB owner release failed: {error}"));
+    }
+    if let Err(error) = server_result {
+        failures.push(format!("RPC server stopped: {error}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn run_holt_server(
+    invocation: &Invocation,
+    metadata: &nokv_server::HoltMetadataUrl,
+) -> Result<(), String> {
+    use std::time::Duration;
+
+    use nokv_protocol::{LogicalShardIdentity, ObjectNamespaceIdentity, RootIdentity, RootRoute};
+    use nokv_server::{
+        ArtifactLifecycleDeleter, CommittedMetadataDurability, LifecycleObjectDeleter,
+        LifecycleRunner, LifecycleRunnerOptions, ServerOptions,
+    };
+
+    if invocation.server.lifecycle_interval_millis == 0
+        || invocation.server.lifecycle_interval_millis > 60_000
+    {
+        return Err("--lifecycle-interval-millis must be within 1..=60000".to_owned());
+    }
+    if invocation.server.handshake_timeout_millis == 0
+        || invocation.server.handshake_timeout_millis > 60_000
+    {
+        return Err("--handshake-timeout-millis must be within 1..=60000".to_owned());
+    }
+    if invocation.server.max_inflight_connections == 0
+        || invocation.server.max_inflight_connections > 4_096
+    {
+        return Err("--max-inflight-connections must be within 1..=4096".to_owned());
+    }
+    let endpoint = invocation
+        .server
+        .advertise_endpoint
+        .as_deref()
+        .ok_or_else(|| "serve requires --advertise-endpoint".to_owned())?
+        .parse::<std::net::SocketAddr>()
+        .map_err(|error| format!("invalid --advertise-endpoint: {error}"))?;
+    let shutdown = install_shutdown_signal()?;
+    let runtime = nokv_server::serve_holt(metadata, endpoint).map_err(|error| error.to_string())?;
+    let namespace = runtime
+        .roots()
+        .first()
+        .expect("serve_holt requires at least one Ready root")
+        .object_namespace_id;
+    if runtime
+        .roots()
+        .iter()
+        .any(|root| root.object_namespace_id != namespace)
+    {
+        return Err("standalone Holt roots do not share one object namespace".to_owned());
+    }
+    let objects = Arc::new(CliObjectStore::build(&invocation.client.object)?.bind(namespace)?);
+    objects.validate_agent_capabilities()?;
+    let server = runtime
+        .workspace_server(ServerOptions {
+            bind: invocation.server.bind,
+            handshake_timeout: Duration::from_millis(invocation.server.handshake_timeout_millis),
+            read_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
+            lease_renew_interval: Duration::from_secs(30),
+            max_inflight_connections: invocation.server.max_inflight_connections,
+        })
+        .map_err(|error| error.to_string())?;
+    let owner_loss = server.owner_loss_signal();
+    let lifecycle_objects: Arc<dyn LifecycleObjectDeleter> =
+        Arc::new(ArtifactLifecycleDeleter::new(objects));
+    let durability = Arc::new(CommittedMetadataDurability);
+    let mut lifecycles = Vec::with_capacity(runtime.roots().len());
+    for root in runtime.roots() {
+        let route = RootRoute {
+            root_id: RootIdentity::from(root.root_id),
+            logical_shard_id: LogicalShardIdentity::from(runtime.logical_shard_id()),
+            object_namespace_id: ObjectNamespaceIdentity::from(root.object_namespace_id),
+            placement_generation: root.placement_generation.get(),
+            owner_epoch: runtime.owner_epoch().get(),
+        };
+        let lifecycle = LifecycleRunner::new(
+            Arc::clone(runtime.meta()),
+            Arc::clone(runtime.registry()),
+            route,
+            owner_loss.clone(),
+            Arc::clone(&lifecycle_objects),
+            durability.clone(),
+            LifecycleRunnerOptions {
+                poll_interval: Duration::from_millis(invocation.server.lifecycle_interval_millis),
+                ..LifecycleRunnerOptions::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        lifecycles.push(lifecycle);
+    }
+    let mut lifecycle_workers = Vec::with_capacity(lifecycles.len());
+    for (index, lifecycle) in lifecycles.into_iter().enumerate() {
+        let worker_owner_loss = owner_loss.clone();
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = std::thread::Builder::new()
+            .name(format!("nokv-holt-lifecycle-{index}"))
+            .spawn(move || {
+                let result = lifecycle.run_until_owner_loss_or_shutdown(worker_shutdown.as_ref());
+                if result.is_err() {
+                    worker_owner_loss.fail_closed();
+                }
+                result
+            });
+        match worker {
+            Ok(worker) => lifecycle_workers.push(worker),
+            Err(error) => {
+                owner_loss.fail_closed();
+                let mut failures = vec![format!("cannot start lifecycle worker: {error}")];
+                join_lifecycle_workers(lifecycle_workers, &mut failures);
+                if let Err(error) = server.release_ownership() {
+                    failures.push(format!("standalone owner release failed: {error}"));
                 }
                 return Err(failures.join("; "));
             }
@@ -1065,15 +996,13 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     if server_result.is_err() {
         owner_loss.fail_closed();
     }
-
     let mut failures = Vec::new();
     join_lifecycle_workers(lifecycle_workers, &mut failures);
-    let release_result = server.release_ownership();
+    if let Err(error) = server.release_ownership() {
+        failures.push(format!("standalone owner release failed: {error}"));
+    }
     if let Err(error) = server_result {
         failures.push(format!("RPC server stopped: {error}"));
-    }
-    if let Err(error) = release_result {
-        failures.push(format!("owner release failed: {error}"));
     }
     if failures.is_empty() {
         Ok(())
@@ -1082,15 +1011,8 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     }
 }
 
-#[cfg(not(feature = "etcd"))]
-fn run_server(_invocation: &Invocation) -> Result<(), String> {
-    Err("serve requires the nokv etcd feature".to_owned())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-
     use super::*;
 
     #[test]
@@ -1181,169 +1103,5 @@ mod tests {
                 "commit_version": 12,
             })
         );
-    }
-
-    #[test]
-    fn agent_binding_mismatch_stops_before_client_preflight() {
-        use nokv_control::{ControlStore, InMemoryControlStore, RootAgentBinding};
-        use nokv_types::{AgentId, RootId};
-
-        let control = InMemoryControlStore::new();
-        let root_id = RootId::from_bytes([1; nokv_types::FIXED_ID_BYTES]);
-        control
-            .create_root_agent_binding(RootAgentBinding {
-                root_id,
-                agent_id: AgentId::from_bytes([7; nokv_types::FIXED_ID_BYTES]),
-            })
-            .unwrap();
-        let rpc_preflight_called = Cell::new(false);
-
-        let error = after_agent_root_admission(
-            &control,
-            root_id,
-            AgentId::from_bytes([8; nokv_types::FIXED_ID_BYTES]),
-            || {
-                rpc_preflight_called.set(true);
-                Ok(())
-            },
-        )
-        .unwrap_err();
-
-        assert!(error.contains("already bound to another Agent"));
-        assert!(!rpc_preflight_called.get());
-        assert!(!error.contains(&"07".repeat(nokv_types::FIXED_ID_BYTES)));
-        assert!(!error.contains(&"08".repeat(nokv_types::FIXED_ID_BYTES)));
-
-        after_agent_root_admission(
-            &control,
-            root_id,
-            AgentId::from_bytes([7; nokv_types::FIXED_ID_BYTES]),
-            || {
-                rpc_preflight_called.set(true);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(rpc_preflight_called.get());
-    }
-
-    #[test]
-    fn missing_agent_binding_stops_before_client_preflight() {
-        use nokv_control::InMemoryControlStore;
-        use nokv_types::{AgentId, RootId};
-
-        let control = InMemoryControlStore::new();
-        let rpc_preflight_called = Cell::new(false);
-        let error = after_agent_root_admission(
-            &control,
-            RootId::from_bytes([1; nokv_types::FIXED_ID_BYTES]),
-            AgentId::from_bytes([7; nokv_types::FIXED_ID_BYTES]),
-            || {
-                rpc_preflight_called.set(true);
-                Ok(())
-            },
-        )
-        .unwrap_err();
-
-        assert!(error.contains("no durable Agent binding"));
-        assert!(error.contains("--adopt-legacy-agent-binding"));
-        assert!(!rpc_preflight_called.get());
-    }
-
-    #[test]
-    fn static_agent_route_fails_before_rpc_configuration() {
-        let invocation = cli::parse(
-            [
-                "--root-id",
-                "11111111111111111111111111111111",
-                "--agent-id",
-                "77777777777777777777777777777777",
-                "--workbench-root",
-                "/agents/test/wb",
-                "--logical-shard-id",
-                "not-a-valid-shard-id",
-                "mcp",
-                "--profile",
-                "agent",
-            ]
-            .into_iter()
-            .map(str::to_owned),
-        )
-        .unwrap();
-
-        assert_eq!(
-            invocation.command,
-            Command::Mcp {
-                profile: McpProfile::Agent
-            }
-        );
-
-        let error = configured_agent_admission(&invocation).unwrap_err();
-        assert!(error.contains("durable etcd control"));
-        assert!(!error.contains("logical-shard-id"));
-    }
-
-    #[cfg(feature = "etcd")]
-    #[test]
-    fn shard_startup_selects_every_active_root_and_no_other_placement() {
-        use nokv_control::{ControlStore, InMemoryControlStore, RootAgentBinding, RootPlacement};
-        use nokv_types::{
-            AgentId, LogicalShardId, PlacementGeneration, RootId, RootPlacementLifecycle,
-        };
-
-        let root = |fill| RootId::from_bytes([fill; nokv_types::FIXED_ID_BYTES]);
-        let shard = |fill| LogicalShardId::from_bytes([fill; nokv_types::FIXED_ID_BYTES]);
-        let control = InMemoryControlStore::new();
-        let namespace = nokv_types::ObjectNamespaceId::from_bytes([10; 16]);
-        provision::provision_and_activate(&control, root(1), shard(9), namespace).unwrap();
-        provision::provision_and_activate(&control, root(2), shard(9), namespace).unwrap();
-        provision::provision_and_activate(&control, root(3), shard(8), namespace).unwrap();
-        control
-            .create_root_placement(RootPlacement {
-                root_id: root(4),
-                logical_shard_id: shard(9),
-                placement_generation: PlacementGeneration::new(1).unwrap(),
-                lifecycle: RootPlacementLifecycle::Provisioning,
-            })
-            .unwrap();
-
-        let seed = control.get_root_placement(&root(1)).unwrap().unwrap();
-        let placements = active_shard_placements(&control, &seed).unwrap();
-        assert_eq!(
-            placements
-                .iter()
-                .map(|placement| placement.root_id)
-                .collect::<Vec<_>>(),
-            vec![root(1), root(2)]
-        );
-
-        let owner_before = control
-            .get_logical_shard(&shard(9))
-            .unwrap()
-            .unwrap()
-            .owner_epoch;
-        let error = validate_served_root_agent_bindings(&control, &placements).unwrap_err();
-        assert!(error.contains("no durable Agent binding"));
-        assert_eq!(
-            control
-                .get_logical_shard(&shard(9))
-                .unwrap()
-                .unwrap()
-                .owner_epoch,
-            owner_before
-        );
-
-        for (root_id, agent_fill) in [(root(1), 7), (root(2), 8)] {
-            control
-                .create_root_agent_binding(RootAgentBinding {
-                    root_id,
-                    agent_id: AgentId::from_bytes([agent_fill; nokv_types::FIXED_ID_BYTES]),
-                })
-                .unwrap();
-        }
-        validate_served_root_agent_bindings(&control, &placements).unwrap();
-
-        let provisioning = control.get_root_placement(&root(4)).unwrap().unwrap();
-        assert!(active_shard_placements(&control, &provisioning).is_err());
     }
 }

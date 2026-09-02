@@ -30,7 +30,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     return gap_main(
         producer_id="lingtai-mcp",
         scenarios=SCENARIOS,
-        dependency_names=("etcd", "lingtai-kernel", "object-store"),
+        dependency_names=("nokv-seed", "lingtai-kernel", "object-store"),
         evidence_roles=("producer-result", "qualification", "mcp-transcript"),
         reason=REASON,
         description=__doc__ or "LingTai MCP qualification",

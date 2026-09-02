@@ -4,8 +4,11 @@ members = [
     "crates/nokv-protocol",
     "crates/nokv-meta-store",
     "crates/nokv-meta-holt",
+    "crates/nokv-fdb",
+    "crates/nokv-meta-fdb",
     "crates/nokv-meta",
     "crates/nokv-control",
+    "crates/nokv-control-fdb",
     "crates/nokv-object",
     "crates/nokv-client",
     "crates/nokv-agent",
@@ -31,8 +34,11 @@ nokv-types = { path = "crates/nokv-types", version = "0.1.0" }
 nokv-protocol = { path = "crates/nokv-protocol", version = "0.1.0" }
 nokv-meta-store = { path = "crates/nokv-meta-store", version = "0.1.0" }
 nokv-meta-holt = { path = "crates/nokv-meta-holt", version = "0.1.0" }
+nokv-fdb = { path = "crates/nokv-fdb", version = "0.1.0" }
+nokv-meta-fdb = { path = "crates/nokv-meta-fdb", version = "0.1.0" }
 nokv-meta = { path = "crates/nokv-meta", version = "0.1.0" }
 nokv-control = { path = "crates/nokv-control", version = "0.1.0" }
+nokv-control-fdb = { path = "crates/nokv-control-fdb", version = "0.1.0" }
 nokv-workbench-projection = { path = "crates/nokv-workbench-projection", version = "0.1.0" }
 nokv-object = { path = "crates/nokv-object", version = "0.1.0" }
 nokv-client = { path = "crates/nokv-client", version = "0.1.0" }
@@ -41,9 +47,11 @@ nokv-server = { path = "crates/nokv-server", version = "0.1.0" }
 nokv = { path = "crates/nokv", version = "0.11.0" }
 nokv-python = { path = "crates/nokv-python", version = "0.1.0" }
 nokv-bench = { path = "bench", version = "0.1.0" }
+foundationdb = { version = "=0.11.0", default-features = false, features = ["embedded-fdb-include", "fdb-7_3"] }
+futures = "0.3.32"
 holt = { version = "=0.8.6", default-features = false }
-etcd-client = { version = "0.19.0", default-features = false }
 opendal = { version = "0.57.0", default-features = false, features = ["blocking", "executors-tokio", "reqwest-rustls-tls", "services-s3"] }
+percent-encoding = "2.3.2"
 rmp-serde = "1.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -52,4 +60,5 @@ sha2 = "0.10"
 signal-hook = { version = "=0.3.18", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread"] }
+url = "2.5.8"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }

@@ -108,16 +108,16 @@ impl PythonWorkspaceClient {
         workbench_root: Option<String>,
     ) -> PyResult<Self> {
         let root_id = RootIdentity(parse_fixed_hex("root_id", root_id)?);
-        let transport = FramedTcpTransport::new(FramedTcpOptions {
+        let transport_options = FramedTcpOptions {
             connect_timeout: Duration::from_millis(connect_timeout_ms),
             handshake_timeout: Duration::from_millis(handshake_timeout_ms),
             read_timeout: Duration::from_millis(read_timeout_ms),
             write_timeout: Duration::from_millis(write_timeout_ms),
-        })
-        .map_err(value_error)?;
+        };
+        let transport = FramedTcpTransport::new(transport_options).map_err(value_error)?;
         let routing = (*routing).clone();
         let resolver = py
-            .detach(move || routing.build(root_id))
+            .detach(move || routing.build(transport_options, max_attempts))
             .map_err(value_error)?;
         let client =
             WorkspaceClient::new(root_id, transport, resolver, ClientOptions { max_attempts })
@@ -1445,7 +1445,7 @@ fn client_error(error: ClientError) -> PyErr {
 
 fn client_error_code(error: &ClientError) -> Option<nokv_protocol::ErrorCode> {
     match error {
-        ClientError::Rpc(failure) => Some(failure.code),
+        ClientError::Discovery(failure) | ClientError::Rpc(failure) => Some(failure.code),
         ClientError::ArtifactPublishFailed { source, .. }
         | ClientError::RetryExhausted {
             last_error: source, ..

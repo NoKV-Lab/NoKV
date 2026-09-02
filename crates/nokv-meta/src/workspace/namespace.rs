@@ -958,6 +958,8 @@ mod tests {
     fn path_entry(fill: u8, generation_value: u64) -> PathEntry {
         PathEntry {
             generation: Generation::new(generation_value).unwrap(),
+            index_generation: nokv_types::PathIndexGenerationId::from_bytes([fill; FIXED_ID_BYTES]),
+            path_digest: [fill; SHA256_BYTES],
             artifact_revision_id: ArtifactRevisionId::from_bytes([fill; FIXED_ID_BYTES]),
             body_digest_uri: format!("sha256:body-{fill}"),
             manifest_digest_uri: format!("sha256:manifest-{fill}"),

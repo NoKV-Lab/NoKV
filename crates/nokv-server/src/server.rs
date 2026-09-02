@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -13,15 +12,59 @@ use std::time::{Duration, Instant};
 
 use nokv_protocol::{
     decode_handshake_payload, decode_request, encode_handshake_frame, encode_response,
-    has_handshake_magic, ErrorCode, HandshakeKind, ProtocolError, RpcFailure, WorkspaceHandshake,
-    WorkspaceRpcOutcome, WorkspaceRpcResponse, HANDSHAKE_PAYLOAD_BYTES, MAX_FRAME_BYTES,
-    WORKSPACE_PROTOCOL_SCHEMA,
+    has_handshake_magic, DiscoverRouteOutcome, DiscoverRouteRequest, DiscoverRouteResponse,
+    DiscoveredRoute, ErrorCode, HandshakeKind, ProtocolError, RootIdentity, RpcFailure, RpcRequest,
+    RpcResponse, WorkspaceHandshake, WorkspaceRpcOutcome, WorkspaceRpcResponse,
+    HANDSHAKE_PAYLOAD_BYTES, MAX_FRAME_BYTES, WORKSPACE_PROTOCOL_SCHEMA,
 };
 
 use crate::legacy_rejection::{legacy_rejection_response, MAX_LEGACY_FIRST_FRAME_BYTES};
-use crate::{RootOwnerRegistry, ServerError, ShardOwner};
+use crate::{RootOwnerRegistry, ServerError};
 
 static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Storage-neutral source consulted by a NoKV seed for one route lookup.
+pub trait RouteDiscoverySource: Send + Sync {
+    fn discover_route(&self, root_id: RootIdentity) -> Result<DiscoveredRoute, RpcFailure>;
+}
+
+impl<T> RouteDiscoverySource for Arc<T>
+where
+    T: RouteDiscoverySource + ?Sized,
+{
+    fn discover_route(&self, root_id: RootIdentity) -> Result<DiscoveredRoute, RpcFailure> {
+        (**self).discover_route(root_id)
+    }
+}
+
+/// Provider-specific ownership maintenance retained behind the server
+/// composition boundary. Implementations must stop registry admission before
+/// returning a renewal failure.
+pub(crate) trait OwnershipMaintenance: Send + Sync {
+    #[cfg(any(feature = "fdb", test))]
+    fn required_renew_interval(&self) -> Option<Duration> {
+        None
+    }
+
+    fn renew(&self) -> Result<(), ServerError>;
+    fn release(&self) -> Result<(), ServerError>;
+}
+
+#[derive(Default)]
+struct UnavailableRouteDiscovery;
+
+impl RouteDiscoverySource for UnavailableRouteDiscovery {
+    fn discover_route(&self, _root_id: RootIdentity) -> Result<DiscoveredRoute, RpcFailure> {
+        Err(RpcFailure {
+            code: ErrorCode::RouteUnavailable,
+            message: "route discovery is not configured on this seed".to_owned(),
+            retryable: true,
+            conflict: None,
+            current_generation: None,
+            route_hint: None,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServerOptions {
@@ -166,32 +209,82 @@ pub struct ServerHealth {
 pub struct WorkspaceServer {
     options: ServerOptions,
     registry: Arc<RootOwnerRegistry>,
-    ownership: Vec<ShardOwner>,
+    maintenance: Option<Arc<dyn OwnershipMaintenance>>,
     owner_loss: OwnerLossSignal,
+    discovery: Arc<dyn RouteDiscoverySource>,
 }
 
 impl WorkspaceServer {
-    pub fn new(
+    /// Construct a standalone owner whose physical Holt lock is its ownership
+    /// authority. The registry must already contain at least one exact route.
+    pub fn new_local(
         options: ServerOptions,
         registry: Arc<RootOwnerRegistry>,
-        ownership: Vec<ShardOwner>,
     ) -> Result<Self, ServerError> {
         let owner_loss = registry.owner_loss_signal();
-
-        if let Err(error) = require_owner_retained(&owner_loss) {
-            return Err(release_rejected_ownership(ownership, error));
-        }
-
-        if let Err(error) = validate_ownership(options, &registry, &ownership) {
-            return Err(release_rejected_ownership(ownership, error));
+        require_owner_retained(&owner_loss)?;
+        options.validate()?;
+        if registry.installed_root_count()? == 0 {
+            return Err(ServerError::InvalidOptions(
+                "standalone serving requires at least one installed root route".to_owned(),
+            ));
         }
 
         Ok(Self {
             options,
             registry,
-            ownership,
+            maintenance: None,
             owner_loss,
+            discovery: Arc::new(UnavailableRouteDiscovery),
         })
+    }
+
+    #[cfg(any(feature = "fdb", test))]
+    pub(crate) fn new_distributed(
+        options: ServerOptions,
+        registry: Arc<RootOwnerRegistry>,
+        maintenance: Arc<dyn OwnershipMaintenance>,
+    ) -> Result<Self, ServerError> {
+        let owner_loss = registry.owner_loss_signal();
+        let validation = (|| {
+            require_owner_retained(&owner_loss)?;
+            options.validate()?;
+            if registry.installed_root_count()? == 0 {
+                return Err(ServerError::InvalidOptions(
+                    "distributed serving requires at least one installed root route".to_owned(),
+                ));
+            }
+            if let Some(required) = maintenance.required_renew_interval() {
+                if required.is_zero() {
+                    return Err(ServerError::InvalidOptions(
+                        "distributed ownership declares a zero lease renewal interval".to_owned(),
+                    ));
+                }
+                if options.lease_renew_interval != required {
+                    return Err(ServerError::InvalidOptions(format!(
+                        "distributed ownership requires lease renewal interval {required:?}, but ServerOptions configures {:?}",
+                        options.lease_renew_interval,
+                    )));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(primary) = validation {
+            return Err(release_rejected_maintenance(maintenance.as_ref(), primary));
+        }
+        Ok(Self {
+            options,
+            owner_loss,
+            registry,
+            maintenance: Some(maintenance),
+            discovery: Arc::new(UnavailableRouteDiscovery),
+        })
+    }
+
+    /// Install the seed-visible route source for this server process.
+    pub fn with_discovery_source(mut self, source: Arc<dyn RouteDiscoverySource>) -> Self {
+        self.discovery = source;
+        self
     }
 
     pub fn health(&self) -> Result<ServerHealth, ServerError> {
@@ -204,15 +297,14 @@ impl WorkspaceServer {
     /// Runtime lease-renewal hook. A failed renewal uninstalls that owner's
     /// complete root-route set before the error is returned.
     pub fn renew_ownership(&self) -> Result<(), ServerError> {
-        for owner in &self.ownership {
-            if let Err(error) = owner.renew_or_uninstall() {
+        if let Some(maintenance) = &self.maintenance {
+            if let Err(error) = maintenance.renew() {
                 match &error {
                     ServerError::Control(control) => {
                         self.owner_loss.fail_closed_with_control(control.clone());
                     }
                     _ => self.owner_loss.mark_lost(),
                 }
-
                 return Err(error);
             }
         }
@@ -222,7 +314,11 @@ impl WorkspaceServer {
 
     /// Remove all routes and release every logical-shard lease once.
     pub fn release_ownership(self) -> Result<(), ServerError> {
-        release_ownership(self.ownership)
+        self.maintenance
+            .as_ref()
+            .map(|maintenance| maintenance.release())
+            .transpose()
+            .map(|_| ())
     }
 
     pub fn owner_loss_signal(&self) -> OwnerLossSignal {
@@ -254,6 +350,7 @@ impl WorkspaceServer {
             listener,
             self.options,
             Arc::clone(&self.registry),
+            Arc::clone(&self.discovery),
             self.owner_loss.clone(),
             shutdown,
             || self.renew_ownership(),
@@ -261,9 +358,19 @@ impl WorkspaceServer {
     }
 
     pub fn dispatch_frame(&self, encoded: &[u8]) -> Result<Vec<u8>, ServerError> {
-        let request = decode_request(encoded)?;
-        let response = self.registry.dispatch_guarded(request)?;
-        encode_response(response.response()).map_err(ServerError::Protocol)
+        match decode_request(encoded)? {
+            RpcRequest::DiscoverRoute(request) => {
+                encode_response(&discovery_response(self.discovery.as_ref(), request))
+                    .map_err(ServerError::Protocol)
+            }
+            RpcRequest::Workspace(request) => {
+                let response = self.registry.dispatch_guarded(*request)?;
+                encode_response(&RpcResponse::Workspace(Box::new(
+                    response.response().clone(),
+                )))
+                .map_err(ServerError::Protocol)
+            }
+        }
     }
 }
 
@@ -271,6 +378,7 @@ fn serve_socket_loop(
     listener: TcpListener,
     options: ServerOptions,
     registry: Arc<RootOwnerRegistry>,
+    discovery: Arc<dyn RouteDiscoverySource>,
     owner_loss: OwnerLossSignal,
     shutdown: &AtomicBool,
     mut renew_ownership: impl FnMut() -> Result<(), ServerError>,
@@ -309,11 +417,12 @@ fn serve_socket_loop(
                     .set_nonblocking(false)
                     .map_err(ServerError::Connection)?;
                 let registry = Arc::clone(&registry);
+                let discovery = Arc::clone(&discovery);
                 thread::Builder::new()
                     .name("nokv-workspace-rpc".to_owned())
                     .spawn(move || {
                         let _permit = permit;
-                        let _ = serve_connection(stream, registry, options);
+                        let _ = serve_connection(stream, registry, discovery, options);
                     })
                     .map_err(ServerError::Connection)?;
             }
@@ -355,82 +464,14 @@ fn sleep_until_runtime_event(next_renewal: Instant) {
     thread::sleep(until_renewal.min(Duration::from_millis(10)));
 }
 
-fn validate_ownership(
-    options: ServerOptions,
-    registry: &Arc<RootOwnerRegistry>,
-    ownership: &[ShardOwner],
-) -> Result<(), ServerError> {
-    options.validate()?;
-    if ownership.is_empty() {
-        return Err(ServerError::InvalidOptions(
-            "serving requires at least one logical-shard owner".to_owned(),
-        ));
-    }
-    let mut shards = BTreeSet::new();
-    let mut roots = BTreeSet::new();
-    for (index, owner) in ownership.iter().enumerate() {
-        if !owner.is_for_registry(registry) {
-            return Err(ServerError::InvalidOptions(format!(
-                "ownership entry {index} belongs to another registry"
-            )));
-        }
-
-        if let Some(required) = owner.owner_lease_renew_interval() {
-            if required.is_zero() {
-                return Err(ServerError::InvalidOptions(format!(
-                    "ownership entry {index} declares a zero lease renewal interval"
-                )));
-            }
-
-            if options.lease_renew_interval != required {
-                return Err(ServerError::InvalidOptions(
-                    format!(
-                        "ownership entry {index} requires lease renewal interval {required:?}, but ServerOptions configures {:?}",
-                        options.lease_renew_interval,
-                    ),
-                ));
-            }
-        }
-
-        if !shards.insert(owner.shard_id()) {
-            return Err(ServerError::InvalidOptions(format!(
-                "ownership entry {index} duplicates logical shard {:?}",
-                owner.shard_id()
-            )));
-        }
-        if owner.routes().is_empty() {
-            return Err(ServerError::InvalidOptions(format!(
-                "ownership entry {index} has no root routes"
-            )));
-        }
-        for route in owner.routes() {
-            if route.logical_shard_id != nokv_protocol::LogicalShardIdentity::from(owner.shard_id())
-            {
-                return Err(ServerError::InvalidOptions(format!(
-                    "ownership entry {index} contains a route for another logical shard"
-                )));
-            }
-            if !roots.insert(route.root_id) {
-                return Err(ServerError::InvalidOptions(format!(
-                    "ownership entry {index} duplicates root route {:?}",
-                    route.root_id
-                )));
-            }
-            if !registry.contains_exact(*route)? {
-                return Err(ServerError::InvalidOptions(format!(
-                    "ownership entry {index} has no exact installed route for root {:?}",
-                    route.root_id
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn release_rejected_ownership(ownership: Vec<ShardOwner>, primary: ServerError) -> ServerError {
+#[cfg(any(feature = "fdb", test))]
+fn release_rejected_maintenance(
+    maintenance: &dyn OwnershipMaintenance,
+    primary: ServerError,
+) -> ServerError {
     let preserve_control = matches!(&primary, ServerError::Control(_));
 
-    match release_ownership(ownership) {
+    match maintenance.release() {
         Ok(()) => primary,
         Err(_) if preserve_control => primary,
         Err(cleanup) => ServerError::BootstrapRollback {
@@ -440,24 +481,10 @@ fn release_rejected_ownership(ownership: Vec<ShardOwner>, primary: ServerError) 
     }
 }
 
-fn release_ownership(ownership: Vec<ShardOwner>) -> Result<(), ServerError> {
-    let failures = ownership
-        .into_iter()
-        .filter_map(|owner| owner.release().err().map(|error| error.to_string()))
-        .collect::<Vec<_>>();
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(ServerError::BootstrapRollback {
-            primary: "release logical-shard ownership".to_owned(),
-            rollback: failures.join("; "),
-        })
-    }
-}
-
 fn serve_connection(
     mut stream: TcpStream,
     registry: Arc<RootOwnerRegistry>,
+    discovery: Arc<dyn RouteDiscoverySource>,
     options: ServerOptions,
 ) -> Result<(), ServerError> {
     if !admit_current_protocol(&mut stream, options.handshake_timeout)? {
@@ -470,14 +497,70 @@ fn serve_connection(
         .set_write_timeout(Some(options.write_timeout))
         .map_err(ServerError::Connection)?;
     while let Some(request) = read_frame(&mut stream)? {
-        let request = decode_request(&request)?;
-        let response = registry.dispatch_guarded(request)?;
-        let encoded = encode_response_or_internal_failure(response.response())?;
-        write_frame(&mut stream, &encoded)?;
-        drop(response);
+        match decode_request(&request)? {
+            RpcRequest::DiscoverRoute(request) => {
+                let response = discovery_response(discovery.as_ref(), request);
+                write_frame(&mut stream, &encode_response(&response)?)?;
+            }
+            RpcRequest::Workspace(request) => {
+                let response = registry.dispatch_guarded(*request)?;
+                let encoded = encode_response_or_internal_failure(response.response())?;
+                write_frame(&mut stream, &encoded)?;
+                drop(response);
+            }
+        }
         require_owner_retained(&registry.owner_loss_signal())?;
     }
     Ok(())
+}
+
+fn discovery_response(
+    source: &dyn RouteDiscoverySource,
+    request: DiscoverRouteRequest,
+) -> RpcResponse {
+    let outcome = match source.discover_route(request.root_id) {
+        Ok(route) => match route.validate() {
+            Ok(()) if route.root_id == request.root_id => DiscoverRouteOutcome::Found(route),
+            Ok(()) => DiscoverRouteOutcome::Failure(RpcFailure {
+                code: ErrorCode::RouteUnavailable,
+                message: "discovery source returned a route for another root".to_owned(),
+                retryable: true,
+                conflict: None,
+                current_generation: None,
+                route_hint: None,
+            }),
+            Err(error) => DiscoverRouteOutcome::Failure(RpcFailure {
+                code: ErrorCode::RouteUnavailable,
+                message: format!("discovery source returned an invalid route: {error}"),
+                retryable: true,
+                conflict: None,
+                current_generation: None,
+                route_hint: None,
+            }),
+        },
+        Err(failure)
+            if failure.validate().is_ok()
+                && failure.retryable
+                && matches!(
+                    failure.code,
+                    ErrorCode::RouteUnavailable | ErrorCode::RouteExpired
+                ) =>
+        {
+            DiscoverRouteOutcome::Failure(failure)
+        }
+        Err(_) => DiscoverRouteOutcome::Failure(RpcFailure {
+            code: ErrorCode::RouteUnavailable,
+            message: "discovery source returned an invalid failure".to_owned(),
+            retryable: true,
+            conflict: None,
+            current_generation: None,
+            route_hint: None,
+        }),
+    };
+    RpcResponse::DiscoverRoute(DiscoverRouteResponse {
+        root_id: request.root_id,
+        outcome,
+    })
 }
 
 /// Encodes one response frame. A success projection that fails wire
@@ -488,7 +571,7 @@ fn serve_connection(
 fn encode_response_or_internal_failure(
     response: &WorkspaceRpcResponse,
 ) -> Result<Vec<u8>, ServerError> {
-    match encode_response(response) {
+    match encode_response(&RpcResponse::Workspace(Box::new(response.clone()))) {
         Ok(encoded) => Ok(encoded),
         Err(ProtocolError::FrameTooLarge { bytes, max }) => {
             Err(ServerError::FrameTooLarge { bytes, max })
@@ -512,7 +595,7 @@ fn encode_response_or_internal_failure(
                     route_hint: None,
                 }),
             };
-            Ok(encode_response(&failure)?)
+            Ok(encode_response(&RpcResponse::Workspace(Box::new(failure)))?)
         }
     }
 }
@@ -692,19 +775,98 @@ mod tests {
     use std::sync::mpsc;
 
     use nokv_protocol::{
-        decode_handshake_frame, decode_response, encode_handshake_frame, encode_request,
-        CreateWorkspaceRequest, HandshakeKind, LogicalShardIdentity, ObjectNamespaceIdentity,
-        RequestIdentity, RootIdentity, RootRoute, RpcFailure, WorkbenchName, WorkspaceHandshake,
-        WorkspaceIdentity, WorkspaceRequest, WorkspaceResult, WorkspaceRpcOutcome,
-        WorkspaceRpcRequest, WorkspaceSummary, HANDSHAKE_FRAME_BYTES, HANDSHAKE_PAYLOAD_BYTES,
+        decode_handshake_frame, encode_handshake_frame, CreateWorkspaceRequest, HandshakeKind,
+        LogicalShardIdentity, ObjectNamespaceIdentity, RequestIdentity, RootIdentity, RootRoute,
+        RpcFailure, WorkbenchName, WorkspaceHandshake, WorkspaceIdentity, WorkspaceRequest,
+        WorkspaceResult, WorkspaceRpcOutcome, WorkspaceRpcRequest, WorkspaceSummary,
+        HANDSHAKE_FRAME_BYTES, HANDSHAKE_PAYLOAD_BYTES,
     };
     use serde::{Deserialize, Serialize};
 
     use super::*;
     use crate::{ExecutedRequest, WorkspaceRequestExecutor};
 
+    fn encode_request(request: &WorkspaceRpcRequest) -> Result<Vec<u8>, ProtocolError> {
+        nokv_protocol::encode_request(&RpcRequest::Workspace(Box::new(request.clone())))
+    }
+
+    fn encode_response(response: &WorkspaceRpcResponse) -> Result<Vec<u8>, ProtocolError> {
+        nokv_protocol::encode_response(&RpcResponse::Workspace(Box::new(response.clone())))
+    }
+
+    fn decode_response(encoded: &[u8]) -> Result<WorkspaceRpcResponse, ProtocolError> {
+        match nokv_protocol::decode_response(encoded)? {
+            RpcResponse::Workspace(response) => Ok(*response),
+            RpcResponse::DiscoverRoute(_) => Err(ProtocolError::Decode(
+                "expected a workspace response".to_owned(),
+            )),
+        }
+    }
+
+    fn serve_connection(
+        stream: TcpStream,
+        registry: Arc<RootOwnerRegistry>,
+        options: ServerOptions,
+    ) -> Result<(), ServerError> {
+        super::serve_connection(
+            stream,
+            registry,
+            Arc::new(UnavailableRouteDiscovery),
+            options,
+        )
+    }
+
+    fn serve_socket_loop(
+        listener: TcpListener,
+        options: ServerOptions,
+        registry: Arc<RootOwnerRegistry>,
+        owner_loss: OwnerLossSignal,
+        shutdown: &AtomicBool,
+        renew_ownership: impl FnMut() -> Result<(), ServerError>,
+    ) -> Result<(), ServerError> {
+        super::serve_socket_loop(
+            listener,
+            options,
+            registry,
+            Arc::new(UnavailableRouteDiscovery),
+            owner_loss,
+            shutdown,
+            renew_ownership,
+        )
+    }
+
     struct CountingExecutor {
         calls: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct CountingMaintenance {
+        renewals: AtomicUsize,
+        releases: AtomicUsize,
+        reject_renewal: AtomicBool,
+        required_renew_interval: Option<Duration>,
+    }
+
+    impl OwnershipMaintenance for CountingMaintenance {
+        fn required_renew_interval(&self) -> Option<Duration> {
+            self.required_renew_interval
+        }
+
+        fn renew(&self) -> Result<(), ServerError> {
+            self.renewals.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.reject_renewal.load(AtomicOrdering::SeqCst) {
+                Err(ServerError::InvalidBootstrap(
+                    "test owner session was lost".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn release(&self) -> Result<(), ServerError> {
+            self.releases.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(())
+        }
     }
 
     impl WorkspaceRequestExecutor for CountingExecutor {
@@ -724,6 +886,27 @@ mod tests {
                 commit_version: Some(9),
                 replayed: false,
             })
+        }
+    }
+
+    struct FixedDiscovery {
+        route: DiscoveredRoute,
+    }
+
+    impl RouteDiscoverySource for FixedDiscovery {
+        fn discover_route(&self, root_id: RootIdentity) -> Result<DiscoveredRoute, RpcFailure> {
+            if self.route.root_id == root_id {
+                Ok(self.route.clone())
+            } else {
+                Err(RpcFailure {
+                    code: ErrorCode::RouteUnavailable,
+                    message: "root is not present on this seed".to_owned(),
+                    retryable: true,
+                    conflict: None,
+                    current_generation: None,
+                    route_hint: None,
+                })
+            }
         }
     }
 
@@ -757,6 +940,50 @@ mod tests {
                 workspace_incarnation_id: WorkspaceIdentity([5; 16]),
             }),
         }
+    }
+
+    #[test]
+    fn discovery_returns_a_complete_serving_route() {
+        let route = DiscoveredRoute::new(
+            route(),
+            13,
+            nokv_protocol::OwnerEndpoint::new("127.0.0.1:7750").unwrap(),
+            nokv_protocol::RouteState::Serving,
+        )
+        .unwrap();
+        let response = discovery_response(
+            &FixedDiscovery {
+                route: route.clone(),
+            },
+            DiscoverRouteRequest {
+                root_id: route.root_id,
+            },
+        );
+        let encoded = nokv_protocol::encode_response(&response).unwrap();
+        let decoded = nokv_protocol::decode_response(&encoded).unwrap();
+        assert_eq!(decoded, response);
+        let RpcResponse::DiscoverRoute(response) = decoded else {
+            panic!("discovery must return a discovery envelope");
+        };
+        assert_eq!(response.outcome, DiscoverRouteOutcome::Found(route));
+    }
+
+    #[test]
+    fn discovery_unavailable_is_typed_and_retryable() {
+        let response = discovery_response(
+            &UnavailableRouteDiscovery,
+            DiscoverRouteRequest {
+                root_id: route().root_id,
+            },
+        );
+        let RpcResponse::DiscoverRoute(response) = response else {
+            panic!("discovery must return a discovery envelope");
+        };
+        let DiscoverRouteOutcome::Failure(failure) = response.outcome else {
+            panic!("unconfigured discovery must fail");
+        };
+        assert_eq!(failure.code, ErrorCode::RouteUnavailable);
+        assert!(failure.retryable);
     }
 
     #[test]
@@ -832,6 +1059,61 @@ mod tests {
     }
 
     #[test]
+    fn distributed_maintenance_renews_fails_closed_and_releases() {
+        let (registry, _) = registry();
+        let maintenance = Arc::new(CountingMaintenance::default());
+        let erased: Arc<dyn OwnershipMaintenance> = maintenance.clone();
+        let server = WorkspaceServer::new_distributed(options(), registry, erased).unwrap();
+
+        server.renew_ownership().unwrap();
+        assert_eq!(maintenance.renewals.load(AtomicOrdering::SeqCst), 1);
+        maintenance
+            .reject_renewal
+            .store(true, AtomicOrdering::SeqCst);
+        assert!(server.renew_ownership().is_err());
+        assert!(server.owner_loss_signal().is_lost());
+
+        server.release_ownership().unwrap();
+        assert_eq!(maintenance.releases.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rejected_distributed_server_releases_maintenance() {
+        let maintenance = Arc::new(CountingMaintenance::default());
+        let erased: Arc<dyn OwnershipMaintenance> = maintenance.clone();
+        let error = match WorkspaceServer::new_distributed(
+            options(),
+            Arc::new(RootOwnerRegistry::new()),
+            erased,
+        ) {
+            Ok(_) => panic!("empty distributed registry must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("at least one installed root"));
+        assert_eq!(maintenance.releases.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn distributed_server_rejects_ownership_renewal_cadence_drift() {
+        let (registry, _) = registry();
+        let maintenance = Arc::new(CountingMaintenance {
+            required_renew_interval: Some(Duration::from_secs(2)),
+            ..CountingMaintenance::default()
+        });
+        let erased: Arc<dyn OwnershipMaintenance> = maintenance.clone();
+        let error = match WorkspaceServer::new_distributed(options(), registry, erased) {
+            Ok(_) => panic!("mismatching ownership cadence must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("requires lease renewal interval 2s"));
+        assert_eq!(maintenance.releases.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
     fn frame_round_trips_exact_bytes() {
         let expected = b"workspace request";
         let mut encoded = Vec::new();
@@ -887,13 +1169,16 @@ mod tests {
         let (registry, executor) = registry();
         let serving = thread::spawn(move || serve_connection(server, registry, options()));
 
-        let mut legacy = encode_request(&request()).unwrap();
-        let position = legacy
-            .windows(WORKSPACE_PROTOCOL_SCHEMA.len())
-            .position(|window| window == WORKSPACE_PROTOCOL_SCHEMA.as_bytes())
-            .unwrap();
-        legacy[position..position + WORKSPACE_PROTOCOL_SCHEMA.len()]
-            .copy_from_slice(crate::legacy_rejection::LEGACY_V3_SCHEMA.as_bytes());
+        #[derive(Serialize)]
+        struct LegacyFrame {
+            schema: &'static str,
+            payload: WorkspaceRpcRequest,
+        }
+        let legacy = rmp_serde::to_vec_named(&LegacyFrame {
+            schema: crate::legacy_rejection::LEGACY_V3_SCHEMA,
+            payload: request(),
+        })
+        .unwrap();
         write_frame(&mut client, &legacy).unwrap();
         let response = read_frame(&mut client).unwrap().unwrap();
         let response = decode_response(&response).unwrap();
@@ -964,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_hello_gets_v9_incompatible_and_zero_dispatch() {
+    fn v7_hello_gets_v10_incompatible_and_zero_dispatch() {
         let (mut client, server) = streams();
         let (registry, executor) = registry();
         let serving = thread::spawn(move || serve_connection(server, registry, options()));

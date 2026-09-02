@@ -1,0 +1,22 @@
+[package]
+name = "nokv-meta-fdb"
+version = "0.1.0"
+description = "FoundationDB characterization adapter for NoKV metadata transactions."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = []
+fdb = ["nokv-fdb/fdb"]
+
+[dependencies]
+nokv-fdb.workspace = true
+nokv-meta-store.workspace = true
+
+[dev-dependencies]
+nokv-meta-store = { workspace = true, features = ["test-support"] }
+uuid = { version = "1", features = ["v4"] }

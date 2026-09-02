@@ -11,7 +11,7 @@ Status: normative workspace architecture.
 
 ```mermaid
 flowchart LR
-    Skills["Downstream Agent skills"] --> CLI["Native full nokv CLI"]
+    Integrations["Downstream Agent integrations"] --> CLI["Native full nokv CLI"]
     CLI --> Agent["Transport-free Workbench facade"]
     Agent --> SDK["Rust Agent SDK"]
     CLI --> SDK
@@ -20,12 +20,16 @@ flowchart LR
     Local --> Python
 
     SDK --> Router["Root router"]
-    Router --> Control["Control plane<br/>root placement + owner lease"]
+    Router -.-> Seed["NoKV seeds<br/>route discovery / refresh"]
     Router --> Owner["Fenced logical-shard owner"]
 
     Owner --> Meta["NoKV metadata semantics"]
     Meta --> Store["TxnStore<br/>ordered reads + checked writes"]
-    Store --> Holt["HoltStore<br/>serving local adapter"]
+    Store --> Holt["Holt adapter<br/>standalone"]
+    Store --> FdbMeta["FDB metadata adapter<br/>distributed, feature gated"]
+    Owner -.-> FdbControl["FDB control adapter<br/>catalog + route + session<br/>(FDB mode only)"]
+    FdbMeta --> FDB["FoundationDB<br/>shared authority"]
+    FdbControl --> FDB
 
     SDK --> Data["Direct immutable-object data path"]
     Data --> Cache["Local NVMe soft cache"]
@@ -35,7 +39,11 @@ flowchart LR
 
 The metadata and object paths are separate. Small control and namespace records
 go through the shard owner. Clients stream immutable blocks directly through
-the object boundary after receiving a revision/upload plan.
+the object boundary after receiving a revision/upload plan. Exactly one
+metadata adapter is selected by the explicit metadata URL: standalone Holt has
+no distributed control plane, while distributed FDB keeps control and metadata
+records in the same shared authority. There is no provider auto-selection,
+migration, fallback, or dual-write path.
 
 FUSE, POSIX, CSI, and fsspec are not architecture layers.
 
@@ -55,12 +63,20 @@ flowchart TD
     Server --> Meta["nokv-meta"]
     Server --> Store["nokv-meta-store"]
     Server --> HoltAdapter["nokv-meta-holt"]
+    Server --> FdbMetaAdapter["nokv-meta-fdb"]
     Server --> Control["nokv-control"]
+    Server --> FdbControlAdapter["nokv-control-fdb"]
+    Server --> FdbRuntime["nokv-fdb"]
     Server --> Object
     Meta --> Types
     Meta --> Store
     HoltAdapter --> Store
     HoltAdapter --> Holt["Holt"]
+    FdbMetaAdapter --> Store
+    FdbMetaAdapter --> FdbRuntime
+    FdbControlAdapter --> Control
+    FdbControlAdapter --> FdbRuntime
+    FdbRuntime --> FDB["FoundationDB"]
     Control --> Types
     Object --> Types
 ```
@@ -72,7 +88,10 @@ Key constraints:
 
 - types and protocol are storage-neutral;
 - metadata owns durable semantics, logical keyspaces, and record codecs;
-- the Holt adapter owns the physical tree mapping and local durability;
+- the Holt adapter owns the standalone physical mapping and local durability;
+- the feature-gated FDB metadata and control adapters share the process-global
+  `nokv-fdb` runtime but retain separate domain ownership;
+- the server selects exactly one metadata runtime from an explicit URL;
 - control owns root placement and owner fencing, not path semantics;
 - object owns provider I/O, not reachability;
 - client uses protocol/routing and never imports meta/server;
@@ -123,7 +142,7 @@ sequenceDiagram
     participant C as SDK
     participant R as Router
     participant M as Shard owner
-    participant S as TxnStore (Holt local profile)
+    participant S as TxnStore (selected Holt or FDB profile)
     participant O as Object backend/cache
 
     C->>R: stat/open(root, workbench, path)
@@ -159,22 +178,23 @@ continuations retain one exact root read version. Live continuations may move
 to a newer root read version only while the target workspace incarnation and
 revision remain unchanged; target drift fails closed, and an initial bounded
 collection may restart in full but never merges workspace revisions. This
-contract is gated by operation schema `nokv.workspace.rpc.v9`; v7 added the
+contract is gated by operation schema `nokv.workspace.rpc.v10`; v7 added the
 exact read-version fence used by path point reads, v8 added the required typed
 `Prefix`/`Exact` catalog path match so an artifact cannot inherit fields from
-same-name descendants, and v9 adds an explicit query profile plus tagged query
-rows and authoritative search, aggregate, and catalog totals/facets. V3 first
+same-name descendants, v9 added an explicit query profile plus tagged query
+rows and authoritative search, aggregate, and catalog totals/facets, and v10
+separates seed discovery from root-routed workspace requests. V3 first
 added the provider-neutral object namespace identity to every root route.
 
 Each TCP connection starts with the fixed-width, schema-neutral transport
 handshake v1. The client offers one exact operation schema, and the server
-accepts only `nokv.workspace.rpc.v9`; the handshake version remains stable when
+accepts only `nokv.workspace.rpc.v10`; the handshake version remains stable when
 the operation schema changes. For upgrade diagnostics, the server recognizes
 only operation-first envelopes from the public v2 client and the post-tag v3
 client. It parses a bounded route/request header, ignores the operation, emits
 one schema-readable failure, and closes without dispatch. The v2 client gets
-its exact v2 failure envelope; the v3 client gets a v9 failure envelope so its
-decoder reports the v9/v3 schema mismatch. Unknown legacy schemas, malformed
+its exact v2 failure envelope; the v3 client gets a v10 failure envelope so its
+decoder reports the v10/v3 schema mismatch. Unknown legacy schemas, malformed
 envelopes, and malformed handshakes fail closed. This is a read-only rejection
 path, not a legacy response decoder or operation fallback.
 
@@ -204,7 +224,7 @@ sequenceDiagram
     participant C as SDK
     participant M as Shard owner
     participant O as Object backend
-    participant S as TxnStore (Holt local profile)
+    participant S as TxnStore (selected Holt or FDB profile)
 
     C->>M: begin publish + request id
     M-->>C: operation/revision/object plan
@@ -216,9 +236,10 @@ sequenceDiagram
     M-->>C: generation + revision + digest
 ```
 
-The command validates schema, local root fence, owner epoch, request id,
-workspace/path generations, and revision reference state before applying any
-mutation. It atomically publishes:
+The command validates schema, root fence, the selected provider's exact owner
+predicate, request id, workspace/path generations, and revision reference state
+before applying any mutation. In FDB mode the stable-session predicate is part
+of the same physical transaction. The command atomically publishes:
 
 - the revision and block manifest;
 - the new path and workspace revision;
@@ -314,16 +335,19 @@ NoKV deliberately avoids a lazy overlay that would tax every later read/list.
 
 ## Sharding And Ownership
 
-The control plane persists placement before a root's first write:
+The selected serving runtime fixes placement before a root's first write:
 
 ```text
 RootId -> immutable LogicalShardId
-LogicalShardId -> current physical owner, lease, epoch
+LogicalShardId -> current owner identity and fencing generation
 ```
 
-The owner installs or validates `RootFence` in its metadata shard and checks
-the lease epoch in the same physical transaction as each metadata commit.
-Placement is never inferred from a path or modulo the number of owners.
+Standalone Holt derives one local logical shard and installs its local
+`RootFence` without a distributed catalog or lease service. Distributed FDB
+persists the root/shard catalog, route, and exact owner session before serving.
+The owner validates `RootFence` and its provider-specific ownership predicate in
+the same physical transaction as each metadata commit. Placement is never
+inferred from a path or modulo the number of owners.
 
 A hot root's logical shard may be assigned to a dedicated physical process.
 That is owner movement, not a change to logical shard or object keys.
@@ -333,80 +357,37 @@ partial work.
 
 ## Recovery And Durability
 
-Each production profile names its acknowledgement boundary:
+Each metadata URL names one acknowledgement and recovery authority:
 
 ```text
-local
-  ACK after shard-local Holt WAL boundary
+holt:///absolute/path
+  ACK after the exclusive Holt store commits its local journal
+  restart by reopening that same exact store
 
-durable distributed
-  ACK after the configured shared logical-log boundary
+fdb:///absolute/fdb.cluster?prefix=NAME
+  ACK after the shared FDB transaction commits
+  fail over through an exact FDB owner session and metadata fence
 ```
 
-The two modes have separate SLOs and benchmark rows. Recovery uses checkpoint
-images plus the logical command log. Owner epoch prevents an old process from
-committing or deleting objects after failover.
+Holt has no control plane and does not claim copied-directory or replacement
+host recovery. FDB stores the manifest, catalog, route, session, heartbeat, and
+workspace metadata in one shared authority. A stale FDB owner must satisfy its
+stable-session predicate in the same physical transaction as every metadata
+commit.
 
-Current implementation status: the local Holt WAL boundary and the
-object-backed shared-log boundary are executable. Every acknowledged metadata
-mutation first commits to the shard-local hash-chained recovery outbox. The
-shared boundary then persists an exact upload intent in Control, creates the
-receipt-addressed immutable chunks and manifest, and atomically publishes the
-new log frontier before returning. Control bounds both the logical chain and
-the canonical encoded record so an upload is rejected before its first object
-write if its pending or finalized etcd record cannot fit the admitted request
-budget.
+Clients never open either metadata store. They use one or more NoKV seeds to
+discover the current owner and accept only monotonic route/session generations.
 
-`Reopen` restarts the same exclusive Holt namespace. `RecoverLog` creates or
-resumes a local namespace from strict shared-log receipts. Both paths validate
-canonical receipts and prove the Control frontier is an exact prefix before
-owner acquisition, then renew and repeat the proof after acquisition before
-installing the owner fence. Complete pending uploads are replayed exactly;
-incomplete uploads retain their intent until every receipt-derived cleanup key
-is confirmed deleted or absent, after which an owner-fenced CAS may abort the
-intent. Ambiguous cleanup remains fail-closed. Crashes after pending replay or
-owner activation are resumable because a verified local-ahead prefix is not
-mistaken for divergence. A completed owner gets the next epoch; an unfinished
-`Recovering` owner rebinds the same epoch, so repeated crashes cannot create an
-epoch gap.
+Lifecycle recovery is driven by durable metadata ledgers, not object listing.
+This covers staged uploads, commit construction, restore staging and cleanup,
+snapshot retirement, and GC claims. An ambiguous destructive provider outcome
+is quarantined. The retired distributed-local-log publication path is not a
+third profile or a compatibility fallback.
 
-Cold checkpoint installation is not yet admitted by the default product build:
-the pinned published Holt dependency does not expose the bounded borrowed
-checkpoint API. A Control checkpoint frontier therefore remains fail-closed in
-`RecoverLog`. Log truncation/compaction, copied-directory identity, cross-host
-checkpoint failover, and fsck also remain outside this qualification.
-
-Because no checkpoint publisher exists yet, the shared log chain only grows:
-every acknowledged mutation appends one segment reference to the Control
-logical-shard record, and Control bounds that record (`MAX_LOGICAL_SHARD_RECORD_BYTES`)
-and the chain length (`MAX_RECOVERY_LOG_SEGMENTS`). A shard that reaches either
-bound loses its owner fence and stops serving; on the current record size that
-happens after roughly a hundred acknowledged publications. Shared publication
-is therefore an opt-in, not the resting state.
-
-`nokv serve --recovery-publication` selects the recovery authority:
-
-- `local-only` (**default**) keeps the exclusive Holt WAL as the only recovery
-  authority, publishes no segments, leaves any earlier shared frontier frozen,
-  and still proves owner liveness before every acknowledgement. Control (etcd)
-  is used for routing and the owner lease only. A `local-only` shard has no
-  shared-log successor path: losing its Holt directory loses the metadata,
-  exactly as with the `local` mode above.
-- `shared` is the object-first boundary described above. It is implied by
-  `--metadata-recover-log`, which can only resume from a shared frontier, and
-  it cannot be combined with `local-only` on that open mode. Do not select it
-  for a shard that will accept more than a bounded burst of writes until
-  checkpoint compaction lands.
-
-Durable ledgers, not object listing, recover:
-
-- staged/multipart uploads;
-- commit construction;
-- restore staging and cleanup;
-- GC claims and ambiguous deletes.
-
-The required fsck recomputes reference counts and closure seals from metadata;
-source or design text alone is not fsck evidence.
+The FDB runtime is feature gated and remains **NOT QUALIFIED** until its real
+conformance, unknown-outcome, takeover, crash, seed-discovery, lifecycle,
+transaction-limit, and performance gates have retained evidence. Source wiring
+or unit tests alone cannot change that status.
 
 ## Architecture Acceptance
 

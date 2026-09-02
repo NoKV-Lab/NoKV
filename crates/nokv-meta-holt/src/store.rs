@@ -14,8 +14,8 @@ use std::sync::Mutex;
 use holt::{DBView, RangeEntry, RecordVersion, DB};
 use nokv_meta_store::{
     AckBoundary, Authority, Check, Commit, Keyspace, Mutation, ReadBatch, ReadOp, ReadResult,
-    ReadSnapshot, Scan, ScanItem, ScanPage, StoreCheckpointEnvelope, StoreError, StoreLimits,
-    StoreProfile, TxnStore, UnknownCommit, WriteTxn,
+    ReadSnapshot, RecoveryMode, Scan, ScanItem, ScanPage, StoreCheckpointEnvelope, StoreError,
+    StoreLimits, StoreProfile, TxnStore, UnknownCommit, WriteTxn,
 };
 
 #[cfg(any(test, feature = "test-support"))]
@@ -23,6 +23,16 @@ use crate::TreeBinding;
 use crate::{HoltOptions, HoltRecoveryStagingAdoptionAuthority, HoltRecoveryStagingIdentity};
 
 static STORE_INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn local_profile(limits: StoreLimits) -> StoreProfile {
+    StoreProfile {
+        limits,
+        transaction_target_bytes: limits.max_transaction_bytes,
+        ack: AckBoundary::LocalSync,
+        authority: Authority::Local,
+        recovery: RecoveryMode::LocalJournal,
+    }
+}
 
 /// Embedded Holt transaction store for one local metadata authority.
 pub struct HoltStore {
@@ -106,11 +116,7 @@ impl HoltStore {
         crate::checkpoint::validate_install_markers(path, Some(expected), expected_catalog)?;
         require_holt_location(path)?;
         let location = Some(path.to_path_buf());
-        let profile = StoreProfile {
-            limits: options.limits,
-            ack: AckBoundary::LocalSync,
-            authority: Authority::Local,
-        };
+        let profile = local_profile(options.limits);
         let db = DB::open(options.config).map_err(map_open_error)?;
         prepare_trees(&db, &trees, OpenAction::Existing)?;
         crate::checkpoint::validate_install_markers(
@@ -151,11 +157,7 @@ impl HoltStore {
         crate::checkpoint::validate_recovery_staging_adoption(path, &expected)?;
         require_holt_location(path)?;
         let location = Some(path.to_path_buf());
-        let profile = StoreProfile {
-            limits: options.limits,
-            ack: AckBoundary::LocalSync,
-            authority: Authority::Local,
-        };
+        let profile = local_profile(options.limits);
         let db = DB::open(options.config).map_err(map_open_error)?;
         prepare_trees(&db, &trees, OpenAction::Existing)?;
         crate::checkpoint::adopt_recovery_staging_marker(
@@ -173,11 +175,7 @@ impl HoltStore {
         let trees = options.validate(allow_memory)?;
         preflight_location(&options, action, &trees)?;
         let location = options.file_path()?.map(std::path::Path::to_path_buf);
-        let profile = StoreProfile {
-            limits: options.limits,
-            ack: AckBoundary::LocalSync,
-            authority: Authority::Local,
-        };
+        let profile = local_profile(options.limits);
         let db = DB::open(options.config).map_err(map_open_error)?;
         prepare_trees(&db, &trees, action)?;
         Ok(Self::from_parts(profile, db, trees, location, None))
@@ -223,11 +221,7 @@ impl HoltStore {
     ) -> Result<Self, StoreError> {
         let location = options.file_path()?.map(std::path::Path::to_path_buf);
         Ok(Self::from_parts(
-            StoreProfile {
-                limits: options.limits,
-                ack: AckBoundary::LocalSync,
-                authority: Authority::Local,
-            },
+            local_profile(options.limits),
             db,
             trees,
             location,

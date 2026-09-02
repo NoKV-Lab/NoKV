@@ -41,8 +41,7 @@ mod tests {
             _native(&module).unwrap();
 
             let routing = module.getattr("RoutingConfig").unwrap();
-            assert!(routing.getattr("static").is_ok());
-            assert!(routing.getattr("etcd").is_ok());
+            assert!(routing.getattr("seeds").is_ok());
             assert!(module.getattr("Client").is_ok());
             assert!(module.getattr("ObjectStoreConfig").is_ok());
 

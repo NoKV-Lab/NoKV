@@ -15,6 +15,8 @@ use crate::{Commit, ReadBatch, ReadSnapshot, StoreError, StoreProfile, WriteTxn}
 /// the store's configured acknowledgement boundary. A false check returns
 /// [`Commit::Conflict`] and applies no mutation. An uncertain commit returns
 /// [`StoreError::OutcomeUnknown`]. The store never reports it as a conflict.
+/// Loss of the physical ownership authority bound to the handle returns
+/// [`StoreError::Fenced`] and applies no mutation.
 ///
 /// An adapter that returns a poisoned unknown outcome must enter that state
 /// before it returns. No overlapping or later `read` or `commit` may return

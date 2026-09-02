@@ -20,7 +20,7 @@ use super::codec::{
 use super::commit::RUN_MANIFEST_PATH;
 use super::engine::{
     CommandMutation, CommandPredicate, HistoryProjection, MetaError, MetaShard, MetadataCommand,
-    RootFenceAction,
+    RootFenceAction, MAX_EVENT_BYTES,
 };
 use super::event_projection::change_event_projection;
 use super::keyspace::MetadataFamily;
@@ -30,12 +30,14 @@ use super::publication_records::{
     WorkspaceRecord,
 };
 use super::query_records::{
-    secondary_index_key, ChangeEventKind, ChangeEventRecord, QueryRecordError,
-    SecondaryIndexRecord, TypedProjection,
+    path_index_digest, path_index_generation, path_index_locator_key, secondary_index_key,
+    ChangeEventKind, ChangeEventRecord, PathIndexLocatorRecord, PathIndexLocatorState,
+    QueryRecordError, SecondaryIndexRecord, TypedProjection,
 };
 use super::restore::RESTORE_MANIFEST_PATH;
 
 const RENAME_RESULT_VERSION: u8 = 1;
+const RENAME_INDEX_STAGE_RESULT_VERSION: u8 = 1;
 
 /// One generation-fenced, create-only path move inside a visible Workbench.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,11 +163,12 @@ impl From<QueryRecordError> for RenamePathError {
 
 /// Move one authoritative path without changing its immutable revision lifetime.
 ///
-/// Source and destination namespace rows, the path-owned revision reference,
-/// typed secondary indexes, the Workbench revision, and both change events
-/// advance through one metadata command. The artifact revision row is an exact
-/// predicate only: its reference count, epoch, and last-zero version never
-/// change during a move.
+/// One bounded command stages the destination's typed secondary-index
+/// generation. The final command atomically moves the source/destination
+/// namespace rows and path-owned revision reference, publishes that index
+/// generation, advances the Workbench revision, and emits both change events.
+/// The artifact revision row is an exact predicate only: its reference count,
+/// epoch, and last-zero version never change during a move.
 pub fn rename_path(
     store: &MetaShard,
     request: RenamePathRequest,
@@ -299,6 +302,181 @@ pub fn rename_path(
     );
 
     let projection = TypedProjection::decode_stored(&source.typed_index_projection)?;
+    let destination_index_generation = path_index_generation(request.context.request_id);
+    let destination_path_digest = path_index_digest(&request.destination);
+    let destination = PathEntry {
+        index_generation: destination_index_generation,
+        path_digest: destination_path_digest,
+        ..source.clone()
+    };
+    let destination_payload = destination.encode()?;
+    let index_payload = SecondaryIndexRecord {
+        path_digest: destination_path_digest,
+        index_generation: destination_index_generation,
+    }
+    .encode()?;
+    let locator_key = path_index_locator_key(
+        request.context.root_id,
+        workspace.incarnation_id,
+        destination_path_digest,
+        destination_index_generation,
+    );
+    let staged_locator_payload = PathIndexLocatorRecord {
+        state: PathIndexLocatorState::Staged,
+        path: request.destination.clone(),
+    }
+    .encode()?;
+    let published_locator_payload = PathIndexLocatorRecord {
+        state: PathIndexLocatorState::Published,
+        path: request.destination.clone(),
+    }
+    .encode()?;
+    let index_rows = projection
+        .fields()
+        .iter()
+        .map(|(field, scalar)| {
+            (
+                secondary_index_key(
+                    request.context.root_id,
+                    field,
+                    scalar,
+                    workspace.incarnation_id,
+                    destination_path_digest,
+                    destination_index_generation,
+                ),
+                index_payload.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let removed = change_event_projection(&ChangeEventRecord {
+        workbench_id: request.workbench_id.clone(),
+        workspace_incarnation_id: workspace.incarnation_id,
+        kind: ChangeEventKind::PathRemoved,
+        artifact_revision_id: Some(source.artifact_revision_id),
+        commit_id: None,
+        operation_id: None,
+        path: Some(request.source.clone()),
+        before: projection.clone(),
+        after: TypedProjection::empty(),
+    })?;
+    let published = change_event_projection(&ChangeEventRecord {
+        workbench_id: request.workbench_id.clone(),
+        workspace_incarnation_id: workspace.incarnation_id,
+        kind: ChangeEventKind::ArtifactPublished,
+        artifact_revision_id: Some(source.artifact_revision_id),
+        commit_id: None,
+        operation_id: None,
+        path: Some(request.destination.clone()),
+        before: TypedProjection::empty(),
+        after: projection,
+    })?;
+    if [&removed, &published]
+        .into_iter()
+        .any(|event| event.payload.len() > MAX_EVENT_BYTES)
+    {
+        return Err(RenamePathError::Meta(MetaError::InvalidCommand {
+            reason: "event projection exceeds size bound".to_owned(),
+        }));
+    }
+    let mut stage_predicates = vec![
+        CommandPredicate::Value {
+            family: MetadataFamily::WorkspaceCurrent,
+            key: workspace_key.clone(),
+            expected: Some(workspace_payload.clone()),
+        },
+        CommandPredicate::Value {
+            family: MetadataFamily::PathCurrent,
+            key: source_key.clone(),
+            expected: Some(source_payload.clone()),
+        },
+        CommandPredicate::Value {
+            family: MetadataFamily::PathCurrent,
+            key: destination_key.clone(),
+            expected: None,
+        },
+        CommandPredicate::Value {
+            family: MetadataFamily::ArtifactRevision,
+            key: revision_key.clone(),
+            expected: Some(revision_payload.clone()),
+        },
+        CommandPredicate::Value {
+            family: MetadataFamily::RevisionRef,
+            key: source_reference_key.clone(),
+            expected: Some(source_reference_payload.clone()),
+        },
+        CommandPredicate::Value {
+            family: MetadataFamily::PathIndexLocator,
+            key: locator_key.clone(),
+            expected: None,
+        },
+    ];
+    let mut stage_mutations = vec![CommandMutation::Put {
+        family: MetadataFamily::PathIndexLocator,
+        key: locator_key.clone(),
+        value: staged_locator_payload.clone(),
+    }];
+    for (key, value) in &index_rows {
+        stage_predicates.push(CommandPredicate::Value {
+            family: MetadataFamily::SecondaryIndex,
+            key: key.clone(),
+            expected: None,
+        });
+        stage_mutations.push(CommandMutation::Put {
+            family: MetadataFamily::SecondaryIndex,
+            key: key.clone(),
+            value: value.clone(),
+        });
+    }
+    let stage_request_id =
+        rename_index_stage_request_id(request.context.root_id, request.context.request_id);
+    let stage_command = MetadataCommand {
+        schema_id: SCHEMA_ID.to_owned(),
+        root_id: request.context.root_id,
+        logical_shard_id: request.context.logical_shard_id,
+        object_namespace_id: Some(request.context.object_namespace_id),
+        placement_generation: request.context.placement_generation,
+        owner_epoch: request.context.owner_epoch,
+        request_id: stage_request_id,
+        command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+        read_version: request.context.read_version,
+        root_fence_action: RootFenceAction::RequireActive,
+        predicates: stage_predicates,
+        mutations: stage_mutations,
+        history_projection: Vec::new(),
+        event_projection: Vec::new(),
+        deterministic_result: encode_rename_index_stage_result(input_digest),
+    }
+    .seal();
+    let staged = match store.lookup_request_result(
+        request.context.root_id,
+        request.context.placement_generation,
+        request.context.owner_epoch,
+        stage_request_id,
+    )? {
+        Some(replay) => {
+            validate_rename_index_stage_result(&replay.deterministic_result, input_digest)?;
+            replay
+        }
+        None => match store.execute(&stage_command) {
+            Ok(staged) => staged,
+            Err(
+                MetaError::PredicateFailed
+                | MetaError::WriteConflict
+                | MetaError::WriteReadVersionMismatch { .. },
+            ) => return Err(RenamePathError::ConcurrentMutation),
+            Err(error) => return Err(RenamePathError::Meta(error)),
+        },
+    };
+    let execution_context = RootWriteContext {
+        read_version: if staged.replayed {
+            request.context.read_version
+        } else {
+            nokv_types::ReadVersion::new(staged.commit_version.get())
+                .expect("a commit version is a readable version")
+        },
+        ..request.context
+    };
+
     let mut predicates = Vec::new();
     let mut mutations = Vec::new();
     let mut history_projection = Vec::new();
@@ -324,7 +502,7 @@ pub fn rename_path(
         &mut mutations,
         MetadataFamily::PathCurrent,
         destination_key,
-        source_payload,
+        destination_payload,
     );
     delete(
         &mut predicates,
@@ -347,63 +525,23 @@ pub fn rename_path(
         expected: Some(revision_payload),
     });
 
-    let index_payload = SecondaryIndexRecord {
-        path_generation: source.generation,
-        compact_projection: projection.clone(),
-    }
-    .encode()?;
-    for (field, scalar) in projection.fields() {
-        delete(
-            &mut predicates,
-            &mut mutations,
-            &mut history_projection,
-            MetadataFamily::SecondaryIndex,
-            secondary_index_key(
-                request.context.root_id,
-                field,
-                scalar,
-                workspace.incarnation_id,
-                &request.source,
-            ),
-            index_payload.clone(),
-        );
-        put_absent(
-            &mut predicates,
-            &mut mutations,
-            MetadataFamily::SecondaryIndex,
-            secondary_index_key(
-                request.context.root_id,
-                field,
-                scalar,
-                workspace.incarnation_id,
-                &request.destination,
-            ),
-            index_payload.clone(),
-        );
+    replace(
+        &mut predicates,
+        &mut mutations,
+        &mut history_projection,
+        MetadataFamily::PathIndexLocator,
+        locator_key,
+        staged_locator_payload,
+        published_locator_payload,
+    );
+    for (key, value) in index_rows {
+        predicates.push(CommandPredicate::Value {
+            family: MetadataFamily::SecondaryIndex,
+            key,
+            expected: Some(value),
+        });
     }
 
-    let removed = change_event_projection(&ChangeEventRecord {
-        workbench_id: request.workbench_id.clone(),
-        workspace_incarnation_id: workspace.incarnation_id,
-        kind: ChangeEventKind::PathRemoved,
-        artifact_revision_id: Some(source.artifact_revision_id),
-        commit_id: None,
-        operation_id: None,
-        path: Some(request.source.clone()),
-        before: projection.clone(),
-        after: TypedProjection::empty(),
-    })?;
-    let published = change_event_projection(&ChangeEventRecord {
-        workbench_id: request.workbench_id,
-        workspace_incarnation_id: workspace.incarnation_id,
-        kind: ChangeEventKind::ArtifactPublished,
-        artifact_revision_id: Some(source.artifact_revision_id),
-        commit_id: None,
-        operation_id: None,
-        path: Some(request.destination),
-        before: TypedProjection::empty(),
-        after: projection,
-    })?;
     let deterministic_result = encode_rename_result(
         input_digest,
         workspace_revision,
@@ -419,7 +557,7 @@ pub fn rename_path(
         owner_epoch: request.context.owner_epoch,
         request_id: request.context.request_id,
         command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
-        read_version: request.context.read_version,
+        read_version: execution_context.read_version,
         root_fence_action: RootFenceAction::RequireActive,
         predicates,
         mutations,
@@ -545,6 +683,44 @@ fn rename_input_digest(request: &RenamePathRequest) -> [u8; SHA256_BYTES] {
     hasher.finalize().into()
 }
 
+fn rename_index_stage_request_id(
+    root_id: nokv_types::RootId,
+    request_id: nokv_types::RequestId,
+) -> nokv_types::RequestId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.rename-path.index-stage.v1\0");
+    hasher.update(root_id.as_bytes());
+    hasher.update(request_id.as_bytes());
+    let digest: [u8; SHA256_BYTES] = hasher.finalize().into();
+    nokv_types::RequestId::from_bytes(
+        digest[..FIXED_ID_BYTES]
+            .try_into()
+            .expect("SHA-256 prefix has request-id width"),
+    )
+}
+
+fn encode_rename_index_stage_result(input_digest: [u8; SHA256_BYTES]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(1 + SHA256_BYTES);
+    encoded.push(RENAME_INDEX_STAGE_RESULT_VERSION);
+    encoded.extend_from_slice(&input_digest);
+    encoded
+}
+
+fn validate_rename_index_stage_result(
+    encoded: &[u8],
+    expected_input_digest: [u8; SHA256_BYTES],
+) -> Result<(), RenamePathError> {
+    if encoded.len() != 1 + SHA256_BYTES || encoded[0] != RENAME_INDEX_STAGE_RESULT_VERSION {
+        return Err(RenamePathError::DeterministicResultMismatch {
+            reason: "invalid rename index-stage receipt".to_owned(),
+        });
+    }
+    if encoded[1..] != expected_input_digest {
+        return Err(RenamePathError::RequestInputMismatch);
+    }
+    Ok(())
+}
+
 fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
@@ -620,7 +796,12 @@ fn decode_rename_result(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
 
+    use nokv_meta_store::{
+        Commit, ReadBatch, ReadSnapshot, StoreError, StoreProfile, TxnStore, WriteTxn,
+    };
     use nokv_types::{
         CommandDigest, LogicalShardId, ObjectNamespaceId, OwnerEpoch, PlacementGeneration,
         ReferenceEpoch, RequestId, RevisionState, RootActivationState, RootId,
@@ -630,13 +811,59 @@ mod tests {
     use super::*;
     use crate::workspace::{
         artifact_revision_key, create_visible_workspace, get_visible_path_at,
-        get_visible_workspace_at, path_current_key, path_revision_ref_key, read_changes_at,
-        secondary_index_key, workspace_current_key, ArtifactRevisionRecord, ChangeEventKind,
-        ChangePageRequest, CommandMutation, CommandPredicate, HistoryProjection, MetadataCommand,
-        MetadataFamily, PathEntry, QueryFieldId, QueryScalar, QueryScope, RevisionRefRecord,
-        RootFenceAction, RootReadContext, SecondaryIndexRecord, TypedProjection, WorkspaceRecord,
-        SCHEMA_ID,
+        get_visible_workspace_at, path_current_key, path_index_locator_key, path_revision_ref_key,
+        read_changes_at, secondary_index_key, workspace_current_key, ArtifactRevisionRecord,
+        ChangeEventKind, ChangePageRequest, CommandMutation, CommandPredicate, HistoryProjection,
+        MetadataCommand, MetadataFamily, PathEntry, PathIndexLocatorRecord, QueryFieldId,
+        QueryScalar, QueryScope, RevisionRefRecord, RootFenceAction, RootReadContext,
+        SecondaryIndexRecord, TypedProjection, WorkspaceRecord, SCHEMA_ID,
     };
+
+    struct FailSecondArmedCommitStore {
+        inner: Arc<dyn TxnStore>,
+        armed: AtomicBool,
+        commit_index: AtomicUsize,
+    }
+
+    impl FailSecondArmedCommitStore {
+        fn new(inner: Arc<dyn TxnStore>) -> Self {
+            Self {
+                inner,
+                armed: AtomicBool::new(false),
+                commit_index: AtomicUsize::new(0),
+            }
+        }
+
+        fn arm(&self) {
+            self.commit_index.store(0, Ordering::Release);
+            self.armed.store(true, Ordering::Release);
+        }
+    }
+
+    impl TxnStore for FailSecondArmedCommitStore {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            self.inner.read(batch)
+        }
+
+        fn commit(&self, transaction: WriteTxn) -> Result<Commit, StoreError> {
+            if self.armed.load(Ordering::Acquire) {
+                let index = self.commit_index.fetch_add(1, Ordering::AcqRel);
+                if index == 1 {
+                    self.armed.store(false, Ordering::Release);
+                    return Ok(Commit::Conflict);
+                }
+            }
+            self.inner.commit(transaction)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
 
     fn root() -> RootId {
         RootId::from_bytes([1; FIXED_ID_BYTES])
@@ -743,6 +970,48 @@ mod tests {
         ArtifactRevisionRecord,
     ) {
         let store = crate::workspace::test_support::memory(shard()).unwrap();
+        prepare_store(store, default_projection())
+    }
+
+    fn ready_capturing_store(
+        projection: TypedProjection,
+    ) -> (
+        MetaShard,
+        TypedProjection,
+        PathEntry,
+        ArtifactRevisionRecord,
+        std::sync::Arc<crate::workspace::test_support::CommitCaptureStore>,
+    ) {
+        let inner = crate::workspace::test_support::memory_txn_store().unwrap();
+        let (capturing, capture) = crate::workspace::test_support::capture_txn_store(inner);
+        let store = MetaShard::initialize(capturing, shard()).unwrap();
+        let (store, projection, path, revision) = prepare_store(store, projection);
+        (store, projection, path, revision, capture)
+    }
+
+    fn default_projection() -> TypedProjection {
+        TypedProjection::new(BTreeMap::from([
+            (
+                QueryFieldId::new("artifact.stage").unwrap(),
+                QueryScalar::String("complete".to_owned()),
+            ),
+            (
+                QueryFieldId::new("artifact.score").unwrap(),
+                QueryScalar::Unsigned(9),
+            ),
+        ]))
+        .unwrap()
+    }
+
+    fn prepare_store(
+        store: MetaShard,
+        projection: TypedProjection,
+    ) -> (
+        MetaShard,
+        TypedProjection,
+        PathEntry,
+        ArtifactRevisionRecord,
+    ) {
         store.advance_owner_epoch(None, owner()).unwrap();
         store
             .execute(&command(
@@ -773,19 +1042,10 @@ mod tests {
         )
         .unwrap();
 
-        let projection = TypedProjection::new(BTreeMap::from([
-            (
-                QueryFieldId::new("artifact.stage").unwrap(),
-                QueryScalar::String("complete".to_owned()),
-            ),
-            (
-                QueryFieldId::new("artifact.score").unwrap(),
-                QueryScalar::Unsigned(9),
-            ),
-        ]))
-        .unwrap();
         let path = PathEntry {
             generation: Generation::new(7).unwrap(),
+            index_generation: nokv_types::PathIndexGenerationId::from_bytes([7; FIXED_ID_BYTES]),
+            path_digest: crate::workspace::query_records::path_index_digest(&source()),
             artifact_revision_id: revision(),
             body_digest_uri: format!("sha256:{}", "11".repeat(32)),
             manifest_digest_uri: format!("sha256:{}", "22".repeat(32)),
@@ -815,8 +1075,8 @@ mod tests {
             reference_epoch_at_add: ReferenceEpoch::new(4),
         };
         let index = SecondaryIndexRecord {
-            path_generation: path.generation,
-            compact_projection: projection.clone(),
+            path_digest: path.path_digest,
+            index_generation: path.index_generation,
         }
         .encode()
         .unwrap();
@@ -836,11 +1096,33 @@ mod tests {
                 path_revision_ref_key(root(), incarnation(), &source(), revision()),
                 reference.encode().unwrap(),
             ),
+            (
+                MetadataFamily::PathIndexLocator,
+                path_index_locator_key(
+                    root(),
+                    incarnation(),
+                    path.path_digest,
+                    path.index_generation,
+                ),
+                PathIndexLocatorRecord {
+                    state: PathIndexLocatorState::Published,
+                    path: source(),
+                }
+                .encode()
+                .unwrap(),
+            ),
         ];
         for (field, scalar) in projection.fields() {
             rows.push((
                 MetadataFamily::SecondaryIndex,
-                secondary_index_key(root(), field, scalar, incarnation(), &source()),
+                secondary_index_key(
+                    root(),
+                    field,
+                    scalar,
+                    incarnation(),
+                    path.path_digest,
+                    path.index_generation,
+                ),
                 index.clone(),
             ));
         }
@@ -895,6 +1177,11 @@ mod tests {
     #[test]
     fn rename_atomically_moves_namespace_reference_indexes_and_events_without_revision_churn() {
         let (store, projection, path, revision_record) = ready_store();
+        let destination_path = PathEntry {
+            index_generation: path_index_generation(request(5)),
+            path_digest: path_index_digest(&destination()),
+            ..path.clone()
+        };
         let request = rename_request(&store, request(5));
         let outcome = rename_path(&store, request.clone()).unwrap();
         assert!(!outcome.replayed);
@@ -914,7 +1201,7 @@ mod tests {
         );
         assert_eq!(
             get_visible_path_at(&store, context, &workbench(), &destination()).unwrap(),
-            Some(path.clone())
+            Some(destination_path.clone())
         );
         assert_eq!(
             get_visible_workspace_at(&store, context, &workbench())
@@ -955,21 +1242,42 @@ mod tests {
                 read(
                     &store,
                     MetadataFamily::SecondaryIndex,
-                    &secondary_index_key(root(), field, scalar, incarnation(), &source()),
+                    &secondary_index_key(
+                        root(),
+                        field,
+                        scalar,
+                        incarnation(),
+                        path.path_digest,
+                        path.index_generation,
+                    ),
                 ),
-                None
+                Some(
+                    SecondaryIndexRecord {
+                        path_digest: path.path_digest,
+                        index_generation: path.index_generation,
+                    }
+                    .encode()
+                    .unwrap()
+                )
             );
             let moved = read(
                 &store,
                 MetadataFamily::SecondaryIndex,
-                &secondary_index_key(root(), field, scalar, incarnation(), &destination()),
+                &secondary_index_key(
+                    root(),
+                    field,
+                    scalar,
+                    incarnation(),
+                    destination_path.path_digest,
+                    destination_path.index_generation,
+                ),
             )
             .unwrap();
             assert_eq!(
                 SecondaryIndexRecord::decode(&moved).unwrap(),
                 SecondaryIndexRecord {
-                    path_generation: path.generation,
-                    compact_projection: projection.clone(),
+                    path_digest: destination_path.path_digest,
+                    index_generation: destination_path.index_generation,
                 }
             );
         }
@@ -1000,6 +1308,88 @@ mod tests {
     }
 
     #[test]
+    fn retry_resumes_a_durable_index_stage_after_the_clock_advances() {
+        let inner = crate::workspace::test_support::memory_txn_store().unwrap();
+        let failing = Arc::new(FailSecondArmedCommitStore::new(inner));
+        let store = MetaShard::initialize(failing.clone(), shard()).unwrap();
+        let (store, _, _, _) = prepare_store(store, default_projection());
+        failing.arm();
+
+        let request_id = request(5);
+        assert_eq!(
+            rename_path(&store, rename_request(&store, request_id)),
+            Err(RenamePathError::ConcurrentMutation)
+        );
+        store
+            .execute(&command(
+                &store,
+                request(6),
+                RootFenceAction::RequireActive,
+                Vec::new(),
+                Vec::new(),
+            ))
+            .unwrap();
+
+        let resumed = rename_path(&store, rename_request(&store, request_id)).unwrap();
+        assert!(!resumed.replayed);
+        assert!(read(
+            &store,
+            MetadataFamily::PathCurrent,
+            &path_current_key(root(), incarnation(), &source())
+        )
+        .is_none());
+        assert!(read(
+            &store,
+            MetadataFamily::PathCurrent,
+            &path_current_key(root(), incarnation(), &destination())
+        )
+        .is_some());
+        let destination_digest = path_index_digest(&destination());
+        let locator = PathIndexLocatorRecord::decode(
+            &read(
+                &store,
+                MetadataFamily::PathIndexLocator,
+                &path_index_locator_key(
+                    root(),
+                    incarnation(),
+                    destination_digest,
+                    path_index_generation(request_id),
+                ),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(locator.state, PathIndexLocatorState::Published);
+    }
+
+    #[test]
+    fn maximum_projection_rename_transaction_shape_stays_below_fdb_target() {
+        let projection = TypedProjection::new(
+            (0..super::super::query_records::MAX_TYPED_PROJECTION_FIELDS)
+                .map(|index| {
+                    (
+                        QueryFieldId::new(format!("rename.field_{index:02}")).unwrap(),
+                        QueryScalar::String("x".repeat(997)),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(projection.encode().unwrap().len(), 61_143);
+        let (store, _, _, _, capture) = ready_capturing_store(projection);
+
+        rename_path(&store, rename_request(&store, request(5))).unwrap();
+        let transaction_bytes = capture.with_last_commits(2, |transactions| {
+            transactions
+                .iter()
+                .map(crate::workspace::test_support::transaction_bytes)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(transaction_bytes, vec![397_090, 696_614]);
+        assert!(transaction_bytes.iter().all(|bytes| *bytes <= 900_000));
+    }
+
+    #[test]
     fn rename_exact_replay_rejects_missing_or_tampered_recovery_binding() {
         for replacement in [None, Some(b"tampered recovery header".to_vec())] {
             let (store, _, _, _) = ready_store();
@@ -1010,7 +1400,13 @@ mod tests {
                 .unwrap()
                 .unwrap();
             store
-                .replace_recovery_header_for_test(dedupe.recovery_lsn, replacement)
+                .replace_recovery_header_for_test(
+                    dedupe
+                        .recovery_receipt
+                        .expect("local dedupe must carry a recovery receipt")
+                        .recovery_lsn,
+                    replacement,
+                )
                 .unwrap();
 
             assert!(matches!(

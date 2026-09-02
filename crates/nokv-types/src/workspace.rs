@@ -114,6 +114,11 @@ fixed_bytes_type!(
     FIXED_ID_BYTES
 );
 fixed_bytes_type!(
+    /// Never-reused identity for one durable path secondary-index generation.
+    PathIndexGenerationId,
+    FIXED_ID_BYTES
+);
+fixed_bytes_type!(
     /// Stable request identity used for exact command replay.
     RequestId,
     FIXED_ID_BYTES
@@ -993,6 +998,7 @@ mod tests {
         let revision = ArtifactRevisionId::from_bytes(bytes);
         let operation = OperationId::from_bytes(bytes);
         let generic_index_generation = GenericIndexGenerationId::from_bytes(bytes);
+        let path_index_generation = PathIndexGenerationId::from_bytes(bytes);
         let request = RequestId::from_bytes(bytes);
         let commit = CommitId::from_bytes(digest_bytes);
         let command_digest = CommandDigest::from_bytes(digest_bytes);
@@ -1006,6 +1012,7 @@ mod tests {
         assert_eq!(revision.as_bytes(), &bytes);
         assert_eq!(operation.as_bytes(), &bytes);
         assert_eq!(generic_index_generation.as_bytes(), &bytes);
+        assert_eq!(path_index_generation.as_bytes(), &bytes);
         assert_eq!(request.as_bytes(), &bytes);
         assert_eq!(commit.as_bytes(), &digest_bytes);
         assert_eq!(command_digest.as_bytes(), &digest_bytes);
@@ -1025,6 +1032,7 @@ mod tests {
             std::mem::size_of::<GenericIndexGenerationId>(),
             FIXED_ID_BYTES
         );
+        assert_eq!(std::mem::size_of::<PathIndexGenerationId>(), FIXED_ID_BYTES);
         assert_eq!(std::mem::size_of::<RequestId>(), FIXED_ID_BYTES);
         assert_eq!(std::mem::size_of::<CommitId>(), SHA256_BYTES);
         assert_eq!(std::mem::size_of::<CommandDigest>(), SHA256_BYTES);

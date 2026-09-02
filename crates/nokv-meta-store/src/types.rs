@@ -64,6 +64,18 @@ pub enum Authority {
     Replicated,
 }
 
+/// Durable evidence used to recover a command that reached its acknowledgement
+/// boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryMode {
+    /// Each command transaction must include the local recovery receipt and
+    /// journal material required to reopen the same exclusive authority.
+    LocalJournal,
+    /// The shared or replicated transaction store is itself the successor's
+    /// recovery authority; domain commands do not write a second local journal.
+    StoreAuthority,
+}
+
 /// Hard request and response limits for one store instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreLimits {
@@ -83,12 +95,21 @@ pub struct StoreLimits {
     pub max_result_bytes: usize,
 }
 
-/// Store limits, acknowledgement boundary, and recovery authority.
+/// Store limits, planning target, acknowledgement boundary, and recovery
+/// authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreProfile {
     pub limits: StoreLimits,
+    /// Serving logical affected-byte ceiling used by domain batch planners
+    /// and enforced before a metadata transaction is dispatched.
+    ///
+    /// The adapter still enforces `limits.max_transaction_bytes` as its hard
+    /// request limit. This target must be nonzero and no greater than that hard
+    /// limit.
+    pub transaction_target_bytes: usize,
     pub ack: AckBoundary,
     pub authority: Authority,
+    pub recovery: RecoveryMode,
 }
 
 /// Point and prefix reads that must share one consistent snapshot.

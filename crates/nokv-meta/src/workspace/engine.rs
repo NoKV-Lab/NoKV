@@ -10,8 +10,9 @@ use std::thread;
 use std::time::Duration;
 
 use nokv_meta_store::{
-    Check, Commit, Key, Keyspace, LimitKind, Mutation, ReadBatch, ReadOp, ReadResult, ReadSnapshot,
-    Scan, ScanItem, ScanPage, StoreError, StoreLimits, TxnStore, WriteTxn,
+    AckBoundary, Authority, Check, Commit, Key, Keyspace, LimitKind, Mutation, ReadBatch, ReadOp,
+    ReadResult, ReadSnapshot, RecoveryMode, Scan, ScanItem, ScanPage, StoreError, StoreLimits,
+    StoreProfile, TxnStore, WriteTxn,
 };
 use nokv_types::{
     CommandDigest, CommitVersion, LogicalShardId, ObjectNamespaceId, OwnerEpoch,
@@ -29,7 +30,9 @@ use super::keyspace::{
 };
 #[cfg(feature = "metadata-read-stats")]
 use super::read_stats::{self, MetadataReadStats, MetadataReadStatsSessionError};
-use super::records::{CommandDedupeRecord, CurrentValue, HistoryValue, RootFence};
+use super::records::{
+    CommandDedupeRecord, CurrentValue, HistoryValue, LocalRecoveryReceipt, RootFence,
+};
 use super::recovery::{
     assemble_recovery_storage, decode_recovery_outbox_key, recovery_chunk_key,
     recovery_chunk_key_for_layout, recovery_genesis_digest, recovery_outbox_key,
@@ -50,6 +53,7 @@ const SYSTEM_VALUE_FORMAT_VERSION: u8 = 1;
 const INITIAL_COMMIT_VERSION: u64 = 1;
 
 const MAX_COMMAND_ITEMS: usize = 256;
+const READ_FENCE_OPS: usize = 3;
 const MAX_DELIMITED_SCAN_ITEMS: usize = MAX_COMMAND_ITEMS * 2;
 const MAX_HISTORICAL_SCAN_PAGE_ROWS: usize = MAX_COMMAND_ITEMS;
 const MAX_HISTORICAL_SCAN_ATTEMPTS: usize = 4;
@@ -69,26 +73,27 @@ const HISTORY_KEY_OVERHEAD_BYTES: usize =
     1 + std::mem::size_of::<u32>() + std::mem::size_of::<u64>();
 const MAX_DERIVED_KEY_BYTES: usize = MAX_COMMAND_KEY_BYTES + HISTORY_KEY_OVERHEAD_BYTES;
 const MAX_STORED_VALUE_BYTES: usize = u16::MAX as usize;
+// One maximum delimiter-aware scan is issued with the owner, root, and commit
+// clock point reads in the same snapshot. Its conservative read estimate is
+// one lookahead row, maximum-size start and end keys, and the three fence keys.
+const MIN_SERVING_READ_BYTES: usize =
+    (MAX_DELIMITED_SCAN_ITEMS + READ_FENCE_OPS + 3) * MAX_DERIVED_KEY_BYTES + 1;
+const MIN_TRANSACTION_TARGET_BYTES: usize = 900_000;
 // Domain payloads are wrapped in CurrentValue, HistoryValue, or
 // CommandDedupeRecord before insertion. Keep explicit headroom for every
 // durable envelope without binding the schema to one adapter.
 const MAX_RECORD_PAYLOAD_BYTES: usize = 60 * 1024;
 const MAX_COMMAND_VALUE_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
 const MAX_DETERMINISTIC_RESULT_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
-const MAX_EVENT_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
+pub(super) const MAX_EVENT_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
 
-/// Transitional transaction-store limits for the workspace schema.
+/// Local Holt transaction-store limits for the workspace schema.
 ///
-/// The decimal 16,000,000-byte transaction envelope preserves three
-/// high-amplification lifecycles characterized against the pre-provider
-/// Holt-backed engine: a 60-field, 61,203-byte projection on a short path, and
-/// a 4,096-byte path with 64 dependencies and a 57,243-byte projection, plus a
-/// successful disjoint 60-field replacement whose fully derived transaction is
-/// 9,859,091 bytes at the maximum tested event-union boundary.
-/// Together with the configured maximum mutation overhead it remains below
-/// Holt's 16 MiB WAL-record ceiling. This is a transitional compatibility
-/// profile, not proof that every domain-valid command fits; providers with a
-/// smaller hard transaction limit are not qualified for it.
+/// The decimal 16,000,000-byte envelope retains conservative headroom for
+/// schema-owned lifecycles and stays below Holt's 16 MiB WAL-record ceiling
+/// after configured mutation overhead. Every format-11 metadata commit is
+/// planned and admitted against the selected store's transaction target; this
+/// local hard profile is not evidence that another adapter is qualified.
 pub const fn store_limits() -> StoreLimits {
     StoreLimits {
         max_reads: 8,
@@ -213,8 +218,27 @@ impl MetadataCommand {
     }
 
     pub fn canonical_digest(&self) -> CommandDigest {
+        self.canonical_digest_with_owner_epoch(true)
+    }
+
+    /// Stable exact-replay digest for one logical command across owner takeover.
+    ///
+    /// The physical command digest above continues to bind the owner epoch for
+    /// recovery and transaction integrity. This replay digest excludes only
+    /// that replaceable physical-owner field; read version, routing identity,
+    /// predicates, mutations, projections, and the deterministic result remain
+    /// exact-bound.
+    fn canonical_replay_digest(&self) -> CommandDigest {
+        self.canonical_digest_with_owner_epoch(false)
+    }
+
+    fn canonical_digest_with_owner_epoch(&self, include_owner_epoch: bool) -> CommandDigest {
         let mut hasher = Sha256::new();
-        hasher.update(b"nokv.metadata.command.v1\0");
+        if include_owner_epoch {
+            hasher.update(b"nokv.metadata.command.v1\0");
+        } else {
+            hasher.update(b"nokv.metadata.command-replay.v1\0");
+        }
         hash_bytes(&mut hasher, self.schema_id.as_bytes());
         hasher.update(self.root_id.as_bytes());
         hasher.update(self.logical_shard_id.as_bytes());
@@ -222,7 +246,9 @@ impl MetadataCommand {
             hasher.update(object_namespace_id.as_bytes());
         }
         hasher.update(self.placement_generation.get().to_be_bytes());
-        hasher.update(self.owner_epoch.get().to_be_bytes());
+        if include_owner_epoch {
+            hasher.update(self.owner_epoch.get().to_be_bytes());
+        }
         hasher.update(self.request_id.as_bytes());
         hasher.update(self.read_version.get().to_be_bytes());
         match self.root_fence_action {
@@ -291,10 +317,9 @@ impl MetadataCommand {
 pub struct MetadataCommandResult {
     pub commit_version: CommitVersion,
     pub deterministic_result: Vec<u8>,
-    /// Exact RecoveryOutbox position committed in the same transaction.
-    pub recovery_lsn: u64,
-    /// Hash-chain digest at `recovery_lsn`; exact retries return the same value.
-    pub recovery_chain_digest: [u8; RECOVERY_CHAIN_DIGEST_BYTES],
+    /// Local recovery evidence, absent when the transaction store is the
+    /// shared or replicated successor authority.
+    pub recovery_receipt: Option<LocalRecoveryReceipt>,
     pub replayed: bool,
 }
 
@@ -358,6 +383,9 @@ pub enum MetaError {
     InvalidCommand {
         reason: String,
     },
+    RecoveryUnavailable {
+        operation: &'static str,
+    },
     CommandDigestMismatch,
     RequestIdReused,
     OwnerEpochMismatch {
@@ -415,6 +443,10 @@ impl std::fmt::Display for MetaError {
             Self::InvalidCommand { reason } => {
                 write!(formatter, "invalid metadata command: {reason}")
             }
+            Self::RecoveryUnavailable { operation } => write!(
+                formatter,
+                "metadata {operation} requires a local recovery journal"
+            ),
             Self::CommandDigestMismatch => formatter.write_str("metadata command digest mismatch"),
             Self::RequestIdReused => {
                 formatter.write_str("request id was already used by a different command")
@@ -601,7 +633,7 @@ impl MetaShard {
     }
 
     fn bind(store: Arc<dyn TxnStore>, logical_shard_id: LogicalShardId) -> Result<Self, MetaError> {
-        validate_store_profile(store.profile().limits)?;
+        validate_store_profile(store.profile())?;
         store
             .ready()
             .map_err(|source| store_error("readiness check", source))?;
@@ -662,7 +694,14 @@ impl MetaShard {
             )?,
             "System(lease_clock_high_water)",
         )?;
-        self.verify_recovery_chain_unlocked()?;
+        match self.store.profile().recovery {
+            RecoveryMode::LocalJournal => {
+                self.verify_recovery_chain_unlocked()?;
+            }
+            RecoveryMode::StoreAuthority => {
+                self.verify_store_authority_recovery_state_unlocked()?;
+            }
+        }
         Ok(self)
     }
 
@@ -753,8 +792,17 @@ impl MetaShard {
         decode_system_u64(&value, "System(lease_clock_high_water)")
     }
 
+    fn require_local_recovery(&self, operation: &'static str) -> Result<(), MetaError> {
+        if self.store.profile().recovery == RecoveryMode::LocalJournal {
+            Ok(())
+        } else {
+            Err(MetaError::RecoveryUnavailable { operation })
+        }
+    }
+
     /// Return the durable recovery tail atomically serialized with writes.
     pub fn recovery_state(&self) -> Result<RecoveryState, MetaError> {
+        self.require_local_recovery("read recovery state")?;
         let _read_guard = self
             .command_gate
             .read()
@@ -804,6 +852,7 @@ impl MetaShard {
         limit: usize,
         max_encoded_bytes: usize,
     ) -> Result<Vec<RecoveryOutboxRecord>, MetaError> {
+        self.require_local_recovery("read recovery outbox")?;
         const MAX_RECOVERY_PAGE_ROWS: usize = 1024;
         if limit == 0 || limit > MAX_RECOVERY_PAGE_ROWS {
             return Err(invalid(format!(
@@ -884,6 +933,7 @@ impl MetaShard {
 
     /// Verify every durable recovery row and the `System` tail.
     pub fn verify_recovery_chain(&self) -> Result<RecoveryState, MetaError> {
+        self.require_local_recovery("verify recovery chain")?;
         let _read_guard = self
             .command_gate
             .read()
@@ -897,6 +947,7 @@ impl MetaShard {
         boundary: RecoveryState,
         limit: usize,
     ) -> Result<Option<RecoveryOutboxSegment>, MetaError> {
+        self.require_local_recovery("seal recovery segment")?;
         if limit == 0 || limit > MAX_RECOVERY_SEGMENT_RECORDS {
             return Err(invalid(format!(
                 "recovery segment limit must be in 1..={MAX_RECOVERY_SEGMENT_RECORDS}"
@@ -957,6 +1008,7 @@ impl MetaShard {
         &self,
         record: &RecoveryOutboxRecord,
     ) -> Result<RecoveryState, MetaError> {
+        self.require_local_recovery("replay recovery record")?;
         record
             .verify()
             .map_err(|error| corrupt("RecoveryOutbox replay", error))?;
@@ -981,6 +1033,7 @@ impl MetaShard {
         &self,
         segment: &RecoveryOutboxSegment,
     ) -> Result<RecoveryState, MetaError> {
+        self.require_local_recovery("replay recovery segment")?;
         segment
             .verify()
             .map_err(|error| corrupt("RecoveryOutbox replay", error))?;
@@ -1035,6 +1088,7 @@ impl MetaShard {
     /// between every metadata-command row and its exact dedupe result. This is
     /// diagnostic only and never repairs, skips, or guesses a missing row.
     pub fn fsck_recovery(&self) -> Result<RecoveryFsckReport, MetaError> {
+        self.require_local_recovery("fsck recovery")?;
         let _read_guard = self
             .command_gate
             .read()
@@ -1084,7 +1138,7 @@ impl MetaShard {
                     let dedupe = CommandDedupeRecord::decode(&value)
                         .map_err(|error| corrupt("CommandDedupe", error))?;
                     let bound = self.validate_dedupe_recovery_binding(&key, &dedupe)?;
-                    if &bound != row {
+                    if bound.as_ref() != Some(row) {
                         return Err(corrupt(
                             "CommandDedupe recovery binding",
                             format!("dedupe points away from LSN {}", row.recovery_lsn),
@@ -1199,10 +1253,13 @@ impl MetaShard {
             ) => {
                 let result =
                     self.execute_with_lease_deadline_unlocked(command, *lease_deadline_ms)?;
+                let expected_receipt = Some(LocalRecoveryReceipt {
+                    recovery_lsn: record.recovery_lsn,
+                    chain_digest: record.chain_digest,
+                });
                 if &result.commit_version != commit_version
                     || &result.deterministic_result != deterministic_result
-                    || result.recovery_lsn != record.recovery_lsn
-                    || result.recovery_chain_digest != record.chain_digest
+                    || result.recovery_receipt != expected_receipt
                 {
                     return Err(corrupt(
                         "RecoveryOutbox replay",
@@ -1368,11 +1425,43 @@ impl MetaShard {
                 value: encode_system_u64(observed_ms).to_vec(),
             }],
         };
-        enqueue_recovery(&mut txn, &recovery);
-        match self.commit("advance lease clock", txn)? {
-            Commit::Applied => Ok(observed_ms),
-            Commit::Conflict => Err(MetaError::WriteConflict),
+        enqueue_recovery(&mut txn, recovery.as_ref());
+        match self.commit("advance lease clock", txn) {
+            Ok(Commit::Applied) => Ok(observed_ms),
+            Ok(Commit::Conflict) => Err(MetaError::WriteConflict),
+            Err(
+                primary @ MetaError::Store {
+                    source: StoreError::OutcomeUnknown { .. },
+                    ..
+                },
+            ) => match self.lease_clock_readback(root_id, placement_generation, owner_epoch) {
+                Ok(current) if current >= observed_ms => Ok(current),
+                Ok(_) | Err(_) => Err(primary),
+            },
+            Err(error) => Err(error),
         }
+    }
+
+    fn lease_clock_readback(
+        &self,
+        root_id: RootId,
+        placement_generation: PlacementGeneration,
+        owner_epoch: OwnerEpoch,
+    ) -> Result<u64, MetaError> {
+        let (_, mut results) = self.read_batch_at_fence(
+            ReadFenceContext {
+                root_id,
+                placement_generation,
+                owner_epoch,
+            },
+            vec![ReadOp::Get(Key::new(
+                SYSTEM.id,
+                SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
+            ))],
+            "reconcile unknown lease-clock outcome",
+        )?;
+        let clock = required_get_result(results.pop(), "System(lease_clock_high_water)")?;
+        decode_system_u64(&clock, "System(lease_clock_high_water)")
     }
 
     /// Advance the durable physical-owner epoch against one exact predecessor.
@@ -1445,10 +1534,20 @@ impl MetaShard {
                 value: encode_system_u64(next.get()).to_vec(),
             }],
         };
-        enqueue_recovery(&mut txn, &recovery);
-        match self.commit("advance owner epoch", txn)? {
-            Commit::Applied => Ok(()),
-            Commit::Conflict => Err(MetaError::WriteConflict),
+        enqueue_recovery(&mut txn, recovery.as_ref());
+        match self.commit("advance owner epoch", txn) {
+            Ok(Commit::Applied) => Ok(()),
+            Ok(Commit::Conflict) => Err(MetaError::WriteConflict),
+            Err(
+                primary @ MetaError::Store {
+                    source: StoreError::OutcomeUnknown { .. },
+                    ..
+                },
+            ) => match self.current_owner_epoch() {
+                Ok(Some(current)) if current == next => Ok(()),
+                Ok(_) | Err(_) => Err(primary),
+            },
+            Err(error) => Err(error),
         }
     }
 
@@ -1467,16 +1566,20 @@ impl MetaShard {
     /// Check whether a fresh execution of `command` fits the serving write
     /// envelope without reading or mutating the transaction store.
     ///
-    /// This check covers the fully derived transaction, including history,
-    /// dedupe, and recovery-outbox rows. It does not check current predicates,
-    /// fences, the commit clock, or an existing dedupe result.
+    /// This check covers the fully derived provider-selected transaction,
+    /// including history, dedupe, and local recovery rows when required. It
+    /// does not check current predicates, fences, the commit clock, or an
+    /// existing dedupe result.
     pub(crate) fn command_fit(
         &self,
         command: &MetadataCommand,
         lease_deadline_ms: Option<u64>,
     ) -> Result<CommandFit, MetaError> {
         let txn = self.command_txn_for_fit(command, lease_deadline_ms)?;
-        match txn.validate(&store_limits()) {
+        let profile = self.store.profile();
+        let mut planning_limits = profile.limits;
+        planning_limits.max_transaction_bytes = profile.transaction_target_bytes;
+        match txn.validate(&planning_limits) {
             Ok(()) => Ok(CommandFit::Fits),
             Err(StoreError::LimitExceeded {
                 kind,
@@ -1509,18 +1612,21 @@ impl MetaShard {
         let predicate_plan = synthetic_predicate_plan(command)?;
         self.validate_history_projection(command, &predicate_plan)?;
         let root_plan = synthetic_root_fence_plan(command)?;
-        let recovery = build_recovery_plan(
-            encode_system_u64(0).to_vec(),
-            encode_system_digest(recovery_genesis_digest(command.logical_shard_id)),
-            RecoveryMutationV1::MetadataCommand {
-                command: Box::new(command.clone()),
-                lease_deadline_ms,
-            },
-            RecoveryResultV1::MetadataCommand {
-                commit_version: next_version,
-                deterministic_result: command.deterministic_result.clone(),
-            },
-        )?;
+        let recovery = match self.store.profile().recovery {
+            RecoveryMode::LocalJournal => Some(build_recovery_plan(
+                encode_system_u64(0).to_vec(),
+                encode_system_digest(recovery_genesis_digest(command.logical_shard_id)),
+                RecoveryMutationV1::MetadataCommand {
+                    command: Box::new(command.clone()),
+                    lease_deadline_ms,
+                },
+                RecoveryResultV1::MetadataCommand {
+                    commit_version: next_version,
+                    deterministic_result: command.deterministic_result.clone(),
+                },
+            )?),
+            RecoveryMode::StoreAuthority => None,
+        };
         let state = CommandTxnState {
             next_version,
             schema: encode_schema_marker(),
@@ -1561,7 +1667,11 @@ impl MetaShard {
         lease_deadline_ms: Option<u64>,
     ) -> Result<MetadataCommandResult, MetaError> {
         let dedupe_key = command_dedupe_key(command.root_id, command.request_id);
-        if let Some(result) = self.replayed_result(&dedupe_key, command.command_digest)? {
+        if let Some(result) = self.replayed_result(
+            &dedupe_key,
+            command.command_digest,
+            command.canonical_replay_digest(),
+        )? {
             return Ok(result);
         }
 
@@ -1649,12 +1759,15 @@ impl MetaShard {
             Commit::Applied => Ok(MetadataCommandResult {
                 commit_version: next_version,
                 deterministic_result: command.deterministic_result.clone(),
-                recovery_lsn: state.recovery.row.recovery_lsn,
-                recovery_chain_digest: state.recovery.row.chain_digest,
+                recovery_receipt: state.recovery.as_ref().map(RecoveryPlan::receipt),
                 replayed: false,
             }),
             Commit::Conflict => {
-                if let Some(result) = self.replayed_result(&dedupe_key, command.command_digest)? {
+                if let Some(result) = self.replayed_result(
+                    &dedupe_key,
+                    command.command_digest,
+                    command.canonical_replay_digest(),
+                )? {
                     Ok(result)
                 } else {
                     Err(MetaError::WriteConflict)
@@ -1687,6 +1800,103 @@ impl MetaShard {
                 owner_epoch,
             },
         )
+    }
+
+    /// Read one bounded set of exact metadata keys through one physical
+    /// snapshot and one owner/root/clock fence batch.
+    ///
+    /// Current values are decoded from that batch. Only keys that require
+    /// historical reconstruction fall back to their individual History scan.
+    pub(super) fn read_many_at(
+        &self,
+        root_id: RootId,
+        placement_generation: PlacementGeneration,
+        owner_epoch: OwnerEpoch,
+        requests: &[(MetadataFamily, Vec<u8>)],
+        version: ReadVersion,
+    ) -> Result<Vec<Option<Vec<u8>>>, MetaError> {
+        let maximum = self.point_read_batch_capacity();
+        if requests.len() > maximum {
+            return Err(invalid(format!(
+                "point-read batch count {} exceeds {maximum}",
+                requests.len()
+            )));
+        }
+        let _read_guard = self
+            .command_gate
+            .read()
+            .map_err(|error| internal("lock read gate", error))?;
+        for (_, key) in requests {
+            validate_root_scoped_bytes(root_id, key, "batched read key")?;
+        }
+        let context = ReadFenceContext {
+            root_id,
+            placement_generation,
+            owner_epoch,
+        };
+        let operations = requests
+            .iter()
+            .map(|(family, key)| ReadOp::Get(Key::new(family.keyspace(), key.clone())))
+            .collect();
+        let (clock, results) =
+            self.read_batch_at_fence(context, operations, "read metadata point batch")?;
+        if version > clock {
+            return Err(MetaError::ReadVersionInFuture {
+                requested: version.get(),
+                current: clock.get(),
+            });
+        }
+        if results.len() != requests.len() {
+            return Err(corrupt(
+                "transaction-store read",
+                "point batch result count does not match its request",
+            ));
+        }
+        let mut decoded = Vec::with_capacity(requests.len());
+        for ((family, key), result) in requests.iter().zip(results) {
+            let ReadResult::Get(raw) = result else {
+                return Err(corrupt(
+                    "transaction-store read",
+                    "point batch returned a scan result",
+                ));
+            };
+            #[cfg(feature = "metadata-read-stats")]
+            self.record_point(point_source(*family), raw.as_ref().map(Vec::len));
+            let current = raw
+                .as_deref()
+                .map(CurrentValue::decode)
+                .transpose()
+                .map_err(|error| corrupt(family.name(), error))?;
+            if let Some(current) = current {
+                if current.modified_version.get() > clock.get() {
+                    return Err(corrupt(
+                        family.name(),
+                        format!(
+                            "record version {} is newer than the captured commit clock {}",
+                            current.modified_version.get(),
+                            clock.get()
+                        ),
+                    ));
+                }
+                if current.modified_version.get() <= version.get() {
+                    decoded.push(Some(current.payload));
+                    continue;
+                }
+            } else if version == clock {
+                decoded.push(None);
+                continue;
+            }
+            decoded.push(self.read_at_fence(*family, key, version, context)?);
+        }
+        Ok(decoded)
+    }
+
+    pub(super) fn point_read_batch_capacity(&self) -> usize {
+        self.store
+            .profile()
+            .limits
+            .max_reads
+            .saturating_sub(READ_FENCE_OPS)
     }
 
     /// Run dependent point reads at one captured logical version.
@@ -1791,12 +2001,11 @@ impl MetaShard {
             .read()
             .map_err(|error| internal("lock read gate", error))?;
         let key = command_dedupe_key(root_id, request_id);
-        let recovery = self.validate_dedupe_recovery_binding(&key, &dedupe)?;
+        self.validate_dedupe_recovery_binding(&key, &dedupe)?;
         Ok(Some(MetadataCommandResult {
             commit_version: dedupe.commit_version,
             deterministic_result: dedupe.deterministic_result,
-            recovery_lsn: dedupe.recovery_lsn,
-            recovery_chain_digest: recovery.chain_digest,
+            recovery_receipt: dedupe.recovery_receipt,
             replayed: true,
         }))
     }
@@ -2342,7 +2551,7 @@ impl MetaShard {
         data_ops: Vec<ReadOp>,
         operation: &'static str,
     ) -> Result<(ReadVersion, Vec<ReadResult>), MetaError> {
-        let mut ops = Vec::with_capacity(3 + data_ops.len());
+        let mut ops = Vec::with_capacity(READ_FENCE_OPS + data_ops.len());
         ops.push(ReadOp::Get(Key::new(SYSTEM.id, SYSTEM_OWNER_FENCE_KEY)));
         ops.push(ReadOp::Get(Key::new(
             ROOT_FENCE.id,
@@ -2741,7 +2950,8 @@ impl MetaShard {
     fn replayed_result(
         &self,
         key: &[u8],
-        digest: CommandDigest,
+        command_digest: CommandDigest,
+        replay_digest: CommandDigest,
     ) -> Result<Option<MetadataCommandResult>, MetaError> {
         let Some(value) = self.read_value(
             COMMAND_DEDUPE.id,
@@ -2754,15 +2964,14 @@ impl MetaShard {
         };
         let record =
             CommandDedupeRecord::decode(&value).map_err(|error| corrupt("CommandDedupe", error))?;
-        if record.command_digest != digest {
+        if record.command_digest != command_digest && record.replay_digest != replay_digest {
             return Err(MetaError::RequestIdReused);
         }
-        let recovery = self.validate_dedupe_recovery_binding(key, &record)?;
+        self.validate_dedupe_recovery_binding(key, &record)?;
         Ok(Some(MetadataCommandResult {
             commit_version: record.commit_version,
             deterministic_result: record.deterministic_result,
-            recovery_lsn: record.recovery_lsn,
-            recovery_chain_digest: recovery.chain_digest,
+            recovery_receipt: record.recovery_receipt,
             replayed: true,
         }))
     }
@@ -2771,8 +2980,24 @@ impl MetaShard {
         &self,
         dedupe_key: &[u8],
         dedupe: &CommandDedupeRecord,
-    ) -> Result<RecoveryOutboxRecord, MetaError> {
-        let row = self.recovery_record_at_unlocked(dedupe.recovery_lsn)?;
+    ) -> Result<Option<RecoveryOutboxRecord>, MetaError> {
+        let receipt = match (self.store.profile().recovery, dedupe.recovery_receipt) {
+            (RecoveryMode::LocalJournal, Some(receipt)) => receipt,
+            (RecoveryMode::StoreAuthority, None) => return Ok(None),
+            (RecoveryMode::LocalJournal, None) => {
+                return Err(corrupt(
+                    "CommandDedupe recovery binding",
+                    "local-journal result is missing its recovery receipt",
+                ));
+            }
+            (RecoveryMode::StoreAuthority, Some(_)) => {
+                return Err(corrupt(
+                    "CommandDedupe recovery binding",
+                    "store-authority result contains a local recovery receipt",
+                ));
+            }
+        };
+        let row = self.recovery_record_at_unlocked(receipt.recovery_lsn)?;
         let (
             RecoveryMutationV1::MetadataCommand { command, .. },
             RecoveryResultV1::MetadataCommand {
@@ -2785,24 +3010,26 @@ impl MetaShard {
                 "CommandDedupe recovery binding",
                 format!(
                     "dedupe LSN {} does not name a metadata command",
-                    dedupe.recovery_lsn
+                    receipt.recovery_lsn
                 ),
             ));
         };
         if command_dedupe_key(command.root_id, command.request_id) != dedupe_key
             || command.command_digest != dedupe.command_digest
+            || command.canonical_replay_digest() != dedupe.replay_digest
             || commit_version != &dedupe.commit_version
             || deterministic_result != &dedupe.deterministic_result
+            || row.chain_digest != receipt.chain_digest
         {
             return Err(corrupt(
                 "CommandDedupe recovery binding",
                 format!(
                     "dedupe result does not match RecoveryOutbox LSN {}",
-                    dedupe.recovery_lsn
+                    receipt.recovery_lsn
                 ),
             ));
         }
-        Ok(row)
+        Ok(Some(row))
     }
 
     fn recovery_state_unlocked(&self) -> Result<RecoveryState, MetaError> {
@@ -2850,9 +3077,44 @@ impl MetaShard {
         &self,
         mutation: RecoveryMutationV1,
         result: RecoveryResultV1,
-    ) -> Result<RecoveryPlan, MetaError> {
-        let (lsn_value, digest_value) = self.recovery_tail_values()?;
-        build_recovery_plan(lsn_value, digest_value, mutation, result)
+    ) -> Result<Option<RecoveryPlan>, MetaError> {
+        match self.store.profile().recovery {
+            RecoveryMode::LocalJournal => {
+                let (lsn_value, digest_value) = self.recovery_tail_values()?;
+                build_recovery_plan(lsn_value, digest_value, mutation, result).map(Some)
+            }
+            RecoveryMode::StoreAuthority => Ok(None),
+        }
+    }
+
+    fn verify_store_authority_recovery_state_unlocked(&self) -> Result<(), MetaError> {
+        let state = self.recovery_state_unlocked()?;
+        let expected = RecoveryState {
+            applied_recovery_lsn: 0,
+            chain_digest: recovery_genesis_digest(self.logical_shard_id),
+        };
+        if state != expected {
+            return Err(corrupt(
+                "System(recovery tail)",
+                "store-authority profile contains local recovery progress",
+            ));
+        }
+        let page = self.scan_page(
+            RECOVERY_OUTBOX.id,
+            &[],
+            None,
+            1,
+            None,
+            0,
+            "verify absent RecoveryOutbox",
+        )?;
+        if !page.items.is_empty() {
+            return Err(corrupt(
+                "RecoveryOutbox",
+                "store-authority profile contains local recovery material",
+            ));
+        }
+        Ok(())
     }
 
     fn verify_recovery_chain_unlocked(&self) -> Result<RecoveryState, MetaError> {
@@ -3176,8 +3438,9 @@ impl MetaShard {
         batch: ReadBatch,
         operation: &'static str,
     ) -> Result<ReadSnapshot, MetaError> {
+        let limits = self.store.profile().limits;
         batch
-            .validate(&store_limits())
+            .validate(&limits)
             .map_err(|source| store_error(operation, source))?;
         self.store
             .read(batch)
@@ -3185,7 +3448,10 @@ impl MetaShard {
     }
 
     fn commit(&self, operation: &'static str, txn: WriteTxn) -> Result<Commit, MetaError> {
-        txn.validate(&store_limits())
+        let profile = self.store.profile();
+        let mut planning_limits = profile.limits;
+        planning_limits.max_transaction_bytes = profile.transaction_target_bytes;
+        txn.validate(&planning_limits)
             .map_err(|source| store_error(operation, source))?;
         self.store
             .commit(txn)
@@ -3203,7 +3469,16 @@ impl MetaShard {
         reserved_gets: usize,
         operation: &'static str,
     ) -> Result<ScanPage, MetaError> {
-        let scan = scan_request(keyspace, prefix, after, limit, delimiter, reserved_gets)?;
+        let limits = self.store.profile().limits;
+        let scan = scan_request(
+            keyspace,
+            prefix,
+            after,
+            limit,
+            delimiter,
+            reserved_gets,
+            &limits,
+        )?;
         let snapshot = self.read_batch(
             ReadBatch {
                 ops: vec![ReadOp::Scan(scan)],
@@ -3230,7 +3505,8 @@ impl MetaShard {
         context: ReadFenceContext,
         operation: &'static str,
     ) -> Result<Option<ScanPage>, MetaError> {
-        let scan = scan_request(keyspace, prefix, after, limit, delimiter, 3)?;
+        let limits = self.store.profile().limits;
+        let scan = scan_request(keyspace, prefix, after, limit, delimiter, 3, &limits)?;
         let (clock, mut results) =
             self.read_batch_at_fence(context, vec![ReadOp::Scan(scan)], operation)?;
         let Some(ReadResult::Scan(page)) = results.pop() else {
@@ -3294,6 +3570,15 @@ struct RecoveryPlan {
     row: RecoveryOutboxRecord,
 }
 
+impl RecoveryPlan {
+    fn receipt(&self) -> LocalRecoveryReceipt {
+        LocalRecoveryReceipt {
+            recovery_lsn: self.row.recovery_lsn,
+            chain_digest: self.row.chain_digest,
+        }
+    }
+}
+
 struct CommandTxnState {
     next_version: CommitVersion,
     schema: Vec<u8>,
@@ -3303,7 +3588,7 @@ struct CommandTxnState {
     lease_clock: Option<Vec<u8>>,
     root_plan: RootFencePlan,
     predicate_plan: PredicatePlan,
-    recovery: RecoveryPlan,
+    recovery: Option<RecoveryPlan>,
 }
 
 struct PlannedExactPredicate {
@@ -3467,8 +3752,9 @@ fn build_command_txn(
     let dedupe_key = command_dedupe_key(command.root_id, command.request_id);
     let dedupe_record = CommandDedupeRecord {
         command_digest: command.command_digest,
+        replay_digest: command.canonical_replay_digest(),
         commit_version: state.next_version,
-        recovery_lsn: state.recovery.row.recovery_lsn,
+        recovery_receipt: state.recovery.as_ref().map(RecoveryPlan::receipt),
         deterministic_result: command.deterministic_result.clone(),
     }
     .encode()
@@ -3583,7 +3869,7 @@ fn build_command_txn(
         key: Key::new(COMMAND_DEDUPE.id, dedupe_key),
         value: dedupe_record,
     });
-    enqueue_recovery(&mut txn, &state.recovery);
+    enqueue_recovery(&mut txn, state.recovery.as_ref());
     Ok(txn)
 }
 
@@ -3616,7 +3902,10 @@ fn enqueue_root_fence(txn: &mut WriteTxn, command: &MetadataCommand, plan: &Root
     }
 }
 
-fn enqueue_recovery(txn: &mut WriteTxn, plan: &RecoveryPlan) {
+fn enqueue_recovery(txn: &mut WriteTxn, plan: Option<&RecoveryPlan>) {
+    let Some(plan) = plan else {
+        return;
+    };
     txn.checks.push(value_check(
         SYSTEM.id,
         SYSTEM_APPLIED_RECOVERY_LSN_KEY,
@@ -3880,7 +4169,8 @@ fn system_bootstrap_rows(shard: LogicalShardId) -> Vec<(&'static [u8], Vec<u8>)>
     ]
 }
 
-fn validate_store_profile(actual: StoreLimits) -> Result<(), MetaError> {
+fn validate_store_profile(profile: StoreProfile) -> Result<(), MetaError> {
+    let actual = profile.limits;
     let required = store_limits();
     for (name, available, needed) in [
         ("reads", actual.max_reads, required.max_reads),
@@ -3892,12 +4182,7 @@ fn validate_store_profile(actual: StoreLimits) -> Result<(), MetaError> {
             actual.max_value_bytes,
             required.max_value_bytes,
         ),
-        ("read bytes", actual.max_read_bytes, required.max_read_bytes),
-        (
-            "transaction bytes",
-            actual.max_transaction_bytes,
-            required.max_transaction_bytes,
-        ),
+        ("read bytes", actual.max_read_bytes, MIN_SERVING_READ_BYTES),
         (
             "result rows",
             actual.max_result_rows,
@@ -3916,6 +4201,43 @@ fn validate_store_profile(actual: StoreLimits) -> Result<(), MetaError> {
                 ),
             });
         }
+    }
+    if profile.transaction_target_bytes < MIN_TRANSACTION_TARGET_BYTES {
+        return Err(MetaError::SchemaGate {
+            reason: format!(
+                "metadata store transaction target {} is below serving schema minimum {MIN_TRANSACTION_TARGET_BYTES}",
+                profile.transaction_target_bytes
+            ),
+        });
+    }
+    if profile.transaction_target_bytes > actual.max_transaction_bytes {
+        return Err(MetaError::SchemaGate {
+            reason: format!(
+                "metadata store transaction target {} exceeds hard transaction limit {}",
+                profile.transaction_target_bytes, actual.max_transaction_bytes
+            ),
+        });
+    }
+    if !matches!(
+        (profile.authority, profile.ack, profile.recovery),
+        (
+            Authority::Local,
+            AckBoundary::LocalSync,
+            RecoveryMode::LocalJournal
+        ) | (
+            Authority::Shared,
+            AckBoundary::SharedCommit,
+            RecoveryMode::StoreAuthority
+        ) | (
+            Authority::Replicated,
+            AckBoundary::QuorumCommit,
+            RecoveryMode::StoreAuthority
+        )
+    ) {
+        return Err(MetaError::SchemaGate {
+            reason: "metadata store authority, acknowledgement boundary, and recovery mode are inconsistent"
+                .to_owned(),
+        });
     }
     Ok(())
 }
@@ -3964,8 +4286,8 @@ fn scan_request(
     limit: usize,
     delimiter: Option<u8>,
     reserved_gets: usize,
+    limits: &StoreLimits,
 ) -> Result<Scan, MetaError> {
-    let limits = store_limits();
     let reserved_bytes = reserved_gets
         .checked_mul(limits.max_value_bytes)
         .ok_or_else(|| internal("build scan", "point-read reserve overflow"))?;
@@ -4032,7 +4354,9 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use nokv_meta_store::{AckBoundary, Authority, LimitKind, StoreProfile, UnknownCommit};
+    use nokv_meta_store::{
+        AckBoundary, Authority, LimitKind, RecoveryMode, StoreProfile, UnknownCommit,
+    };
     use tempfile::tempdir;
 
     use super::super::query_records::{ChangeEventKind, ChangeEventRecord, TypedProjection};
@@ -4069,6 +4393,7 @@ mod tests {
     struct AppliedThenLostAckStore {
         inner: Arc<dyn TxnStore>,
         lose_next_ack: AtomicBool,
+        commit_calls: AtomicUsize,
     }
 
     impl TxnStore for AppliedThenLostAckStore {
@@ -4081,12 +4406,85 @@ mod tests {
         }
 
         fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            self.commit_calls.fetch_add(1, Ordering::AcqRel);
             let lose_ack = self.lose_next_ack.swap(false, Ordering::AcqRel);
             let outcome = self.inner.commit(txn)?;
             if lose_ack && outcome == Commit::Applied {
                 return Err(StoreError::OutcomeUnknown {
                     state: UnknownCommit::Settled,
                     reason: "injected acknowledgement loss after apply".to_owned(),
+                });
+            }
+            Ok(outcome)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
+
+    struct UnknownWithoutApplyStore {
+        inner: Arc<dyn TxnStore>,
+        fail_next_commit: AtomicBool,
+        commit_calls: AtomicUsize,
+    }
+
+    impl TxnStore for UnknownWithoutApplyStore {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            self.inner.read(batch)
+        }
+
+        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            self.commit_calls.fetch_add(1, Ordering::AcqRel);
+            if self.fail_next_commit.swap(false, Ordering::AcqRel) {
+                return Err(StoreError::OutcomeUnknown {
+                    state: UnknownCommit::MayCommit,
+                    reason: "injected unknown outcome without apply".to_owned(),
+                });
+            }
+            self.inner.commit(txn)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
+
+    struct AppliedThenLostAckAndReadHookStore {
+        inner: Arc<dyn TxnStore>,
+        controller: MetaShard,
+        hook: fn(&MetaShard),
+        lose_next_ack: AtomicBool,
+        run_hook_before_next_read: AtomicBool,
+        commit_calls: AtomicUsize,
+    }
+
+    impl TxnStore for AppliedThenLostAckAndReadHookStore {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            if self.run_hook_before_next_read.swap(false, Ordering::AcqRel) {
+                (self.hook)(&self.controller);
+            }
+            self.inner.read(batch)
+        }
+
+        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            self.commit_calls.fetch_add(1, Ordering::AcqRel);
+            let lose_ack = self.lose_next_ack.swap(false, Ordering::AcqRel);
+            let outcome = self.inner.commit(txn)?;
+            if lose_ack && outcome == Commit::Applied {
+                self.run_hook_before_next_read
+                    .store(true, Ordering::Release);
+                return Err(StoreError::OutcomeUnknown {
+                    state: UnknownCommit::Settled,
+                    reason: "injected acknowledgement loss before readback hook".to_owned(),
                 });
             }
             Ok(outcome)
@@ -4322,8 +4720,10 @@ mod tests {
         fn profile(&self) -> StoreProfile {
             StoreProfile {
                 limits: self.limits,
+                transaction_target_bytes: self.limits.max_transaction_bytes,
                 ack: AckBoundary::LocalSync,
                 authority: Authority::Local,
+                recovery: RecoveryMode::LocalJournal,
             }
         }
 
@@ -4337,6 +4737,63 @@ mod tests {
 
         fn ready(&self) -> Result<(), StoreError> {
             panic!("profile rejection must happen before readiness I/O")
+        }
+    }
+
+    struct ProfileOverrideStore {
+        inner: Arc<dyn TxnStore>,
+        profile: StoreProfile,
+    }
+
+    impl TxnStore for ProfileOverrideStore {
+        fn profile(&self) -> StoreProfile {
+            self.profile
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            batch.validate(&self.profile.limits)?;
+            let snapshot = self.inner.read(batch.clone())?;
+            snapshot.validate(&batch, &self.profile.limits)?;
+            Ok(snapshot)
+        }
+
+        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            txn.validate(&self.profile.limits)?;
+            self.inner.commit(txn)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
+
+    fn shared_profile() -> StoreProfile {
+        StoreProfile {
+            limits: store_limits(),
+            transaction_target_bytes: store_limits().max_transaction_bytes,
+            ack: AckBoundary::SharedCommit,
+            authority: Authority::Shared,
+            recovery: RecoveryMode::StoreAuthority,
+        }
+    }
+
+    fn fdb_serving_profile() -> StoreProfile {
+        StoreProfile {
+            limits: StoreLimits {
+                max_reads: 8,
+                max_checks: 1_024,
+                max_mutations: 1_024,
+                max_key_bytes: 8_205,
+                max_value_bytes: 65_535,
+                max_read_bytes: 4_500_000,
+                max_transaction_bytes: 2_900_000,
+                max_result_rows: 1_024,
+                max_result_bytes: 8 * 1024 * 1024,
+            },
+            transaction_target_bytes: 900_000,
+            ack: AckBoundary::SharedCommit,
+            authority: Authority::Shared,
+            recovery: RecoveryMode::StoreAuthority,
         }
     }
 
@@ -4388,9 +4845,64 @@ mod tests {
         }
     }
 
+    fn advance_clock_before_unknown_readback(store: &MetaShard) {
+        assert_eq!(
+            store
+                .observe_lease_clock(root(2), generation(7), epoch(1), 200)
+                .unwrap(),
+            200
+        );
+    }
+
+    fn advance_owner_before_unknown_readback(store: &MetaShard) {
+        store.advance_owner_epoch(Some(epoch(1)), epoch(2)).unwrap();
+    }
+
+    fn advance_owner_again_before_unknown_readback(store: &MetaShard) {
+        store.advance_owner_epoch(Some(epoch(2)), epoch(3)).unwrap();
+    }
+
+    fn drain_root_before_unknown_readback(store: &MetaShard) {
+        let command = base_command(
+            store,
+            request(200),
+            RootFenceAction::Transition {
+                expected: RootActivationState::Active,
+                next: RootActivationState::Draining,
+            },
+        )
+        .seal();
+        store.execute(&command).unwrap();
+    }
+
     fn ready_store() -> MetaShard {
         let store = crate::workspace::test_support::memory(shard(1)).unwrap();
         make_store_ready(store)
+    }
+
+    fn ready_store_with_unknown_readback_hook(
+        hook: fn(&MetaShard),
+    ) -> (MetaShard, Arc<AppliedThenLostAckAndReadHookStore>) {
+        let mut store = ready_store();
+        let controller = MetaShard::open(Arc::clone(&store.store), shard(1)).unwrap();
+        let wrapper = Arc::new(AppliedThenLostAckAndReadHookStore {
+            inner: Arc::clone(&store.store),
+            controller,
+            hook,
+            lose_next_ack: AtomicBool::new(false),
+            run_hook_before_next_read: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
+        });
+        store.store = wrapper.clone();
+        (store, wrapper)
+    }
+
+    fn ready_shared_store() -> MetaShard {
+        let store = Arc::new(ProfileOverrideStore {
+            inner: crate::workspace::test_support::memory_txn_store().unwrap(),
+            profile: shared_profile(),
+        });
+        make_store_ready(MetaShard::initialize(store, shard(1)).unwrap())
     }
 
     fn ready_file_store(path: &std::path::Path) -> MetaShard {
@@ -4541,6 +5053,21 @@ mod tests {
         (checks, mutations)
     }
 
+    fn txn_touches_local_recovery(txn: &WriteTxn) -> bool {
+        let is_recovery_key = |key: &Key| {
+            key.keyspace == RECOVERY_OUTBOX.id
+                || (key.keyspace == SYSTEM.id
+                    && (key.bytes.as_slice() == SYSTEM_APPLIED_RECOVERY_LSN_KEY
+                        || key.bytes.as_slice() == SYSTEM_RECOVERY_CHAIN_DIGEST_KEY))
+        };
+        txn.checks.iter().any(|check| match check {
+            Check::Value { key, .. } | Check::Absent { key } => is_recovery_key(key),
+            Check::EmptyPrefix { keyspace, .. } => *keyspace == RECOVERY_OUTBOX.id,
+        }) || txn.mutations.iter().any(|mutation| match mutation {
+            Mutation::Put { key, .. } | Mutation::Delete { key } => is_recovery_key(key),
+        })
+    }
+
     fn capture_next_commit(
         store: &mut MetaShard,
     ) -> Arc<crate::workspace::test_support::CommitCaptureStore> {
@@ -4577,7 +5104,7 @@ mod tests {
     #[test]
     fn fresh_store_freezes_schema_shard_and_bootstrap_version() {
         let store = crate::workspace::test_support::memory(shard(1)).unwrap();
-        assert_eq!(keyspaces().len(), 29);
+        assert_eq!(keyspaces().len(), 30);
         assert_eq!(store.current_read_version().unwrap().get(), 1);
         assert_eq!(
             store.advance_owner_epoch(Some(epoch(1)), epoch(2)),
@@ -4624,6 +5151,89 @@ mod tests {
             error,
             MetaError::SchemaGate { reason }
                 if reason.contains("key bytes") && reason.contains("8205")
+        ));
+    }
+
+    #[test]
+    fn initialization_accepts_the_fdb_serving_profile() {
+        let store = Arc::new(ProfileOverrideStore {
+            inner: crate::workspace::test_support::memory_txn_store().unwrap(),
+            profile: fdb_serving_profile(),
+        });
+        let store = make_store_ready(MetaShard::initialize(store, shard(1)).unwrap());
+        let version = store.current_read_version().unwrap();
+
+        assert!(store
+            .scan_delimited_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &scoped_key(root(2), b"fdb-read-budget/"),
+                b'/',
+                version,
+                None,
+                MAX_DELIMITED_SCAN_ITEMS,
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn initialization_rejects_a_profile_below_the_maximum_fenced_scan_budget() {
+        let mut limits = fdb_serving_profile().limits;
+        limits.max_read_bytes = MIN_SERVING_READ_BYTES - 1;
+        let error = match MetaShard::initialize(Arc::new(ProfileOnlyStore { limits }), shard(1)) {
+            Ok(_) => panic!("a profile below one maximum fenced scan must not bind"),
+            Err(error) => error,
+        };
+        let required = MIN_SERVING_READ_BYTES.to_string();
+        assert!(matches!(
+            error,
+            MetaError::SchemaGate { reason }
+                if reason.contains("read bytes") && reason.contains(&required)
+        ));
+    }
+
+    #[test]
+    fn initialization_rejects_a_transaction_target_below_the_serving_floor() {
+        let mut profile = fdb_serving_profile();
+        profile.transaction_target_bytes = 899_999;
+        let store = Arc::new(ProfileOverrideStore {
+            inner: Arc::new(ProfileOnlyStore {
+                limits: profile.limits,
+            }),
+            profile,
+        });
+        let error = match MetaShard::initialize(store, shard(1)) {
+            Ok(_) => panic!("a transaction target below the serving floor must not bind"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            MetaError::SchemaGate { reason }
+                if reason.contains("transaction target") && reason.contains("900000")
+        ));
+    }
+
+    #[test]
+    fn initialization_rejects_an_inconsistent_recovery_profile_before_io() {
+        let mut profile = shared_profile();
+        profile.ack = AckBoundary::LocalSync;
+        let store = Arc::new(ProfileOverrideStore {
+            inner: Arc::new(ProfileOnlyStore {
+                limits: store_limits(),
+            }),
+            profile,
+        });
+        let error = match MetaShard::initialize(store, shard(1)) {
+            Ok(_) => panic!("an inconsistent recovery profile must not bind"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            MetaError::SchemaGate { reason }
+                if reason.contains("authority") && reason.contains("inconsistent")
         ));
     }
 
@@ -4691,6 +5301,110 @@ mod tests {
             recovery_rows > 2,
             "maximum deterministic result must span multiple recovery chunks"
         );
+    }
+
+    #[test]
+    fn store_authority_commands_use_atomic_dedupe_without_local_recovery() {
+        let local = ready_store();
+        let local_command = create_command(
+            &local,
+            request(249),
+            scoped_key(root(2), b"store-authority"),
+            b"value",
+        );
+        let local_txn = local.command_txn_for_fit(&local_command, None).unwrap();
+        assert!(txn_touches_local_recovery(&local_txn));
+
+        let mut shared = ready_shared_store();
+        let command = create_command(
+            &shared,
+            request(249),
+            scoped_key(root(2), b"store-authority"),
+            b"value",
+        );
+        let predicted = shared.command_txn_for_fit(&command, None).unwrap();
+        assert!(!txn_touches_local_recovery(&predicted));
+        assert!(
+            crate::workspace::test_support::transaction_bytes(&predicted)
+                < crate::workspace::test_support::transaction_bytes(&local_txn)
+        );
+
+        let capture = capture_next_commit(&mut shared);
+        let applied = shared.execute(&command).unwrap();
+        assert_eq!(applied.recovery_receipt, None);
+        capture.with_last_commit(|actual| {
+            assert_eq!(txn_shape(&predicted), txn_shape(actual));
+            assert!(!txn_touches_local_recovery(actual));
+        });
+
+        let dedupe = shared
+            .lookup_request(root(2), generation(7), epoch(1), request(249))
+            .unwrap()
+            .unwrap();
+        assert_eq!(dedupe.recovery_receipt, None);
+        let lookup = shared
+            .lookup_request_result(root(2), generation(7), epoch(1), request(249))
+            .unwrap()
+            .unwrap();
+        assert!(lookup.replayed);
+        assert_eq!(lookup.recovery_receipt, None);
+
+        let replay = shared.execute(&command).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.recovery_receipt, None);
+        let mut reused = command.clone();
+        reused.deterministic_result = b"different".to_vec();
+        assert_eq!(
+            shared.execute(&reused.seal()),
+            Err(MetaError::RequestIdReused)
+        );
+        assert!(matches!(
+            shared.recovery_state(),
+            Err(MetaError::RecoveryUnavailable { .. })
+        ));
+        assert!(matches!(
+            shared.verify_recovery_chain(),
+            Err(MetaError::RecoveryUnavailable { .. })
+        ));
+        MetaShard::open(Arc::clone(&shared.store), shard(1)).unwrap();
+    }
+
+    #[test]
+    fn command_fit_uses_the_store_transaction_planning_target() {
+        let mut store = ready_shared_store();
+        let mut command = create_command(
+            &store,
+            request(248),
+            scoped_key(root(2), b"planning-target"),
+            b"value",
+        );
+        command.deterministic_result = vec![0x5a; MAX_DETERMINISTIC_RESULT_BYTES];
+        let command = command.seal();
+        let txn = store.command_txn_for_fit(&command, None).unwrap();
+        let transaction_bytes = crate::workspace::test_support::transaction_bytes(&txn);
+        assert!(transaction_bytes > 1);
+
+        let mut profile = shared_profile();
+        profile.transaction_target_bytes = transaction_bytes - 1;
+        store.store = Arc::new(ProfileOverrideStore {
+            inner: Arc::clone(&store.store),
+            profile,
+        });
+        assert!(matches!(
+            store.command_fit(&command, None),
+            Ok(CommandFit::Exceeds {
+                kind: CommandLimit::TransactionBytes,
+                actual,
+                maximum,
+            }) if actual == transaction_bytes && maximum == transaction_bytes - 1
+        ));
+
+        profile.transaction_target_bytes = transaction_bytes;
+        store.store = Arc::new(ProfileOverrideStore {
+            inner: Arc::clone(&store.store),
+            profile,
+        });
+        assert_eq!(store.command_fit(&command, None), Ok(CommandFit::Fits));
     }
 
     #[test]
@@ -4802,11 +5516,61 @@ mod tests {
     }
 
     #[test]
+    fn actual_metadata_commit_enforces_the_store_transaction_target() {
+        let store = Arc::new(ProfileOverrideStore {
+            inner: crate::workspace::test_support::memory_txn_store().unwrap(),
+            profile: fdb_serving_profile(),
+        });
+        let store = make_store_ready(MetaShard::initialize(store, shard(1)).unwrap());
+        let version_before = store.current_read_version().unwrap();
+        let mut command = base_command(&store, request(83), RootFenceAction::RequireActive);
+        for index in 0..16 {
+            let key = scoped_key(root(2), format!("fdb-target/{index:02}").as_bytes());
+            command.predicates.push(CommandPredicate::Value {
+                family: MetadataFamily::Operation,
+                key: key.clone(),
+                expected: None,
+            });
+            command.mutations.push(CommandMutation::Put {
+                family: MetadataFamily::Operation,
+                key,
+                value: vec![index as u8; MAX_COMMAND_VALUE_BYTES],
+            });
+        }
+        let command = command.seal();
+        assert!(matches!(
+            store.command_fit(&command, None),
+            Ok(CommandFit::Exceeds {
+                kind: CommandLimit::TransactionBytes,
+                actual,
+                maximum: 900_000,
+            }) if actual < 2_900_000
+        ));
+
+        let error = store
+            .execute(&command)
+            .expect_err("an actual FDB metadata commit must honor the planner target");
+        assert!(matches!(
+            error,
+            MetaError::Store {
+                operation: "execute metadata command",
+                source: StoreError::LimitExceeded {
+                    kind: LimitKind::TransactionBytes,
+                    maximum: 900_000,
+                    ..
+                },
+            }
+        ));
+        assert_eq!(store.current_read_version().unwrap(), version_before);
+    }
+
+    #[test]
     fn applied_then_lost_ack_remains_typed_and_reconciles_by_request() {
         let mut store = ready_store();
         let wrapper = Arc::new(AppliedThenLostAckStore {
             inner: Arc::clone(&store.store),
             lose_next_ack: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
         });
         store.store = wrapper.clone();
         let command = create_command(
@@ -4835,8 +5599,52 @@ mod tests {
 
         let reconciled = store.execute(&command).unwrap();
         assert!(reconciled.replayed);
-        assert_eq!(reconciled.recovery_lsn, after_unknown.applied_recovery_lsn);
-        assert_eq!(reconciled.recovery_chain_digest, after_unknown.chain_digest);
+        assert_eq!(
+            reconciled.recovery_receipt,
+            Some(LocalRecoveryReceipt {
+                recovery_lsn: after_unknown.applied_recovery_lsn,
+                chain_digest: after_unknown.chain_digest,
+            })
+        );
+    }
+
+    #[test]
+    fn store_authority_lost_ack_reconciles_without_a_local_receipt() {
+        let mut store = ready_shared_store();
+        let wrapper = Arc::new(AppliedThenLostAckStore {
+            inner: Arc::clone(&store.store),
+            lose_next_ack: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
+        });
+        store.store = wrapper.clone();
+        let command = create_command(
+            &store,
+            request(247),
+            scoped_key(root(2), b"shared-unknown-outcome"),
+            b"value",
+        );
+        wrapper.lose_next_ack.store(true, Ordering::Release);
+        assert!(matches!(
+            store.execute(&command),
+            Err(MetaError::Store {
+                operation: "execute metadata command",
+                source: StoreError::OutcomeUnknown {
+                    state: UnknownCommit::Settled,
+                    ..
+                },
+            })
+        ));
+
+        let reconciled = store.execute(&command).unwrap();
+        assert!(reconciled.replayed);
+        assert_eq!(reconciled.recovery_receipt, None);
+        assert_eq!(reconciled.deterministic_result, b"created");
+        let dedupe = store
+            .lookup_request(root(2), generation(7), epoch(1), request(247))
+            .unwrap()
+            .unwrap();
+        assert_eq!(dedupe.recovery_receipt, None);
+        MetaShard::open(Arc::clone(&store.store), shard(1)).unwrap();
     }
 
     #[test]
@@ -4943,6 +5751,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(durable.command_digest, command.command_digest);
+        assert_eq!(durable.replay_digest, command.canonical_replay_digest());
         assert_eq!(durable.commit_version, first.commit_version);
         assert_eq!(durable.deterministic_result, b"created");
         assert!(store
@@ -4956,6 +5765,49 @@ mod tests {
         assert_eq!(store.execute(&mismatch), Err(MetaError::RequestIdReused));
         assert_eq!(
             read_operation(&store, &key, first.commit_version),
+            Some(b"v1".to_vec())
+        );
+    }
+
+    #[test]
+    fn exact_replay_crosses_owner_epoch_without_weakening_command_identity() {
+        let store = ready_store();
+        let key = scoped_key(root(2), b"owner-replay");
+        let command = create_command(&store, request(6), key.clone(), b"v1");
+        let first = store.execute(&command).unwrap();
+
+        store.advance_owner_epoch(Some(epoch(1)), epoch(2)).unwrap();
+        let mut successor_replay = command.clone();
+        successor_replay.owner_epoch = epoch(2);
+        successor_replay = successor_replay.seal();
+        assert_ne!(successor_replay.command_digest, command.command_digest);
+        assert_eq!(
+            successor_replay.canonical_replay_digest(),
+            command.canonical_replay_digest()
+        );
+
+        let replay = store.execute(&successor_replay).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.commit_version, first.commit_version);
+        assert_eq!(replay.deterministic_result, first.deterministic_result);
+
+        successor_replay.deterministic_result = b"different".to_vec();
+        successor_replay = successor_replay.seal();
+        assert_eq!(
+            store.execute(&successor_replay),
+            Err(MetaError::RequestIdReused)
+        );
+        assert_eq!(
+            store
+                .read_at(
+                    root(2),
+                    generation(7),
+                    epoch(2),
+                    MetadataFamily::Operation,
+                    &key,
+                    ReadVersion::new(first.commit_version.get()).unwrap(),
+                )
+                .unwrap(),
             Some(b"v1".to_vec())
         );
     }
@@ -5879,6 +6731,204 @@ mod tests {
     }
 
     #[test]
+    fn lease_clock_reconciles_an_applied_unknown_outcome_without_a_second_commit() {
+        let mut store = ready_store();
+        let wrapper = Arc::new(AppliedThenLostAckStore {
+            inner: Arc::clone(&store.store),
+            lose_next_ack: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
+        });
+        store.store = wrapper.clone();
+        let before = store.recovery_state().unwrap();
+
+        wrapper.lose_next_ack.store(true, Ordering::Release);
+        assert_eq!(
+            store
+                .observe_lease_clock(root(2), generation(7), epoch(1), 100)
+                .unwrap(),
+            100
+        );
+
+        assert_eq!(store.lease_clock_high_water().unwrap(), 100);
+        let after = store.recovery_state().unwrap();
+        assert_eq!(after.applied_recovery_lsn, before.applied_recovery_lsn + 1);
+        assert_eq!(
+            store
+                .observe_lease_clock(root(2), generation(7), epoch(1), 100)
+                .unwrap(),
+            100
+        );
+        assert_eq!(store.recovery_state().unwrap(), after);
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn lease_clock_keeps_an_unproved_unknown_outcome_typed() {
+        let mut store = ready_store();
+        let wrapper = Arc::new(UnknownWithoutApplyStore {
+            inner: Arc::clone(&store.store),
+            fail_next_commit: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
+        });
+        store.store = wrapper.clone();
+        let before = store.recovery_state().unwrap();
+
+        wrapper.fail_next_commit.store(true, Ordering::Release);
+        assert!(matches!(
+            store.observe_lease_clock(root(2), generation(7), epoch(1), 100),
+            Err(MetaError::Store {
+                operation: "advance lease clock",
+                source: StoreError::OutcomeUnknown {
+                    state: UnknownCommit::MayCommit,
+                    ..
+                },
+            })
+        ));
+        assert_eq!(store.lease_clock_high_water().unwrap(), 0);
+        assert_eq!(store.recovery_state().unwrap(), before);
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn owner_epoch_reconciles_an_applied_unknown_outcome_without_a_second_commit() {
+        let mut store = ready_store();
+        let wrapper = Arc::new(AppliedThenLostAckStore {
+            inner: Arc::clone(&store.store),
+            lose_next_ack: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
+        });
+        store.store = wrapper.clone();
+        let before = store.recovery_state().unwrap();
+
+        wrapper.lose_next_ack.store(true, Ordering::Release);
+        store.advance_owner_epoch(Some(epoch(1)), epoch(2)).unwrap();
+
+        assert_eq!(store.current_owner_epoch().unwrap(), Some(epoch(2)));
+        let after = store.recovery_state().unwrap();
+        assert_eq!(after.applied_recovery_lsn, before.applied_recovery_lsn + 1);
+        store.advance_owner_epoch(Some(epoch(1)), epoch(2)).unwrap();
+        assert_eq!(store.recovery_state().unwrap(), after);
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn owner_epoch_keeps_an_unproved_unknown_outcome_typed() {
+        let mut store = ready_store();
+        let wrapper = Arc::new(UnknownWithoutApplyStore {
+            inner: Arc::clone(&store.store),
+            fail_next_commit: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
+        });
+        store.store = wrapper.clone();
+        let before = store.recovery_state().unwrap();
+
+        wrapper.fail_next_commit.store(true, Ordering::Release);
+        assert!(matches!(
+            store.advance_owner_epoch(Some(epoch(1)), epoch(2)),
+            Err(MetaError::Store {
+                operation: "advance owner epoch",
+                source: StoreError::OutcomeUnknown {
+                    state: UnknownCommit::MayCommit,
+                    ..
+                },
+            })
+        ));
+        assert_eq!(store.current_owner_epoch().unwrap(), Some(epoch(1)));
+        assert_eq!(store.recovery_state().unwrap(), before);
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn lease_clock_accepts_a_larger_legal_value_under_the_same_fence() {
+        let (store, wrapper) =
+            ready_store_with_unknown_readback_hook(advance_clock_before_unknown_readback);
+        let before = store.recovery_state().unwrap();
+
+        wrapper.lose_next_ack.store(true, Ordering::Release);
+        assert_eq!(
+            store
+                .observe_lease_clock(root(2), generation(7), epoch(1), 100)
+                .unwrap(),
+            200
+        );
+
+        assert_eq!(store.lease_clock_high_water().unwrap(), 200);
+        assert_eq!(
+            store.recovery_state().unwrap().applied_recovery_lsn,
+            before.applied_recovery_lsn + 2
+        );
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn lease_clock_unknown_readback_rejects_a_changed_owner_fence() {
+        let (store, wrapper) =
+            ready_store_with_unknown_readback_hook(advance_owner_before_unknown_readback);
+
+        wrapper.lose_next_ack.store(true, Ordering::Release);
+        assert!(matches!(
+            store.observe_lease_clock(root(2), generation(7), epoch(1), 100),
+            Err(MetaError::Store {
+                operation: "advance lease clock",
+                source: StoreError::OutcomeUnknown {
+                    state: UnknownCommit::Settled,
+                    ..
+                },
+            })
+        ));
+
+        assert_eq!(store.lease_clock_high_water().unwrap(), 100);
+        assert_eq!(store.current_owner_epoch().unwrap(), Some(epoch(2)));
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn lease_clock_unknown_readback_rejects_a_changed_root_fence() {
+        let (store, wrapper) =
+            ready_store_with_unknown_readback_hook(drain_root_before_unknown_readback);
+
+        wrapper.lose_next_ack.store(true, Ordering::Release);
+        assert!(matches!(
+            store.observe_lease_clock(root(2), generation(7), epoch(1), 100),
+            Err(MetaError::Store {
+                operation: "advance lease clock",
+                source: StoreError::OutcomeUnknown {
+                    state: UnknownCommit::Settled,
+                    ..
+                },
+            })
+        ));
+
+        assert_eq!(store.lease_clock_high_water().unwrap(), 100);
+        assert_eq!(
+            store.root_fence(root(2)).unwrap().unwrap().activation_state,
+            RootActivationState::Draining
+        );
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn owner_epoch_unknown_readback_rejects_an_ahead_epoch() {
+        let (store, wrapper) =
+            ready_store_with_unknown_readback_hook(advance_owner_again_before_unknown_readback);
+
+        wrapper.lose_next_ack.store(true, Ordering::Release);
+        assert!(matches!(
+            store.advance_owner_epoch(Some(epoch(1)), epoch(2)),
+            Err(MetaError::Store {
+                operation: "advance owner epoch",
+                source: StoreError::OutcomeUnknown {
+                    state: UnknownCommit::Settled,
+                    ..
+                },
+            })
+        ));
+
+        assert_eq!(store.current_owner_epoch().unwrap(), Some(epoch(3)));
+        assert_eq!(wrapper.commit_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
     fn write_requires_the_exact_current_read_version() {
         let store = ready_store();
         let stale = create_command(&store, request(3), scoped_key(root(2), b"stale"), b"stale");
@@ -6107,9 +7157,12 @@ mod tests {
             b"value",
         );
         let applied = store.execute_before_lease_deadline(&command, 101).unwrap();
-        assert_eq!(applied.recovery_lsn, 5);
+        let applied_receipt = applied
+            .recovery_receipt
+            .expect("local metadata command must return a recovery receipt");
+        assert_eq!(applied_receipt.recovery_lsn, 5);
         assert_eq!(
-            applied.recovery_chain_digest,
+            applied_receipt.chain_digest,
             store.recovery_outbox_after(4, 1).unwrap()[0].chain_digest
         );
         store.advance_owner_epoch(Some(epoch(1)), epoch(2)).unwrap();
@@ -6130,7 +7183,7 @@ mod tests {
             .lookup_request(root(2), generation(7), epoch(2), request(50))
             .unwrap()
             .unwrap();
-        assert_eq!(dedupe.recovery_lsn, 5);
+        assert_eq!(dedupe.recovery_receipt, Some(applied_receipt));
 
         store
             .observe_lease_clock(root(2), generation(7), epoch(2), 75)
@@ -6138,8 +7191,7 @@ mod tests {
         store.advance_owner_epoch(Some(epoch(1)), epoch(2)).unwrap();
         let replay = store.execute_before_lease_deadline(&command, 101).unwrap();
         assert!(replay.replayed);
-        assert_eq!(replay.recovery_lsn, applied.recovery_lsn);
-        assert_eq!(replay.recovery_chain_digest, applied.recovery_chain_digest);
+        assert_eq!(replay.recovery_receipt, applied.recovery_receipt);
         assert_eq!(store.recovery_state().unwrap(), state);
     }
 
@@ -6250,21 +7302,21 @@ mod tests {
     }
 
     #[test]
-    fn format9_store_is_rejected_without_rewriting_its_marker_or_recovery_tail() {
+    fn format11_store_is_rejected_without_rewriting_its_marker_or_recovery_tail() {
         let temporary = tempdir().unwrap();
         let database = temporary.path().join("metadata");
         let expected_recovery;
-        let format9_marker;
+        let format11_marker;
         {
             let store = ready_file_store(&database);
             expected_recovery = store.verify_recovery_chain().unwrap();
-            format9_marker = {
+            format11_marker = {
                 let mut marker = encode_schema_marker();
                 let version_start = marker.len() - std::mem::size_of::<u32>();
-                marker[version_start..].copy_from_slice(&9_u32.to_be_bytes());
+                marker[version_start..].copy_from_slice(&11_u32.to_be_bytes());
                 marker
             };
-            raw_put(&store, SYSTEM.id, SYSTEM_SCHEMA_KEY, &format9_marker);
+            raw_put(&store, SYSTEM.id, SYSTEM_SCHEMA_KEY, &format11_marker);
         }
 
         assert!(matches!(
@@ -6285,7 +7337,7 @@ mod tests {
         let ReadResult::Get(marker) = &snapshot.results[0] else {
             panic!("schema marker read must return a point value");
         };
-        assert_eq!(marker.as_deref(), Some(format9_marker.as_slice()));
+        assert_eq!(marker.as_deref(), Some(format11_marker.as_slice()));
         let ReadResult::Get(lsn) = &snapshot.results[1] else {
             panic!("recovery LSN read must return a point value");
         };
@@ -6448,6 +7500,7 @@ mod tests {
         let wrapper = Arc::new(AppliedThenLostAckStore {
             inner: Arc::clone(&target.store),
             lose_next_ack: AtomicBool::new(false),
+            commit_calls: AtomicUsize::new(0),
         });
         target.store = wrapper.clone();
         target.replay_recovery_record(&source_rows[0]).unwrap();
@@ -6523,10 +7576,13 @@ mod tests {
             .recovery_segment_after(before, 16)
             .unwrap()
             .expect("the applied command must be exportable before its caller can acknowledge it");
+        let receipt = result
+            .recovery_receipt
+            .expect("local metadata command must return a recovery receipt");
 
-        assert_eq!(segment.first_lsn, result.recovery_lsn);
-        assert_eq!(segment.last_lsn, result.recovery_lsn);
-        assert_eq!(segment.last_chain_digest, result.recovery_chain_digest);
+        assert_eq!(segment.first_lsn, receipt.recovery_lsn);
+        assert_eq!(segment.last_lsn, receipt.recovery_lsn);
+        assert_eq!(segment.last_chain_digest, receipt.chain_digest);
         assert_eq!(segment.records.len(), 1);
     }
 
@@ -6577,7 +7633,11 @@ mod tests {
             .required_value(COMMAND_DEDUPE.id, &key, "CommandDedupe")
             .unwrap();
         let mut dedupe = CommandDedupeRecord::decode(&raw).unwrap();
-        dedupe.recovery_lsn = 1;
+        dedupe
+            .recovery_receipt
+            .as_mut()
+            .expect("local dedupe must carry a recovery receipt")
+            .recovery_lsn = 1;
         let corrupted = dedupe.encode().unwrap();
         raw_put(&store, COMMAND_DEDUPE.id, &key, &corrupted);
 
@@ -6597,6 +7657,72 @@ mod tests {
                 "fsck must diagnose without repairing or guessing"
             );
         }
+    }
+
+    #[test]
+    fn recovery_receipt_mode_mismatches_fail_closed_on_exact_replay() {
+        let local = ready_store();
+        let local_command = create_command(
+            &local,
+            request(62),
+            scoped_key(root(2), b"missing-local-receipt"),
+            b"payload",
+        );
+        local.execute(&local_command).unwrap();
+        let local_key = command_dedupe_key(root(2), request(62));
+        let mut local_dedupe = CommandDedupeRecord::decode(
+            &local
+                .required_value(COMMAND_DEDUPE.id, &local_key, "CommandDedupe")
+                .unwrap(),
+        )
+        .unwrap();
+        local_dedupe.recovery_receipt = None;
+        raw_put(
+            &local,
+            COMMAND_DEDUPE.id,
+            &local_key,
+            &local_dedupe.encode().unwrap(),
+        );
+        assert!(matches!(
+            local.execute(&local_command),
+            Err(MetaError::CorruptRecord {
+                record: "CommandDedupe recovery binding",
+                ..
+            })
+        ));
+
+        let shared = ready_shared_store();
+        let shared_command = create_command(
+            &shared,
+            request(62),
+            scoped_key(root(2), b"unexpected-local-receipt"),
+            b"payload",
+        );
+        shared.execute(&shared_command).unwrap();
+        let shared_key = command_dedupe_key(root(2), request(62));
+        let mut shared_dedupe = CommandDedupeRecord::decode(
+            &shared
+                .required_value(COMMAND_DEDUPE.id, &shared_key, "CommandDedupe")
+                .unwrap(),
+        )
+        .unwrap();
+        shared_dedupe.recovery_receipt = Some(LocalRecoveryReceipt {
+            recovery_lsn: 1,
+            chain_digest: [0; RECOVERY_CHAIN_DIGEST_BYTES],
+        });
+        raw_put(
+            &shared,
+            COMMAND_DEDUPE.id,
+            &shared_key,
+            &shared_dedupe.encode().unwrap(),
+        );
+        assert!(matches!(
+            shared.execute(&shared_command),
+            Err(MetaError::CorruptRecord {
+                record: "CommandDedupe recovery binding",
+                ..
+            })
+        ));
     }
 
     #[test]

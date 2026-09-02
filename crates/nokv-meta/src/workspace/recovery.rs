@@ -1,8 +1,10 @@
-//! Durable, strictly ordered material for exporting and replaying metadata writes.
+//! Durable, strictly ordered local material for exporting and replaying metadata writes.
 //!
-//! The outbox is committed in the same transaction as the authoritative
-//! mutation. It is not a second namespace state machine: a consumer replays the
-//! decoded mutation through the ordinary [`MetaShard`] write entrypoints.
+//! A `LocalJournal` store commits the outbox in the same transaction as the
+//! authoritative mutation. A `StoreAuthority` store does not use this module's
+//! durable rows. The outbox is not a second namespace state machine: a consumer
+//! replays the decoded mutation through the ordinary [`MetaShard`] write
+//! entrypoints.
 
 use std::fmt;
 

@@ -224,6 +224,7 @@ impl RootOwnerRegistry {
         self.fail_closed_shard_after_signal(logical_shard_id)
     }
 
+    #[cfg(any(feature = "fdb", test))]
     pub(crate) fn fail_closed_shard_with_control(
         &self,
         logical_shard_id: nokv_protocol::LogicalShardIdentity,
@@ -433,7 +434,7 @@ fn not_owner_response(
             retryable: true,
             conflict: Some(ConflictKind::RootPlacement),
             current_generation: None,
-            route_hint,
+            route_hint: None,
         }),
     }
 }
@@ -688,7 +689,7 @@ mod tests {
             panic!("stale preflight route must fail");
         };
         assert_eq!(failure.code, ErrorCode::NotOwner);
-        assert_eq!(failure.route_hint, Some(route(8)));
+        assert_eq!(failure.route_hint, None);
 
         let current = registry.dispatch(preflight_request(route(8))).unwrap();
         let WorkspaceRpcOutcome::Success(result) = current.outcome else {
@@ -709,7 +710,7 @@ mod tests {
             panic!("stale route must fail");
         };
         assert_eq!(failure.code, ErrorCode::NotOwner);
-        assert_eq!(failure.route_hint, Some(route(8)));
+        assert_eq!(failure.route_hint, None);
     }
 
     #[test]
@@ -806,6 +807,28 @@ mod tests {
             })
         ));
         assert_eq!(healthy_executor.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn typed_control_fail_close_preserves_the_first_cause() {
+        let registry = RootOwnerRegistry::new();
+        let installed = route(8);
+        registry.install(installed, Arc::new(EchoExecutor)).unwrap();
+        let first =
+            nokv_control::ControlError::Backend("injected owner renewal failure".to_owned());
+        registry
+            .fail_closed_shard_with_control(installed.logical_shard_id, first.clone())
+            .unwrap();
+        registry
+            .fail_closed_shard_with_control(
+                installed.logical_shard_id,
+                nokv_control::ControlError::Backend("later cleanup failure".to_owned()),
+            )
+            .unwrap();
+
+        assert!(registry.owner_loss_signal().is_lost());
+        assert_eq!(registry.owner_loss_signal().control_error(), Some(first));
+        assert_eq!(registry.installed_root_count().unwrap(), 0);
     }
 
     #[test]

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import unittest
 from pathlib import Path
 
@@ -19,10 +18,8 @@ import cursor_differential_qualification
 import lingtai_mcp_qualification
 import live_workbench
 import nokv_agent_qualification
-import object_namespace_recovery_gate
 import pre423_contract_ledger
 import python_sdk_qualification
-import restore_composition_gate
 import snapshot_lifecycle_qualification
 
 
@@ -38,9 +35,7 @@ PRODUCER_MODULES = {
     "nokv-agent-unit": nokv_agent_qualification,
     "lingtai-mcp": lingtai_mcp_qualification,
     "live-workbench": live_workbench,
-    "object-namespace-recovery": object_namespace_recovery_gate,
     "python-sdk": python_sdk_qualification,
-    "restore-composition": restore_composition_gate,
     "snapshot-lifecycle": snapshot_lifecycle_qualification,
 }
 PRODUCER_SCENARIOS = {
@@ -59,9 +54,7 @@ INVOCATION_IDS = {
     "nokv-agent-unit-nq",
     "lingtai-mcp-nq",
     "live-workbench-nq",
-    "object-namespace-recovery-nq",
     "python-sdk-nq",
-    "restore-composition-nq",
     "snapshot-lifecycle-pass",
     "snapshot-lifecycle-nq",
 }
@@ -96,7 +89,7 @@ class QualificationInvocationManifestTests(unittest.TestCase):
         )
         invocation_ids = {invocation["id"] for invocation in invocations}
         self.assertEqual(len(invocation_ids), len(invocations))
-        self.assertEqual(len(invocations), 16)
+        self.assertEqual(len(invocations), 14)
         self.assertEqual(invocation_ids, INVOCATION_IDS)
         for invocation in invocations:
             self.assertEqual(
@@ -157,7 +150,7 @@ class QualificationInvocationManifestTests(unittest.TestCase):
             all_claims.extend(invocation["claims"])
 
         self.assertEqual(len(all_claims), len(set(all_claims)))
-        self.assertEqual((pass_count, nq_count), (74, 98))
+        self.assertEqual((pass_count, nq_count), (74, 66))
 
         ledger = pre423_contract_ledger.load_ledger()
         typed_producers = set(manifest["typed_producers"])
@@ -178,7 +171,7 @@ class QualificationInvocationManifestTests(unittest.TestCase):
             for invocation in invocations
             for claim in invocation["claims"]
         }
-        self.assertEqual(len(typed_eligible_scenarios), 172)
+        self.assertEqual(len(typed_eligible_scenarios), 140)
         self.assertEqual(manifest_scenarios, typed_eligible_scenarios)
 
         outcomes_by_producer: dict[str, set[str]] = {}
@@ -196,14 +189,12 @@ class QualificationInvocationManifestTests(unittest.TestCase):
                 "lingtai-mcp": {"NQ"},
                 "live-workbench": {"NQ"},
                 "nokv-agent-unit": {"PASS", "NQ"},
-                "object-namespace-recovery": {"NQ"},
                 "python-sdk": {"NQ"},
-                "restore-composition": {"NQ"},
                 "snapshot-lifecycle": {"PASS", "NQ"},
             },
         )
 
-    def test_aggregate_expectation_has_no_omitted_producers_but_remains_nq(
+    def test_aggregate_expectation_names_retired_producers_and_remains_nq(
         self,
     ) -> None:
         manifest = _load_manifest()
@@ -220,7 +211,11 @@ class QualificationInvocationManifestTests(unittest.TestCase):
         )
         self.assertEqual(expectation["expected_status"], "NQ")
         self.assertEqual(expectation["expected_exit_code"], 3)
-        self.assertEqual(expectation["omitted_producers"], [])
+        retired_producers = {
+            "object-namespace-recovery",
+            "restore-composition",
+        }
+        self.assertEqual(set(expectation["omitted_producers"]), retired_producers)
         self.assertIs(expectation["product_artifact_manifest"], True)
         expected_receipt_count = sum(
             len({":".join(claim.split(":", 2)[:2]) for claim in invocation["claims"]})
@@ -241,101 +236,27 @@ class QualificationInvocationManifestTests(unittest.TestCase):
         ledger = pre423_contract_ledger.load_ledger()
         self.assertEqual(
             set(ledger["producer_catalog"]) - set(manifest["typed_producers"]),
-            set(),
+            retired_producers,
         )
 
-    def test_required_workflow_executes_and_uploads_fail_closed_qualification(
+    def test_required_workflow_checks_qualification_policy_and_live_holt(
         self,
     ) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
         required_tokens = (
-            "scripts/workbench/qualification_invocation_manifest.json",
-            "scripts/workbench/qualification_invocation_check.py",
-            "scripts/workbench/qualification_invocation_check_test.py",
-            "scripts/workbench/source_bound_producer.py",
-            "scripts/workbench/source_bound_producer_test.py",
-            "scripts/workbench/typed_live_qualification.py",
-            "scripts/workbench/typed_live_qualification_test.py",
-            "scripts/workbench/qualification_receipt.py",
-            "scripts/workbench/qualification_receipt_test.py",
-            "scripts/workbench/qualification_aggregate.py",
-            "scripts/workbench/qualification_aggregate_test.py",
-            "scripts/workbench/api_absence_qualification.py",
-            "scripts/workbench/api_absence_qualification_test.py",
-            "scripts/workbench/api_decision_qualification.py",
-            "scripts/workbench/api_decision_qualification_test.py",
-            "scripts/workbench/commit_replay_qualification.py",
-            "scripts/workbench/commit_replay_qualification_test.py",
-            "scripts/workbench/cursor_differential_qualification.py",
-            "scripts/workbench/cursor_differential_qualification_test.py",
-            "scripts/workbench/nokv_agent_qualification.py",
-            "scripts/workbench/nokv_agent_qualification_test.py",
-            "scripts/workbench/lingtai_mcp_qualification.py",
-            "scripts/workbench/python_sdk_qualification.py",
-            "scripts/workbench/live_gap_qualification_test.py",
-            "scripts/workbench/snapshot_lifecycle_qualification.py",
-            "scripts/workbench/snapshot_lifecycle_qualification_test.py",
-            "runner_python=$(python3 -c 'import os,sys; print(os.path.realpath(sys.executable))')",
-            '[[ -x "$runner_python" && "$runner_python" = /* ]]',
-            '"$runner_python" scripts/workbench/qualification_receipt.py',
-            '"$runner_python" "$script"',
-            "cargo build --locked -p nokv --bin nokv --target-dir target/phase1-qualification",
-            '--evidence "qualification=$evidence_root/qualification.json"',
-            '--evidence "mcp-transcript=$evidence_root/mcp-transcript.jsonl"',
-            "lingtai-kernel=git:834274df1304488d3e6b5b2cde4a3b481a81e38b",
-            "python_sdk_sha256=$(git ls-files -s crates/nokv-python | sha256sum",
-            "python3 scripts/workbench/qualification_aggregate.py",
-            "python3 scripts/workbench/qualification_invocation_check.py",
-            '[[ "$aggregate_status" -eq 3 ]]',
-            "'.status == \"NQ\"'",
-            "'.receipt_counts == $expected'",
-            "phase1-qualification-${{ github.sha }}",
-            "id: qualification_product",
-            "phase1-product-${{ github.sha }}",
-            "steps.qualification_product.outputs.artifact-id",
-            "steps.qualification_product.outputs.artifact-digest",
-            "nokv.pre423.product_artifact_manifest.v1",
-            "workbench-contract:\n    runs-on: ubuntu-latest\n    timeout-minutes: 45",
-            "if: ${{ always() }}",
-            "if-no-files-found: warn",
+            "python3 -m compileall -q scripts/workbench",
+            "PYTHONPATH=scripts/workbench python3 -m unittest discover",
+            "standalone-live-workbench:",
+            "python3 scripts/workbench/live_workbench.py",
+            "--metadata-dir \"$LIVE_WORKBENCH_ROOT/metadata\"",
+            "--advertise-endpoint 127.0.0.1:17750",
+            "if: ${{ always() && steps.live_workbench.outcome != 'skipped' }}",
+            "if-no-files-found: error",
             "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-            "snapshot-lifecycle)",
         )
         for token in required_tokens:
             with self.subTest(token=token):
                 self.assertIn(token, workflow)
-        self.assertIn("--product-artifact-manifest", workflow)
-
-    def test_workflow_runner_python_matches_receipt_executable_identity(self) -> None:
-        workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
-        assignments = [
-            line.strip()
-            for line in workflow.splitlines()
-            if line.strip().startswith("runner_python=")
-        ]
-        self.assertEqual(len(assignments), 1)
-        completed = subprocess.run(
-            [
-                "bash",
-                "-c",
-                "\n".join(
-                    (
-                        "set -euo pipefail",
-                        assignments[0],
-                        '[[ -x "$runner_python" && "$runner_python" = /* ]]',
-                        'printf "argv0=%s\\n" "$runner_python"',
-                        '"$runner_python" -c \'import os,sys; print("executable=" + os.path.realpath(sys.executable))\'',
-                    )
-                ),
-            ],
-            cwd=REPO,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        identity = dict(line.split("=", 1) for line in completed.stdout.splitlines())
-        self.assertEqual(identity["argv0"], identity["executable"])
 
 
 if __name__ == "__main__":

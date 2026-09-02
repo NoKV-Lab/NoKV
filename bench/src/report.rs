@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -34,6 +34,78 @@ pub struct WorkloadReport {
 pub struct MeasuredWorkload<S> {
     pub report: WorkloadReport,
     pub diagnostics: S,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassifiedOutcome {
+    Successful,
+    Conflicted,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClassifiedLatencySample {
+    pub latency_ns: u64,
+    pub outcome: ClassifiedOutcome,
+    pub checksum: u64,
+}
+
+/// Summarize already-timed concurrent samples with the same nearest-rank
+/// estimator used by the sequential benchmark helper.
+pub fn summarize_classified_samples(
+    workload: impl Into<String>,
+    samples: &[ClassifiedLatencySample],
+    retried: u64,
+    elapsed: Duration,
+) -> Result<WorkloadReport, String> {
+    if samples.is_empty() {
+        return Err("classified workload must contain at least one sample".to_owned());
+    }
+    let mut latencies = samples
+        .iter()
+        .map(|sample| sample.latency_ns)
+        .collect::<Vec<_>>();
+    latencies.sort_unstable();
+    let successful = samples
+        .iter()
+        .filter(|sample| sample.outcome == ClassifiedOutcome::Successful)
+        .count() as u64;
+    let conflicted = samples
+        .iter()
+        .filter(|sample| sample.outcome == ClassifiedOutcome::Conflicted)
+        .count() as u64;
+    let failed = samples
+        .iter()
+        .filter(|sample| sample.outcome == ClassifiedOutcome::Failed)
+        .count() as u64;
+    let attempted = samples.len() as u64;
+    let checksum = samples.iter().fold(0_u64, |checksum, sample| {
+        checksum.rotate_left(7) ^ sample.checksum
+    });
+    let elapsed_seconds = elapsed.as_secs_f64();
+    Ok(WorkloadReport {
+        workload: workload.into(),
+        attempted,
+        successful,
+        conflicted,
+        retried,
+        failed,
+        elapsed_seconds,
+        operations_per_second: if elapsed_seconds == 0.0 {
+            0.0
+        } else {
+            attempted as f64 / elapsed_seconds
+        },
+        latency: LatencyDistribution {
+            p50_ns: percentile(&latencies, 50),
+            p95_ns: percentile(&latencies, 95),
+            p99_ns: percentile(&latencies, 99),
+            max_ns: *latencies.last().expect("samples are nonempty"),
+        },
+        result_checksum: checksum,
+        latency_estimator: "nearest_rank",
+        completion_policy: "retain_all_terminal_outcomes",
+    })
 }
 
 /// Measure one workload and bracket only its timed operations with diagnostics.
@@ -68,35 +140,19 @@ pub fn measure_with_diagnostics<D, S>(
     }
     let elapsed = interval.elapsed();
     let diagnostics = finish_diagnostics(diagnostics)?;
-    samples.sort_unstable();
-    let elapsed_seconds = elapsed.as_secs_f64();
-
+    let classified = samples
+        .iter()
+        .map(|latency_ns| ClassifiedLatencySample {
+            latency_ns: *latency_ns,
+            outcome: ClassifiedOutcome::Successful,
+            checksum,
+        })
+        .collect::<Vec<_>>();
+    let mut report = summarize_classified_samples(workload, &classified, 0, elapsed)?;
+    report.result_checksum = checksum;
+    report.completion_policy = "abort_without_report_on_first_operation_error";
     Ok(MeasuredWorkload {
-        report: WorkloadReport {
-            workload: workload.into(),
-            attempted: iterations,
-            successful: iterations,
-            conflicted: 0,
-            retried: 0,
-            failed: 0,
-            elapsed_seconds,
-            operations_per_second: if elapsed_seconds == 0.0 {
-                0.0
-            } else {
-                iterations as f64 / elapsed_seconds
-            },
-            latency: LatencyDistribution {
-                p50_ns: percentile(&samples, 50),
-                p95_ns: percentile(&samples, 95),
-                p99_ns: percentile(&samples, 99),
-                max_ns: *samples
-                    .last()
-                    .expect("iterations are validated as positive"),
-            },
-            result_checksum: checksum,
-            latency_estimator: "nearest_rank",
-            completion_policy: "abort_without_report_on_first_operation_error",
-        },
+        report,
         diagnostics,
     })
 }
@@ -171,5 +227,38 @@ mod tests {
 
         assert_eq!(result.err().unwrap(), "operation failed");
         assert!(!active.get());
+    }
+
+    #[test]
+    fn classified_summary_retains_conflicts_retries_and_failures() {
+        let report = summarize_classified_samples(
+            "mixed",
+            &[
+                ClassifiedLatencySample {
+                    latency_ns: 10,
+                    outcome: ClassifiedOutcome::Successful,
+                    checksum: 1,
+                },
+                ClassifiedLatencySample {
+                    latency_ns: 20,
+                    outcome: ClassifiedOutcome::Conflicted,
+                    checksum: 2,
+                },
+                ClassifiedLatencySample {
+                    latency_ns: 30,
+                    outcome: ClassifiedOutcome::Failed,
+                    checksum: 3,
+                },
+            ],
+            2,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(report.attempted, 3);
+        assert_eq!(report.successful, 1);
+        assert_eq!(report.conflicted, 1);
+        assert_eq!(report.retried, 2);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.latency.p99_ns, 30);
     }
 }

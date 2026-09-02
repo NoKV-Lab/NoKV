@@ -45,6 +45,14 @@ pub enum StoreError {
         actual: usize,
         maximum: usize,
     },
+    /// The physical authority bound to this store handle is no longer current.
+    ///
+    /// No mutation from this call applied. The caller must stop using the
+    /// handle and reacquire ownership before opening a replacement.
+    Fenced {
+        expected_owner_epoch: u64,
+        expected_session_generation: u64,
+    },
     /// The operation could not run because the store was unavailable.
     ///
     /// No mutation from this call applied. An upper layer may retry the same
@@ -90,6 +98,13 @@ impl fmt::Display for StoreError {
             } => write!(
                 formatter,
                 "store {kind} limit exceeded: {actual}, maximum {maximum}"
+            ),
+            Self::Fenced {
+                expected_owner_epoch,
+                expected_session_generation,
+            } => write!(
+                formatter,
+                "metadata store owner session {expected_owner_epoch}/{expected_session_generation} is fenced"
             ),
             Self::Unavailable(reason) => {
                 write!(formatter, "metadata store unavailable: {reason}")

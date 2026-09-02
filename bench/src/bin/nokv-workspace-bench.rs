@@ -14,8 +14,9 @@ use std::time::Instant;
 
 use nokv_protocol::{
     decode_request, encode_request, ListPathsRequest, LogicalShardIdentity,
-    ObjectNamespaceIdentity, PageRequest, RequestIdentity, RootIdentity, RootRoute, WorkbenchName,
-    WorkspaceReadView, WorkspaceRequest, WorkspaceRpcRequest, WORKSPACE_PROTOCOL_SCHEMA,
+    ObjectNamespaceIdentity, PageRequest, RequestIdentity, RootIdentity, RootRoute, RpcRequest,
+    WorkbenchName, WorkspaceReadView, WorkspaceRequest, WorkspaceRpcRequest,
+    WORKSPACE_PROTOCOL_SCHEMA,
 };
 use serde_json::json;
 
@@ -33,7 +34,7 @@ fn main() {
 
 fn run(arguments: impl Iterator<Item = String>) -> Result<(), String> {
     let iterations = parse_iterations(arguments)?;
-    let request = sample_request()?;
+    let request = RpcRequest::Workspace(Box::new(sample_request()?));
     let encoded = encode_request(&request).map_err(|error| error.to_string())?;
 
     let started = Instant::now();

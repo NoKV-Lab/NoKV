@@ -22,7 +22,7 @@ pub use errors::{LimitKind, StoreError, UnknownCommit};
 pub use store::TxnStore;
 pub use types::{
     AckBoundary, Authority, Check, Commit, Key, Keyspace, Mutation, ReadBatch, ReadOp, ReadResult,
-    ReadSnapshot, Scan, ScanItem, ScanPage, StoreLimits, StoreProfile, WriteTxn,
+    ReadSnapshot, RecoveryMode, Scan, ScanItem, ScanPage, StoreLimits, StoreProfile, WriteTxn,
 };
 
 #[cfg(test)]

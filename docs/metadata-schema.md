@@ -19,15 +19,16 @@ Every logical-shard store has one authoritative marker:
 System("schema")
   -> value_format_version = 1
      schema_id = "nokv_workspace"
-     format_version = 10
+     format_version = 12
 ```
 
 Startup is fail-closed:
 
 - an empty store is initialized with the exact supported marker and logical
   keyspace catalog;
-- format-9 and older stores are rejected without writes; there is no marker-only
-  upgrade because format 10 adds authoritative Generic index families;
+- format-11 and older stores are rejected without writes; there is no
+  marker-only upgrade because format 12 adds a logical replay digest to every
+  command-dedupe record while retaining the owner-bound physical digest;
 - a nonempty current store opens only when its marker, value format, and
   configured adapter catalog match this contract;
 - a missing, malformed, unknown-version, or inconsistent store is rejected.
@@ -51,6 +52,7 @@ SnapshotId               8 bytes, unsigned big-endian and unique within one Root
                                   exactly the numeric Workbench facade id
 OperationId             16 bytes, unique within one RootId
 GenericIndexGenerationId 16 bytes, never reused within one RootId
+PathIndexGenerationId   16 bytes, never reused within one RootId
 CommitId                32 bytes, root-global SHA-256 identity
 ```
 
@@ -84,7 +86,7 @@ exact key is a strict prefix of another valid path key. A child/subtree prefix
 appends NUL, so `a` cannot match `ab`. The empty path has no `PathCurrent`
 record; the workspace root is synthesized from `WorkspaceCurrent`. This path
 key layout was introduced by system format version 8 and is retained by
-version 10.
+version 12.
 
 The one shared normalizer enforces:
 
@@ -105,26 +107,34 @@ float, timestamp, bytes, and string values.
 
 ## Durable Format Registry
 
-`System.format_version` is `10`. Version 10 retains the format-9 RecoveryOutbox
-LSN encoding as
-canonical fixed-width decimal keys. Numeric ordering is unchanged, while the
-sequential key shape avoids pathological underfilled Holt frames. Logical
-recovery records, deterministic results, and hash-chain bytes are unchanged.
+`System.format_version` is `12`. Version 12 retains the format-11 path, index,
+recovery-authority, and fixed-width decimal RecoveryOutbox layouts. It adds a
+logical replay digest to `CommandDedupe` alongside the owner-bound physical
+command digest. The replay digest excludes only the replaceable owner epoch;
+read version, routing identity, predicates, mutations, projections, and the
+deterministic result remain exact-bound. `RecoveryMode::LocalJournal` writes
+the optional typed recovery receipt and hash-chained RecoveryOutbox in the same
+transaction. `RecoveryMode::StoreAuthority` writes neither; its atomic dedupe
+result in the shared or replicated store is the recovery evidence. The system
+recovery tail remains at LSN zero and the logical-shard genesis digest in
+store-authority mode, and RecoveryOutbox must remain empty.
 
-Ordinary open does not migrate a format-9 marker, even when its old catalog is
-otherwise internally consistent. Format 9 lacks the three authoritative
-Generic index families, so marker-only upgrade would advertise records and
-lifecycle invariants that were never installed. Migration remains not
-qualified; every older or unknown marker is fail-closed and unchanged.
+Ordinary open does not migrate a format-11 marker, even when its catalog is
+otherwise internally consistent. Format 11 has no logical replay digest and
+cannot prove an exact command replay after owner replacement. Migration remains
+not qualified; every older or unknown marker is fail-closed and unchanged.
 
 Durable codecs are independently versioned:
-publication-owned workspace/path/revision records use value version `2`;
+publication-owned workspace/path/revision records use value version `3`;
 `CommitRecord` uses version `3` and dual-decodes version `2`, while its member,
-consumer, head, and tag records remain version `2`; `ChangeEvent` and the
-logical recovery-outbox record use value version `2`; other ordinary workspace
+consumer, head, and tag records remain version `2`; `ChangeEvent` uses value
+version `2`, and the logical recovery-outbox record uses version `3` with
+strict legacy-version-2 decoding; other ordinary workspace
 records and the recovery storage header/chunk records currently use value
-version `1`; `CommandDedupe` uses version `2` to bind its exact result to a
-recovery LSN. `BuildCommitOperation` and `CommitRetireOperation` use version `6`
+version `1`; `CommandDedupe` uses version `4` to bind its owner-bound physical
+digest, cross-owner logical replay digest, exact result, and optional local
+recovery receipt. `BuildCommitOperation` and
+`CommitRetireOperation` use version `6`
 and dual-decode version `5`; the build record retains the complete exact commit
 request, opaque Agent projection-input digest, first owner-observed commit time,
 run-manifest publication condition, immutable staged-manifest binding, and the
@@ -134,6 +144,15 @@ complete source workbench/incarnation, concrete source selector, and both path
 and Generic-index closure progress needed for source-independent terminal
 replay. Unknown versions fail closed. Keys do not repeat a version because the
 store-level schema marker gates their codec.
+SecondaryIndexV2 values use version `2` and contain only `path_digest` plus
+`PathIndexGenerationId`; `PathIndexLocator` values use version `1` and contain
+the locator state plus the one canonical normalized path. A publication's
+secondary-index staging `CommandDedupe` result uses version `2`: its intent
+digest binds the root and operation identities, stable operation/workspace/path
+keys, staged locator key and payload, and ordered secondary-index rows. It does
+not bind mutable operation, workspace, or current-path payload bytes. The first
+stage transaction still asserts those exact payloads before writing any staged
+row.
 Generic index current, generation, row, reference, append-receipt,
 registration-operation, and commit-member payloads use value version `1`.
 Row binding is explicit: `Directory` cannot later decorate an artifact,
@@ -176,14 +195,16 @@ and name. Store adapters map this catalog to their physical layout.
 | `generic_index_current` | `0x0219` | `0x19` |
 | `generic_index_generation` | `0x021a` | `0x1a` |
 | `commit_generic_index_member` | `0x021b` | `0x1b` |
+| `path_index_locator` | `0x021c` | `0x1c` |
 
 System keyspaces use IDs `0x0101` through `0x0106`. Domain keyspaces use
 `0x0200 | format_tag`. The `MetadataFamily` format tags remain one byte and keep
 their existing recovery and history encoding. Reserved format tags do not name
 caller-mutable metadata families. Tags `0x10`, `0x14`, and `0x18` are
-permanently reserved and cannot be reassigned. `MetaShard` appends
-`recovery_outbox` rows in
-the same transaction as each authoritative mutation.
+permanently reserved and cannot be reassigned. Under a local-journal store
+profile, `MetaShard` appends `recovery_outbox` rows in the same transaction as
+each authoritative mutation. A store-authority profile never writes this
+keyspace.
 
 Initial durable enum discriminants:
 
@@ -208,6 +229,7 @@ GenericIndexRegistrationPhase: Preparing=1, Appending=2, Sealing=3,
 GenericIndexReferenceKind: Current=1, Commit=2, BuildCommit=3, Restore=4,
                            Registration=5
 GenericIndexRowBinding: Directory=1, Unbound=2, Artifact=3
+PathIndexLocatorState: Staged=1, Published=2
 PublishPhase:    Uploading=1, Finalizing=2, Published=3, Aborting=4,
                  Cleaning=5, Cleaned=6, Quarantined=7
 BuildCommitPhase: Building=1, Sealing=2, Complete=3, Aborting=4,
@@ -325,10 +347,10 @@ WorkspaceIncarnationClaim
 
 PathCurrent
   key: root_id | workspace_incarnation_id | normalized_relative_path
-  val: PathEntry: generation, artifact_revision_id, logical_size,
-       body_digest_uri, manifest_digest_uri, dependency_count,
-       dependency_depth, content_type, producer, manifest_id,
-       typed_index_projection
+  val: PathEntry: generation, path_index_generation_id, path_digest,
+       artifact_revision_id, logical_size, body_digest_uri,
+       manifest_digest_uri, dependency_count, dependency_depth,
+       content_type, producer, manifest_id, typed_index_projection
 
 ArtifactRevision
   key: root_id | artifact_revision_id
@@ -410,9 +432,24 @@ CommitConsumer
   val: consumer_epoch_at_add, created_version
 
 SecondaryIndex
-  key: root_id | index_id | encoded_value
-       | workspace_incarnation_id | ordered(normalized_relative_path)
-  val: path_generation, compact projection
+  key: root_id | len(field_id) | field_id | ordered_typed_value
+       | workspace_incarnation_id | path_digest | path_index_generation_id
+  val: path_digest, path_index_generation_id
+
+PathIndexLocator
+  key: root_id | workspace_incarnation_id | path_digest
+       | path_index_generation_id
+  val: Staged | Published, normalized_relative_path
+
+  path_digest = sha256(
+      "nokv.metadata.path-index.v1\0"
+      | u32be(normalized_path_bytes)
+      | normalized_path_bytes
+  )
+
+  A locator whose key digest disagrees with its canonical stored path is
+  corruption. Creation, query, and cleanup fail closed; no collision fallback
+  or alternate path lookup exists.
 
 ChangeEvent
   key: root_id | commit_version | event_sequence
@@ -436,7 +473,9 @@ StagedObject
 
 CommandDedupe
   key: root_id | request_id
-  val: command digest, deterministic result, commit_version, recovery_lsn
+  val: owner-bound command digest, cross-owner replay digest,
+       deterministic result, commit_version,
+       optional local recovery LSN and chain digest
 
 GcCandidate
   key: root_id | artifact_revision_id | reference_epoch
@@ -496,6 +535,8 @@ truncation/compaction and fsck are not wired.
 
 ```text
 path_generation
+path_index_generation_id
+path_digest
 artifact_revision_id
 body_digest_uri
 manifest_digest_uri
@@ -514,9 +555,31 @@ record, or fallback path index.
 
 Clients attach queryable fields to `ArtifactDescriptor.index_fields` on the
 artifact publication request. The workspace executor validates and encodes
-that typed projection, and final publication updates `PathCurrent` and the
-corresponding `SecondaryIndex` rows in the same metadata command. There is no
-separate namespace-index registration RPC or second mutation path.
+that typed projection. Publication and rename first use one derived request id
+to create the generation's `Staged` locator and compact SecondaryIndexV2 rows.
+That command is invisible and has a durable replay receipt. One bounded final
+command then changes the locator to `Published` atomically with `PathCurrent`
+and the authoritative namespace, reference, event, and dedupe changes. Restore
+can write `Published` locators and rows while its workspace is hidden because
+`WorkspaceCurrent(Staging)` remains the outer visibility fence. There is no
+separate namespace-index registration RPC or alternate mutation path.
+
+An indexed query resolves each compact row through its exact locator and then
+the exact `PathCurrent` row at one fenced read version. It accepts only a
+`Published` locator whose workspace, path digest, and index generation match
+the current entry; staged or stale generations are invisible. These point
+joins are issued in store-profile-bounded batches. `PathCurrent` remains the
+authority even when an index is missing or stale.
+
+Remove deletes `PathCurrent`, which immediately makes its old published index
+generation stale and invisible. A root-wide, two-phase maintenance cursor
+reclaims stale SecondaryIndexV2 rows before stale published locators. Every
+delete predicates the exact derived row, exact published locator, and current
+`PathCurrent` payload or absence. A secondary row without its locator is
+corruption, not cleanup authority. The worker never deletes `Staged` locators;
+the owning durable publication or rename request must resume them. Cleanup
+pages shrink to the store transaction-planning target and return a durable,
+replayable cursor and row counts.
 
 A cold exact artifact lookup needs one logical `WorkspaceCurrent` point read
 and, only when its state is `Visible`, one logical `PathCurrent` point read.
@@ -618,8 +681,11 @@ Before any mutation, the shard validates:
 
 An unrelated intervening commit makes a write's read version stale and the
 caller must rebuild the command. An exact request-id replay is checked before
-that fence and returns the stored result. Reusing a request id with different
-inputs is an error. A failed predicate applies no mutation.
+that fence and returns the stored result. A serving successor first admits the
+RPC through its current ownership fence, then may match either the original
+physical command digest or the logical replay digest that differs only by owner
+epoch. Reusing a request id with any other changed command input is an error. A
+failed predicate applies no mutation.
 
 Ordinary put/replace/remove has a fixed upper bound on predicates and mutations
 apart from bounded manifest and index rows. It performs no namespace prefix
@@ -703,10 +769,12 @@ evidence and the operator's verification transcript, transitions
 `Quarantined -> Cleaned`, and releases the revision claim when this operation
 owns it.
 
-The final metadata command creates the `ArtifactRevision` as `Available`, its
-manifest, the first path reference, `PathCurrent`, workspace revision, indexes,
-event, and dedupe result. A failed upload is invisible. A response-loss retry
-returns the stored result without allocating another revision.
+After its invisible index-stage command, the final metadata command creates the
+`ArtifactRevision` as `Available`, its manifest, the first path reference,
+`PathCurrent`, workspace revision, event, and dedupe result, and flips the exact
+locator to `Published`. It predicates every staged SecondaryIndexV2 row. A
+failed upload or incomplete stage is invisible. A response-loss retry returns
+the stored result without allocating another revision or index generation.
 
 Append stores immutable segments in the new revision manifest and atomically
 advances the path generation. A manifest row names the revision that physically
@@ -828,10 +896,11 @@ of them is an operation input mismatch.
    exact Sealed state/consumer epoch and build parent_count/parent_digest
 7. verify the revision and parent count/digest pairs against their exact rows
 8. CAS BuildCommit Building -> Sealing against all three closure digests
-9. one command publishes PathCurrent(metadata/run_manifest.json), its path ref,
-   WorkspaceCurrent, the sealed Commit, WorkbenchCommitHead, and the old/new
-   CommitConsumer rows/counts/epochs; it also releases the replaced path ref,
-   changes Sealing -> Complete, emits the event, and releases HistoryHold
+9. one command publishes PathCurrent(metadata/run_manifest.json), its
+   `Published` path-index locator, its path ref, WorkspaceCurrent, the sealed
+   Commit, WorkbenchCommitHead, and the old/new CommitConsumer
+   rows/counts/epochs; it also releases the replaced path ref, changes
+   Sealing -> Complete, emits the event, and releases HistoryHold
 ```
 
 The `Commit` seal is the closure proof. `CommitMember` path membership, unique
@@ -964,6 +1033,7 @@ The durable state machine is:
        `Sealed` Commit state/consumer epoch
 2. for each source entry, one bounded batch writes:
      - destination PathCurrent under the new incarnation
+     - its `Published` path-index locator and compact SecondaryIndexV2 rows
      - its Path RevisionRef
      - ordered RestoreMember with row digest
      - the next source cursor and member sequence

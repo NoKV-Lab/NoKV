@@ -6,8 +6,8 @@
 use std::io::Cursor;
 
 use nokv_protocol::{
-    encode_response, ErrorCode, RequestIdentity, RootRoute, RpcFailure, WorkspaceRpcOutcome,
-    WorkspaceRpcResponse,
+    encode_response, ErrorCode, RequestIdentity, RootRoute, RpcFailure, RpcResponse,
+    WorkspaceRpcOutcome, WorkspaceRpcResponse,
 };
 use serde::{de::IgnoredAny, Deserialize, Serialize};
 
@@ -155,7 +155,7 @@ fn reject_v3(encoded: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let _ = envelope.payload.operation;
-    encode_response(&WorkspaceRpcResponse {
+    encode_response(&RpcResponse::Workspace(Box::new(WorkspaceRpcResponse {
         route: envelope.payload.route,
         request_id: envelope.payload.request_id,
         commit_version: None,
@@ -168,7 +168,7 @@ fn reject_v3(encoded: &[u8]) -> Option<Vec<u8>> {
             current_generation: None,
             route_hint: None,
         }),
-    })
+    })))
     .ok()
 }
 
@@ -189,13 +189,22 @@ where
 #[cfg(test)]
 mod tests {
     use nokv_protocol::{
-        decode_response, ErrorCode, LogicalShardIdentity, ObjectNamespaceIdentity, ProtocolError,
-        RequestIdentity, RootIdentity, RootRoute, WorkspaceRpcOutcome, WorkspaceRpcResponse,
+        ErrorCode, LogicalShardIdentity, ObjectNamespaceIdentity, ProtocolError, RequestIdentity,
+        RootIdentity, RootRoute, RpcResponse, WorkspaceRpcOutcome, WorkspaceRpcResponse,
         WORKSPACE_PROTOCOL_SCHEMA,
     };
     use serde::{Deserialize, Serialize};
 
     use super::*;
+
+    fn decode_response(encoded: &[u8]) -> Result<WorkspaceRpcResponse, ProtocolError> {
+        match nokv_protocol::decode_response(encoded)? {
+            RpcResponse::Workspace(response) => Ok(*response),
+            RpcResponse::DiscoverRoute(_) => Err(ProtocolError::Decode(
+                "expected a workspace response".to_owned(),
+            )),
+        }
+    }
 
     #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
@@ -356,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn post_tag_v3_gets_a_v9_failure_that_its_decoder_reports_as_schema_mismatch() {
+    fn post_tag_v3_gets_a_v10_failure_that_its_decoder_reports_as_schema_mismatch() {
         let route = v3_route();
         let request = request(LEGACY_V3_SCHEMA, route, "run-42");
         let response = legacy_rejection_response(&request).unwrap();
@@ -375,10 +384,13 @@ mod tests {
         #[derive(Deserialize)]
         struct V3TypedResponseFrame {
             schema: String,
-            payload: WorkspaceRpcResponse,
+            payload: RpcResponse,
         }
         let envelope: V3TypedResponseFrame = rmp_serde::from_slice(&response).unwrap();
-        assert_eq!(envelope.payload.route, route);
+        let RpcResponse::Workspace(payload) = envelope.payload else {
+            panic!("legacy workspace request must receive a workspace response");
+        };
+        assert_eq!(payload.route, route);
         assert_eq!(envelope.schema, WORKSPACE_PROTOCOL_SCHEMA);
         let mismatch = ProtocolError::SchemaMismatch {
             actual: envelope.schema,

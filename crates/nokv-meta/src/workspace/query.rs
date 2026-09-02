@@ -6,9 +6,10 @@
 //! Correctness-first workspace metadata queries.
 //!
 //! All results are derived from authoritative `WorkspaceCurrent`,
-//! `PathCurrent`, commit-head, and change-event scans at one exact
-//! [`RootReadContext`]. Secondary projections are decoded once from each path
-//! row; query execution never follows them with per-entry point reads.
+//! `PathCurrent`, commit-head, and change-event state at one exact
+//! [`RootReadContext`]. Equality candidates may come from SecondaryIndexV2,
+//! but a locator and the exact current path identity must agree before a row
+//! becomes visible.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,7 +27,7 @@ use super::codec::{
     change_event_key, decode_change_event_key as decode_change_event_key_bytes,
     decode_generic_index_row_key, decode_path_current_key, decode_workspace_current_key,
     generic_index_current_key, generic_index_generation_key, generic_index_row_prefix,
-    path_child_prefix, workbench_commit_head_key,
+    path_child_prefix, path_current_key, workbench_commit_head_key,
 };
 use super::commit_records::{CommitRecordError, WorkbenchCommitHeadRecord};
 use super::engine::{MetaError, MetaShard, MetadataScanItem};
@@ -40,12 +41,15 @@ use super::keyspace::MetadataFamily;
 use super::namespace::{get_visible_workspace_at, NamespaceError, RootReadContext};
 use super::publication_records::{PathEntry, PublicationRecordCodecError, WorkspaceRecord};
 use super::query_records::{
-    ChangeEventRecord, FiniteFloat, QueryFieldId, QueryRecordError, QueryScalar, QueryScalarType,
-    TypedProjection,
+    decode_secondary_index_key, path_index_digest, path_index_locator_key,
+    secondary_index_value_prefix, ChangeEventRecord, FiniteFloat, PathIndexLocatorRecord,
+    PathIndexLocatorState, QueryFieldId, QueryRecordError, QueryScalar, QueryScalarType,
+    SecondaryIndexRecord, TypedProjection,
 };
 
 /// Maximum page size for query, aggregate, catalog, discovery, and event APIs.
 pub const MAX_QUERY_PAGE_SIZE: usize = 256;
+const MAX_INDEX_JOIN_BATCH_SIZE: usize = 64;
 /// Maximum metadata predicates.
 pub const MAX_QUERY_PREDICATES: usize = 64;
 /// Maximum distinct scalar members in one canonical `In` operand.
@@ -863,8 +867,17 @@ pub fn search_paths_at(
     let catalog = build_catalog(&collected)?;
     validate_query_fields(&catalog, request)?;
 
-    let mut matching = collected
-        .rows
+    let candidate_rows = collect_indexed_rows(
+        store,
+        context,
+        &request.scope,
+        request.path_prefix.as_ref(),
+        CatalogPathMatch::Prefix,
+        &request.predicates,
+    )?
+    .map_or(collected.rows, |indexed| indexed.rows);
+
+    let mut matching = candidate_rows
         .into_iter()
         .filter(|row| predicates_match(row, &request.predicates, false))
         .collect::<Vec<_>>();
@@ -1050,8 +1063,17 @@ pub fn aggregate_paths_at(
     let catalog = build_catalog(&collected)?;
     validate_aggregate_fields(&catalog, request)?;
 
-    let matching = collected
-        .rows
+    let candidate_rows = collect_indexed_rows(
+        store,
+        context,
+        &request.scope,
+        request.path_prefix.as_ref(),
+        CatalogPathMatch::Prefix,
+        &request.predicates,
+    )?
+    .map_or(collected.rows, |indexed| indexed.rows);
+
+    let matching = candidate_rows
         .iter()
         .filter(|row| predicates_match(*row, &request.predicates, false))
         .collect::<Vec<_>>();
@@ -1652,6 +1674,178 @@ fn collect_rows(
         rows,
         scope_visible,
     })
+}
+
+fn collect_indexed_rows(
+    store: &MetaShard,
+    context: RootReadContext,
+    scope: &QueryScope,
+    path_prefix: Option<&NormalizedRelativePath>,
+    path_match: CatalogPathMatch,
+    predicates: &[QueryPredicate],
+) -> Result<Option<CollectedRows>, QueryError> {
+    let Some((field, values)) = indexed_candidate_predicate(predicates) else {
+        return Ok(None);
+    };
+    let visible = visible_workspaces_for_scope(store, context, scope)?;
+    let scope_visible = !visible.is_empty();
+    let visible_by_incarnation = visible
+        .into_iter()
+        .map(|(workbench_id, workspace)| (workspace.incarnation_id, workbench_id))
+        .collect::<BTreeMap<_, _>>();
+    let mut saw_visible_index_row = false;
+    let index_join_batch_size = store
+        .point_read_batch_capacity()
+        .min(MAX_INDEX_JOIN_BATCH_SIZE);
+    debug_assert!(index_join_batch_size > 0);
+    let mut materialized =
+        BTreeMap::<(WorkbenchId, NormalizedRelativePath), MaterializedRow>::new();
+
+    for value in values {
+        let prefix = secondary_index_value_prefix(context.root_id, field, value);
+        let items = scan_all_prefix(store, context, MetadataFamily::SecondaryIndex, &prefix)?;
+        let mut candidates = Vec::new();
+        for item in items {
+            let (workspace, digest, generation) = decode_secondary_index_key(
+                context.root_id,
+                field,
+                value,
+                &item.key,
+            )
+            .ok_or_else(|| QueryError::CorruptKey {
+                family: "SecondaryIndex",
+                reason: "key does not use the canonical field/value/workspace/digest/generation encoding"
+                    .to_owned(),
+            })?;
+            let Some(workbench_id) = visible_by_incarnation.get(&workspace) else {
+                continue;
+            };
+            let index = SecondaryIndexRecord::decode(&item.value)?;
+            if index.path_digest != digest || index.index_generation != generation {
+                return Err(QueryError::CorruptKey {
+                    family: "SecondaryIndex",
+                    reason: "value identity disagrees with its key suffix".to_owned(),
+                });
+            }
+            candidates.push((workbench_id.clone(), workspace, digest, generation));
+        }
+        for candidates in candidates.chunks(index_join_batch_size) {
+            let locator_requests = candidates
+                .iter()
+                .map(|(_, workspace, digest, generation)| {
+                    (
+                        MetadataFamily::PathIndexLocator,
+                        path_index_locator_key(context.root_id, *workspace, *digest, *generation),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let locator_payloads = store.read_many_at(
+                context.root_id,
+                context.placement_generation,
+                context.owner_epoch,
+                &locator_requests,
+                context.read_version,
+            )?;
+            let mut located = Vec::new();
+            for ((workbench_id, workspace, digest, generation), locator_payload) in
+                candidates.iter().zip(locator_payloads)
+            {
+                let Some(locator_payload) = locator_payload else {
+                    continue;
+                };
+                let locator = PathIndexLocatorRecord::decode(&locator_payload)?;
+                if locator.state != PathIndexLocatorState::Published {
+                    continue;
+                }
+                saw_visible_index_row = true;
+                if path_index_digest(&locator.path) != *digest {
+                    return Err(QueryError::CorruptKey {
+                        family: "PathIndexLocator",
+                        reason: "locator path does not match its digest key".to_owned(),
+                    });
+                }
+                if path_prefix.is_some_and(|prefix| match path_match {
+                    CatalogPathMatch::Prefix => !path_is_at_or_below(&locator.path, prefix),
+                    CatalogPathMatch::Exact => locator.path != *prefix,
+                }) {
+                    continue;
+                }
+                located.push((
+                    workbench_id.clone(),
+                    *workspace,
+                    *digest,
+                    *generation,
+                    locator.path,
+                ));
+            }
+            if located.is_empty() {
+                continue;
+            }
+            let current_requests = located
+                .iter()
+                .map(|(_, workspace, _, _, path)| {
+                    (
+                        MetadataFamily::PathCurrent,
+                        path_current_key(context.root_id, *workspace, path),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let current_payloads = store.read_many_at(
+                context.root_id,
+                context.placement_generation,
+                context.owner_epoch,
+                &current_requests,
+                context.read_version,
+            )?;
+            for ((workbench_id, _, digest, generation, path), current_payload) in
+                located.into_iter().zip(current_payloads)
+            {
+                let Some(current_payload) = current_payload else {
+                    continue;
+                };
+                let entry = PathEntry::decode(&current_payload)
+                    .map_err(|source| QueryError::PathCodec { source })?;
+                if entry.path_digest != digest || entry.index_generation != generation {
+                    continue;
+                }
+                let projection = TypedProjection::decode_stored(&entry.typed_index_projection)?;
+                materialized.insert(
+                    (workbench_id.clone(), path.clone()),
+                    MaterializedRow {
+                        workbench_id,
+                        path,
+                        entry,
+                        projection,
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(saw_visible_index_row.then(|| CollectedRows {
+        rows: materialized.into_values().collect(),
+        scope_visible,
+    }))
+}
+
+fn indexed_candidate_predicate(
+    predicates: &[QueryPredicate],
+) -> Option<(&QueryFieldId, Vec<&QueryScalar>)> {
+    predicates
+        .iter()
+        .filter(|predicate| !predicate.field_id.is_builtin())
+        .filter_map(
+            |predicate| match (&predicate.operator, &predicate.operand) {
+                (QueryOperator::Equal, QueryOperand::Scalar(value)) => {
+                    Some((&predicate.field_id, vec![value]))
+                }
+                (QueryOperator::In, QueryOperand::Set(values)) => {
+                    Some((&predicate.field_id, values.iter().collect()))
+                }
+                _ => None,
+            },
+        )
+        .min_by_key(|(_, values)| values.len())
 }
 
 fn visible_workspaces_for_scope(
@@ -3856,6 +4050,10 @@ mod tests {
     fn entry(value: u64, generation: u64, fields: Vec<(&str, QueryScalar)>) -> PathEntry {
         PathEntry {
             generation: Generation::new(generation).unwrap(),
+            index_generation: nokv_types::PathIndexGenerationId::from_bytes(
+                *revision(value).as_bytes(),
+            ),
+            path_digest: [value as u8; SHA256_BYTES],
             artifact_revision_id: revision(value),
             body_digest_uri: format!("sha256:{value:064x}"),
             manifest_digest_uri: format!("sha256:{:064x}", value.saturating_add(1)),
