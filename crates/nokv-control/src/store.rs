@@ -1634,6 +1634,36 @@ mod tests {
         }
     }
 
+    struct InMemoryHarness(InMemoryControlStore);
+
+    impl crate::conformance::ConformanceHarness for InMemoryHarness {
+        fn store(&self) -> &dyn ControlStore {
+            &self.0
+        }
+
+        fn lose_session(&self, lease: &LogicalShardLease) {
+            // Simulate owner-process death: the durable record stays, the
+            // liveness session disappears without a clean release.
+            let removed = self
+                .0
+                .state
+                .lock()
+                .expect("control store mutex poisoned")
+                .owner_sessions
+                .remove(&lease.logical_shard_id);
+            assert_eq!(removed.as_ref(), Some(lease));
+        }
+
+        fn fresh_shard(&self, scenario: u8) -> (RootId, LogicalShardId) {
+            (root_id(scenario), shard_id(scenario))
+        }
+    }
+
+    #[test]
+    fn in_memory_store_passes_provider_conformance() {
+        crate::conformance::run_all(&InMemoryHarness(InMemoryControlStore::new()));
+    }
+
     #[test]
     fn root_agent_binding_is_immutable_and_exact_replay_is_idempotent() {
         let store = InMemoryControlStore::new();

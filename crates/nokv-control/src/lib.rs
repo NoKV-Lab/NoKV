@@ -6,6 +6,8 @@
 //! respective packages.
 
 mod codec;
+#[cfg(test)]
+mod conformance;
 mod errors;
 #[cfg(feature = "etcd")]
 mod etcd;
