@@ -533,6 +533,13 @@ The [DBDB.io profile](https://dbdb.io/db/nokv) documents NoKV's earlier Go
 storage-engine line. Listings are discovery metadata, not foundation-hosted
 status, integration, deployment, or qualification evidence.
 
+**Open-source collaborations.** Active: [LoopX](https://github.com/huangruiteng/loopx),
+[OpenViking](https://github.com/volcengine/OpenViking), and
+[LingTai AI](https://github.com/Lingtai-AI/lingtai). Projects initiated:
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) and
+[heima](https://github.com/litentry/heima). These labels describe collaboration
+stage, not production adoption or completed qualification.
+
 ## Contributing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md), the
