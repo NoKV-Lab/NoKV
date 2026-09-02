@@ -6,13 +6,20 @@ SPDX-License-Identifier: Apache-2.0
 <div align="center">
   <img src="./docs/public/img/logo.png" width="320" alt="NoKV" />
 
-  <h3>Durable agent workspaces.</h3>
+  <h3>Durable, versioned workspaces for disposable agents.</h3>
 
   <p>
-    NoKV is an Agent-native distributed workspace and artifact store. It
-    publishes crash-consistent, versioned workspace state over immutable
-    S3-compatible artifacts. `TxnStore` persists ordered shard-local metadata.
-    Holt is the current serving local adapter.
+    NoKV keeps declared inputs, code, outputs, logs, and lineage alive when an
+    agent sandbox disappears. It publishes immutable S3-compatible artifact
+    bytes through a path-native, transactional metadata control plane; it does
+    not pretend to restore process memory, a model session, or a VM.
+  </p>
+
+  <p>
+    <strong>18-operation native CLI</strong> ·
+    <strong>direct Python and Rust SDKs</strong> ·
+    <strong>commit, snapshot, and restore</strong> ·
+    <strong>conditional publication and exact replay</strong>
   </p>
 
   <p>
@@ -22,398 +29,403 @@ SPDX-License-Identifier: Apache-2.0
     <a href="https://github.com/NoKV-Lab/NoKV/actions/workflows/python-sdk.yml">
       <img alt="Python SDK" src="https://github.com/NoKV-Lab/NoKV/actions/workflows/python-sdk.yml/badge.svg?branch=main" />
     </a>
-    <a href="https://github.com/NoKV-Lab/NoKV/actions/workflows/docker-image.yml">
-      <img alt="Multi-architecture container build" src="https://img.shields.io/github/actions/workflow/status/NoKV-Lab/NoKV/docker-image.yml?branch=main&amp;label=multi-arch%20build" />
-    </a>
-    <a href="https://github.com/NoKV-Lab/NoKV/actions/workflows/dco.yml">
-      <img alt="DCO" src="https://github.com/NoKV-Lab/NoKV/actions/workflows/dco.yml/badge.svg?branch=main" />
-    </a>
     <a href="https://github.com/NoKV-Lab/NoKV/releases/latest">
       <img alt="Latest release" src="https://img.shields.io/github/v/release/NoKV-Lab/NoKV?sort=date&amp;display_name=tag&amp;label=release" />
-    </a>
-    <a href="https://github.com/NoKV-Lab/homebrew-tap/blob/main/Formula/nokv.rb">
-      <img alt="Homebrew source release" src="https://img.shields.io/badge/Homebrew-source%20release-FBB040?logo=homebrew&amp;logoColor=black" />
     </a>
     <a href="./LICENSE">
       <img alt="Apache-2.0 license" src="https://img.shields.io/github/license/NoKV-Lab/NoKV" />
     </a>
-    <a href="./SECURITY.md">
-      <img alt="Security policy with private reporting" src="https://img.shields.io/badge/security-private%20reporting-2ea44f" />
-    </a>
   </p>
 
   <p>
-    <a href="https://landscape.cncf.io/?group=projects-and-products&amp;item=runtime--cloud-native-storage--nokv">
-      <img alt="Listed in the CNCF Landscape" src="https://img.shields.io/badge/CNCF%20Landscape-listed-0086FF" />
-    </a>
-    <a href="https://landscape.lfai.foundation/?group=projects-and-products&amp;item=data--store-format--nokv">
-      <img alt="Listed in the LF AI &amp; Data Landscape" src="https://img.shields.io/badge/LF%20AI%20%26%20Data%20Landscape-listed-003764" />
-    </a>
-    <a href="https://github.com/rust-unofficial/awesome-rust#database">
-      <img alt="Listed in Awesome Rust" src="https://img.shields.io/badge/Awesome%20Rust-listed-DEA584?logo=rust&amp;logoColor=white" />
-    </a>
-    <a href="https://dbdb.io/db/nokv">
-      <img alt="Historical DBDB.io profile" src="https://img.shields.io/badge/DBDB.io-historical%20profile-244A64" />
-    </a>
-  </p>
-
-  <p>
-    <a href="https://nokv.io/"><strong>Website</strong></a> ·
-    <a href="./docs/index.md"><strong>Documentation</strong></a> ·
-    <a href="#quick-start"><strong>Quick Start</strong></a> ·
-    <a href="https://github.com/orgs/NoKV-Lab/discussions"><strong>Discussions</strong></a> ·
-    <a href="#contributing"><strong>Contributing</strong></a>
+    <a href="#what-nokv-adds"><strong>What it adds</strong></a> ·
+    <a href="#use-cases"><strong>Use cases</strong></a> ·
+    <a href="#feature-map"><strong>Feature map</strong></a> ·
+    <a href="#choose-an-interface"><strong>Integrate</strong></a> ·
+    <a href="#evidence-and-qualification"><strong>Evidence</strong></a> ·
+    <a href="#quick-start"><strong>Quick start</strong></a> ·
+    <a href="./docs/index.md"><strong>Docs</strong></a>
   </p>
 </div>
 
-## Our building partners include:
+> [!IMPORTANT]
+> This README describes the current `main` contract. An installed release may
+> pin different component revisions; run `nokv version --json` to identify the
+> exact NoKV commit, Workbench schema, and
+> [Holt](https://github.com/NoKV-Lab/holt) build. Implemented and
+> deterministic-test-passing do not mean live or production-qualified. The
+> current qualification boundary is explicit below.
 
-<table>
-  <tr>
-    <th align="left" width="190">Partner</th>
-    <th align="left" width="330">Project</th>
-    <th align="center" width="150">Stars</th>
-  </tr>
-  <tr>
-    <td><strong>LoopX</strong></td>
-    <td><a href="https://github.com/huangruiteng/loopx">GitHub</a></td>
-    <td align="center"><img alt="LoopX stars" src="https://img.shields.io/github/stars/huangruiteng/loopx?style=flat&amp;label=stars" /></td>
-  </tr>
-  <tr>
-    <td><strong>LingTai</strong></td>
-    <td><a href="https://lingtai.ai/en/">Website</a> · <a href="https://github.com/Lingtai-AI/lingtai">GitHub</a></td>
-    <td align="center"><img alt="LingTai stars" src="https://img.shields.io/github/stars/Lingtai-AI/lingtai?style=flat&amp;label=stars" /></td>
-  </tr>
-  <tr>
-    <td><strong>OpenViking</strong></td>
-    <td><a href="https://openviking.ai/">Website</a> · <a href="https://github.com/volcengine/OpenViking">GitHub</a></td>
-    <td align="center"><img alt="OpenViking stars" src="https://img.shields.io/github/stars/volcengine/OpenViking?style=flat&amp;label=stars" /></td>
-  </tr>
-  <tr>
-    <td><strong>Hermes Agent</strong></td>
-    <td><a href="https://github.com/NousResearch/hermes-agent">GitHub</a></td>
-    <td align="center"><img alt="Hermes Agent stars" src="https://img.shields.io/github/stars/NousResearch/hermes-agent?style=flat&amp;label=stars" /></td>
-  </tr>
-  <tr>
-    <td><strong>heima</strong></td>
-    <td><a href="https://github.com/litentry/heima">GitHub</a></td>
-    <td align="center"><img alt="heima stars" src="https://img.shields.io/github/stars/litentry/heima?style=flat&amp;label=stars" /></td>
-  </tr>
-</table>
+## What NoKV Adds
 
-Building-partner status denotes an active collaboration. It does not by itself
-imply a production deployment, support SLA, or completed enterprise
-qualification.
+Most agent systems already have an object store and a database. Their hard
+problem is the failure window between them: bytes may exist without a visible
+workspace entry, a retry may publish twice, a stale worker may overwrite a
+newer result, or cleanup may delete an object that history still references.
 
-## Third-party listings
-
-<table>
-  <tr>
-    <td align="center" width="120">
-      <a href="https://landscape.cncf.io/?group=projects-and-products&item=runtime--cloud-native-storage--nokv">
-        <img src="./docs/public/img/recognition/cncf.svg" width="56" alt="CNCF Landscape" />
-      </a>
-    </td>
-    <td>
-      <strong>CNCF Landscape</strong><br/>
-      Listed under Runtime / Cloud Native Storage, with AI Native Infra / Storage
-      as an additional path.
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="120">
-      <a href="https://landscape.lfai.foundation/?group=projects-and-products&item=data--store-format--nokv">
-        <img src="./docs/public/img/recognition/lfai.svg" width="56" alt="LF AI &amp; Data Landscape" />
-      </a>
-    </td>
-    <td>
-      <strong>LF AI &amp; Data Landscape</strong><br/>
-      Listed under Data / Store &amp; Format.
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="120">
-      <a href="https://github.com/rust-unofficial/awesome-rust#database">
-        <img src="https://awesome.re/mentioned-badge.svg" width="110" alt="Mentioned in Awesome Rust" />
-      </a>
-    </td>
-    <td>
-      <strong>Awesome Rust</strong><br/>
-      Listed under Applications / Database.
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="120">
-      <a href="https://dbdb.io/db/nokv">
-        <img src="./docs/public/img/recognition/dbdb.svg" width="56" alt="DBDB.io" />
-      </a>
-    </td>
-    <td>
-      <strong>DBDB.io</strong><br/>
-      Historical profile of NoKV's earlier Go storage-engine line.
-    </td>
-  </tr>
-</table>
-
-Landscape entries are third-party catalog listings, not foundation-hosted
-project status. The DBDB.io entry describes the earlier Go implementation and
-is preserved here with that scope made explicit.
-
-## What NoKV Owns
-
-Agent runs produce datasets, scripts, logs, outputs, checkpoints, reports, and
-provenance across files and object keys. NoKV gives that state one path-shaped
-workspace and owns the metadata needed to publish, inspect, query, snapshot,
-commit, restore, retain, and collect it.
+NoKV closes that window as one artifact lifecycle:
 
 ```text
-Downstream skills -> native full nokv CLI
-Embedded callers  -> direct Python SDK
-Native callers    -> lower-level Rust SDK
-                             |
-                             v
-          NoKV workspace service
- full-path namespace, versions, snapshots,
- commits, query indexes, retention, and GC
-                     |
-          +----------+----------+
-          |                     |
-          v                     v
- MetaShard + TxnStore   S3-compatible storage
-  metadata truth       immutable artifact bytes
- (local: HoltStore)
+produce bytes
+    |
+    v
+upload immutable blocks + verify provider admission
+    |
+    v
+one final bounded metadata command makes the revision visible
+  - compare the current path generation and owner epoch
+  - publish the immutable revision and advance the path head
+  - update indexes, references, change history, and operation receipt
+    |
+    v
+visible workspace result, or a typed conflict / recoverable exact replay
 ```
 
-NoKV owns namespace truth, shard-local metadata transactions, versioned body
-descriptors, snapshots, commits, typed change events, query indexes, restore
-operations, and object-reference GC policy. The object provider owns the
-physical durability, replication, availability, and access policy of artifact
-bytes.
+The current hard-to-substitute increment is this combined closure, not one
+data structure or a claim that alternatives cannot exist. A replacement must
+preserve all of the following under response loss and restart, then pass the
+same conformance and fault evidence:
 
-NoKV is not a semantic-memory database or an Agent orchestrator. Context
-retrieval, ranking, planning, validation, and runtime policy stay above the
-storage layer. FUSE, POSIX emulation, CSI, transparent fsspec access, and a
-general NAS replacement are outside the product architecture.
+- **Atomic visibility:** artifact bytes are staged first and become reachable
+  only when their revision, path head, indexes, references, and receipt commit.
+- **No silent overwrite:** create, replace, edit, append, rename, and remove
+  are explicit and generation-fenced. A stale writer gets a conflict.
+- **Exact retry:** request identity and operation records distinguish
+  definitely-not-applied, applied-with-lost-response, and unknown outcomes.
+- **Durable decision points:** commits retain an immutable revision closure;
+  restore builds a hidden same-root incarnation and publishes it atomically.
+- **History-aware collection:** object listing is never namespace truth. GC is
+  fenced by path references, commits, snapshots, restore operations, and
+  quarantine state.
+- **Fenced ownership:** persisted root placement and owner epochs prevent an
+  obsolete shard owner from continuing to publish metadata.
 
-## Workspace Guarantees
+### Find a capability by job
 
-- **Atomic publication.** NoKV uploads artifact bytes first. One bounded
-  metadata command makes the new generation visible last.
-- **Canonical path reads.**
-  `PathCurrent(root, workspace_incarnation, normalized_relative_path)` is the
-  only namespace truth, and directories are implicit prefixes.
-- **Immutable bodies.** Every published body has a never-reused
-  `ArtifactRevisionId`, immutable revision-owned blocks, and a whole-body
-  digest.
-- **Stable historical reads.** Leased MVCC snapshots hold a consistent read
-  version for short-lived recovery and inspection.
-- **Durable reuse.** Sealed commits and tags retain exact artifact revisions
-  without pinning the global history floor.
-- **Safe restore.** A restore reuses immutable revisions in a fresh hidden
-  same-root incarnation, then publishes visibility atomically.
-- **Deterministic Agent surface.** The same exact 18-tool Workbench semantics
-  are available through the primary native CLI, the direct Python SDK, and the
-  lower-level Rust SDK.
+| I need to... | Use | What the caller gets |
+| --- | --- | --- |
+| Persist one run | `workbench_create`, `workbench_put_file`, `workbench_append`, `workbench_edit`, `workbench_commit` | Five-section workspace, explicit write modes, immutable revisions, and a sealed run manifest |
+| Reopen work from another process | `workbench_list`, `workbench_stat`, `workbench_read`, `workbench_find` | Path-shaped discovery and verified reads without retaining the original sandbox |
+| Prevent stale or duplicate writes | generations, explicit request identity, exact replay | Typed conflict for stale state; the same outcome for an exact retry after response loss |
+| Search many artifacts or runs | `workbench_grep`, `workbench_search`, `workbench_aggregate`, `workbench_catalog`, `workbench_find` | Literal body search plus typed indexed metadata query and aggregation |
+| Freeze a short-lived view | `workbench_snapshot`, `workbench_snapshot_renew`, `workbench_snapshot_list` | Leased point-in-time reads with explicit lifecycle state |
+| Create a durable replay point | `workbench_commit` then `workbench_restore` | Retained revision closure and atomic restore into a new destination |
+| Run a local executable | `nokv materialize` then `nokv collect` | Verified input files in disposable scratch and explicit output publication |
+| Embed NoKV in Python | direct `Client`, Workbench fsspec, checkpoint, optional torch DCP | In-process path/artifact/range/query/lifecycle APIs bounded to an explicit Workbench |
+| Build a native provider or control plane | Rust `WorkspaceClient`, change polling, custom-index registration, operation status | Typed lower-level integration and recovery primitives |
 
-These guarantees are shard-local. NoKV does not provide cross-shard
-transactions. Snapshot protection is leased, and root or Workbench scoping is
-not an authentication or RBAC boundary.
+## Use Cases
 
-## Provenance and Evidence, Without a SQL Sidecar
+### State provider for disposable agent sandboxes
 
-Run provenance is the workload NoKV is shaped for. The default answer — a
-relational database next to the object store — rebuilds everything the
-workspace already owns: tables of paths, hand-rolled versioning, a second
-GC, and a two-phase dance to keep rows and S3 bytes agreeing.
+An agent sandbox should be disposable; its durable state should not be. Any
+agent, loop harness, or sandbox runner can keep transient execution local while
+using NoKV as the durable state provider for everything that must survive:
+task state, inputs, code, tool outputs, logs, checkpoints, and lineage.
 
-Agent evidence is path-shaped, append-heavy, and immutable once sealed.
-NoKV stores it with the guarantees above, plus:
+```text
+run inside a sandbox
+  -> publish immutable state and artifacts with generation fences
+  -> seal a deterministic Workbench commit
 
-- **Tamper-evident artifacts.** Never-reused revision ids and whole-body
-  digests on every published body; commits bind a caller-computed content
-  digest and replay idempotently.
-- **Hash-chained history.** Every acknowledged metadata mutation is
-  synchronously durable in the owning shard's WAL and appends canonical
-  hash-chained replay material in the same store.
-- **Crash-tested durability.** The metadata engine's checkpoint rewrites
-  are shadow-paged and power-loss tested down to torn 512 KiB frames
-  (holt >= 0.8.3); a torn-frame guard probe pins that property in this
-  repository's own test suite.
-- **Lineage as data.** Sealed commits and tags retain exact revisions,
-  leased snapshots freeze a consistent view, and restore forks it without
-  rewriting history.
-- **Evidence layout.** A Workbench keeps `logs/` as the tool-call evidence
-  stream and `metadata/` as run manifests, next to the inputs and outputs
-  they describe — one namespace, one query surface, one GC.
+sandbox exits or disappears
+  -> reopen the workspace from its durable identity
+  -> continue from the commit, or restore it into a fresh Workbench
+  -> retry the same request exactly; reject an obsolete writer
+```
 
-Reach for SQL when you need relational reporting across many runs. Storing
-the evidence itself — files, manifests, lineage, and the bytes they attest
-— belongs in the workspace that publishes them atomically.
+**The value is not another state-blob write.** NoKV is not raw storage alone;
+it is an implemented, composable, sandbox-native functional storage layer. A
+harness can use its lifecycle primitives through the native CLI or SDK:
 
-## Distributed Status
+- **Atomic checkpoint visibility:** artifact bytes are published first; a
+  Workbench commit then seals one canonical manifest and its exact immutable
+  revision closure as the durable decision point.
+- **Idempotent recovery:** for the same request identity and inputs, durable
+  operation receipts return the prior outcome after a lost response instead of
+  applying the same transition twice.
+- **Stale-writer rejection:** a caller submits the generation it observed;
+  generation compare-and-swap rejects its update if newer state won first.
+  Owner epochs separately fence an obsolete shard owner.
+- **Restore without payload copying:** a retained commit can populate a hidden
+  same-root incarnation whose destination becomes visible atomically. Leased
+  snapshots provide shorter-lived point-in-time recovery and inspection.
+- **One recoverable workspace:** verified materialize/collect, indexed search,
+  immutable lineage, and retention-aware GC share one workspace contract. The
+  Rust SDK additionally exposes change polling; quarantine and reconciliation
+  remain internal lifecycle mechanisms rather than CLI commands.
 
-| Status | Capabilities and limits |
+The harness still decides which state is authoritative and when execution may
+resume. Restoring state does not grant a replacement worker permission to act;
+the harness must reacquire its own leases and gates. NoKV recovers declared
+durable state, not RAM, sockets, credentials, container or VM state, or an
+in-flight model session. These lifecycle primitives are implemented and
+layer-tested at the evidence revision below; a complete harness adapter and
+authority handoff remain caller-owned and require separate live qualification.
+
+### AI-for-science: durable evidence for adaptive HPC loops
+
+An adaptive AI-for-science campaign can use a fast surrogate to screen a broad
+candidate space, spend expensive high-fidelity compute on a selected subset,
+and feed the verified results into the next round. [atomate2](https://materialsproject.github.io/atomate2/)
+and [jobflow](https://materialsproject.github.io/jobflow/) continue to own the
+scientific Jobs and Flows, dependencies, result schemas, JobStore, and
+execution environment. NoKV adds the durable state and evidence boundary
+between rounds and around the expensive jobs:
+
+1. Publish exact inputs, code, configuration, model artifacts, and candidate
+   sets as immutable, versioned artifacts.
+2. Before high-fidelity work is launched, seal the selected tasks and decision
+   inputs as one deterministic Workbench commit.
+3. Record the workflow's calculation identity and attach returned outcomes,
+   including failures, as new immutable revisions instead of overwriting prior
+   evidence.
+4. Retrain, re-analyse, or restore from a retained commit identity; populate a
+   fresh Workbench from its closure without silently mixing incompatible
+   inputs or results.
+
+This target shape makes each expensive selection a reproducible checkpoint:
+what was chosen, from which inputs and model state, under which code and
+configuration, and what came back. NoKV does not build the workflow graph,
+submit or cancel external jobs, validate scientific correctness, or replace
+the workflow
+engine, scheduler, or JobStore. This is a target integration shape, not a
+currently bundled atomate2/jobflow adapter, partner adoption, or live-qualified
+HPC deployment. A future adapter would bind workflow job ids, output
+references, and scheduler receipts to Workbench revisions; scientific workflow
+semantics remain above NoKV.
+
+## Feature Map
+
+### Native Workbench CLI: the stable agent surface
+
+`nokv workbench <tool> '<json arguments>'` is the primary integration surface.
+The names and normalized input schemas below are fixed by the
+[Workbench contract](docs/workbench-contract.md).
+
+| Operation | Downstream outcome |
 | --- | --- |
-| **Current product** | Persisted `RootId -> LogicalShardId` affinity; one epoch-fenced active owner per shard; canonical full-path metadata keys; immutable S3-compatible bodies; native full CLI; direct Python and Rust SDKs; exact 18-tool Workbench semantics; snapshots, commits, restore, queries, and reference-fenced GC |
-| **Current durability profile** | Acknowledged metadata writes are synchronously durable in the owning shard's local Holt WAL. Each mutation also appends canonical hash-chained replay material in the same store. First-owner acquisition accepts a new or prepared epoch-zero store. Exact current-lease resume is also admitted. Unknown, mixed, or unverified successor stores fail closed. |
-| **Not qualified** | Remote checkpoint/log recovery, shared metadata durability, multi-machine failover, production metadata HA, tenant identity/RBAC, cross-shard transactions, and complete provider fault-injection qualification |
+| `workbench_create` | Create one jailed Workbench with `input`, `scripts`, `outputs`, `logs`, and `metadata` sections. |
+| `workbench_put_file` | Publish create-only or replace-only bytes; it is never upsert. |
+| `workbench_append` | Append through immutable publication plus generation CAS and bounded conflict retry. |
+| `workbench_edit` | Replace exact UTF-8 text, revalidate after conflicts, and avoid a new revision for a byte-identical result. |
+| `workbench_list` | List direct children with scope-bound cursors at live state or a leased snapshot. |
+| `workbench_stat` | Read a compact artifact or implicit-prefix card without loading the body. |
+| `workbench_read` | Read verified whole bodies, byte ranges, or structured JSON/YAML/text at live state or a snapshot. |
+| `workbench_grep` | Run bounded case-insensitive literal body search with optional basename glob; it is not regex. |
+| `workbench_search` | Query indexed metadata with predicates, sort, projection, and facets. |
+| `workbench_aggregate` | Compute bounded count, sum, average, min, max, and grouped aggregates over indexed metadata. |
+| `workbench_catalog` | Discover stable field ids and the query operations actually available for them. |
+| `workbench_find` | Find Workbenches by committed state and canonical run-manifest literal match. |
+| `workbench_commit` | Seal a canonical run manifest and immutable revision closure with deterministic identity and exact replay. |
+| `workbench_snapshot` | Mint a leased point-in-time view; the default is seven days and the maximum is 90 days. |
+| `workbench_snapshot_renew` | Extend, but never shorten, a live snapshot lease. |
+| `workbench_snapshot_retire` | Retire a root-bound snapshot idempotently and release its hold when allowed. |
+| `workbench_snapshot_list` | Inspect aliases, deadlines, annotations, and `alive`/`expired`/`retired`/`reaped` state. |
+| `workbench_restore` | Restore a snapshot or commit into an absent destination without copying immutable payload blocks. |
 
-Root placement is persisted control-plane state. NoKV never derives shard
-placement from a filename, path prefix, or the current shard count, so a
-populated root remains on its logical shard. Holt layout remains internal and
-never leaks into the SDK or Workbench contract.
+All 18 operations have complete parser-to-metadata implementation chains, with
+object-store effects for body-bearing operations, and deterministic
+adjacent-layer tests at the evidence revision below. Their native-CLI
+real-service acceptance gate is still **not qualified**.
 
-See the [architecture](docs/architecture.md),
-[metadata schema](docs/metadata-schema.md), and
-[workspace acceptance checklist](docs/development/workspace-acceptance.md) for
-the exact contracts and qualification gates.
+### Other CLI capabilities
 
-## Interfaces
+| Command | Purpose | Boundary |
+| --- | --- | --- |
+| `nokv version --json` | Report the exact NoKV revision, lockfile identity, Holt source/version/checksum, schema, and tool count. | Identity/readback only. |
+| `nokv schema` | Emit the exact 18 normalized Workbench input schemas. | Contract inventory, not a live health check. |
+| `nokv materialize` | Copy a verified workspace artifact to a new local path. | The destination is disposable scratch, not a namespace or mount. |
+| `nokv collect` | Publish one bounded regular local file, create-only or generation-fenced replace. | Symlinks and unbounded/non-regular inputs fail closed. |
+| `nokv workspace-path rename` / `nokv workspace-path remove` | Apply an explicit generation- and request-id-fenced path mutation. | Custom CLI surface; not one of the 18 Workbench tools. |
+| `nokv provision` | Bind `RootId` to `AgentId`, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. |
+| `nokv serve` | Start one explicit metadata owner from create, same-namespace reopen, or recovery-log state. | Shared recovery publication is opt-in and not currently qualified. |
+| `nokv mcp` | Deprecated stdio transport retained only because qualification runners still use it. | **Unsupported for integration.** |
 
-- **Native full `nokv` CLI — primary.** It exposes every Workbench operation
-  through `nokv workbench <tool> '<json arguments>'`, plus `materialize`,
-  `collect`, `workspace-path`, `provision`, `serve`, and `schema` commands.
-- **Direct Python SDK — secondary.** [`nokv-python`](crates/nokv-python)
-  serves embedded programmatic callers and includes explicit
-  materialize/collect adapters for local executables.
-- **Rust Agent SDK.** [`nokv-client`](crates/nokv-client) is the lower-level
-  native integration and shared implementation boundary.
-- **Transport-free Agent contracts** in
-  [`nokv-agent`](crates/nokv-agent), shared by every adapter.
+### Programmatic and non-CLI capabilities
 
-Downstream Agent systems should normally write skills that invoke the native
-CLI. Use the Python SDK when an in-process boundary is preferable. Every
-surface delegates to the same transport-free facade; none of them is a separate
-metadata or lifecycle authority.
+The interfaces share protocol, metadata, object, and lifecycle semantics. They
+do not expose identical method shapes.
 
-RootId is the only storage and routing identity. A Workbench presentation root
-shapes Agent-facing paths and manifests but never enters canonical metadata
-keys.
+| Surface | Current public capability | Additional boundary |
+| --- | --- | --- |
+| Direct Python `Client` | 23 methods covering create/stat/exists/list/remove/rename, byte/file publish, whole/range/batch reads, query/aggregate/catalog/find, commit/restore, snapshot lifecycle, materialize, and collect | Direct SDK, not a tool-for-tool copy of the 18-name CLI facade |
+| Python adapters | Workbench-scoped fsspec, checkpoint helpers, and optional torch Distributed Checkpoint reader/writer | Bounded to an explicit Workbench; not arbitrary-root POSIX or FUSE |
+| Rust `WorkspaceClient` | Lower-level typed workspace, publication, query, lifecycle, routing, and batch-range workflows | Recommended when the caller must own typed retry and recovery integration |
+| Rust-only extensions | Polling change feed, generic custom-index registration, raw operation status, and phased publish/restore primitives | No native CLI or Python method today; change feed is polling, not push |
+| Metadata and server lifecycle | snapshot reap, commit/tag holds, reference-fenced GC, quarantine reconciliation, Holt reopen, and optional shared recovery records | Internal/operator mechanisms, not independent end-user commands |
 
-## Stable Workbench
+The Python SDK does not currently expose CLI-equivalent append, exact-string
+edit, or body grep methods. Use the CLI contract for those exact behaviors.
+Custom SDK compositions are caller-owned and are not equivalent qualification
+evidence.
 
-The native CLI accepts exactly these 18 Workbench operation names:
-
-```text
-workbench_create
-workbench_put_file
-workbench_append
-workbench_edit
-workbench_list
-workbench_stat
-workbench_read
-workbench_grep
-workbench_search
-workbench_aggregate
-workbench_catalog
-workbench_find
-workbench_commit
-workbench_snapshot
-workbench_snapshot_renew
-workbench_snapshot_retire
-workbench_snapshot_list
-workbench_restore
-```
-
-Tool names, normalized input schemas, create/replace semantics, generation and
-digest relationships, commit identity, snapshot lifecycle, and restore
-idempotency form the stable contract. Workbench result shaping remains an
-adapter concern and does not dictate durable metadata families.
-
-The 18 names define behavior, not a transport. The native CLI exposes them
-directly, and the Python SDK provides the underlying programmatic operations.
-
-See the [Workbench Contract](docs/workbench-contract.md).
-
-## Integration Model
-
-The Workbench contract is runtime-neutral. A downstream Agent runtime exposes
-skills over the native CLI, or embeds the Python SDK, and exercises the same
-scientific reconstruction workflow:
+## Choose an Interface
 
 ```text
-upload dataset
-  -> seal immutable input commit/tag
-  -> run multiple Workbenches against the same input
-  -> materialize verified files for a local executable
-  -> collect declared outputs, logs, and run metadata
-  -> commit lineage
-  -> query, compare, snapshot, and restore
+Downstream skill or shell harness
+  -> native nokv workbench CLI       exact 18-operation contract
+
+Embedded Python application
+  -> nokv Python Client/adapters     direct path/artifact/lifecycle API
+
+Native control plane or provider
+  -> nokv-client Rust crate          lower-level typed integration
 ```
 
-Materialization creates a disposable local sandbox. It is not a NoKV namespace
-or a transparent host-filesystem access path.
+Use the native CLI for agent skills because it provides one inspectable schema,
+stable JSON envelopes, and fail-closed admission. Use Python when the caller
+needs in-process range reads, fsspec/checkpoint integration, or direct typed
+methods. Use Rust for provider, routing, change-feed, or recovery-aware work.
 
-LingTai is the active design partner and first integrated client, but it uses
-this same public boundary rather than a partner-specific NoKV route.
+Every agent-facing CLI command requires self-refreshing etcd routing plus the
+durable `RootId` to `AgentId` binding. Static route pins remain an SDK/testing
+option and are rejected by the agent-facing CLI.
 
-## Use Case: A Research Workbench for Agents
+## Core Semantics
 
-An Agent runtime uses NoKV as the durable artifact store behind its research
-agents. Runtime state — locks, heartbeats, mailboxes, and event logs — can stay
-in a disposable local workdir; what a task produces and needs to prove crosses
-into a Workbench.
+### Namespace and publication
 
-The default integration is a downstream skill that calls the native CLI. It
-can invoke the same 18 operations with `nokv workbench <tool> '<json
-arguments>'`; an embedded host can instead call the Python SDK directly.
+- `RootId` is the only storage and routing identity. A presentation path such
+  as `/agents/research/wb` shapes returned paths and manifests but grants no
+  storage authority.
+- `PathCurrent(root, incarnation, normalized_path)` is canonical namespace
+  truth. Directories are implicit prefixes; an object-store listing is never
+  authoritative.
+- Every published body has a never-reused artifact revision id, immutable
+  revision-owned blocks, a whole-body digest, and a caller-visible generation.
+- Append is not a server-side lock. It reads the current head, attempts a
+  generation-fenced immutable publication, and retries bounded conflicts.
 
-In every integration shape, the runtime persists a stable `AgentId` and a
-distinct `RootId` for each
-isolation boundary. Provisioning immutably binds that root to the AgentId;
-`--workbench-root` remains only the human-facing path projection and cannot
-grant isolation by itself. The binding prevents accidental root reuse, but is
-not an authentication credential. The 18 `workbench_*` tools land next to the
-agent's local file tools instead of replacing them, and grant no new authority.
+### Commit, snapshot, and restore
 
-A research run then follows the fixed section layout — `input`, `scripts`,
-`outputs`, `logs`, `metadata`:
+- A commit is the durable decision point: it binds a canonical run manifest
+  and retains the exact artifact revision closure.
+- A snapshot is a leased liveness hold, not archival retention. Use snapshot
+  plus restore while the lease is active; use commit plus restore when a
+  decision point must remain recoverable after the lease expires.
+- Restore preserves its source, reuses immutable payload blocks, stages a
+  fresh same-root incarnation invisibly, and atomically publishes the new
+  destination. It is not a cross-root or cross-shard copy transaction.
 
-```text
-workbench_create spedas-task-001
-  put    input/    task payload and dataset references
-  put    scripts/  the exact analysis code a rerun needs
-  append logs/     tool-call evidence while the run executes
-  put    outputs/  figures, tables, reports
-  workbench_commit
-    -> seals the run, writes metadata/run_manifest.json,
-       binds the caller-computed content digest
-  workbench_snapshot        (leased checkpoint, default 7 days)
-  workbench_restore
-    -> forks the frozen view into a fresh Workbench
-       for handoff or replay
-```
+### Sharding, identity, and authority
 
-The write semantics are collaboration discipline, not convenience:
-`workbench_put_file` is create-only or replace-only, never upsert, and
-appends serialize server-side. A parent agent creates the Workbench, assigns
-paths, and commits; spawned child agents write only the paths they were
-assigned. When a local executable needs real files, `materialize` copies
-verified inputs into the sandbox and `collect` brings declared outputs back.
+- Root placement is persisted control-plane state, never derived from a path
+  prefix or the current shard count.
+- One epoch-fenced active owner executes a shard-local metadata command.
+- Transactions, snapshots, commit closure, restore, and GC barriers are
+  shard-local. NoKV does not provide cross-shard transactions.
+- Workbench jailing and `RootId` to `AgentId` binding are safety boundaries,
+  not tenant authentication, authorization, or RBAC.
 
-What this buys an agent fleet: a task's artifacts, provenance, and history
-outlive any single context window, and a leased snapshot plus restore is how
-an agent — or its successor — finds its work again after a context reset.
+## Why Holt Fits the Current Local Profile
+
+[Holt](https://github.com/NoKV-Lab/holt) is NoKV's purpose-built embedded Rust
+metadata engine. Its persistent adaptive radix trees provide ordered point and
+prefix access for path-shaped metadata while its WAL and atomic batches provide
+the local durability boundary. NoKV owns the workspace semantics in `nokv-meta`
+over the storage-neutral `TxnStore` contract; Holt is the currently wired and
+tested `LocalSync` implementation, while S3-compatible storage still owns
+artifact bytes.
+
+This evidence snapshot covers NoKV's exact `holt = "=0.8.6"` dependency.
+Later upstream Holt `main` features are outside this section's claims; identify
+an installed build with `nokv version --json`.
+
+Holt maps NoKV metadata families to named persistent adaptive radix trees:
+
+- adaptive Node4/16/48/256 fanout and path compression fit NoKV's
+  prefix-rich encodings for workspace paths, commit members, and indexes;
+- the same persistent ART index supports point lookup and native ordered
+  prefix/start-after/delimiter pages, which maps directly to hierarchical
+  listing without rebuilding order in the application;
+- one bounded `DB::atomic` batch checks and mutates multiple metadata families
+  through a single WAL record, matching one NoKV metadata command;
+- one scoped `DB::view` captures a consistent multi-tree read view for a NoKV
+  read batch; it is not the same object as a durable NoKV snapshot;
+- NoKV's file-backed Holt profile forces synchronous WAL acknowledgement;
+  replay, shadow checkpoint slots, and an exclusive manifest writer define the
+  tested same-namespace restart boundary;
+- compacted blobs support page-granular routed reads, while corrupt read
+  accelerators fall back to the authoritative blob.
+
+This is a workload fit, not proof that ART is universally faster or uniquely
+able to implement NoKV. The adapter contract deliberately permits another
+`TxnStore` after equivalent conformance, receipt, snapshot, scan, restart, and
+fault qualification. Current tests cover deterministic torn-frame injection
+and a real child `SIGKILL` after a durable non-empty partial manifest record;
+they do **not** constitute a physical power-cycle, remote failover, cross-host
+fencing, or metadata-HA test. No current third-party A/B number is claimed.
+
+## Evidence and Qualification
+
+The labels below mean exactly:
+
+- **Implemented:** the typed call chain and durable effect exist in current
+  source.
+- **Layer-tested:** deterministic tests exercise real adjacent implementations;
+  fake/mock tests remain identified as such.
+- **Live-qualified:** the supported entrypoint ran against the required real
+  dependencies at the pinned revision and produced accepted evidence.
+
+Evidence snapshot:
+
+- NoKV commit [`0f1995ebee96`](https://github.com/NoKV-Lab/NoKV/commit/0f1995ebee96048e5d4f9d4745d84c3518c64351);
+- pinned Holt `0.8.6` dependency.
+
+| Surface | Current evidence | Status |
+| --- | --- | --- |
+| Rust workspace | 1,090 passed, 0 failed; 10 ignored real-etcd/S3 cases | Implemented and layer-tested; ignored cases are NQ |
+| 18 Workbench operations | all names execute against typed backend primitives; parser, facade, client/protocol, server, metadata, Holt, and object layers pass focused tests | Implemented and layer-tested |
+| Built CLI identity/schema/fail-closed admission | real process checks passed for help, version, exact schema, missing-etcd/static-route rejection, generation/request-id validation, and absence of a mount command | Local smoke passed |
+| Native CLI against real etcd + server + S3 | partial real-service CLI paths exist, but no accepted full-surface Gate 0 transcript covers the complete lifecycle; the current black-box runner uses deprecated MCP and also lacks terminal snapshot-reap evidence | **Not qualified** |
+| Installed Python wheel against real service | native ABI surface checks and focused unit/mock tests pass; fsspec/checkpoint/torch tests are mock/stub based | **Not qualified** |
+| Holt 0.8.6 | 705 listed entries; 10 marked ignored; all executed entries passed; the NoKV adapter adds 32 unit and one reopen/conformance integration test | Layer-tested for the embedded local boundary |
+| Holt third-party A/B | the current v0.8.6 Holt/RocksDB/SQLite/sled comparator target was attempted; local `librocksdb-sys`/`libclang` build failed before measurement | No result; no performance claim |
+
+The 10 ignored NoKV workspace tests are six real-etcd tests, two direct object
+provider tests, and two Python S3-admission tests. They are gaps, not passes.
+See [Workspace acceptance](docs/development/workspace-acceptance.md) for the
+normative gate and [Benchmarks and evidence](docs/benchmarks.md) for evidence
+rules.
+
+### Implemented, but not currently live-qualified
+
+- opt-in shared recovery publication and receipt-directed recovery-log install.
+
+### Not qualified by current evidence
+
+- remote checkpoint compaction, copied-directory failover, shared metadata
+  durability, multi-machine failover, or metadata HA;
+- accepted full-surface native-CLI and installed-Python Gate 0 live acceptance;
+- complete provider timeout and ambiguous-delete fault coverage;
+- cross-host writer fencing;
+- physical power-cycle behavior, production tail latency, write amplification,
+  RSS advantage, or universal ART performance.
+
+### Not offered by NoKV
+
+- tenant identity, authentication, or RBAC;
+- cross-shard transactions;
+- transparent POSIX/FUSE/CSI/NAS behavior.
 
 ## Quick Start
 
-Build the custom CLI and inspect the checked-in Workbench schema:
+### Inspect the contract locally
+
+Build the CLI, identify the exact bits, and inspect the frozen schema:
 
 ```bash
 cargo build --release -p nokv --bin nokv
-./target/release/nokv --help
+./target/release/nokv version --json
 ./target/release/nokv schema
+python3 scripts/workbench/workbench_contract_test.py
 ```
 
-`nokv schema` reports the frozen contract marker
-`nokv.workbench.mcp_input_schemas.v1`, and `nokv --help` still lists an `mcp`
-subcommand. Both are retained wire identity for the qualification harness. The
-MCP sidecar is deprecated and is not a supported NoKV integration surface; use
-the native CLI or the Python SDK.
+These commands prove build identity and the offline contract. They do not
+exercise a deployed metadata owner or object provider.
 
-Anyone can instead install the current stable source release from NoKV's public
-Homebrew tap. The fully qualified command adds the tap and trusts only the
-`nokv` Formula:
+A source Formula is available from NoKV's public Homebrew tap:
 
 ```bash
 brew install NoKV-Lab/tap/nokv
@@ -421,72 +433,120 @@ nokv version --json
 nokv schema
 ```
 
-The current source Formula release gate covers Apple Silicon and Intel macOS.
-Linuxbrew is not yet a qualified release target.
+The Formula may trail the latest GitHub release. Read back `nokv version --json`
+and verify release-specific target evidence before treating a version or
+platform as supported.
 
-To add the tap separately before installing by short name, grant the same
-Formula-scoped trust explicitly:
+### Call a provisioned deployment
 
-```bash
-brew tap NoKV-Lab/tap
-brew trust --formula NoKV-Lab/tap/nokv
-brew install nokv
-```
-
-Pull a merged tap update and install a newer NoKV release with:
+A live deployment requires a persisted root placement, a leased shard owner,
+etcd routing, and admitted S3-compatible object coordinates. After following
+the [live deployment preflight](docs/workbench-preflight.md), the current
+source-level CLI shape is below. The command form is documented; full
+native-CLI real-service Gate 0 remains not qualified.
 
 ```bash
-brew update
-brew upgrade nokv
-nokv version --json
+nokv \
+  --root-id "$NOKV_ROOT_ID" \
+  --agent-id "$NOKV_AGENT_ID" \
+  --workbench-root /agents/research/wb \
+  --etcd-endpoint "$NOKV_ETCD_ENDPOINT" \
+  --object-bucket "$NOKV_BUCKET" \
+  --object-endpoint "$NOKV_OBJECT_ENDPOINT" \
+  workbench workbench_create '{"id":"run-001"}'
+
+nokv \
+  --root-id "$NOKV_ROOT_ID" \
+  --agent-id "$NOKV_AGENT_ID" \
+  --workbench-root /agents/research/wb \
+  --etcd-endpoint "$NOKV_ETCD_ENDPOINT" \
+  --object-bucket "$NOKV_BUCKET" \
+  --object-endpoint "$NOKV_OBJECT_ENDPOINT" \
+  workbench workbench_put_file \
+  '{"id":"run-001","section":"scripts","path":"main.py","text":"print(42)","replace":false}'
+
+nokv \
+  --root-id "$NOKV_ROOT_ID" \
+  --agent-id "$NOKV_AGENT_ID" \
+  --workbench-root /agents/research/wb \
+  --etcd-endpoint "$NOKV_ETCD_ENDPOINT" \
+  --object-bucket "$NOKV_BUCKET" \
+  --object-endpoint "$NOKV_OBJECT_ENDPOINT" \
+  workbench workbench_read \
+  '{"id":"run-001","section":"scripts","path":"main.py","format":"structured"}'
 ```
 
-The Formula keeps Homebrew `version_scheme 1` so the corrected pre-1.0 release
-line upgrades cleanly from the earlier `1.0.0` Formula.
+Credentials use the provider's normal chain or
+`--object-access-key-id`, `--object-secret-access-key`, and optional
+`--object-session-token`; never embed them in Workbench content or manifests.
 
-The Formula version follows the stable NoKV release tag and the `crates/nokv`
-package version, not Holt, Rust, or protobuf. Every NoKV release carries its
-own `Cargo.lock` and embeds the exact Holt version, source, and checksum in the
-installed identity. A Holt update reaches the tap only as part of a new NoKV
-release whose generated Formula has been merged into the tap.
+## Architecture and Ownership
 
-Run the offline Workbench contract gate:
-
-```bash
-python3 scripts/workbench/workbench_contract_test.py
+```text
+agent skill / harness       embedded Python         native control plane
+        |                        |                         |
+        v                        v                         v
+  18-tool CLI facade      direct Python API       lower-level Rust SDK
+        +------------------------+-------------------------+
+                                 |
+                         typed NoKV protocol
+                                 |
+                   epoch-fenced logical-shard owner
+                                 |
+                    nokv-meta state machine
+                 path, revisions, receipts, holds,
+                    queries, restore, and GC
+                       /                   \
+                      v                     v
+        TxnStore metadata adapter      artifact object store
+          current local: Holt          S3-compatible bytes
 ```
 
-A live deployment additionally needs a root id, persisted logical-shard
-placement, one admitted shard owner, and S3-compatible object coordinates. The
-[live deployment preflight](docs/workbench-preflight.md) gives the provision,
-serve, admission, and acceptance flow.
+NoKV is not a semantic-memory database or an agent orchestrator. Retrieval
+ranking, planning, scientific validation, trace/scorer semantics, and runtime
+policy remain above it. The object provider owns physical durability,
+replication, availability, and access policy for bytes. NoKV owns which
+immutable revisions are visible and retained by a workspace.
 
 ## Documentation
 
-- [Documentation Index](docs/index.md)
-- [Product Design](docs/product-design.md)
+- [Documentation index](docs/index.md)
+- [Product design](docs/product-design.md)
 - [Architecture](docs/architecture.md)
-- [Workbench Contract](docs/workbench-contract.md)
-- [Metadata Schema](docs/metadata-schema.md)
-- [Object Layout](docs/object-layout.md)
-- [Benchmarks and Evidence](docs/benchmarks.md)
-- [Workspace Acceptance](docs/development/workspace-acceptance.md)
-- [Path-Native Metadata Comparison](docs/development/path-native-metadata-comparison.md)
-- [Agent Contributor Handbook](docs/development/nokv-agent.md)
-- [Code Contract](docs/development/code_contract.md)
-- [PR Review Checklist](docs/development/pr_review_checklist.md)
-- [Live Deployment Preflight](docs/workbench-preflight.md)
-- [Source-only Homebrew Release](scripts/release/README.md)
+- [Workbench contract](docs/workbench-contract.md)
+- [Metadata schema](docs/metadata-schema.md)
+- [Object layout](docs/object-layout.md)
+- [Path-native metadata comparison](docs/development/path-native-metadata-comparison.md)
+- [Workspace acceptance](docs/development/workspace-acceptance.md)
+- [Live deployment preflight](docs/workbench-preflight.md)
+- [Agent contributor handbook](docs/development/nokv-agent.md)
+- [Code contract](docs/development/code_contract.md)
+- [PR review checklist](docs/development/pr_review_checklist.md)
+- [Source-only Homebrew release](scripts/release/README.md)
+
+## Third-party Listings
+
+NoKV is listed in the
+[LF AI & Data Landscape](https://landscape.lfai.foundation/?group=projects-and-products&item=data--store-format--nokv)
+and [Awesome Rust](https://github.com/rust-unofficial/awesome-rust#database).
+The [DBDB.io profile](https://dbdb.io/db/nokv) documents NoKV's earlier Go
+storage-engine line. Listings are discovery metadata, not foundation-hosted
+status, integration, deployment, or qualification evidence.
+
+**Open-source collaborations.** Active: [LoopX](https://github.com/huangruiteng/loopx),
+[OpenViking](https://github.com/volcengine/OpenViking), and
+[LingTai AI](https://github.com/Lingtai-AI/lingtai). Projects initiated:
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) and
+[heima](https://github.com/litentry/heima). These labels describe collaboration
+stage, not production adoption or completed qualification.
 
 ## Contributing
 
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the
-[code contract](docs/development/code_contract.md) before changing package
-boundaries or durable storage semantics. Open work suitable for newcomers is
-listed under the dynamic
-[good first issue query](https://github.com/NoKV-Lab/NoKV/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22).
-
-All commits must include a DCO `Signed-off-by` trailer.
+Read [CONTRIBUTING.md](CONTRIBUTING.md), the
+[code contract](docs/development/code_contract.md), and the
+[PR review checklist](docs/development/pr_review_checklist.md) before changing
+package boundaries or durable storage semantics. Every commit requires a DCO
+`Signed-off-by` trailer.
 
 Before pushing a substantial change, run:
 
@@ -502,18 +562,18 @@ git diff --check
 
 | Crate | Role |
 | --- | --- |
-| [`nokv-types`](crates/nokv-types) | Storage-neutral Agent workspace domain types |
+| [`nokv-types`](crates/nokv-types) | Storage-neutral agent-workspace domain types |
 | [`nokv-protocol`](crates/nokv-protocol) | Versioned metadata and lifecycle RPC DTOs and framing |
-| [`nokv-meta-store`](crates/nokv-meta-store) | Storage-neutral ordered metadata transaction contract and conformance suite |
-| [`nokv-meta-holt`](crates/nokv-meta-holt) | Serving local Holt adapter, strict open/reopen, recovery, and physical diagnostics |
-| [`nokv-meta`](crates/nokv-meta) | Workspace schema, commands, history, indexes, commits, snapshots, restore, and GC over `TxnStore` |
+| [`nokv-meta-store`](crates/nokv-meta-store) | Ordered metadata transaction contract and conformance suite |
+| [`nokv-meta-holt`](crates/nokv-meta-holt) | Embedded Holt adapter, strict open/reopen, recovery, and physical diagnostics |
+| [`nokv-meta`](crates/nokv-meta) | Workspace schema, commands, history, indexes, commits, snapshots, restore, and GC |
 | [`nokv-control`](crates/nokv-control) | Persisted root placement, shard ownership, epoch fencing, and recovery coordination |
-| [`nokv-object`](crates/nokv-object) | Immutable S3-compatible artifact storage and local hot tier |
-| [`nokv-client`](crates/nokv-client) | Root-routed Rust Agent SDK and direct immutable-object data path |
-| [`nokv-agent`](crates/nokv-agent) | Transport-free 18-tool Workbench facade and stable result shaping |
-| [`nokv-python`](crates/nokv-python) | Direct Python SDK and explicit materialize/collect adapters |
-| [`nokv-server`](crates/nokv-server) | Logical-shard owner, metadata adapter composition, RPC server, and root-affine lifecycle workers |
-| [`nokv`](crates/nokv) | Thin native full CLI wiring |
+| [`nokv-object`](crates/nokv-object) | Immutable S3-compatible artifact storage and optional local hot tier |
+| [`nokv-client`](crates/nokv-client) | Root-routed Rust SDK and immutable-object data path |
+| [`nokv-agent`](crates/nokv-agent) | Transport-free 18-operation Workbench facade and result shaping |
+| [`nokv-python`](crates/nokv-python) | Direct Python SDK and bounded fsspec/checkpoint adapters |
+| [`nokv-server`](crates/nokv-server) | Logical-shard owner, RPC executor, adapter composition, and lifecycle workers |
+| [`nokv`](crates/nokv) | Native CLI wiring |
 | [`nokv-bench`](bench) | Non-product contract, recovery, and performance workloads |
 
 ## License
