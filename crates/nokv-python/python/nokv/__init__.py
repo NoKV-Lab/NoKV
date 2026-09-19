@@ -3,10 +3,16 @@
 from importlib.metadata import PackageNotFoundError, version as _distribution_version
 
 from . import checkpoint
-from ._native import Client, RoutingConfig, ObjectStoreConfig
+from ._native import WORKSPACE_PROTOCOL_SCHEMA, Client, RoutingConfig, ObjectStoreConfig
 from .fsspec import WorkbenchFileSystem
 
 API_VERSION = 1
+
+# WORKSPACE_PROTOCOL_SCHEMA is the exact metadata RPC schema this wheel speaks
+# (for example "nokv.workspace.rpc.v10"). A `nokv serve` process with a
+# different schema refuses the handshake, so a deployment that pins a wheel
+# should compare this value with `nokv version --json` before connecting.
+# It is distinct from API_VERSION (Python surface) and __version__ (release).
 
 try:
     # The installed distribution version is the NoKV release line the wheel
@@ -21,6 +27,7 @@ __all__ = [
     "Client",
     "ObjectStoreConfig",
     "RoutingConfig",
+    "WORKSPACE_PROTOCOL_SCHEMA",
     "WorkbenchFileSystem",
     "checkpoint",
 ]

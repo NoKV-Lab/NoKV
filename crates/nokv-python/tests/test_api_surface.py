@@ -12,10 +12,12 @@ def test_versioned_workbench_surface():
         "Client",
         "ObjectStoreConfig",
         "RoutingConfig",
+        "WORKSPACE_PROTOCOL_SCHEMA",
         "WorkbenchFileSystem",
         "checkpoint",
     ]
     assert hasattr(nokv.RoutingConfig, "seeds")
+    assert nokv.WORKSPACE_PROTOCOL_SCHEMA == "nokv.workspace.rpc.v10"
     assert hasattr(nokv.Client, "create_workspace")
     assert hasattr(nokv.Client, "stat")
     assert hasattr(nokv.Client, "list")
