@@ -2366,6 +2366,11 @@ pub fn apply_restore_initialization(
             affected_members: 0,
         });
     }
+    if restore_phase_reached(loaded.record.phase, RestorePhase::DestinationSealing) {
+        // A concurrent exact finalizer initialized this destination and has
+        // already carried it further; that progress is this step's outcome.
+        return converged_step_outcome(loaded, context);
+    }
     require_phase(&loaded.record, RestorePhase::SourceSealed, "SourceSealed")?;
     let RestoreCommitProvenance::V5(provenance) = &loaded.record.commit_provenance else {
         return Err(RestoreError::CommitRetentionMismatch);
@@ -2469,14 +2474,11 @@ pub fn build_restore_commit_members(
         });
     }
     let loaded = load_operation(store, context, request.operation_id)?;
-    if loaded.record.phase == RestorePhase::DestinationSealing {
+    if restore_phase_reached(loaded.record.phase, RestorePhase::DestinationSealing) {
+        // Every destination member is durable: either this batch's own phase
+        // transition or a concurrent finalizer's further progress.
         return Ok(BuildRestoreCommitBatchOutcome {
-            command: RestoreCommandOutcome {
-                operation: loaded.record,
-                commit_version: commit_version_from_read(context.read_version)?,
-                replayed: true,
-                affected_members: 0,
-            },
+            command: converged_step_outcome(loaded, context)?,
             built_members: 0,
             members_complete: true,
         });
@@ -2813,14 +2815,11 @@ pub fn seal_restore_commit_revisions(
         });
     }
     let loaded = load_operation(store, context, request.operation_id)?;
-    if loaded.record.phase == RestorePhase::Ready {
+    if restore_phase_reached(loaded.record.phase, RestorePhase::Ready) {
+        // Every destination revision is sealed: by this batch's own phase
+        // transition or by a concurrent finalizer that went on to Complete.
         return Ok(SealRestoreCommitBatchOutcome {
-            command: RestoreCommandOutcome {
-                operation: loaded.record,
-                commit_version: commit_version_from_read(context.read_version)?,
-                replayed: true,
-                affected_members: 0,
-            },
+            command: converged_step_outcome(loaded, context)?,
             sealed_revisions: 0,
             ready: true,
         });
@@ -2968,6 +2967,19 @@ pub fn complete_restore(
         return Ok(CompleteRestoreOutcome { command, result });
     }
     let loaded = load_operation(store, context, request.operation_id)?;
+    if loaded.record.phase == RestorePhase::Complete {
+        // A concurrent exact finalizer completed the restore; the durable
+        // terminal row is this step's outcome.
+        let result = loaded.record.result.clone().ok_or_else(|| {
+            RestoreError::DeterministicResultMismatch {
+                reason: "completed restore does not contain a result".to_owned(),
+            }
+        })?;
+        return Ok(CompleteRestoreOutcome {
+            command: converged_step_outcome(loaded, context)?,
+            result,
+        });
+    }
     require_phase(&loaded.record, RestorePhase::Ready, "Ready")?;
     validate_source_retention(store, context, &loaded.record)?;
     verify_destination_commit_scaffolding(store, context, &loaded.record)?;
@@ -5459,6 +5471,54 @@ fn read_payload(
             context.read_version,
         )
         .map_err(Into::into)
+}
+
+/// Rank of the forward finalization phases. Preparation, abort, cleanup and
+/// quarantine phases are unranked on purpose: a finalize step that meets one
+/// of them must still refuse with `InvalidPhase` so the caller reports the
+/// terminal state instead of treating it as progress.
+fn forward_finalize_rank(phase: RestorePhase) -> Option<u8> {
+    match phase {
+        RestorePhase::SourceSealed => Some(0),
+        RestorePhase::DestinationBuilding => Some(1),
+        RestorePhase::DestinationSealing => Some(2),
+        RestorePhase::Ready => Some(3),
+        RestorePhase::Complete => Some(4),
+        RestorePhase::Preparing
+        | RestorePhase::Copying
+        | RestorePhase::Aborting
+        | RestorePhase::Cleaning
+        | RestorePhase::Cleaned
+        | RestorePhase::Quarantined => None,
+    }
+}
+
+/// True when `actual` is `floor` or a later forward finalization phase.
+///
+/// Concurrent exact finalizers converge on this rule: a peer may have carried
+/// the operation any number of phases beyond the one a step produces, and that
+/// durable progress is the step's own outcome, replayed. A one-phase lead was
+/// already recognised; a longer lead used to surface as a non-retryable
+/// `InvalidPhase` for work that had in fact finished.
+pub fn restore_phase_reached(actual: RestorePhase, floor: RestorePhase) -> bool {
+    match (forward_finalize_rank(actual), forward_finalize_rank(floor)) {
+        (Some(actual), Some(floor)) => actual >= floor,
+        _ => false,
+    }
+}
+
+/// The outcome a finalize step returns when the durable operation is already
+/// at or beyond the phase the step would have produced.
+fn converged_step_outcome(
+    loaded: Loaded<RestoreOperationRecord>,
+    context: RootWriteContext,
+) -> Result<RestoreCommandOutcome, RestoreError> {
+    Ok(RestoreCommandOutcome {
+        operation: loaded.record,
+        commit_version: commit_version_from_read(context.read_version)?,
+        replayed: true,
+        affected_members: 0,
+    })
 }
 
 fn require_phase(
@@ -10924,6 +10984,111 @@ mod tests {
     /// Drives one snapshot-source restore end to end exactly as the client
     /// workflow does: begin, start copy, bounded copy batches, seal, the
     /// RestoreStaging restore-manifest publication, initialization, complete.
+    /// Every finalize step, issued as a fresh request after the restore is
+    /// Complete, must converge on the durable terminal row instead of refusing
+    /// finished work: that is what lets concurrent exact finalizers that fell
+    /// behind by more than one phase still return the same result.
+    fn assert_finalize_steps_converge_on_complete(
+        store: &MetaShard,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+        operation_id: OperationId,
+        completed: &CompleteRestoreOutcome,
+    ) {
+        let initialized = apply_restore_initialization(
+            store,
+            write_context(store, counter, owner_epoch),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        assert!(initialized.replayed);
+        assert_eq!(initialized.operation.phase, RestorePhase::Complete);
+        assert_eq!(initialized.operation, completed.command.operation);
+
+        let built = build_restore_commit_members(
+            store,
+            write_context(store, counter, owner_epoch),
+            RestoreClosureBatchRequest {
+                operation_id,
+                limit: MAX_RESTORE_BATCH_MEMBERS,
+            },
+        )
+        .unwrap();
+        assert!(built.command.replayed && built.members_complete);
+        assert_eq!(built.built_members, 0);
+        assert_eq!(built.command.operation.phase, RestorePhase::Complete);
+
+        let sealed = seal_restore_commit_revisions(
+            store,
+            write_context(store, counter, owner_epoch),
+            RestoreClosureBatchRequest {
+                operation_id,
+                limit: MAX_RESTORE_BATCH_MEMBERS,
+            },
+        )
+        .unwrap();
+        assert!(sealed.command.replayed && sealed.ready);
+        assert_eq!(sealed.sealed_revisions, 0);
+        assert_eq!(sealed.command.operation.phase, RestorePhase::Complete);
+
+        let completed_again = complete_restore(
+            store,
+            write_context(store, counter, owner_epoch),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        assert!(completed_again.command.replayed);
+        assert_eq!(completed_again.result, completed.result);
+        assert_eq!(
+            completed_again.command.operation,
+            completed.command.operation
+        );
+    }
+
+    #[test]
+    fn forward_finalize_phases_are_reached_in_order_and_terminal_phases_never_are() {
+        let forward = [
+            RestorePhase::SourceSealed,
+            RestorePhase::DestinationBuilding,
+            RestorePhase::DestinationSealing,
+            RestorePhase::Ready,
+            RestorePhase::Complete,
+        ];
+        for (floor_index, floor) in forward.iter().enumerate() {
+            for (actual_index, actual) in forward.iter().enumerate() {
+                assert_eq!(
+                    restore_phase_reached(*actual, *floor),
+                    actual_index >= floor_index,
+                    "{actual:?} reached {floor:?}"
+                );
+            }
+        }
+        let unranked = [
+            RestorePhase::Preparing,
+            RestorePhase::Copying,
+            RestorePhase::Aborting,
+            RestorePhase::Cleaning,
+            RestorePhase::Cleaned,
+            RestorePhase::Quarantined,
+        ];
+        for phase in unranked {
+            for floor in forward {
+                assert!(
+                    !restore_phase_reached(phase, floor),
+                    "{phase:?} reached {floor:?}"
+                );
+                assert!(
+                    !restore_phase_reached(floor, phase),
+                    "{floor:?} reached {phase:?}"
+                );
+            }
+            assert!(
+                !restore_phase_reached(phase, phase),
+                "{phase:?} reached itself"
+            );
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn drive_snapshot_restore_to_visible(
         store: &MetaShard,
@@ -11112,6 +11277,13 @@ mod tests {
         assert_eq!(
             completed.result.destination_workspace_revision.get(),
             restore_publication_revision.unwrap().get()
+        );
+        assert_finalize_steps_converge_on_complete(
+            store,
+            counter,
+            owner_epoch,
+            restore_operation_id,
+            &completed,
         );
         completed
     }
