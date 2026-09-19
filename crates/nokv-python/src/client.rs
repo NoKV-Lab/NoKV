@@ -513,7 +513,8 @@ impl PythonWorkspaceClient {
         index_fields = None,
         block_size = 4_194_304,
         operation_id = None,
-        artifact_revision_id = None
+        artifact_revision_id = None,
+        expected_workspace_incarnation_id = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn publish_bytes<'py>(
@@ -530,6 +531,7 @@ impl PythonWorkspaceClient {
         block_size: usize,
         operation_id: Option<&str>,
         artifact_revision_id: Option<&str>,
+        expected_workspace_incarnation_id: Option<&str>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let options = self.publish_options(
             workbench,
@@ -542,12 +544,13 @@ impl PythonWorkspaceClient {
             block_size,
             operation_id,
             artifact_revision_id,
+            expected_workspace_incarnation_id,
         )?;
         let client = Arc::clone(&self.client);
         let objects = Arc::clone(&self.objects);
         let outcome = py
             .detach(move || client.publish_artifact(objects.as_ref(), options, &data))
-            .map_err(client_error)?;
+            .map_err(|error| publish_error(py, error, expected_workspace_incarnation_id))?;
         publish_outcome_to_py(py, &outcome)
     }
 
@@ -563,7 +566,8 @@ impl PythonWorkspaceClient {
         index_fields = None,
         block_size = 4_194_304,
         operation_id = None,
-        artifact_revision_id = None
+        artifact_revision_id = None,
+        expected_workspace_incarnation_id = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn publish_file<'py>(
@@ -580,6 +584,7 @@ impl PythonWorkspaceClient {
         block_size: usize,
         operation_id: Option<&str>,
         artifact_revision_id: Option<&str>,
+        expected_workspace_incarnation_id: Option<&str>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let options = self.publish_options(
             workbench,
@@ -592,16 +597,25 @@ impl PythonWorkspaceClient {
             block_size,
             operation_id,
             artifact_revision_id,
+            expected_workspace_incarnation_id,
         )?;
         let local_file = PathBuf::from(local_file);
         let client = Arc::clone(&self.client);
         let objects = Arc::clone(&self.objects);
-        let outcome = py.detach(move || {
-            let bytes = read_regular_file(&local_file).map_err(runtime_error)?;
-            client
-                .publish_artifact(objects.as_ref(), options, &bytes)
-                .map_err(client_error)
-        })?;
+        let outcome = py
+            .detach(move || {
+                let bytes = read_regular_file(&local_file)
+                    .map_err(|error| PublishFileError::Read(error.to_string()))?;
+                client
+                    .publish_artifact(objects.as_ref(), options, &bytes)
+                    .map_err(PublishFileError::Publish)
+            })
+            .map_err(|error| match error {
+                PublishFileError::Read(message) => PyRuntimeError::new_err(message),
+                PublishFileError::Publish(error) => {
+                    publish_error(py, error, expected_workspace_incarnation_id)
+                }
+            })?;
         publish_outcome_to_py(py, &outcome)
     }
 
@@ -1048,6 +1062,7 @@ impl PythonWorkspaceClient {
         block_size: usize,
         operation_id: Option<&str>,
         artifact_revision_id: Option<&str>,
+        expected_workspace_incarnation_id: Option<&str>,
     ) -> PyResult<ArtifactPublishOptions> {
         let operation_id = match operation_id {
             Some(identity) => OperationIdentity(parse_fixed_hex("operation_id", identity)?),
@@ -1079,6 +1094,11 @@ impl PythonWorkspaceClient {
         }
         if let Some(manifest_identity) = manifest_identity {
             options = options.with_manifest_identity(manifest_identity);
+        }
+        if let Some(identity) = expected_workspace_incarnation_id {
+            options = options.with_expected_workspace_incarnation(WorkspaceIdentity(
+                parse_fixed_hex("expected_workspace_incarnation_id", identity)?,
+            ));
         }
         Ok(options)
     }
@@ -1431,6 +1451,44 @@ fn validate_list_page_fence(
 
 fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
+}
+
+/// Publish-file work that runs without the GIL; converted to Python errors
+/// only once the interpreter is reattached.
+enum PublishFileError {
+    Read(String),
+    Publish(ClientError),
+}
+
+/// Map a publish failure, surfacing a refused incarnation fence as the typed
+/// `nokv.WorkspaceIncarnationMismatch` so callers never parse error text.
+fn publish_error(py: Python<'_>, error: ClientError, expected: Option<&str>) -> PyErr {
+    if let Some(expected) = expected {
+        let fenced = client_error_failure(&error).is_some_and(|failure| {
+            failure.conflict == Some(nokv_protocol::ConflictKind::WorkspaceIncarnation)
+        });
+        if fenced {
+            let message = error.to_string();
+            return py
+                .import("nokv")
+                .and_then(|module| module.getattr("WorkspaceIncarnationMismatch"))
+                .and_then(|class| class.call1((message.clone(), expected)))
+                .map(PyErr::from_value)
+                .unwrap_or_else(|_| PyRuntimeError::new_err(message));
+        }
+    }
+    client_error(error)
+}
+
+fn client_error_failure(error: &ClientError) -> Option<&nokv_protocol::RpcFailure> {
+    match error {
+        ClientError::Rpc(failure) => Some(failure),
+        ClientError::ArtifactPublishFailed { source, .. }
+        | ClientError::RetryExhausted {
+            last_error: source, ..
+        } => client_error_failure(source),
+        _ => None,
+    }
 }
 
 fn client_error(error: ClientError) -> PyErr {

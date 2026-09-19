@@ -1892,6 +1892,9 @@ impl MetadataWorkspaceRequestExecutor {
         self.claim_mutation(rpc)?;
         let step_id = derived_request_id(rpc.request_id, b"publish-begin", 0);
         if let Some(outcome) = self.replayed_publish(rpc.route, step_id)? {
+            // A request-id replay reaches here only with byte-identical inputs
+            // (`claim_mutation` refuses a reused id with different inputs), so
+            // it necessarily carries the same fence as the recorded publish.
             return publish_operation_response(outcome);
         }
         let context = self.publication_context(rpc.route, step_id)?;
@@ -1909,6 +1912,10 @@ impl MetadataWorkspaceRequestExecutor {
                 let workspace = meta::get_visible_workspace_at(&self.meta, read, &workbench)
                     .map_err(namespace_failure)?
                     .ok_or_else(|| not_found("workbench does not exist"))?;
+                // Same read version as the path generation claim below, so a
+                // recreated workbench cannot pass one check against one state
+                // and the other against another.
+                require_publish_incarnation_fence(request, workspace.incarnation_id)?;
                 let current =
                     meta::get_path_at_visible_workspace(&self.meta, read, &workspace, &path)
                         .map_err(namespace_failure)?;
@@ -5788,6 +5795,27 @@ fn retry_restore_preparation_progress<T>(
     unreachable!("internal restore progress retry bound is non-zero")
 }
 
+/// Enforce the caller's optional expected-incarnation fence before any durable
+/// publish row, revision claim, or object write exists.
+fn require_publish_incarnation_fence(
+    request: &protocol::BeginArtifactPublishRequest,
+    current: types::WorkspaceIncarnationId,
+) -> Result<(), protocol::RpcFailure> {
+    let Some(expected) = request.expected_workspace_incarnation_id else {
+        return Ok(());
+    };
+    let expected: types::WorkspaceIncarnationId = expected.into();
+    if expected == current {
+        return Ok(());
+    }
+    Err(conflict(
+        protocol::ConflictKind::WorkspaceIncarnation,
+        "workbench is not the expected workspace incarnation; read the current incarnation \
+         before retrying",
+        None,
+    ))
+}
+
 fn invalid_argument(message: impl Into<String>) -> protocol::RpcFailure {
     failure(protocol::ErrorCode::InvalidArgument, message, false, None)
 }
@@ -8136,6 +8164,7 @@ mod tests {
                             target: target.clone(),
                             authority,
                             condition: protocol::PublishCondition::CreateOnly,
+                            expected_workspace_incarnation_id: None,
                             staged_object_count: seals.staged_object_count,
                             staged_object_seal: seals.staged_object_seal,
                             manifest_row_count: seals.manifest_row_count,
@@ -9320,6 +9349,7 @@ mod tests {
                         target: target.clone(),
                         authority: protocol::PublicationAuthority::Visible,
                         condition: protocol::PublishCondition::CreateOnly,
+                        expected_workspace_incarnation_id: None,
                         staged_object_count: seals.staged_object_count,
                         staged_object_seal: seals.staged_object_seal,
                         manifest_row_count: seals.manifest_row_count,
@@ -10020,6 +10050,164 @@ mod tests {
     }
 
     #[test]
+    fn publish_incarnation_fence_refuses_before_any_durable_row() {
+        let (_store, executor) = ready_executor();
+        executor
+            .execute(&create_request(0x71, "fenced-publish", 0x72, 1))
+            .unwrap();
+        let operation_id = protocol::OperationIdentity([0x73; types::FIXED_ID_BYTES]);
+        let artifact_revision_id =
+            protocol::ArtifactRevisionIdentity([0x74; types::FIXED_ID_BYTES]);
+        let revision_id: types::ArtifactRevisionId = artifact_revision_id.into();
+        let object_key = meta::object_block_key(shard(), root(), revision_id, 0);
+        let body_digest =
+            protocol::sha256_digest_uri(protocol::Digest(Sha256::digest([7u8]).into()));
+        let staged_objects = vec![protocol::StagedObject {
+            sequence: 0,
+            object_identity: protocol::ObjectIdentity::new(object_key.clone()).unwrap(),
+            expected_length: 1,
+            expected_digest: body_digest.clone(),
+            multipart_token: None,
+        }];
+        let manifest_rows = vec![protocol::ArtifactManifestRow {
+            object_index: 0,
+            physical_object_index: 0,
+            logical_offset: 0,
+            physical_owner_revision_id: artifact_revision_id,
+            object_identity: protocol::ObjectIdentity::new(object_key).unwrap(),
+            object_offset: 0,
+            length: 1,
+            digest: body_digest,
+            append_segment: None,
+        }];
+        let seals = protocol::seal_artifact_publish_plan(
+            artifact_revision_id,
+            &staged_objects,
+            &manifest_rows,
+        )
+        .unwrap();
+        let begin = |request_fill: u8, fence: Option<u8>, condition: protocol::PublishCondition| {
+            restore_rpc(
+                request_fill,
+                protocol::WorkspaceRequest::BeginArtifactPublish(
+                    protocol::BeginArtifactPublishRequest {
+                        operation_id,
+                        artifact_revision_id,
+                        target: protocol::WorkspacePath {
+                            workbench: protocol::WorkbenchName::new("fenced-publish").unwrap(),
+                            path: protocol::RelativePath::new("outputs/fenced.bin").unwrap(),
+                        },
+                        authority: protocol::PublicationAuthority::Visible,
+                        condition,
+                        expected_workspace_incarnation_id: fence
+                            .map(|fill| protocol::WorkspaceIdentity([fill; types::FIXED_ID_BYTES])),
+                        staged_object_count: seals.staged_object_count,
+                        staged_object_seal: seals.staged_object_seal,
+                        manifest_row_count: seals.manifest_row_count,
+                        manifest_seal: seals.manifest_seal,
+                        dependency_owner_revision_ids: Vec::new(),
+                    },
+                ),
+            )
+        };
+        let assert_fence_conflict = |failure: protocol::RpcFailure| {
+            assert_eq!(failure.code, protocol::ErrorCode::Conflict);
+            assert_eq!(
+                failure.conflict,
+                Some(protocol::ConflictKind::WorkspaceIncarnation)
+            );
+            assert!(!failure.retryable);
+            assert_eq!(failure.current_generation, None);
+        };
+
+        // A stale fence is refused atomically, before the durable operation row
+        // or the revision claim exists, and ahead of the generation claim.
+        let stale = executor
+            .execute(&begin(
+                0x75,
+                Some(0x99),
+                protocol::PublishCondition::CreateOnly,
+            ))
+            .unwrap_err();
+        assert_fence_conflict(stale);
+        let stale_replace = executor
+            .execute(&begin(
+                0x76,
+                Some(0x99),
+                protocol::PublishCondition::ReplaceOnly {
+                    expected_generation: 1,
+                },
+            ))
+            .unwrap_err();
+        assert_fence_conflict(stale_replace);
+        let missing = executor
+            .execute(&restore_rpc(
+                0x77,
+                protocol::WorkspaceRequest::GetOperation(protocol::GetOperationRequest {
+                    operation_id,
+                }),
+            ))
+            .unwrap_err();
+        assert_eq!(missing.code, protocol::ErrorCode::NotFound);
+
+        // The same operation and revision identities are still free: a publish
+        // with the current incarnation begins normally.
+        let begun = executor
+            .execute(&begin(
+                0x78,
+                Some(0x72),
+                protocol::PublishCondition::CreateOnly,
+            ))
+            .unwrap();
+        let protocol::WorkspaceResult::Operation(status) = begun.result else {
+            panic!("begin publish returned the wrong result variant");
+        };
+        assert_eq!(status.state, protocol::OperationState::Running);
+        assert!(!begun.replayed);
+
+        // An exact request replay carries the same fence and replays. Reusing
+        // the request id with another fence, or with the fence dropped, changes
+        // the request bytes and is refused by the request ledger before any
+        // publish logic runs, so a replay is never evaluated against a
+        // different fence than the one that was recorded.
+        let replayed = executor
+            .execute(&begin(
+                0x78,
+                Some(0x72),
+                protocol::PublishCondition::CreateOnly,
+            ))
+            .unwrap();
+        assert!(replayed.replayed);
+        for reused in [
+            begin(0x78, Some(0x99), protocol::PublishCondition::CreateOnly),
+            begin(0x78, None, protocol::PublishCondition::CreateOnly),
+        ] {
+            let mismatch = executor.execute(&reused).unwrap_err();
+            assert_eq!(mismatch.code, protocol::ErrorCode::RequestReplayMismatch);
+        }
+
+        // A fresh request that repeats the same operation identities with a
+        // stale fence is refused by the fence ahead of the operation replay;
+        // with the current fence it replays the recorded operation.
+        let stale_operation_replay = executor
+            .execute(&begin(
+                0x79,
+                Some(0x99),
+                protocol::PublishCondition::CreateOnly,
+            ))
+            .unwrap_err();
+        assert_fence_conflict(stale_operation_replay);
+        let same_operation_current_fence = executor
+            .execute(&begin(
+                0x7A,
+                Some(0x72),
+                protocol::PublishCondition::CreateOnly,
+            ))
+            .unwrap();
+        assert!(same_operation_current_fence.replayed);
+    }
+
+    #[test]
     fn exact_publish_stage_retry_resumes_after_its_heartbeat_committed() {
         let (store, executor) = ready_executor();
         executor
@@ -10043,6 +10231,7 @@ mod tests {
                         },
                         authority: protocol::PublicationAuthority::Visible,
                         condition: protocol::PublishCondition::CreateOnly,
+                        expected_workspace_incarnation_id: None,
                         staged_object_count: seals.staged_object_count,
                         staged_object_seal: seals.staged_object_seal,
                         manifest_row_count: seals.manifest_row_count,
@@ -10321,6 +10510,7 @@ mod tests {
                             },
                             authority: protocol::PublicationAuthority::Visible,
                             condition: protocol::PublishCondition::CreateOnly,
+                            expected_workspace_incarnation_id: None,
                             staged_object_count: seals.staged_object_count,
                             staged_object_seal: seals.staged_object_seal,
                             manifest_row_count: seals.manifest_row_count,
@@ -10555,6 +10745,7 @@ mod tests {
                             },
                             authority: protocol::PublicationAuthority::Visible,
                             condition: protocol::PublishCondition::CreateOnly,
+                            expected_workspace_incarnation_id: None,
                             staged_object_count: seals.staged_object_count,
                             staged_object_seal: seals.staged_object_seal,
                             manifest_row_count: seals.manifest_row_count,

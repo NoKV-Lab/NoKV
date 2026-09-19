@@ -13,8 +13,11 @@ def test_versioned_workbench_surface():
         "ObjectStoreConfig",
         "RoutingConfig",
         "WorkbenchFileSystem",
+        "WorkspaceIncarnationMismatch",
         "checkpoint",
     ]
+    assert issubclass(nokv.WorkspaceIncarnationMismatch, RuntimeError)
+    assert nokv.WorkspaceIncarnationMismatch("m", "a" * 32).expected == "a" * 32
     assert hasattr(nokv.RoutingConfig, "static")
     assert hasattr(nokv.RoutingConfig, "etcd")
     assert hasattr(nokv.Client, "create_workspace")
@@ -26,6 +29,10 @@ def test_versioned_workbench_surface():
     assert hasattr(nokv.Client, "rename")
     assert hasattr(nokv.Client, "publish_bytes")
     assert hasattr(nokv.Client, "publish_file")
+    for method in (nokv.Client.publish_bytes, nokv.Client.publish_file):
+        parameters = inspect.signature(method).parameters
+        assert "expected_workspace_incarnation_id" in parameters
+        assert parameters["expected_workspace_incarnation_id"].default is None
     assert hasattr(nokv.Client, "read")
     assert hasattr(nokv.Client, "read_range")
     assert hasattr(nokv.Client, "read_ranges_batch")

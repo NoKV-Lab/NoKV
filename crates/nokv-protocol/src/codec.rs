@@ -233,6 +233,43 @@ mod tests {
     }
 
     #[test]
+    fn publish_fence_is_absent_from_the_wire_when_not_requested() {
+        let begin = |fence: Option<WorkspaceIdentity>| WorkspaceRpcRequest {
+            route: route(),
+            request_id: RequestIdentity([3; 16]),
+            operation: WorkspaceRequest::BeginArtifactPublish(crate::BeginArtifactPublishRequest {
+                operation_id: OperationIdentity([1; 16]),
+                artifact_revision_id: crate::ArtifactRevisionIdentity([2; 16]),
+                target: crate::WorkspacePath {
+                    workbench: WorkbenchName::new("run-42").unwrap(),
+                    path: crate::RelativePath::new("outputs/result.bin").unwrap(),
+                },
+                authority: crate::PublicationAuthority::Visible,
+                condition: crate::PublishCondition::CreateOnly,
+                expected_workspace_incarnation_id: fence,
+                staged_object_count: 1,
+                staged_object_seal: Digest([3; 32]),
+                manifest_row_count: 1,
+                manifest_seal: Digest([4; 32]),
+                dependency_owner_revision_ids: Vec::new(),
+            }),
+        };
+        let without = begin(None);
+        let encoded = encode_request(&without).unwrap();
+        let text = String::from_utf8_lossy(&encoded);
+        assert!(
+            !text.contains("expected_workspace_incarnation_id"),
+            "a request without a fence must encode exactly as before the field existed"
+        );
+        assert_eq!(decode_request(&encoded).unwrap(), without);
+
+        let with = begin(Some(WorkspaceIdentity([9; 16])));
+        let encoded = encode_request(&with).unwrap();
+        assert!(String::from_utf8_lossy(&encoded).contains("expected_workspace_incarnation_id"));
+        assert_eq!(decode_request(&encoded).unwrap(), with);
+    }
+
+    #[test]
     fn request_round_trips_with_exact_schema() {
         assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v9");
         let expected = request();

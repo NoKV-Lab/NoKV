@@ -319,6 +319,14 @@ WorkspaceIncarnationClaim
   key: root_id | workspace_incarnation_id
   val: stable workbench_id
 
+Publish fence: `BeginArtifactPublish` may carry `expected_workspace_incarnation_id`.
+The owner compares it with the `WorkspaceCurrent` incarnation on the same read
+version as the path-generation claim and refuses the publish with
+`ConflictKind::WorkspaceIncarnation` before writing the operation row, the
+artifact-revision claim, or any object. The fence is not stored: the operation
+row already records the incarnation the publish was bound to, and a replay that
+names another incarnation is refused the same way.
+
   The claim is created atomically with a direct Workbench create or restore
   staging marker and is never deleted. It prevents two names from sharing the
   same PathCurrent namespace and enforces never-reused incarnation identities.
