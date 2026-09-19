@@ -122,3 +122,10 @@ The source-bound producer and aggregate scripts reject:
 
 Historical pre-4.23 ledgers remain audit material. They do not re-enable a
 removed runtime, CLI option, or compatibility path.
+
+## Downstream partner gate
+
+`experimental/metadata-runtimes` has one additional, mandatory gate before it
+can merge into `main`: production-grade acceptance by LoopX against a build of
+the branch. The procedure, evidence record and the list of what that gate does
+not prove are in [LoopX acceptance gate](loopx-acceptance-gate.md).
