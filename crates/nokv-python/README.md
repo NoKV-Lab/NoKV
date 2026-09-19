@@ -53,7 +53,15 @@ not for installing the SDK.
 
 - `Client` provides Workbench-scoped create, generation-fenced replace, read,
   stat, list, atomic rename, remove, frozen-snapshot reads, bounded range batch,
-  query, materialize, and collect operations.
+  query, materialize, and collect operations. `publish_bytes` and
+  `publish_file` accept an optional `expected_workspace_incarnation_id` (32
+  lowercase hex, the value `find_workspaces` and `read` metadata report): the
+  owner checks it atomically with `expected_generation` before any durable row
+  or object exists, and a workbench bound to a different incarnation raises
+  `nokv.WorkspaceIncarnationMismatch` (a `RuntimeError` subclass carrying
+  `expected`) with nothing written. Callers that omit the argument keep the
+  0.11.0 behaviour; a server older than 0.11.1 rejects a fenced request as an
+  invalid argument instead of ignoring the fence.
 - `WorkbenchFileSystem` is an fsspec compatibility adapter bound to one explicit
   Workbench. Paths must be one of `input`, `scripts`, `outputs`, `logs`, or
   `metadata`, optionally followed by an artifact-relative path. Sections and

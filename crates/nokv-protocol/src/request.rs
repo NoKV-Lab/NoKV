@@ -430,6 +430,15 @@ pub struct BeginArtifactPublishRequest {
     pub target: WorkspacePath,
     pub authority: PublicationAuthority,
     pub condition: PublishCondition,
+    /// Optional fence: the exact workspace incarnation the caller bound its
+    /// durable state to. The owner evaluates it on the same read version as
+    /// the path generation claim and refuses the publish before any durable
+    /// row exists when the workbench is a different incarnation. Only legal
+    /// with `PublicationAuthority::Visible`; staging authorities carry their
+    /// own incarnation binding. Omitted from the wire when `None`, so a request
+    /// without a fence encodes exactly as it did before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_workspace_incarnation_id: Option<WorkspaceIdentity>,
     pub staged_object_count: u32,
     pub staged_object_seal: Digest,
     pub manifest_row_count: u32,
@@ -440,6 +449,14 @@ pub struct BeginArtifactPublishRequest {
 impl BeginArtifactPublishRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
         self.condition.validate()?;
+        if self.expected_workspace_incarnation_id.is_some()
+            && !matches!(self.authority, PublicationAuthority::Visible)
+        {
+            return Err(ProtocolError::invalid(
+                "begin_artifact_publish.expected_workspace_incarnation_id",
+                "an expected workspace incarnation fence applies only to visible publication",
+            ));
+        }
         match self.authority {
             PublicationAuthority::Visible => {
                 if matches!(
@@ -2154,12 +2171,41 @@ mod tests {
             },
             authority,
             condition,
+            expected_workspace_incarnation_id: None,
             staged_object_count: 1,
             staged_object_seal: Digest([3; 32]),
             manifest_row_count: 1,
             manifest_seal: Digest([4; 32]),
             dependency_owner_revision_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn publish_incarnation_fence_is_visible_only() {
+        let mut visible = begin_manifest_publish(
+            "outputs/result.bin",
+            PublicationAuthority::Visible,
+            PublishCondition::CreateOnly,
+        );
+        visible.expected_workspace_incarnation_id = Some(WorkspaceIdentity([9; 16]));
+        visible.validate().unwrap();
+
+        let mut staging = begin_manifest_publish(
+            "metadata/run_manifest.json",
+            PublicationAuthority::CommitStaging {
+                commit_operation_id: OperationIdentity([5; 16]),
+            },
+            PublishCondition::CreateOnly,
+        );
+        staging.validate().unwrap();
+        staging.expected_workspace_incarnation_id = Some(WorkspaceIdentity([9; 16]));
+        assert!(matches!(
+            staging.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "begin_artifact_publish.expected_workspace_incarnation_id",
+                ..
+            })
+        ));
     }
 
     #[test]

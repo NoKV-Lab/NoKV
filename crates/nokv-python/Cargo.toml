@@ -2,7 +2,7 @@
 name = "nokv-python"
 # Wheel version. Keep equal to the crates/nokv package version; the release
 # gate (scripts/release/python_sdk_release.py) refuses a tag otherwise.
-version = "0.11.0"
+version = "0.11.1"
 publish = false
 description = "Python SDK for NoKV Agent workspaces and immutable artifacts."
 edition.workspace = true

@@ -92,6 +92,9 @@ pub enum ConflictKind {
     SnapshotLifecycle,
     OperationState,
     RootPlacement,
+    /// The caller's expected workspace incarnation is not the workbench's
+    /// current incarnation. Emitted only for requests that carry the fence.
+    WorkspaceIncarnation,
 }
 
 /// Storage-neutral error body. Internal engine keys and provider credentials are

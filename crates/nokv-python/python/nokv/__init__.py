@@ -22,8 +22,26 @@ __all__ = [
     "ObjectStoreConfig",
     "RoutingConfig",
     "WorkbenchFileSystem",
+    "WorkspaceIncarnationMismatch",
     "checkpoint",
 ]
+
+
+class WorkspaceIncarnationMismatch(RuntimeError):
+    """A publish was refused because the workbench is not the expected incarnation.
+
+    Raised by ``Client.publish_bytes`` / ``Client.publish_file`` when
+    ``expected_workspace_incarnation_id`` was given and the owner found the
+    workbench bound to a different incarnation. The owner evaluates the fence
+    atomically with ``expected_generation`` before any durable row or object
+    exists, so nothing was written. ``expected`` is the fence the caller sent;
+    read the current incarnation back (``find_workspaces`` or ``read`` metadata)
+    before deciding whether to retry.
+    """
+
+    def __init__(self, message: str, expected: str) -> None:
+        super().__init__(message)
+        self.expected = expected
 
 
 def __getattr__(name):

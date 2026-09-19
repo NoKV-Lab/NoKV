@@ -56,6 +56,10 @@ pub struct ArtifactPublishOptions {
     pub manifest_identity: Option<String>,
     pub index_fields: Vec<FieldValue>,
     pub block_size: usize,
+    /// Optional expected workspace incarnation fence, evaluated atomically by
+    /// the owner with the path generation claim (see
+    /// `BeginArtifactPublishRequest::expected_workspace_incarnation_id`).
+    pub expected_workspace_incarnation_id: Option<WorkspaceIdentity>,
 }
 
 impl ArtifactPublishOptions {
@@ -77,11 +81,21 @@ impl ArtifactPublishOptions {
             manifest_identity: None,
             index_fields: Vec::new(),
             block_size: DEFAULT_ARTIFACT_BLOCK_SIZE,
+            expected_workspace_incarnation_id: None,
         }
     }
 
     pub fn with_block_size(mut self, block_size: usize) -> Self {
         self.block_size = block_size;
+        self
+    }
+
+    /// Refuse the publish unless the workbench is still this exact incarnation.
+    pub fn with_expected_workspace_incarnation(
+        mut self,
+        workspace_incarnation_id: WorkspaceIdentity,
+    ) -> Self {
+        self.expected_workspace_incarnation_id = Some(workspace_incarnation_id);
         self
     }
 
@@ -295,6 +309,7 @@ where
             options.target,
             options.authority,
             options.condition,
+            options.expected_workspace_incarnation_id,
             object_plan,
             staged_objects,
             manifest_rows,
@@ -314,6 +329,7 @@ where
         target: WorkspacePath,
         authority: PublicationAuthority,
         condition: PublishCondition,
+        expected_workspace_incarnation_id: Option<WorkspaceIdentity>,
         object_plan: ArtifactUploadPlan,
         staged_objects: Vec<StagedObject>,
         manifest_rows: Vec<ArtifactManifestRow>,
@@ -332,6 +348,7 @@ where
                 &target,
                 &authority,
                 &condition,
+                expected_workspace_incarnation_id,
                 &object_plan,
                 &staged_objects,
                 &manifest_rows,
@@ -368,6 +385,7 @@ where
         target: &WorkspacePath,
         authority: &PublicationAuthority,
         condition: &PublishCondition,
+        expected_workspace_incarnation_id: Option<WorkspaceIdentity>,
         object_plan: &ArtifactUploadPlan,
         staged_objects: &[StagedObject],
         manifest_rows: &[ArtifactManifestRow],
@@ -387,6 +405,7 @@ where
                 target: target.clone(),
                 authority: *authority,
                 condition: *condition,
+                expected_workspace_incarnation_id,
                 staged_object_count: seals.staged_object_count,
                 staged_object_seal: seals.staged_object_seal,
                 manifest_row_count: seals.manifest_row_count,
@@ -952,6 +971,7 @@ where
             options.target.clone(),
             PublicationAuthority::Visible,
             condition,
+            None,
             object_plan,
             staged_objects,
             manifest_rows,
