@@ -103,6 +103,22 @@ struct RestoreInitializationBarrierRegistration {
     barrier: Arc<dyn RestoreInitializationBarrier>,
 }
 
+/// Test-support observation point: a finalizer reports the durable phase it
+/// loaded before issuing its first step. Unlike the initialization barrier the
+/// observer returns, so a test can hold one finalizer here while a concurrent
+/// exact finalizer carries the same restore any number of phases ahead.
+#[cfg(feature = "restore-crash-test-support")]
+pub trait RestoreFinalizeLoadObserver: Send + Sync {
+    fn loaded(&self, operation_id: protocol::OperationIdentity, phase: types::RestorePhase);
+}
+
+#[cfg(feature = "restore-crash-test-support")]
+#[derive(Clone)]
+struct RestoreFinalizeLoadObserverRegistration {
+    target_operation_id: protocol::OperationIdentity,
+    observer: Arc<dyn RestoreFinalizeLoadObserver>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct RestorePreparationKey {
     root_id: types::RootId,
@@ -145,6 +161,8 @@ pub struct MetadataWorkspaceRequestExecutor {
     restore_preparations: Arc<RestorePreparationCoordinator>,
     #[cfg(feature = "restore-crash-test-support")]
     restore_initialization_barrier: Option<RestoreInitializationBarrierRegistration>,
+    #[cfg(feature = "restore-crash-test-support")]
+    restore_finalize_load_observer: Option<RestoreFinalizeLoadObserverRegistration>,
 }
 
 impl MetadataWorkspaceRequestExecutor {
@@ -154,6 +172,8 @@ impl MetadataWorkspaceRequestExecutor {
             restore_preparations: Arc::new(RestorePreparationCoordinator::default()),
             #[cfg(feature = "restore-crash-test-support")]
             restore_initialization_barrier: None,
+            #[cfg(feature = "restore-crash-test-support")]
+            restore_finalize_load_observer: None,
         }
     }
 
@@ -166,6 +186,19 @@ impl MetadataWorkspaceRequestExecutor {
         self.restore_initialization_barrier = Some(RestoreInitializationBarrierRegistration {
             target_operation_id,
             barrier,
+        });
+        self
+    }
+
+    #[cfg(feature = "restore-crash-test-support")]
+    pub fn with_restore_finalize_load_observer(
+        mut self,
+        target_operation_id: protocol::OperationIdentity,
+        observer: Arc<dyn RestoreFinalizeLoadObserver>,
+    ) -> Self {
+        self.restore_finalize_load_observer = Some(RestoreFinalizeLoadObserverRegistration {
+            target_operation_id,
+            observer,
         });
         self
     }
@@ -1135,6 +1168,14 @@ impl MetadataWorkspaceRequestExecutor {
         if let Some(failure) = restore_terminal_failure(&operation) {
             return Err(failure);
         }
+        #[cfg(feature = "restore-crash-test-support")]
+        if let Some(registration) = &self.restore_finalize_load_observer {
+            if request.operation_id == registration.target_operation_id {
+                registration
+                    .observer
+                    .loaded(request.operation_id, operation.phase);
+            }
+        }
         if operation.phase == types::RestorePhase::Complete {
             return restored_response(&operation, None, true);
         }
@@ -1151,14 +1192,18 @@ impl MetadataWorkspaceRequestExecutor {
             if let Some(failure) = restore_terminal_failure(&initialized.operation) {
                 return Err(failure);
             }
-            if initialized.operation.phase != types::RestorePhase::DestinationBuilding
-                || !restore_step_advances(
-                    &operation,
-                    &initialized.operation,
-                    initialized.replayed,
-                    "restore destination initialization",
-                )?
-            {
+            // A concurrent exact finalizer may already have carried the
+            // operation past DestinationBuilding; any forward phase is this
+            // step's converged outcome as long as progress stays monotonic.
+            if !meta::restore_phase_reached(
+                initialized.operation.phase,
+                types::RestorePhase::DestinationBuilding,
+            ) || !restore_step_advances(
+                &operation,
+                &initialized.operation,
+                initialized.replayed,
+                "restore destination initialization",
+            )? {
                 return Err(internal(
                     "restore initialization did not reach DestinationBuilding",
                 ));
@@ -1221,11 +1266,14 @@ impl MetadataWorkspaceRequestExecutor {
             if let Some(failure) = restore_terminal_failure(&built.command.operation) {
                 return Err(failure);
             }
-            if !matches!(
+            if !meta::restore_phase_reached(
                 built.command.operation.phase,
-                types::RestorePhase::DestinationBuilding | types::RestorePhase::DestinationSealing
+                types::RestorePhase::DestinationBuilding,
             ) || built.members_complete
-                != (built.command.operation.phase == types::RestorePhase::DestinationSealing)
+                != meta::restore_phase_reached(
+                    built.command.operation.phase,
+                    types::RestorePhase::DestinationSealing,
+                )
             {
                 return Err(internal(
                     "restore destination commit-member completion projection is inconsistent",
@@ -1275,10 +1323,14 @@ impl MetadataWorkspaceRequestExecutor {
             if let Some(failure) = restore_terminal_failure(&sealed.command.operation) {
                 return Err(failure);
             }
-            if !matches!(
+            if !meta::restore_phase_reached(
                 sealed.command.operation.phase,
-                types::RestorePhase::DestinationSealing | types::RestorePhase::Ready
-            ) || sealed.ready != (sealed.command.operation.phase == types::RestorePhase::Ready)
+                types::RestorePhase::DestinationSealing,
+            ) || sealed.ready
+                != meta::restore_phase_reached(
+                    sealed.command.operation.phase,
+                    types::RestorePhase::Ready,
+                )
             {
                 return Err(internal(
                     "restore destination revision completion projection is inconsistent",
@@ -1310,10 +1362,16 @@ impl MetadataWorkspaceRequestExecutor {
                 .ok_or_else(|| internal("restore revision-seal batch counter overflow"))?;
         }
 
-        if operation.phase != types::RestorePhase::Ready {
-            return Err(operation_terminal_failure(
-                "restore finalization did not reach Ready",
-            ));
+        match operation.phase {
+            types::RestorePhase::Ready => {}
+            // A step converged on a peer's completed restore: the durable
+            // terminal row is this finalizer's result, replayed.
+            types::RestorePhase::Complete => return restored_response(&operation, None, true),
+            _ => {
+                return Err(operation_terminal_failure(
+                    "restore finalization did not reach Ready",
+                ));
+            }
         }
         let completed = match meta::complete_restore(
             &self.meta,
@@ -11198,6 +11256,145 @@ mod tests {
         let fresh_finalizer = executor.execute(&finalize(0xb9)).unwrap();
         assert!(fresh_finalizer.replayed);
         assert_eq!(fresh_finalizer.result, outcomes[0].result);
+    }
+
+    /// The race the stress test only reaches by scheduling luck, made exact:
+    /// finalizer A loads the restore in `SourceSealed`, is held there while
+    /// finalizer B carries the same restore all the way to `Complete`, and
+    /// then resumes. Every step A issues meets a phase several steps ahead of
+    /// the one it expected and must converge on B's durable result.
+    #[cfg(feature = "restore-crash-test-support")]
+    #[test]
+    fn stale_finalizer_converges_on_a_peer_that_completed_the_restore() {
+        struct HoldAfterLoad {
+            loaded_phase: std::sync::mpsc::Sender<types::RestorePhase>,
+            release: Arc<std::sync::Barrier>,
+        }
+
+        impl RestoreFinalizeLoadObserver for HoldAfterLoad {
+            fn loaded(&self, _: protocol::OperationIdentity, phase: types::RestorePhase) {
+                self.loaded_phase.send(phase).unwrap();
+                self.release.wait();
+            }
+        }
+
+        let (store, executor) = ready_executor();
+        let source =
+            seed_committed_snapshot_source(&store, &executor, "stale-fork-source", 0x38, 12, 3);
+        let (request, destination_restore_manifest_identity) =
+            fork_prepare_request(&source, "stale-fork-destination", 0x58);
+        let restore_operation_id = request.operation_id;
+        let destination = request.destination_workbench.clone();
+        executor
+            .execute(&restore_rpc(
+                0x68,
+                protocol::WorkspaceRequest::PrepareRestore(request),
+            ))
+            .unwrap();
+        let destination_run_manifest_identity = protocol::RestoreManifestIdentity {
+            publication_operation_id: protocol::OperationIdentity([0x69; types::FIXED_ID_BYTES]),
+            artifact_revision_id: protocol::ArtifactRevisionIdentity([0x6a; types::FIXED_ID_BYTES]),
+        };
+        executor
+            .execute(&restore_rpc(
+                0x6b,
+                protocol::WorkspaceRequest::BindRestoreDestination(
+                    protocol::BindRestoreDestinationRequest {
+                        operation_id: restore_operation_id,
+                        destination_commit_id: protocol::CommitIdentity(
+                            [0x6c; types::SHA256_BYTES],
+                        ),
+                        effective_content_digest: protocol::DigestUri::new(format!(
+                            "sha256:{}",
+                            "cc".repeat(types::SHA256_BYTES)
+                        ))
+                        .unwrap(),
+                        destination_run_manifest_projection_input_digest: protocol::Digest(
+                            [0x6d; types::SHA256_BYTES],
+                        ),
+                        destination_run_manifest_identity,
+                        destination_restore_manifest_identity,
+                    },
+                ),
+            ))
+            .unwrap();
+        // The restore manifest body is sealed by the prepare request
+        // (`fork_prepare_request` seals sha256([0x7d])); the run manifest body is
+        // bound at destination binding, not sealed by content.
+        for (fill, identity, path, byte) in [
+            (
+                0x80,
+                destination_run_manifest_identity,
+                RUN_MANIFEST_PATH,
+                0x7c,
+            ),
+            (
+                0x88,
+                destination_restore_manifest_identity,
+                meta::RESTORE_MANIFEST_PATH,
+                0x7d,
+            ),
+        ] {
+            publish_one_byte_artifact(
+                &executor,
+                fill,
+                identity.publication_operation_id,
+                identity.artifact_revision_id,
+                destination.as_str(),
+                path,
+                protocol::PublicationAuthority::RestoreStaging {
+                    restore_operation_id,
+                },
+                byte,
+            );
+        }
+        let finalize = move |request_fill: u8| {
+            restore_rpc(
+                request_fill,
+                protocol::WorkspaceRequest::FinalizeRestore(protocol::FinalizeRestoreRequest {
+                    operation_id: restore_operation_id,
+                }),
+            )
+        };
+
+        let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let held = executor.clone().with_restore_finalize_load_observer(
+            restore_operation_id,
+            Arc::new(HoldAfterLoad {
+                loaded_phase: loaded_tx,
+                release: Arc::clone(&release),
+            }),
+        );
+        let stale = std::thread::spawn(move || held.execute(&finalize(0xc1)));
+        assert_eq!(
+            loaded_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the held finalizer must report the phase it loaded"),
+            types::RestorePhase::SourceSealed
+        );
+
+        // The peer finalizer runs every step to Complete while A is held.
+        let peer = executor.execute(&finalize(0xc2)).unwrap();
+        let protocol::WorkspaceResult::Restored(restored) = &peer.result else {
+            panic!("finalize returned the wrong result variant");
+        };
+        assert!(!peer.replayed);
+        assert_eq!(restored.operation_id, restore_operation_id);
+        assert!(restored.destination.commit_head.is_some());
+
+        release.wait();
+        let converged = stale
+            .join()
+            .unwrap()
+            .expect("a finalizer that fell behind a completed peer must converge");
+        assert!(converged.replayed);
+        assert_eq!(converged.result, peer.result);
+
+        // The terminal row is unchanged and a fresh finalizer still replays it.
+        let fresh = executor.execute(&finalize(0xc3)).unwrap();
+        assert!(fresh.replayed);
+        assert_eq!(fresh.result, peer.result);
     }
 
     #[test]
