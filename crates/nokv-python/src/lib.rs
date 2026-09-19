@@ -26,6 +26,14 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PythonWorkspaceClient>()?;
     module.add_class::<PythonRoutingConfig>()?;
     module.add_class::<PythonObjectStoreConfig>()?;
+    // The exact wire schema this wheel speaks. A server with a different
+    // schema fails the handshake closed, so callers that pin a wheel can
+    // compare this string before connecting instead of learning it from a
+    // refused connection.
+    module.add(
+        "WORKSPACE_PROTOCOL_SCHEMA",
+        nokv_protocol::WORKSPACE_PROTOCOL_SCHEMA,
+    )?;
     Ok(())
 }
 
@@ -44,6 +52,12 @@ mod tests {
             assert!(routing.getattr("seeds").is_ok());
             assert!(module.getattr("Client").is_ok());
             assert!(module.getattr("ObjectStoreConfig").is_ok());
+            let schema: String = module
+                .getattr("WORKSPACE_PROTOCOL_SCHEMA")
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(schema, nokv_protocol::WORKSPACE_PROTOCOL_SCHEMA);
 
             let client = module.getattr("Client").unwrap();
             for method in [

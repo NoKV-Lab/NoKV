@@ -25,6 +25,7 @@ pub fn identity(workbench_contract_schema: &str, workbench_tool_count: usize) ->
             "checksum": HOLT_CHECKSUM,
         },
         "workbench_contract_schema": workbench_contract_schema,
+        "workspace_protocol_schema": nokv_protocol::WORKSPACE_PROTOCOL_SCHEMA,
         "workbench_tool_count": workbench_tool_count,
     })
 }
