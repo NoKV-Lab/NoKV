@@ -46,8 +46,8 @@ from an unreleased commit reports that commit's declared version, so pin by
 release tag, not by version string alone, when qualifying a deployment.
 
 Building from source (`maturin build --release` in `crates/nokv-python`)
-requires a Rust toolchain and a `protoc` binary; that path is for development,
-not for installing the SDK.
+requires a Rust toolchain; that path is for development, not for installing
+the SDK.
 
 ## Version 1 surface
 

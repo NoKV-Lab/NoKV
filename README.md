@@ -238,7 +238,7 @@ real-service acceptance gate is still **not qualified**.
 | `nokv materialize` | Copy a verified workspace artifact to a new local path. | The destination is disposable scratch, not a namespace or mount. |
 | `nokv collect` | Publish one bounded regular local file, create-only or generation-fenced replace. | Symlinks and unbounded/non-regular inputs fail closed. |
 | `nokv workspace-path rename` / `nokv workspace-path remove` | Apply an explicit generation- and request-id-fenced path mutation. | Custom CLI surface; not one of the 18 Workbench tools. |
-| `nokv provision` | Bind `RootId` to `AgentId`, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. |
+| `nokv provision` | Bind `RootId` to `AgentId`, object namespace, logical shard, and persisted placement through the selected metadata runtime (`--meta-url holt:///...` or `fdb:///...`). | `AgentId` prevents accidental root reuse; it is not authentication. |
 | `nokv serve` | Start one explicit metadata owner from create, same-namespace reopen, or recovery-log state. | Shared recovery publication is opt-in and not currently qualified. |
 | `nokv mcp` | Deprecated stdio transport retained only because qualification runners still use it. | **Unsupported for integration.** |
 
@@ -278,9 +278,11 @@ stable JSON envelopes, and fail-closed admission. Use Python when the caller
 needs in-process range reads, fsspec/checkpoint integration, or direct typed
 methods. Use Rust for provider, routing, change-feed, or recovery-aware work.
 
-Every agent-facing CLI command requires self-refreshing etcd routing plus the
-durable `RootId` to `AgentId` binding. Static route pins remain an SDK/testing
-option and are rejected by the agent-facing CLI.
+Every agent-facing CLI command requires at least one `--seed IP:PORT` route to
+a serving metadata owner plus the durable `RootId` to `AgentId` binding. The
+Python SDK takes the same seeds through `RoutingConfig.seeds([...])`; hostnames
+are rejected, and a wheel whose `WORKSPACE_PROTOCOL_SCHEMA` differs from the
+server's schema fails the handshake closed.
 
 ## Core Semantics
 
@@ -440,7 +442,8 @@ platform as supported.
 ### Call a provisioned deployment
 
 A live deployment requires a persisted root placement, a leased shard owner,
-etcd routing, and admitted S3-compatible object coordinates. After following
+at least one seed route to a serving owner, and admitted S3-compatible object
+coordinates. After following
 the [live deployment preflight](docs/workbench-preflight.md), the current
 source-level CLI shape is below. The command form is documented; full
 native-CLI real-service Gate 0 remains not qualified.
@@ -450,7 +453,7 @@ nokv \
   --root-id "$NOKV_ROOT_ID" \
   --agent-id "$NOKV_AGENT_ID" \
   --workbench-root /agents/research/wb \
-  --etcd-endpoint "$NOKV_ETCD_ENDPOINT" \
+  --seed "$NOKV_SEED" \
   --object-bucket "$NOKV_BUCKET" \
   --object-endpoint "$NOKV_OBJECT_ENDPOINT" \
   workbench workbench_create '{"id":"run-001"}'
@@ -459,7 +462,7 @@ nokv \
   --root-id "$NOKV_ROOT_ID" \
   --agent-id "$NOKV_AGENT_ID" \
   --workbench-root /agents/research/wb \
-  --etcd-endpoint "$NOKV_ETCD_ENDPOINT" \
+  --seed "$NOKV_SEED" \
   --object-bucket "$NOKV_BUCKET" \
   --object-endpoint "$NOKV_OBJECT_ENDPOINT" \
   workbench workbench_put_file \
@@ -469,7 +472,7 @@ nokv \
   --root-id "$NOKV_ROOT_ID" \
   --agent-id "$NOKV_AGENT_ID" \
   --workbench-root /agents/research/wb \
-  --etcd-endpoint "$NOKV_ETCD_ENDPOINT" \
+  --seed "$NOKV_SEED" \
   --object-bucket "$NOKV_BUCKET" \
   --object-endpoint "$NOKV_OBJECT_ENDPOINT" \
   workbench workbench_read \
