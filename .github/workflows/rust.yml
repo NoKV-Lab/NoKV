@@ -54,7 +54,8 @@ jobs:
             scripts/workbench/local_wal_recovery_gate.py \
             scripts/workbench/object_namespace_recovery_gate.py \
             scripts/workbench/restore_composition_gate.py \
-            scripts/workbench/fork_restore_recovery_gate.py
+            scripts/workbench/fork_restore_recovery_gate.py \
+            scripts/workbench/wire_compat_gate.py
           python3 scripts/workbench/pre423_contract_ledger.py
           python3 scripts/workbench/pre423_contract_ledger_test.py
           python3 scripts/workbench/workbench_contract_test.py
@@ -63,6 +64,7 @@ jobs:
           python3 scripts/workbench/object_namespace_recovery_gate_test.py
           python3 scripts/workbench/restore_composition_gate_test.py
           python3 scripts/workbench/fork_restore_recovery_gate_test.py
+          python3 scripts/workbench/wire_compat_gate_test.py
           bash -n scripts/workbench/start_rustfs.sh
 
       - name: Check Phase 1 qualification framework
@@ -459,6 +461,103 @@ jobs:
         with:
           name: local-wal-recovery-${{ github.sha }}
           path: ${{ runner.temp }}/local-wal-recovery-evidence
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Build pinned legacy v0.10.0 binary for wire compatibility
+        shell: bash
+        env:
+          LEGACY_NOKV_SOURCE_SHA256: 4b486c18bd4c6c0d07e3a55834bf50bb97cc6085c46bdd405101530ad89ad4c1
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/nokv-0.10.0-source.tar.gz"
+          legacy_dir="$RUNNER_TEMP/nokv-0.10.0"
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 30 --max-time 600 \
+            --output "$archive" \
+            "https://github.com/NoKV-Lab/NoKV/releases/download/v0.10.0/nokv-0.10.0-source.tar.gz"
+          # Frozen from the v0.10.0 release's SHA256SUMS asset. The matrix
+          # must never qualify an unverified archive merely because its URL
+          # names a release tag.
+          echo "$LEGACY_NOKV_SOURCE_SHA256  $archive" | sha256sum --check
+          mkdir -p "$legacy_dir"
+          tar -xzf "$archive" -C "$legacy_dir" --strip-components=1
+          cargo build --locked --manifest-path "$legacy_dir/Cargo.toml" -p nokv
+          legacy_binary="$legacy_dir/target/debug/nokv"
+          test -x "$legacy_binary"
+          legacy_binary_sha256=$(sha256sum "$legacy_binary" | awk '{print $1}')
+          printf 'legacy source sha256: %s\nlegacy binary sha256: %s\n' \
+            "$LEGACY_NOKV_SOURCE_SHA256" "$legacy_binary_sha256"
+          {
+            echo "LEGACY_NOKV_SOURCE=$archive"
+            echo "LEGACY_NOKV_SOURCE_SHA256=$LEGACY_NOKV_SOURCE_SHA256"
+            echo "LEGACY_NOKV_BINARY=$legacy_binary"
+            echo "LEGACY_NOKV_BINARY_SHA256=$legacy_binary_sha256"
+          } >>"$GITHUB_ENV"
+
+      - name: Qualify the wire-compatibility matrix
+        id: wire_compat
+        shell: bash
+        env:
+          WIRE_COMPAT_ETCD_ROOT: ${{ runner.temp }}/wire-compat-etcd
+          WIRE_COMPAT_EVIDENCE_DIR: ${{ runner.temp }}/wire-compat-evidence
+          AWS_ACCESS_KEY_ID: rustfsadmin
+          AWS_SECRET_ACCESS_KEY: rustfsadmin
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_EC2_METADATA_DISABLED: "true"
+        run: |
+          set -euo pipefail
+          endpoint=http://127.0.0.1:22390
+          peer=http://127.0.0.1:22391
+          mkdir -p "$WIRE_COMPAT_ETCD_ROOT"
+          etcd \
+            --name nokv-wire-compat \
+            --data-dir "$WIRE_COMPAT_ETCD_ROOT/data" \
+            --listen-client-urls "$endpoint" \
+            --advertise-client-urls "$endpoint" \
+            --listen-peer-urls "$peer" \
+            --initial-advertise-peer-urls "$peer" \
+            --initial-cluster "nokv-wire-compat=$peer" \
+            --initial-cluster-state new \
+            --log-level warn \
+            >"$WIRE_COMPAT_ETCD_ROOT/etcd.log" 2>&1 &
+          etcd_pid=$!
+          trap 'kill "$etcd_pid" >/dev/null 2>&1 || true; wait "$etcd_pid" >/dev/null 2>&1 || true' EXIT
+          ready=false
+          for _ in $(seq 1 60); do
+            if etcdctl --endpoints "$endpoint" endpoint health >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$etcd_pid" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.25
+          done
+          if [[ "$ready" != true ]]; then
+            cat "$WIRE_COMPAT_ETCD_ROOT/etcd.log"
+            exit 1
+          fi
+          cargo build -p nokv --bin nokv
+          python3 scripts/workbench/wire_compat_gate.py \
+            --new-binary target/debug/nokv \
+            --old-binary "$LEGACY_NOKV_BINARY" \
+            --legacy-source "$LEGACY_NOKV_SOURCE" \
+            --legacy-source-sha256 "$LEGACY_NOKV_SOURCE_SHA256" \
+            --legacy-binary-sha256 "$LEGACY_NOKV_BINARY_SHA256" \
+            --etcd-endpoint "$endpoint" \
+            --object-bucket nokv-local-wal-recovery-gate \
+            --object-root-new local-wire-new \
+            --object-root-old local-wire-old \
+            --agent-id "$(openssl rand -hex 16)" \
+            --evidence-dir "$WIRE_COMPAT_EVIDENCE_DIR"
+
+      - name: Upload wire-compatibility evidence
+        if: ${{ always() && steps.wire_compat.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: wire-compat-${{ github.sha }}
+          path: ${{ runner.temp }}/wire-compat-evidence
           if-no-files-found: error
           retention-days: 7
 
