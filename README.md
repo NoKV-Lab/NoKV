@@ -240,6 +240,8 @@ real-service acceptance gate is still **not qualified**.
 | `nokv workspace-path rename` / `nokv workspace-path remove` | Apply an explicit generation- and request-id-fenced path mutation. | Custom CLI surface; not one of the 18 Workbench tools. |
 | `nokv workspace-path append` | Append bytes under a durable logical identity and recover the original receipt across process restarts. | The first admission requires an existing workspace. Retries use fenced publication attempts under the same identity; the 18-tool schema is unchanged. |
 | `nokv operation status` | Query an append by its logical identity and report its receipt or next recovery action. | Metadata only: no payload, current workspace, or object-store connection is required. |
+| `nokv operation inspect` | Inspect a bounded page of retained staged objects and save the exact operation token. | Metadata only; the cursor binds one observation and fails if state changes. |
+| `nokv operation recover` | Ask the owner to retry quarantined append cleanup. | No payload or object credentials; an explicit saved state digest replays one durable recovery request. |
 | `nokv provision` | Bind `RootId` to `AgentId`, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. |
 | `nokv serve` | Start one explicit metadata owner from create, same-namespace reopen, or recovery-log state. | Shared recovery publication is opt-in and not currently qualified. |
 | `nokv mcp` | Deprecated stdio transport retained only because qualification runners still use it. | **Unsupported for integration.** |
@@ -289,11 +291,41 @@ The response supplies a machine-readable recovery action:
 | `committed` | `none` | Consume the original `receipt`. |
 | `pending` | `poll` | Query the same logical identity again after waiting. |
 | `ready_to_retry` | `resubmit_same` | Resubmit the original append inputs under the same logical identity. |
-| `quarantined` | `operator_reconcile` | Keep the identity and escalate the recorded inconsistency for operator reconciliation. |
+| `quarantined` | `retry_cleanup` | Inspect the failure, restore provider availability, then ask the owner to retry cleanup. |
 
 Status also retains the current physical attempt's `cause_code`,
 `failure_message`, and structured `attempt_failure`, including when the logical
 operation is `ready_to_retry`.
+
+Inspect and recover without object credentials:
+
+```shell
+nokv [route/agent options] operation inspect aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --limit 32
+nokv [route/agent options] operation recover aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --expected-state-digest <saved-operation_token.state_digest>
+```
+
+Inspection returns `operation_token` and `publication_token`, each with
+`operation_id` and `state_digest`, plus the object namespace, `registered_count`,
+`cleanup_cursor`, `remaining_count`, and `entries`. Entries describe retained
+staged objects, not a historical inventory of retired keys. Each entry includes
+its sequence, identity, expected length, digest, and optional multipart token.
+The page limit defaults to 32 and may range from 1 to 192. Continue with the
+opaque base64 `next_cursor` using `--cursor`; a stale cursor returns
+`Conflict/OperationState`, requiring a fresh inspection instead of mixing pages.
+
+Save the logical token before requesting recovery. Reuse its state digest after
+a lost reply or process restart. The owner performs sealing; this command never
+resends the append delta. `requested=true` means a cleanup request was durably
+accepted, including a replay. Its historical `recovery_receipt` contains the
+logical id, publication id, cleanup retry count, and expected state digest.
+The top-level status is a fresh observation and may be newer than that receipt;
+acceptance is not cleanup completion. Omitting the digest targets the current
+state once and is a no-op for pending, cleaned, or committed operations. A later
+quarantine needs an intentional new request with a newly inspected token.
+`AppendCleanupUnresolved` preserves the saved digest, any known recovery receipt,
+and `next_action=retry_same_cleanup`; generic retry handlers must not choose a
+new token. After `ready_to_retry`, resubmit the original append inputs.
 
 An interrupted publication must be fenced and cleaned before a successor
 attempt can start. Status queries only observe this lifecycle. Persist the delta
@@ -317,14 +349,16 @@ do not expose identical method shapes.
 
 | Surface | Current public capability | Additional boundary |
 | --- | --- | --- |
-| Direct Python `Client` | Create/stat/exists/list/remove/rename, byte/file publish, stable append and its operation status, whole/range/batch reads, query/aggregate/catalog/find, commit/restore, snapshot lifecycle, materialize, and collect | Direct SDK, not a tool-for-tool copy of the 18-name CLI facade |
+| Direct Python `Client` | Create/stat/exists/list/remove/rename, byte/file publish, stable append with status/inspect/recover, whole/range/batch reads, query/aggregate/catalog/find, commit/restore, snapshot lifecycle, materialize, and collect | Direct SDK, not a tool-for-tool copy of the 18-name CLI facade |
 | Python adapters | Workbench-scoped fsspec, checkpoint helpers, and optional torch Distributed Checkpoint reader/writer | Bounded to an explicit Workbench; not arbitrary-root POSIX or FUSE |
 | Rust `WorkspaceClient` | Lower-level typed workspace, publication, query, lifecycle, routing, and batch-range workflows | Recommended when the caller must own typed retry and recovery integration |
 | Rust-only extensions | Polling change feed, generic custom-index registration, raw non-append operation status, and phased publish/restore primitives | No native CLI or Python method today; change feed is polling, not push |
 | Metadata and server lifecycle | snapshot reap, commit/tag holds, reference-fenced GC, quarantine reconciliation, Holt reopen, and optional shared recovery records | Internal/operator mechanisms, not independent end-user commands |
 
-Python `append_bytes` and `operation_status` share the native stable append
-contract. The SDK does not expose the legacy 18-tool append facade, exact-string
+Python `append_bytes`, `operation_status`, `operation_inspect`, and
+`operation_recover` share the native stable append contract. Python inspection
+cursors are opaque bytes; recovery state digests are lowercase hex strings.
+The SDK does not expose the legacy 18-tool append facade, exact-string
 edit, or body grep methods; use the CLI for those exact behaviors.
 Custom SDK compositions are caller-owned and are not equivalent qualification
 evidence.

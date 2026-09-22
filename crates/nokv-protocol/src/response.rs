@@ -114,6 +114,8 @@ pub enum WorkspaceResult {
     Renamed(RenamePathResult),
     Removed(RemovePathResult),
     Operation(OperationStatus),
+    AppendCleanupInspection(crate::AppendCleanupInspection),
+    AppendCleanupRetried(crate::AppendCleanupRetryResult),
     Published(PublishResult),
     Commit(CommitResult),
     Snapshot(SnapshotResult),
@@ -141,6 +143,8 @@ impl WorkspaceResult {
             Self::Renamed(renamed) => renamed.validate(),
             Self::Removed(removed) => removed.validate(),
             Self::Operation(operation) => operation.validate(),
+            Self::AppendCleanupInspection(page) => page.validate(),
+            Self::AppendCleanupRetried(receipt) => receipt.validate(),
             Self::Published(published) => published.validate(),
             Self::Commit(commit) => commit.validate(),
             Self::Snapshot(snapshot) => snapshot.validate(),
@@ -1551,7 +1555,7 @@ pub struct OperationStatus {
 }
 
 impl OperationStatus {
-    fn validate(&self) -> Result<(), ProtocolError> {
+    pub(crate) fn validate(&self) -> Result<(), ProtocolError> {
         self.progress.validate()?;
         match (self.kind, self.append_preparation.as_ref()) {
             (OperationKind::ArtifactAppend, Some(preparation)) => {

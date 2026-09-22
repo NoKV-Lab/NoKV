@@ -5,10 +5,11 @@
 
 use nokv_client::{ArtifactPublishOutcome, ArtifactReadOutcome};
 use nokv_protocol::{
-    AggregateFunction, AggregateResult, AggregateSpec, CatalogResult, CommitResult, FacetResult,
-    FieldValue, FindWorkspacesResult, PathListEntry, PathMetadata, PathPage, PublishResult,
-    QueryOperand, QueryOperator, QueryPredicate, ScalarValue, SearchResult, SearchRow,
-    SnapshotResult, SnapshotStatus, SortDirection, SortField, WorkspaceSummary,
+    AggregateFunction, AggregateResult, AggregateSpec, AppendCleanupRetryResult, CatalogResult,
+    CommitResult, FacetResult, FieldValue, FindWorkspacesResult, OperationToken, PathListEntry,
+    PathMetadata, PathPage, PublishResult, QueryOperand, QueryOperator, QueryPredicate,
+    ScalarValue, SearchResult, SearchRow, SnapshotResult, SnapshotStatus, SortDirection, SortField,
+    WorkspaceSummary,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -18,6 +19,34 @@ pub(crate) type PythonFieldSpec = (String, String, String);
 pub(crate) type PythonPredicateSpec = (String, String, String, String);
 pub(crate) type PythonSortSpec = (String, String);
 pub(crate) type PythonAggregateSpec = (String, Option<String>, String);
+
+pub(crate) fn operation_token_to_py<'py>(
+    py: Python<'py>,
+    token: OperationToken,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("operation_id", hex(&token.operation_id.0))?;
+    dict.set_item("state_digest", hex(&token.state_digest.0))?;
+    Ok(dict)
+}
+
+pub(crate) fn cleanup_retry_receipt_to_py<'py>(
+    py: Python<'py>,
+    receipt: &AppendCleanupRetryResult,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("operation_id", hex(&receipt.operation_id.0))?;
+    dict.set_item(
+        "publication_operation_id",
+        hex(&receipt.publication_operation_id.0),
+    )?;
+    dict.set_item("cleanup_retry_count", receipt.cleanup_retry_count)?;
+    dict.set_item(
+        "expected_state_digest",
+        hex(&receipt.expected_state_digest.0),
+    )?;
+    Ok(dict)
+}
 
 pub(crate) fn parse_fixed_hex<const WIDTH: usize>(
     field: &str,

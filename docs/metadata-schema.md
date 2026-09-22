@@ -19,16 +19,16 @@ Every logical-shard store has one authoritative marker:
 System("schema")
   -> value_format_version = 1
      schema_id = "nokv_workspace"
-     format_version = 12
+     format_version = 13
 ```
 
 Startup is fail-closed:
 
 - an empty store is initialized with the exact supported marker and logical
   keyspace catalog;
-- format-11 and older stores are rejected without writes; there is no marker-only
-  upgrade because format 12 adds logical append records and changes the durable
-  publication operation codec;
+- format-12 and older stores are rejected without writes; there is no marker-only
+  upgrade because format 13 adds the monotonic append cleanup retry counter and
+  changes the durable publication operation codec;
 - a nonempty current store opens only when its marker, value format, and
   configured adapter catalog match this contract;
 - a missing, malformed, unknown-version, or inconsistent store is rejected.
@@ -85,7 +85,7 @@ exact key is a strict prefix of another valid path key. A child/subtree prefix
 appends NUL, so `a` cannot match `ab`. The empty path has no `PathCurrent`
 record; the workspace root is synthesized from `WorkspaceCurrent`. This path
 key layout was introduced by system format version 8 and is retained by
-version 12.
+version 13.
 
 The one shared normalizer enforces:
 
@@ -106,21 +106,24 @@ float, timestamp, bytes, and string values.
 
 ## Durable Format Registry
 
-`System.format_version` is `12`. Version 12 adds logical append parents,
+`System.format_version` is `13`. Version 13 adds the monotonic append cleanup
+retry counter and durable exact-token retry receipts in CommandDedupe.
+Version 12 introduced logical append parents,
 publication-attempt bindings, and the active-publication recovery index in the
 existing Operation family. It retains the format-11 full SHA-256 append intent,
 format-10 Generic index families, and format-9 RecoveryOutbox fixed-width decimal
 LSN keys. Existing logical recovery and object formats are unchanged.
 
-Ordinary open does not migrate a format-11 or older marker. A marker-only
+Ordinary open does not migrate a format-12 or older marker. A marker-only
 upgrade would reinterpret publication records without their required codec and
 omit the active index. Migration remains not qualified; every older or unknown
 marker is fail-closed and unchanged.
 
 Durable codecs are independently versioned:
 publish operation, staged-object, and manifest-row records use value version
-`6` and reject version `5`; an append publication binds both the full 256-bit
-intent and logical parent/attempt. `AppendOperationRecord` uses value version
+`7` and reject version `6`; an append publication binds both the full 256-bit
+intent and logical parent/attempt, with a cleanup retry counter that prevents
+repeated quarantine from recreating an earlier state token. `AppendOperationRecord` uses value version
 `1` and retains the current attempt and optional compact receipt. An
 `Operation(ActivePublish)` marker has the exact one-byte value `[1]`. Other
 publication rows retain their existing layouts.
@@ -707,7 +710,8 @@ The mutually exclusive operation transitions are:
 ```text
 Uploading -> Finalizing -> Published
 Uploading -> Aborting -> Cleaning -> Cleaned
-                                  -> Quarantined -> Cleaned # operator reconcile
+                                  -> Quarantined -> Cleaned # generic publication reconcile
+                                     Quarantined -> Cleaning # append owner cleanup retry
 Finalizing -> Aborting # fenced proof of no path/dedupe publication
 ```
 
@@ -726,9 +730,14 @@ through conditional creation or ETag-conditional replacement, without DELETE.
 Only after sealing may cleanup remove their staging rows and reach `Cleaned`.
 The child's `ArtifactRevisionClaim` is retained permanently, including when a
 successor becomes current, to reserve and explain those provider keys. A late
-immutable PUT cannot replace the seal. Reconciliation of a quarantined append
-requires the distinct `ProviderObjectsSealed` verdict and preserves that claim;
-`ProviderObjectsAbsent` is insufficient. Generic publications and published
+immutable PUT cannot replace the seal. Recovery of a quarantined append
+requires exact-token `RetryAppendCleanup`, which increments its durable counter
+and re-enqueues owner cleanup. The stable admission receipt retains the original
+failure and is replayable after later cleanup progress or another quarantine.
+Only the fenced owner supplies sealing proof; caller-supplied absence,
+publication or sealed-object verdicts cannot bypass this contract.
+Metadata-only `InspectAppendCleanup` returns bounded contiguous pages of actual
+retained staged rows, bound to the exact current logical/child state. Generic publications and published
 revision GC retain their existing deletion semantics.
 
 A late upload completion must observe the operation state; after abort it joins
@@ -736,7 +745,7 @@ cleanup instead of publishing. Ambiguous multipart completion, late PUT, or
 DELETE remains ledger-owned and `Quarantined` until reconciled. Object listing
 is never used to discover staged ownership.
 
-Reconciliation is operator-driven, never scanner-driven. The operator verifies
+For generic publications, reconciliation is operator-driven, never scanner-driven. The operator verifies
 provider-side object state for the operation's staged keys out-of-band and
 presents one of two verdicts through
 `ReconcileQuarantinedArtifactPublish`: every staged key verified absent with

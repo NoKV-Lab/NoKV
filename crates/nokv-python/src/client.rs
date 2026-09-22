@@ -39,11 +39,12 @@ use crate::local_adapter::{
 };
 use crate::object_store::{ConfiguredObjectStore, PythonObjectStoreConfig};
 use crate::python_value::{
-    aggregate_result_to_py, append_result_to_py, catalog_result_to_py,
-    find_workspaces_result_to_py, hex, parse_aggregates, parse_field_specs, parse_fixed_hex,
-    parse_predicates, parse_sort, path_metadata_to_py, path_page_to_py, publish_outcome_to_py,
-    read_outcome_to_py, search_result_to_py, snapshot_result_to_py, workspace_summary_to_py,
-    PythonAggregateSpec, PythonFieldSpec, PythonPredicateSpec, PythonSortSpec,
+    aggregate_result_to_py, append_result_to_py, catalog_result_to_py, cleanup_retry_receipt_to_py,
+    find_workspaces_result_to_py, hex, operation_token_to_py, parse_aggregates, parse_field_specs,
+    parse_fixed_hex, parse_predicates, parse_sort, path_metadata_to_py, path_page_to_py,
+    publish_outcome_to_py, read_outcome_to_py, search_result_to_py, snapshot_result_to_py,
+    workspace_summary_to_py, PythonAggregateSpec, PythonFieldSpec, PythonPredicateSpec,
+    PythonSortSpec,
 };
 use crate::routing::PythonRoutingConfig;
 
@@ -220,7 +221,7 @@ impl PythonWorkspaceClient {
         }
         let origin = match (at_snapshot, at_commit) {
             (Some(_), Some(_)) => {
-                return Err(value_error("give at_snapshot or at_commit, not both"))
+                return Err(value_error("give at_snapshot or at_commit, not both"));
             }
             (None, None) => return Err(value_error("give at_snapshot or at_commit")),
             (Some(value), None) => {
@@ -646,71 +647,128 @@ impl PythonWorkspaceClient {
         let call = py
             .detach(move || client.get_append_operation(operation_id))
             .map_err(|error| append_error(py, error, operation_id, None))?;
-        let recovery = nokv_client::append_operation_recovery(&call.value)
-            .map_err(|error| append_error(py, error, operation_id, None))?;
-        let status = &call.value;
-        let preparation = status
-            .append_preparation
-            .as_ref()
-            .ok_or_else(|| runtime_error("append status has no preparation"))?;
-        let dict = PyDict::new(py);
-        dict.set_item("status", "success")?;
-        dict.set_item("operation", "append")?;
-        dict.set_item("operation_id", hex(&status.token.operation_id.0))?;
-        dict.set_item("state", recovery.state.as_str())?;
-        dict.set_item("next_action", recovery.next_action.as_str())?;
-        dict.set_item("observed_state", format!("{:?}", status.state))?;
-        dict.set_item(
-            "publication_operation_id",
-            hex(&preparation.publication_operation_id.0),
-        )?;
-        dict.set_item("attempt", preparation.attempt)?;
-        dict.set_item(
-            "attempt_phase",
-            format!("{:?}", preparation.attempt_phase).to_ascii_lowercase(),
-        )?;
-        dict.set_item("activity_deadline_ms", preparation.activity_deadline_ms)?;
-        dict.set_item(
-            "workspace_incarnation_id",
-            hex(&preparation.workspace_incarnation_id.0),
-        )?;
-        dict.set_item("workbench_id", preparation.target.workbench.as_str())?;
-        dict.set_item("path", preparation.target.path.as_str())?;
-        let progress = PyDict::new(py);
-        progress.set_item("completed_rows", status.progress.completed_rows)?;
-        progress.set_item("total_rows", status.progress.total_rows)?;
-        progress.set_item("completed_bytes", status.progress.completed_bytes)?;
-        progress.set_item("total_bytes", status.progress.total_bytes)?;
-        dict.set_item("progress", progress)?;
-        let attempt_failure = preparation.attempt_failure.as_ref();
-        dict.set_item(
-            "cause_code",
-            attempt_failure.map(|failure| format!("{:?}", failure.code)),
-        )?;
-        dict.set_item(
-            "failure_message",
-            attempt_failure.map(|failure| failure.message.as_str()),
-        )?;
-        match attempt_failure {
-            Some(failure) => {
-                let details = PyDict::new(py);
-                details.set_item("code", format!("{:?}", failure.code))?;
-                details.set_item("message", &failure.message)?;
-                details.set_item("retryable", failure.retryable)?;
-                details.set_item(
-                    "conflict",
-                    failure.conflict.map(|conflict| format!("{conflict:?}")),
-                )?;
-                details.set_item("current_generation", failure.current_generation)?;
-                dict.set_item("attempt_failure", details)?;
-            }
-            None => dict.set_item("attempt_failure", py.None())?,
+        let dict = append_status_to_py(py, &call.value)?;
+        set_call_metadata(&dict, call.commit_version, call.replayed)?;
+        Ok(dict)
+    }
+
+    /// Inspect one bounded page of the current append's remaining staged objects.
+    /// Save the opaque cursor unchanged; it is fenced to this exact logical state.
+    #[pyo3(signature = (operation_id, *, cursor=None, limit=32))]
+    fn operation_inspect<'py>(
+        &self,
+        py: Python<'py>,
+        operation_id: &str,
+        cursor: Option<&Bound<'py, PyBytes>>,
+        limit: u32,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let operation_id = OperationIdentity(parse_fixed_hex("operation_id", operation_id)?);
+        let cursor = cursor.map(|value| value.as_bytes());
+        if cursor.is_some_and(|value| value.len() > PageRequest::MAX_CURSOR_BYTES) {
+            return Err(append_local_error(
+                py,
+                "inspection cursor exceeds its byte limit".to_owned(),
+                operation_id,
+                None,
+                "InvalidArgument",
+                None,
+            ));
         }
-        match &status.result {
-            Some(nokv_protocol::OperationResult::ArtifactAppend(result)) => {
-                dict.set_item("receipt", append_result_to_py(py, result)?)?;
-            }
-            _ => dict.set_item("receipt", py.None())?,
+        let page = PageRequest {
+            cursor: cursor.map(<[u8]>::to_vec),
+            limit,
+        };
+        let client = Arc::clone(&self.client);
+        let call = py
+            .detach(move || client.inspect_append_operation(operation_id, page))
+            .map_err(|error| append_error(py, error, operation_id, None))?;
+        let inspection = &call.value.inspection;
+        let dict = append_status_to_py(py, &inspection.operation)?;
+        dict.set_item("action", "inspect")?;
+        dict.set_item(
+            "operation_token",
+            operation_token_to_py(py, inspection.operation.token)?,
+        )?;
+        dict.set_item(
+            "publication_token",
+            operation_token_to_py(py, inspection.publication_token)?,
+        )?;
+        dict.set_item(
+            "object_namespace_id",
+            hex(&inspection.object_namespace_id.0),
+        )?;
+        dict.set_item("registered_count", inspection.registered_count)?;
+        dict.set_item("cleanup_cursor", inspection.cleanup_cursor)?;
+        dict.set_item("remaining_count", inspection.remaining_count)?;
+        let entries = PyList::empty(py);
+        for entry in &inspection.entries {
+            let row = PyDict::new(py);
+            row.set_item("sequence", entry.sequence)?;
+            row.set_item("object_identity", entry.object_identity.as_str())?;
+            row.set_item("expected_length", entry.expected_length)?;
+            row.set_item("expected_digest", entry.expected_digest.as_str())?;
+            row.set_item("multipart_token", entry.multipart_token.clone())?;
+            entries.append(row)?;
+        }
+        dict.set_item("entries", entries)?;
+        dict.set_item(
+            "next_cursor",
+            call.value
+                .next_cursor
+                .as_ref()
+                .map(|cursor| PyBytes::new(py, cursor)),
+        )?;
+        set_call_metadata(&dict, call.commit_version, call.replayed)?;
+        Ok(dict)
+    }
+
+    /// Ask the owner to retry quarantined cleanup without sending object bytes.
+    /// Reuse the inspected state digest to replay one durable recovery request.
+    #[pyo3(signature = (operation_id, expected_state_digest=None))]
+    fn operation_recover<'py>(
+        &self,
+        py: Python<'py>,
+        operation_id: &str,
+        expected_state_digest: Option<&str>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let operation_id = OperationIdentity(parse_fixed_hex("operation_id", operation_id)?);
+        let expected = expected_state_digest
+            .map(|value| {
+                parse_fixed_hex("expected_state_digest", value).map(|digest| {
+                    nokv_protocol::OperationToken {
+                        operation_id,
+                        state_digest: nokv_protocol::Digest(digest),
+                    }
+                })
+            })
+            .transpose()
+            .map_err(|error| {
+                append_local_error(
+                    py,
+                    error.to_string(),
+                    operation_id,
+                    None,
+                    "InvalidArgument",
+                    None,
+                )
+            })?;
+        let client = Arc::clone(&self.client);
+        let call = py
+            .detach(move || client.recover_append_operation(operation_id, expected))
+            .map_err(|error| append_error(py, error, operation_id, None))?;
+        let dict = append_status_to_py(py, &call.value.operation)?;
+        dict.set_item("action", "recover")?;
+        dict.set_item(
+            "operation_token",
+            operation_token_to_py(py, call.value.operation.token)?,
+        )?;
+        dict.set_item("requested", call.value.requested)?;
+        match &call.value.receipt {
+            Some(receipt) => dict.set_item(
+                "recovery_receipt",
+                cleanup_retry_receipt_to_py(py, receipt)?,
+            )?,
+            None => dict.set_item("recovery_receipt", py.None())?,
         }
         set_call_metadata(&dict, call.commit_version, call.replayed)?;
         Ok(dict)
@@ -1700,6 +1758,79 @@ fn validate_list_page_fence(
     Ok(())
 }
 
+fn append_status_to_py<'py>(
+    py: Python<'py>,
+    status: &nokv_protocol::OperationStatus,
+) -> PyResult<Bound<'py, PyDict>> {
+    let recovery = nokv_client::append_operation_recovery(status)
+        .map_err(|error| append_error(py, error, status.token.operation_id, None))?;
+    let preparation = status
+        .append_preparation
+        .as_ref()
+        .ok_or_else(|| runtime_error("append status has no preparation"))?;
+    let dict = PyDict::new(py);
+    dict.set_item("status", "success")?;
+    dict.set_item("operation", "append")?;
+    dict.set_item("operation_id", hex(&status.token.operation_id.0))?;
+    dict.set_item("state", recovery.state.as_str())?;
+    dict.set_item("next_action", recovery.next_action.as_str())?;
+    dict.set_item("observed_state", format!("{:?}", status.state))?;
+    dict.set_item(
+        "publication_operation_id",
+        hex(&preparation.publication_operation_id.0),
+    )?;
+    dict.set_item("attempt", preparation.attempt)?;
+    dict.set_item("cleanup_retry_count", preparation.cleanup_retry_count)?;
+    dict.set_item(
+        "attempt_phase",
+        format!("{:?}", preparation.attempt_phase).to_ascii_lowercase(),
+    )?;
+    dict.set_item("activity_deadline_ms", preparation.activity_deadline_ms)?;
+    dict.set_item(
+        "workspace_incarnation_id",
+        hex(&preparation.workspace_incarnation_id.0),
+    )?;
+    dict.set_item("workbench_id", preparation.target.workbench.as_str())?;
+    dict.set_item("path", preparation.target.path.as_str())?;
+    let progress = PyDict::new(py);
+    progress.set_item("completed_rows", status.progress.completed_rows)?;
+    progress.set_item("total_rows", status.progress.total_rows)?;
+    progress.set_item("completed_bytes", status.progress.completed_bytes)?;
+    progress.set_item("total_bytes", status.progress.total_bytes)?;
+    dict.set_item("progress", progress)?;
+    let attempt_failure = preparation.attempt_failure.as_ref();
+    dict.set_item(
+        "cause_code",
+        attempt_failure.map(|failure| format!("{:?}", failure.code)),
+    )?;
+    dict.set_item(
+        "failure_message",
+        attempt_failure.map(|failure| failure.message.as_str()),
+    )?;
+    match attempt_failure {
+        Some(failure) => {
+            let details = PyDict::new(py);
+            details.set_item("code", format!("{:?}", failure.code))?;
+            details.set_item("message", &failure.message)?;
+            details.set_item("retryable", failure.retryable)?;
+            details.set_item(
+                "conflict",
+                failure.conflict.map(|conflict| format!("{conflict:?}")),
+            )?;
+            details.set_item("current_generation", failure.current_generation)?;
+            dict.set_item("attempt_failure", details)?;
+        }
+        None => dict.set_item("attempt_failure", py.None())?,
+    }
+    match &status.result {
+        Some(nokv_protocol::OperationResult::ArtifactAppend(result)) => {
+            dict.set_item("receipt", append_result_to_py(py, result)?)?;
+        }
+        _ => dict.set_item("receipt", py.None())?,
+    }
+    Ok(dict)
+}
+
 fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
@@ -1737,6 +1868,40 @@ fn append_error(
     operation_id: OperationIdentity,
     expected: Option<WorkspaceIdentity>,
 ) -> PyErr {
+    if let ClientError::AppendCleanupUnresolved {
+        expected_token,
+        receipt,
+        ..
+    } = &error
+    {
+        let message = error.to_string();
+        let cause_code = client_error_failure(&error).map(|failure| format!("{:?}", failure.code));
+        return py
+            .import("nokv")
+            .and_then(|module| module.getattr("AppendError"))
+            .and_then(|class| {
+                let recovery_receipt = receipt
+                    .as_deref()
+                    .map(|value| cleanup_retry_receipt_to_py(py, value))
+                    .transpose()?;
+                class.call1((
+                    message.clone(),
+                    hex(&operation_id.0),
+                    None::<String>,
+                    "AppendCleanupUnresolved",
+                    None::<String>,
+                    cause_code,
+                    "retry_same_cleanup",
+                    receipt
+                        .as_ref()
+                        .map(|value| hex(&value.publication_operation_id.0)),
+                    hex(&expected_token.state_digest.0),
+                    recovery_receipt,
+                ))
+            })
+            .map(PyErr::from_value)
+            .unwrap_or_else(|_| PyRuntimeError::new_err(message));
+    }
     let identity = hex(&operation_id.0);
     let expected = expected.map(|value| hex(&value.0));
     let state = match &error {
@@ -1809,6 +1974,7 @@ fn client_error_failure(error: &ClientError) -> Option<&nokv_protocol::RpcFailur
         ClientError::Rpc(failure) => Some(failure),
         ClientError::ArtifactPublishFailed { source, .. }
         | ClientError::AppendUnresolved { source, .. }
+        | ClientError::AppendCleanupUnresolved { source, .. }
         | ClientError::RetryExhausted {
             last_error: source, ..
         } => client_error_failure(source),
@@ -1831,6 +1997,7 @@ fn client_error_code(error: &ClientError) -> Option<nokv_protocol::ErrorCode> {
         ClientError::Rpc(failure) => Some(failure.code),
         ClientError::ArtifactPublishFailed { source, .. }
         | ClientError::AppendUnresolved { source, .. }
+        | ClientError::AppendCleanupUnresolved { source, .. }
         | ClientError::RetryExhausted {
             last_error: source, ..
         } => client_error_code(source),

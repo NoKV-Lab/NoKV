@@ -10,6 +10,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
+
 pub const DEFAULT_METADATA_ADDRESS: &str = "127.0.0.1:7750";
 pub const DEFAULT_SERVER_BIND: &str = "127.0.0.1:7750";
 pub const DEFAULT_MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
@@ -138,6 +141,15 @@ pub enum Command {
     OperationStatus {
         operation_id: [u8; 16],
     },
+    OperationInspect {
+        operation_id: [u8; 16],
+        limit: u32,
+        cursor: Option<Vec<u8>>,
+    },
+    OperationRecover {
+        operation_id: [u8; 16],
+        expected_state_digest: Option<[u8; 32]>,
+    },
     Provision {
         logical_shard_id: String,
         adopt_legacy_object_namespace: bool,
@@ -203,10 +215,23 @@ pub enum CliError {
     UnknownOption(String),
     UnknownCommand(String),
     UnexpectedArgument(String),
-    InvalidNumber { option: &'static str, value: String },
-    InvalidAddress { option: &'static str, value: String },
-    InvalidOption { option: &'static str, value: String },
+    InvalidNumber {
+        option: &'static str,
+        value: String,
+    },
+    InvalidAddress {
+        option: &'static str,
+        value: String,
+    },
+    InvalidOption {
+        option: &'static str,
+        value: String,
+    },
     InvalidRequestId(String),
+    OperationInput {
+        operation_id: [u8; 16],
+        message: String,
+    },
     MixedRoutingOptions,
     MixedMetadataStoreOptions,
     LocalOnlyRecoverLog,
@@ -237,6 +262,7 @@ impl fmt::Display for CliError {
                 formatter,
                 "--request-id must be exactly 32 lowercase hexadecimal characters, got {value:?}"
             ),
+            Self::OperationInput { message, .. } => formatter.write_str(message),
             Self::MixedRoutingOptions => formatter.write_str(
                 "static metadata routing options and etcd routing options cannot be combined",
             ),
@@ -507,7 +533,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
                         return Err(CliError::InvalidOption {
                             option: "--recovery-publication",
                             value,
-                        })
+                        });
                     }
                 };
             }
@@ -558,6 +584,8 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             | Command::Collect { .. }
             | Command::WorkspacePath(_)
             | Command::OperationStatus { .. }
+            | Command::OperationInspect { .. }
+            | Command::OperationRecover { .. }
             | Command::Provision { .. }
     ) && agent_id.is_none()
     {
@@ -647,15 +675,93 @@ fn parse_operation(arguments: &mut impl Iterator<Item = String>) -> Result<Comma
     let operation = arguments
         .next()
         .ok_or(CliError::MissingArgument("operation command"))?;
-    if operation != "status" {
+    if !matches!(operation.as_str(), "status" | "inspect" | "recover") {
         return Err(CliError::UnknownCommand(format!("operation {operation}")));
     }
     let identity = arguments
         .next()
         .ok_or(CliError::MissingArgument("operation identity"))?;
-    Ok(Command::OperationStatus {
-        operation_id: parse_append_identity("operation identity", identity)?,
+    let operation_id = parse_append_identity("operation identity", identity)?;
+    if operation == "status" {
+        return Ok(Command::OperationStatus { operation_id });
+    }
+    parse_operation_options(&operation, operation_id, arguments).map_err(|error| {
+        CliError::OperationInput {
+            operation_id,
+            message: error.to_string(),
+        }
     })
+}
+
+fn parse_operation_options(
+    operation: &str,
+    operation_id: [u8; 16],
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<Command, CliError> {
+    let mut limit = None;
+    let mut cursor = None;
+    let mut expected_state_digest = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--limit" if operation == "inspect" && limit.is_none() => {
+                let value = next_value(arguments, &argument)?;
+                let parsed = parse_number::<u32>("--limit", value.clone())?;
+                if !(1..=nokv_client::MAX_APPEND_INSPECTION_LIMIT).contains(&parsed) {
+                    return Err(CliError::InvalidOption {
+                        option: "--limit",
+                        value,
+                    });
+                }
+                limit = Some(parsed);
+            }
+            "--cursor" if operation == "inspect" && cursor.is_none() => {
+                let value = next_value(arguments, &argument)?;
+                let maximum = nokv_protocol::PageRequest::MAX_CURSOR_BYTES;
+                if value.len() > maximum.div_ceil(3) * 4 {
+                    return Err(CliError::InvalidOption {
+                        option: "--cursor",
+                        value,
+                    });
+                }
+                let decoded = STANDARD
+                    .decode(&value)
+                    .map_err(|_| CliError::InvalidOption {
+                        option: "--cursor",
+                        value: value.clone(),
+                    })?;
+                if decoded.len() > maximum {
+                    return Err(CliError::InvalidOption {
+                        option: "--cursor",
+                        value,
+                    });
+                }
+                cursor = Some(decoded);
+            }
+            "--expected-state-digest"
+                if operation == "recover" && expected_state_digest.is_none() =>
+            {
+                let value = next_value(arguments, &argument)?;
+                expected_state_digest =
+                    Some(decode_fixed_hex(&value).ok_or(CliError::InvalidOption {
+                        option: "--expected-state-digest",
+                        value,
+                    })?);
+            }
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    if operation == "inspect" {
+        Ok(Command::OperationInspect {
+            operation_id,
+            limit: limit.unwrap_or(nokv_client::DEFAULT_APPEND_INSPECTION_LIMIT),
+            cursor,
+        })
+    } else {
+        Ok(Command::OperationRecover {
+            operation_id,
+            expected_state_digest,
+        })
+    }
 }
 
 fn parse_mcp(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
@@ -710,7 +816,7 @@ fn parse_workspace_path(arguments: &mut impl Iterator<Item = String>) -> Result<
         _ => {
             return Err(CliError::UnknownCommand(format!(
                 "workspace-path {operation}"
-            )))
+            )));
         }
     };
 
@@ -945,20 +1051,24 @@ fn parse_address(option: &'static str, value: String) -> Result<SocketAddr, CliE
 }
 
 fn parse_request_id(value: String) -> Result<[u8; 16], CliError> {
-    if value.len() != 32
+    decode_fixed_hex(&value).ok_or(CliError::InvalidRequestId(value))
+}
+
+fn decode_fixed_hex<const WIDTH: usize>(value: &str) -> Option<[u8; WIDTH]> {
+    if value.len() != WIDTH * 2
         || !value
             .as_bytes()
             .iter()
             .copied()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
-        return Err(CliError::InvalidRequestId(value));
+        return None;
     }
-    let mut decoded = [0_u8; 16];
+    let mut decoded = [0_u8; WIDTH];
     for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         decoded[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
     }
-    Ok(decoded)
+    Some(decoded)
 }
 
 fn hex_nibble(byte: u8) -> u8 {
@@ -1151,6 +1261,83 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "unexpected",
         ]))
+        .is_err());
+    }
+
+    #[test]
+    fn operation_inspection_and_recovery_preserve_cursor_and_exact_token() {
+        let parse_command = |tail: &[&str]| {
+            let mut input = vec![
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "operation",
+            ];
+            input.extend_from_slice(tail);
+            parse(args(&input))
+        };
+        let identity = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let inspected = parse_command(&["inspect", identity]).unwrap();
+        assert_eq!(
+            inspected.command,
+            Command::OperationInspect {
+                operation_id: [0xaa; 16],
+                limit: 32,
+                cursor: None,
+            }
+        );
+        assert!(inspected.client.object.bucket.is_none());
+        assert!(inspected.workbench_root.is_none());
+        assert_eq!(
+            parse_command(&["inspect", identity, "--limit", "192", "--cursor", "AQID"])
+                .unwrap()
+                .command,
+            Command::OperationInspect {
+                operation_id: [0xaa; 16],
+                limit: 192,
+                cursor: Some(vec![1, 2, 3])
+            }
+        );
+        assert_eq!(
+            parse_command(&["recover", identity]).unwrap().command,
+            Command::OperationRecover {
+                operation_id: [0xaa; 16],
+                expected_state_digest: None
+            }
+        );
+        assert_eq!(
+            parse_command(&[
+                "recover",
+                identity,
+                "--expected-state-digest",
+                &"bb".repeat(32)
+            ])
+            .unwrap()
+            .command,
+            Command::OperationRecover {
+                operation_id: [0xaa; 16],
+                expected_state_digest: Some([0xbb; 32])
+            }
+        );
+        for tail in [
+            vec!["inspect", identity, "--limit", "0"],
+            vec!["inspect", identity, "--limit", "193"],
+            vec!["inspect", identity, "--cursor", "%%%"],
+            vec!["inspect", identity, "--limit", "1", "--limit", "2"],
+            vec!["recover", identity, "--expected-state-digest", "aa"],
+            vec!["recover", identity, "--limit", "1"],
+        ] {
+            assert!(
+                matches!(parse_command(&tail), Err(CliError::OperationInput { operation_id, .. }) if operation_id == [0xaa; 16]),
+                "{tail:?}"
+            );
+        }
+        assert!(parse_command(&["inspect", identity, "--cursor", &"A".repeat(6000)]).is_err());
+        assert!(parse_command(&[
+            "recover",
+            identity,
+            "--expected-state-digest",
+            &"BB".repeat(32)
+        ])
         .is_err());
     }
 

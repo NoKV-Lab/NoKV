@@ -107,7 +107,7 @@ This reserves both markers, places a child's delimiter rollup before its exact
 artifact and both before longer siblings, and prevents an exact key from being
 a strict prefix of another valid path key. The same normalizer/codec owns
 storage keys, request identities, index identities, and restore member ids.
-System format version 9 retains and gates this layout.
+System format version 13 retains and gates this layout.
 
 Directories are implicit. The Workbench root and five standard sections are
 virtual. A file stat is a point read; an implicit-directory stat is a prefix
@@ -159,7 +159,9 @@ continuations retain one exact root read version. Live continuations may move
 to a newer root read version only while the target workspace incarnation and
 revision remain unchanged; target drift fails closed, and an initial bounded
 collection may restart in full but never merges workspace revisions. This
-contract is gated by operation schema `nokv.workspace.rpc.v11`; v11 adds durable logical append parents,
+contract is gated by operation schema `nokv.workspace.rpc.v12`; v12 adds
+metadata-only append ledger inspection and exact-token owner cleanup retry.
+V11 added durable logical append parents,
 predecessor-fenced publication attempts, and metadata-only append status. The
 initial exact append-intent binding was introduced by v10. v7 added the
 exact read-version fence used by path point reads, v8 added the required typed
@@ -170,13 +172,13 @@ added the provider-neutral object namespace identity to every root route.
 
 Each TCP connection starts with the fixed-width, schema-neutral transport
 handshake v1. The client offers one exact operation schema, and the server
-accepts only `nokv.workspace.rpc.v11`; the handshake version remains stable when
+accepts only `nokv.workspace.rpc.v12`; the handshake version remains stable when
 the operation schema changes. For upgrade diagnostics, the server recognizes
 only operation-first envelopes from the public v2 client and the post-tag v3
 client. It parses a bounded route/request header, ignores the operation, emits
 one schema-readable failure, and closes without dispatch. The v2 client gets
-its exact v2 failure envelope; the v3 client gets a v11 failure envelope so its
-decoder reports the v11/v3 schema mismatch. Unknown legacy schemas, malformed
+its exact v2 failure envelope; the v3 client gets a v12 failure envelope so its
+decoder reports the v12/v3 schema mismatch. Unknown legacy schemas, malformed
 envelopes, and malformed handshakes fail closed. This is a read-only rejection
 path, not a legacy response decoder or operation fallback.
 

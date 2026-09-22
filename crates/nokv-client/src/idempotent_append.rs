@@ -100,7 +100,7 @@ pub enum AppendNextAction {
     None,
     Poll,
     ResubmitSame,
-    OperatorReconcile,
+    RetryCleanup,
 }
 
 impl AppendNextAction {
@@ -109,7 +109,7 @@ impl AppendNextAction {
             Self::None => "none",
             Self::Poll => "poll",
             Self::ResubmitSame => "resubmit_same",
-            Self::OperatorReconcile => "operator_reconcile",
+            Self::RetryCleanup => "retry_cleanup",
         }
     }
 }
@@ -160,7 +160,7 @@ pub fn append_operation_recovery(status: &OperationStatus) -> Result<AppendRecov
         },
         AppendAttemptPhase::Quarantined => AppendRecovery {
             state: AppendRecoveryState::Quarantined,
-            next_action: AppendNextAction::OperatorReconcile,
+            next_action: AppendNextAction::RetryCleanup,
         },
         AppendAttemptPhase::Uploading
         | AppendAttemptPhase::Finalizing
@@ -688,6 +688,7 @@ mod tests {
                 artifact_revision_id,
                 attempt_phase: AppendAttemptPhase::Published,
                 attempt_failure: None,
+                cleanup_retry_count: 0,
                 activity_deadline_ms: 1234,
             })),
             publish_preparation: None,

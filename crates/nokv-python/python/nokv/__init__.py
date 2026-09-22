@@ -38,8 +38,12 @@ class AppendError(RuntimeError):
     published. Retry the same intent with the same ``operation_id``; do not
     generate a replacement identity to bypass an unresolved operation. Query
     ``Client.operation_status`` and follow its ``next_action``; the exception's
-    ``next_action`` is conservatively ``query_same``. A publication identity is
-    not inferred from an error and remains ``None`` until observed by a query.
+    ``next_action`` is conservatively ``query_same`` for append errors.
+    ``AppendCleanupUnresolved`` instead supplies ``retry_same_cleanup`` and an
+    ``expected_state_digest``: pass that same digest to ``operation_recover``
+    after an uncertain reply. An already observed ``recovery_receipt`` and its
+    publication identity are retained even when the later status query fails.
+    Without an observed receipt, the publication identity remains ``None``.
     ``cause_code`` preserves the underlying RPC code, for example
     ``RequestReplayMismatch`` for a permanently mismatched intent, or ``None``
     when there is no RPC failure. ``retryable`` is always false: generic retry
@@ -56,6 +60,8 @@ class AppendError(RuntimeError):
         cause_code: str | None = None,
         next_action: str = "query_same",
         publication_operation_id: str | None = None,
+        expected_state_digest: str | None = None,
+        recovery_receipt: dict | None = None,
     ) -> None:
         super().__init__(message)
         self.operation_id = operation_id
@@ -66,6 +72,8 @@ class AppendError(RuntimeError):
         self.retryable = False
         self.next_action = next_action
         self.publication_operation_id = publication_operation_id
+        self.expected_state_digest = expected_state_digest
+        self.recovery_receipt = recovery_receipt
 
 
 class WorkspaceIncarnationMismatch(RuntimeError):

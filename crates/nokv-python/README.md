@@ -89,13 +89,34 @@ not for installing the SDK.
   lazily on object operations, so a fresh status client works during an S3
   outage. The result reports `state` and `next_action` from the shared Rust SDK:
   `committed/none` with the original `receipt`, `pending/poll`,
-  `ready_to_retry/resubmit_same`, or `quarantined/operator_reconcile`. It also
+  `ready_to_retry/resubmit_same`, or `quarantined/retry_cleanup`. It also
   contains the logical and publication identities, attempt number and phase,
   activity deadline, original target and incarnation, progress, `cause_code`,
   `failure_message`, and `attempt_failure` for a failed physical attempt. The
   logical operation may still be `ready_to_retry` while retaining that failure.
   A query never advances an attempt. Retain or reproduce the original delta
   until commitment; follow `resubmit_same` using `append_bytes`.
+- `Client.operation_inspect(operation_id, *, cursor=None, limit=32)` returns the
+  same status plus logical `operation_token`, child `publication_token`, object
+  namespace, `registered_count`, `cleanup_cursor`, `remaining_count`, and a page
+  of retained staged `entries`. Each entry has `sequence`, `object_identity`,
+  `expected_length`, `expected_digest`, and optional `multipart_token`. Retired
+  keys are not a historical inventory. The limit is 1 to 192; `next_cursor` is
+  opaque `bytes` or `None`. Continue with the unchanged cursor. A changed state
+  returns `Conflict`; restart inspection rather than combining different pages.
+- `Client.operation_recover(operation_id, expected_state_digest=None)` asks the
+  owner to retry quarantined cleanup. Both inspection and recovery are metadata
+  only and work with `Client(root_id, routing)` without S3 credentials. Persist
+  the inspected `operation_token["state_digest"]` (a lowercase hex string) and
+  pass it on every retry of one recovery request. `requested=True` means durable
+  acceptance, including replay; `recovery_receipt` preserves that round's
+  logical id, publication id, cleanup retry count, and expected state digest.
+  Top-level status is a fresh observation and may be newer than the receipt.
+  Acceptance is not cleanup completion. Without a digest, the method targets
+  the current state once and is a no-op for pending, cleaned, or committed
+  operations. A later quarantine requires a new intentional recovery request.
+  When status reaches `ready_to_retry`, redeliver the original append inputs;
+  recovery does not reconstruct or publish the delta.
 - Append and status failures carry `operation_id`, observed `state`, `code`,
   expected incarnation in `expected`, `cause_code`, and `next_action=query_same`.
   `publication_operation_id` is `None` until status supplies an observed
@@ -105,6 +126,10 @@ not for installing the SDK.
   lifecycle, so recover the original intent instead of blindly resubmitting.
   `retryable` is false for generic retry handlers. An unknown result or a
   `NotFound` observation never authorizes a replacement logical identity.
+  Cleanup errors use `code=AppendCleanupUnresolved` and
+  `next_action=retry_same_cleanup`, retain `expected_state_digest`, and expose
+  any known `recovery_receipt` and its publication id. Retry using that exact
+  digest; do not automatically choose a fresh token after a lost reply.
 - `WorkbenchFileSystem` is an fsspec compatibility adapter bound to one explicit
   Workbench. Paths must be one of `input`, `scripts`, `outputs`, `logs`, or
   `metadata`, optionally followed by an artifact-relative path. Sections and

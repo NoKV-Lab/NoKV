@@ -2508,7 +2508,8 @@ fn is_append_retry_error(error: &ClientError) -> bool {
         | ClientError::ArtifactIntegrity(_)
         | ClientError::Object(_)
         | ClientError::ArtifactUpload(_)
-        | ClientError::AppendUnresolved { .. } => false,
+        | ClientError::AppendUnresolved { .. }
+        | ClientError::AppendCleanupUnresolved { .. } => false,
     }
 }
 

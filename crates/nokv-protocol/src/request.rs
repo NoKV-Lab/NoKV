@@ -96,6 +96,8 @@ pub enum WorkspaceRequest {
     ReadRestoreSourceRunManifest(ReadRestoreSourceRunManifestRequest),
     FinalizeRestore(FinalizeRestoreRequest),
     GetOperation(GetOperationRequest),
+    InspectAppendCleanup(crate::InspectAppendCleanupRequest),
+    RetryAppendCleanup(crate::RetryAppendCleanupRequest),
     BeginGenericIndexRegistration(BeginGenericIndexRegistrationRequest),
     AppendGenericIndexRows(AppendGenericIndexRowsRequest),
     FinalizeGenericIndexRegistration(FinalizeGenericIndexRegistrationRequest),
@@ -136,6 +138,8 @@ impl WorkspaceRequest {
             Self::ReadRestoreSourceRunManifest(request) => request.validate(),
             Self::FinalizeRestore(request) => request.validate(),
             Self::GetOperation(request) => request.validate(),
+            Self::InspectAppendCleanup(request) => request.validate(),
+            Self::RetryAppendCleanup(_) => Ok(()),
             Self::BeginGenericIndexRegistration(request) => request.validate(),
             Self::AppendGenericIndexRows(request) => request.validate(),
             Self::FinalizeGenericIndexRegistration(request) => request.validate(),
@@ -718,8 +722,6 @@ pub enum QuarantineResolution {
     /// revision was never published; the revision identity is released for a
     /// fresh publication.
     ProviderObjectsAbsent,
-    /// Failed append keys are permanently sealed against delayed immutable creates.
-    ProviderObjectsSealed,
     /// The artifact revision is already published; staged provider keys are
     /// the published revision's live objects and only this operation's
     /// private bookkeeping rows are removed.

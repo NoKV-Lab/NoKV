@@ -41,10 +41,10 @@ use super::publication_records::{
     PublicationRecordCodecError, RevisionRefRecord, WorkspaceRecord,
 };
 use super::publish_operation_records::{
-    AppendOperationRecord, ArtifactManifestRow, ManifestPosition, PublishAuthority, PublishClaim,
-    PublishOperationRecord, PublishRecordError, PublishResult, PublishTerminalError,
-    PublishTerminalErrorKind, PublishTransition, StagedObjectRecord, MAX_DEPENDENCY_COUNT,
-    MAX_MANIFEST_ROWS, MAX_STAGED_OBJECTS,
+    AppendCleanupRetryReceipt, AppendOperationRecord, ArtifactManifestRow, ManifestPosition,
+    PublishAuthority, PublishClaim, PublishOperationRecord, PublishRecordError, PublishResult,
+    PublishTerminalError, PublishTerminalErrorKind, PublishTransition, StagedObjectRecord,
+    MAX_DEPENDENCY_COUNT, MAX_MANIFEST_ROWS, MAX_STAGED_OBJECTS,
 };
 use super::query_records::{
     secondary_index_key, ChangeEventKind, ChangeEventRecord, QueryRecordError,
@@ -56,6 +56,42 @@ use super::restore_records::{
     RestoreManifestPublication, RestoreOperationRecord, RestoreRecordError,
     RESTORE_MANIFEST_CONTENT_TYPE,
 };
+
+/// Exact logical token binds both current parent mapping and all mutable child progress.
+pub fn append_operation_state_digest(
+    parent: &AppendOperationRecord,
+    child: &PublishOperationRecord,
+) -> Result<[u8; SHA256_BYTES], PublishRecordError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.append.state.v1\0");
+    hasher.update(parent.encode()?);
+    hasher.update(Sha256::digest(child.encode()?));
+    Ok(hasher.finalize().into())
+}
+
+fn append_cleanup_retry_request_id(
+    root: RootId,
+    operation: OperationId,
+    state: [u8; SHA256_BYTES],
+) -> RequestId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.append.cleanup-retry.request.v1\0");
+    hasher.update(root.as_bytes());
+    hasher.update(operation.as_bytes());
+    hasher.update(state);
+    let digest = hasher.finalize();
+    let mut id = [0; 16];
+    id.copy_from_slice(&digest[..16]);
+    RequestId::from_bytes(id)
+}
+
+/// One durable cleanup enqueue receipt plus this invocation's replay metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppendCleanupRetryOutcome {
+    pub receipt: AppendCleanupRetryReceipt,
+    pub commit_version: CommitVersion,
+    pub replayed: bool,
+}
 
 /// Maximum rows admitted by one recoverable publication batch.
 pub const MAX_PUBLICATION_BATCH_ROWS: usize = 192;
@@ -179,9 +215,6 @@ pub enum QuarantineReconcileResolution {
     /// was never published. Reconciliation releases the revision identity for
     /// a fresh begin.
     RevisionUnpublished,
-    /// Every failed append key is permanently sealed against delayed immutable
-    /// creates. The unpublished revision identity remains reserved forever.
-    RevisionUnpublishedSealed,
     /// The artifact revision is already published, so the staged provider
     /// keys are the published revision's live objects and must not be touched.
     /// Only this operation's private bookkeeping rows are removed.
@@ -871,6 +904,7 @@ fn validate_begin_request(request: &BeginPublishRequest) -> Result<(), Publicati
         || request.operation.manifest_last_position.is_some()
         || request.operation.cleanup_staged_object_cursor != 0
         || request.operation.cleanup_manifest_cursor != 0
+        || request.operation.cleanup_retry_count != 0
     {
         return Err(PublicationError::InvalidOperationSeal {
             seal: "initial cursor",
@@ -1415,7 +1449,6 @@ fn finalization_takeover_absence_proof(
 fn reconcile_resolution_label(resolution: QuarantineReconcileResolution) -> &'static str {
     match resolution {
         QuarantineReconcileResolution::RevisionUnpublished => "revision-unpublished",
-        QuarantineReconcileResolution::RevisionUnpublishedSealed => "revision-unpublished-sealed",
         QuarantineReconcileResolution::RevisionPublished => "revision-published",
     }
 }
@@ -1438,7 +1471,6 @@ fn reconcile_evidence_digest(
     hasher.update(b"nokv.publish.reconcile-evidence.v1\0");
     hasher.update([match resolution {
         QuarantineReconcileResolution::RevisionUnpublished => 1,
-        QuarantineReconcileResolution::RevisionUnpublishedSealed => 3,
         QuarantineReconcileResolution::RevisionPublished => 2,
     }]);
     match original_evidence_digest {
@@ -2899,23 +2931,14 @@ impl PublicationService<'_> {
         let revision_key = artifact_revision_key(context.root_id, operation.artifact_revision_id);
         let payload =
             self.read_payload(context, MetadataFamily::ArtifactRevision, &revision_key)?;
-        if operation.append_attempt.is_some()
-            != matches!(
-                resolution,
-                QuarantineReconcileResolution::RevisionUnpublishedSealed
-            )
-        {
+        if operation.append_attempt.is_some() {
             return Err(PublicationError::ReconcileResolutionMismatch {
                 resolution,
                 revision_published: payload.is_some(),
             });
         }
         match (resolution, payload) {
-            (
-                QuarantineReconcileResolution::RevisionUnpublished
-                | QuarantineReconcileResolution::RevisionUnpublishedSealed,
-                None,
-            ) => {
+            (QuarantineReconcileResolution::RevisionUnpublished, None) => {
                 plan.assert_value(MetadataFamily::ArtifactRevision, revision_key, None)?;
             }
             (QuarantineReconcileResolution::RevisionPublished, Some(payload)) => {
@@ -3453,7 +3476,171 @@ impl PublicationService<'_> {
                 seal: "append revision reservation",
             });
         }
-        plan.assert_value(MetadataFamily::ArtifactRevision, key, Some(payload))
+        if !plan
+            .exact_keys
+            .contains(&(MetadataFamily::ArtifactRevision, key.clone()))
+        {
+            plan.assert_value(MetadataFamily::ArtifactRevision, key, Some(payload))?;
+        }
+        Ok(())
+    }
+
+    /// Require permanent ownership and absence of a published revision before
+    /// abandoned append cleanup. Live workspace bindings are intentionally irrelevant.
+    fn predicate_append_cleanup_reservation(
+        &self,
+        context: PublicationContext,
+        operation: &PublishOperationRecord,
+        plan: &mut CommandPlan,
+    ) -> Result<(), PublicationError> {
+        self.predicate_append_revision_reservation(context, operation, plan)?;
+        let key = artifact_revision_key(context.root_id, operation.artifact_revision_id);
+        if self
+            .read_payload(context, MetadataFamily::ArtifactRevision, &key)?
+            .is_some()
+        {
+            return Err(PublicationError::InvalidOperationSeal {
+                seal: "append cleanup requires an unpublished revision",
+            });
+        }
+        if !plan
+            .exact_keys
+            .contains(&(MetadataFamily::ArtifactRevision, key.clone()))
+        {
+            plan.assert_value(MetadataFamily::ArtifactRevision, key, None)?;
+        }
+        Ok(())
+    }
+
+    /// Read-only authority check immediately before an owner seals an abandoned
+    /// append object. No provider outcome supplied by a caller can bypass this gate.
+    pub fn validate_append_cleanup_authority(
+        &self,
+        context: PublicationContext,
+        operation: &PublishOperationRecord,
+    ) -> Result<(), PublicationError> {
+        validate_operation_seals(operation)?;
+        require_operation_phase(operation, PublishPhase::Cleaning)?;
+        if operation.append_attempt.is_none() {
+            return Err(PublicationError::OperationInputMismatch);
+        }
+        self.require_current_operation(context, operation)?;
+        let mut plan = CommandPlan::default();
+        self.predicate_append_authority(context, operation, &mut plan)?;
+        self.predicate_append_cleanup_reservation(context, operation, &mut plan)
+    }
+
+    /// Atomically accept one exact quarantined state for owner cleanup. The
+    /// deterministic request identity and full-token receipt survive ACK loss,
+    /// owner restart, later failure, and parent advancement without an ABA retry.
+    pub fn retry_append_cleanup(
+        &self,
+        mut context: PublicationContext,
+        operation_id: OperationId,
+        expected_state_digest: [u8; SHA256_BYTES],
+    ) -> Result<AppendCleanupRetryOutcome, PublicationError> {
+        context.request_id =
+            append_cleanup_retry_request_id(context.root_id, operation_id, expected_state_digest);
+        if let Some(replay) = self.store.lookup_request_result(
+            context.root_id,
+            context.placement_generation,
+            context.owner_epoch,
+            context.request_id,
+        )? {
+            let receipt = AppendCleanupRetryReceipt::decode(&replay.deterministic_result)?;
+            if receipt.operation_id != operation_id
+                || receipt.expected_state_digest != expected_state_digest
+            {
+                return Err(PublicationError::OperationInputMismatch);
+            }
+            return Ok(AppendCleanupRetryOutcome {
+                receipt,
+                commit_version: replay.commit_version,
+                replayed: true,
+            });
+        }
+        let parent_payload = self
+            .read_payload(
+                context,
+                MetadataFamily::Operation,
+                &operation_key(context.root_id, OperationKind::Append, operation_id),
+            )?
+            .ok_or(PublicationError::OperationInputMismatch)?;
+        let parent = AppendOperationRecord::decode(&parent_payload)?;
+        if parent.operation_id != operation_id {
+            return Err(PublicationError::OperationInputMismatch);
+        }
+        let child_key = operation_key(
+            context.root_id,
+            OperationKind::Publish,
+            parent.publication_operation_id,
+        );
+        let child_payload = self
+            .read_payload(context, MetadataFamily::Operation, &child_key)?
+            .ok_or(PublicationError::OperationInputMismatch)?;
+        let child = PublishOperationRecord::decode(&child_payload)?;
+        validate_operation_seals(&child)?;
+        if !parent.matches_publication(&child)
+            || parent.result.is_some()
+            || append_operation_state_digest(&parent, &child)? != expected_state_digest
+        {
+            return Err(PublicationError::ConcurrentMutation);
+        }
+        require_operation_phase(&child, PublishPhase::Quarantined)?;
+        let mut next = child.clone();
+        next.retry_append_cleanup()?;
+        let receipt = AppendCleanupRetryReceipt {
+            operation_id,
+            publication_operation_id: child.operation_id,
+            expected_state_digest,
+            cleanup_retry_count: next.cleanup_retry_count,
+            original_failure: child
+                .terminal_error
+                .clone()
+                .expect("validated quarantine requires failure"),
+        };
+        let mut plan = CommandPlan::default();
+        plan.replace(
+            MetadataFamily::Operation,
+            child_key,
+            child_payload,
+            next.encode()?,
+        )?;
+        let mut command = self.seal_plan(
+            context,
+            plan,
+            next.encode()?,
+            PublicationAuthorityPurpose::Cleanup,
+        )?;
+        command.deterministic_result = receipt.encode()?;
+        let result = match self.store.execute(&command.seal()) {
+            Ok(result) => result,
+            Err(error) => {
+                // A concurrent identical token may commit a command planned at
+                // another read version. Resolve its closed recovery receipt
+                // before surfacing a low-level command digest mismatch.
+                match self.store.lookup_request_result(
+                    context.root_id,
+                    context.placement_generation,
+                    context.owner_epoch,
+                    context.request_id,
+                )? {
+                    Some(replay) => replay,
+                    None => return Err(error.into()),
+                }
+            }
+        };
+        let accepted = AppendCleanupRetryReceipt::decode(&result.deterministic_result)?;
+        if accepted.operation_id != operation_id
+            || accepted.expected_state_digest != expected_state_digest
+        {
+            return Err(PublicationError::OperationInputMismatch);
+        }
+        Ok(AppendCleanupRetryOutcome {
+            receipt: accepted,
+            commit_version: result.commit_version,
+            replayed: result.replayed,
+        })
     }
 
     /// Check the complete publication index and logical-parent graph at one
@@ -3857,7 +4044,18 @@ impl PublicationService<'_> {
         let operation = PublishOperationRecord::decode(&deterministic_result)?;
         self.predicate_append_authority(context, &operation, &mut plan)?;
         self.synchronize_active_publication(context, &operation, &mut plan)?;
-        self.predicate_publication_authority(context, &operation, authority_purpose, &mut plan)?;
+        if operation.append_attempt.is_some()
+            && authority_purpose == PublicationAuthorityPurpose::Cleanup
+        {
+            self.predicate_append_cleanup_reservation(context, &operation, &mut plan)?;
+        } else {
+            self.predicate_publication_authority(
+                context,
+                &operation,
+                authority_purpose,
+                &mut plan,
+            )?;
+        }
         plan.validate_bounds()?;
         Ok(MetadataCommand {
             schema_id: SCHEMA_ID.to_owned(),
@@ -5099,6 +5297,7 @@ mod tests {
             dependency_digest: dependency_owner_digest(&dependencies).unwrap(),
             cleanup_staged_object_cursor: 0,
             cleanup_manifest_cursor: 0,
+            cleanup_retry_count: 0,
             publication_absence_proof: None,
             result: None,
             terminal_error: None,
@@ -6085,39 +6284,32 @@ mod tests {
                     Err(PublicationError::ReconcileResolutionMismatch { .. })
                 ));
                 assert_eq!(store.current_read_version().unwrap(), before);
-                child = service
-                    .reconcile_quarantined_publish_batch(ReconcileQuarantinedPublishBatchRequest {
-                        context: publication_context(&store, &mut counter),
-                        expected_operation: child,
-                        resolution: QuarantineReconcileResolution::RevisionUnpublishedSealed,
-                        staged_object_rows: staged.clone(),
-                    })
-                    .unwrap()
-                    .operation;
-                assert!(service
-                    .finish_reconcile_quarantined_publish(
-                        FinishReconcileQuarantinedPublishRequest {
-                            context: publication_context(&store, &mut counter),
-                            expected_operation: child.clone(),
-                            resolution: QuarantineReconcileResolution::RevisionUnpublished,
-                            reason: "absent is insufficient".to_owned(),
-                            operator_evidence_digest: [0xc2; 32],
-                        }
-                    )
-                    .is_err());
-                child = service
-                    .finish_reconcile_quarantined_publish(
-                        FinishReconcileQuarantinedPublishRequest {
-                            context: publication_context(&store, &mut counter),
-                            expected_operation: child,
-                            resolution: QuarantineReconcileResolution::RevisionUnpublishedSealed,
-                            reason: "each immutable key is permanently sealed".to_owned(),
-                            operator_evidence_digest: [0xc3; 32],
-                        },
+                let parent = read_append_parent(&service, &store, &mut counter);
+                let token = append_operation_state_digest(&parent, &child).unwrap();
+                let receipt = service
+                    .retry_append_cleanup(
+                        publication_context(&store, &mut counter),
+                        parent.operation_id,
+                        token,
                     )
                     .unwrap()
-                    .operation;
-            } else {
+                    .receipt;
+                assert_eq!(receipt.cleanup_retry_count, 1);
+                child = PublishOperationRecord::decode(
+                    &service
+                        .read_payload(
+                            publication_context(&store, &mut counter),
+                            MetadataFamily::Operation,
+                            &operation_key(root(), OperationKind::Publish, child.operation_id),
+                        )
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(child.cleanup_retry_count, 1);
+                assert_eq!(child.phase, PublishPhase::Cleaning);
+            }
+            {
                 let mut next = staged[0].clone();
                 next.provider_state = StagedProviderState::Aborted;
                 next.cleanup_state = StagedCleanupState::Deleted;
@@ -6195,6 +6387,457 @@ mod tests {
                 }),
                 Err(PublicationError::RevisionClaimHeld { .. })
             ));
+        }
+    }
+
+    fn quarantined_append_fixture(
+        store: &MetaShard,
+        counter: &mut u128,
+        count: usize,
+        cleaned: usize,
+    ) -> (PublishOperationRecord, Vec<StagedObjectRecord>) {
+        let service = PublicationService::new(store);
+        let template = logical_append_child(0);
+        let staged = staged_rows(template.artifact_revision_id, count);
+        let mut initial = publish_operation(
+            template.operation_id,
+            template.artifact_revision_id,
+            template.path,
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest_rows(&staged),
+        );
+        initial.append_attempt = template.append_attempt;
+        initial.append_intent_digest = template.append_intent_digest;
+        seal_publish_operation(&mut initial);
+        let child = begin_operation(&service, store, counter, initial);
+        let mut child = service
+            .stage_objects_batch(StageObjectsBatchRequest {
+                context: publication_context(store, counter),
+                expected_operation: child,
+                staged_objects: staged.clone(),
+            })
+            .unwrap()
+            .operation;
+        for transition in [
+            PublishTransition::BeginAbort {
+                terminal_error: PublishTerminalError {
+                    kind: PublishTerminalErrorKind::ActivityLeaseExpired,
+                    message: "abandoned caller".to_owned(),
+                    evidence_digest: None,
+                },
+            },
+            PublishTransition::BeginCleaning,
+        ] {
+            child = service
+                .transition_publish(TransitionPublishRequest {
+                    context: publication_context(store, counter),
+                    expected_operation: child,
+                    transition,
+                })
+                .unwrap()
+                .operation;
+        }
+        if cleaned != 0 {
+            child = service
+                .cleanup_publish_batch(CleanupPublishBatchRequest {
+                    context: publication_context(store, counter),
+                    expected_operation: child,
+                    staged_object_updates: staged[..cleaned]
+                        .iter()
+                        .map(|expected| {
+                            let mut next = expected.clone();
+                            next.provider_state = StagedProviderState::Aborted;
+                            next.cleanup_state = StagedCleanupState::Sealed;
+                            StagedObjectUpdate {
+                                expected: expected.clone(),
+                                next,
+                            }
+                        })
+                        .collect(),
+                })
+                .unwrap()
+                .operation;
+        }
+        let child = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(store, counter),
+                expected_operation: child,
+                transition: PublishTransition::Quarantine {
+                    terminal_error: PublishTerminalError {
+                        kind: PublishTerminalErrorKind::CleanupFailed,
+                        message: "seal ACK and HEAD unavailable".to_owned(),
+                        evidence_digest: Some([0xc1; 32]),
+                    },
+                },
+            })
+            .unwrap()
+            .operation;
+        (child, staged)
+    }
+
+    fn read_append_child_at(
+        service: &PublicationService<'_>,
+        context: PublicationContext,
+        id: OperationId,
+    ) -> PublishOperationRecord {
+        PublishOperationRecord::decode(
+            &service
+                .read_payload(
+                    context,
+                    MetadataFamily::Operation,
+                    &operation_key(context.root_id, OperationKind::Publish, id),
+                )
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn append_cleanup_retry_receipt_survives_aba_partial_progress_owner_restart_and_successor() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("append-cleanup-retry");
+        let mut counter = 1;
+        let store = ready_file_store(&path, &mut counter);
+        let service = PublicationService::new(&store);
+        let (child, staged) = quarantined_append_fixture(&store, &mut counter, 2, 1);
+        let parent = read_append_parent(&service, &store, &mut counter);
+        let token = append_operation_state_digest(&parent, &child).unwrap();
+        let failure = child.terminal_error.clone().unwrap();
+        let first = service
+            .retry_append_cleanup(
+                publication_context(&store, &mut counter),
+                parent.operation_id,
+                token,
+            )
+            .unwrap()
+            .receipt;
+        assert_eq!(first.original_failure, failure);
+        assert_eq!(first.cleanup_retry_count, 1);
+        let next = read_append_child_at(
+            &service,
+            publication_context(&store, &mut counter),
+            child.operation_id,
+        );
+        assert_eq!(next.cleanup_staged_object_cursor, 1);
+        assert_eq!(next.cleanup_manifest_cursor, child.cleanup_manifest_cursor);
+        assert_eq!(next.terminal_error, child.terminal_error);
+        assert_eq!(read_append_parent(&service, &store, &mut counter), parent);
+        let repeated_failure = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: next,
+                transition: PublishTransition::Quarantine {
+                    terminal_error: failure,
+                },
+            })
+            .unwrap()
+            .operation;
+        let newer_token = append_operation_state_digest(&parent, &repeated_failure).unwrap();
+        assert_ne!(
+            newer_token, token,
+            "same error and cursor must not recreate the original token"
+        );
+        let version = store.current_read_version().unwrap();
+        assert_eq!(
+            service
+                .retry_append_cleanup(
+                    publication_context(&store, &mut counter),
+                    parent.operation_id,
+                    token
+                )
+                .unwrap()
+                .receipt,
+            first
+        );
+        assert_eq!(
+            store.current_read_version().unwrap(),
+            version,
+            "old request cannot enqueue a new retry"
+        );
+        let second = service
+            .retry_append_cleanup(
+                publication_context(&store, &mut counter),
+                parent.operation_id,
+                newer_token,
+            )
+            .unwrap()
+            .receipt;
+        assert_eq!(second.cleanup_retry_count, 2);
+        drop(store);
+
+        let store = crate::workspace::test_support::open_file(&path, shard()).unwrap();
+        store
+            .advance_owner_epoch(Some(owner()), successor_owner())
+            .unwrap();
+        let service = PublicationService::new(&store);
+        let version = store.current_read_version().unwrap();
+        assert_eq!(
+            service
+                .retry_append_cleanup(
+                    publication_context_for_owner(&store, &mut counter, successor_owner()),
+                    parent.operation_id,
+                    token
+                )
+                .unwrap()
+                .receipt,
+            first
+        );
+        assert_eq!(store.current_read_version().unwrap(), version);
+        assert!(
+            service
+                .retry_append_cleanup(
+                    publication_context(&store, &mut counter),
+                    parent.operation_id,
+                    token
+                )
+                .is_err(),
+            "old owner cannot replay at a new fence"
+        );
+        let child = read_append_child_at(
+            &service,
+            publication_context_for_owner(&store, &mut counter, successor_owner()),
+            child.operation_id,
+        );
+        let mut sealed = staged[1].clone();
+        sealed.provider_state = StagedProviderState::Aborted;
+        sealed.cleanup_state = StagedCleanupState::Sealed;
+        let child = service
+            .cleanup_publish_batch(CleanupPublishBatchRequest {
+                context: publication_context_for_owner(&store, &mut counter, successor_owner()),
+                expected_operation: child,
+                staged_object_updates: vec![StagedObjectUpdate {
+                    expected: staged[1].clone(),
+                    next: sealed,
+                }],
+            })
+            .unwrap()
+            .operation;
+        let cleaned = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context_for_owner(&store, &mut counter, successor_owner()),
+                expected_operation: child,
+                transition: PublishTransition::FinishCleanup,
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(cleaned.cleanup_staged_object_cursor, 2);
+        assert_eq!(cleaned.cleanup_retry_count, 2);
+        let mut successor = logical_append_child(1);
+        successor.initiating_owner_epoch = successor_owner();
+        seal_publish_operation(&mut successor);
+        service
+            .begin_publish(BeginPublishRequest {
+                context: publication_context_for_owner(&store, &mut counter, successor_owner()),
+                operation: successor,
+            })
+            .unwrap();
+        assert_eq!(
+            service
+                .retry_append_cleanup(
+                    publication_context_for_owner(&store, &mut counter, successor_owner()),
+                    parent.operation_id,
+                    token
+                )
+                .unwrap()
+                .receipt,
+            first
+        );
+        assert_eq!(
+            service
+                .retry_append_cleanup(
+                    publication_context_for_owner(&store, &mut counter, successor_owner()),
+                    parent.operation_id,
+                    newer_token
+                )
+                .unwrap()
+                .receipt,
+            second
+        );
+    }
+
+    #[test]
+    fn append_cleanup_retry_refuses_missing_foreign_or_published_ownership_without_mutation() {
+        for damage in 0..5 {
+            let mut counter = 1;
+            let store = ready_store(&mut counter);
+            let service = PublicationService::new(&store);
+            let (child, _) = quarantined_append_fixture(&store, &mut counter, 1, 0);
+            let parent = read_append_parent(&service, &store, &mut counter);
+            let token = append_operation_state_digest(&parent, &child).unwrap();
+            let context = publication_context(&store, &mut counter);
+            let mut plan = CommandPlan::default();
+            match damage {
+                0 | 1 => {
+                    let key = artifact_revision_claim_key(root(), child.artifact_revision_id);
+                    let old = service
+                        .read_payload(context, MetadataFamily::ArtifactRevision, &key)
+                        .unwrap()
+                        .unwrap();
+                    if damage == 0 {
+                        plan.delete(MetadataFamily::ArtifactRevision, key, old)
+                            .unwrap();
+                    } else {
+                        plan.replace(
+                            MetadataFamily::ArtifactRevision,
+                            key,
+                            old,
+                            ArtifactRevisionClaimRecord {
+                                operation_id: operation_id(999_999),
+                            }
+                            .encode()
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    }
+                }
+                2 => {
+                    // Any revision value, including unknown metadata, must prevent sealing.
+                    plan.put_absent(
+                        MetadataFamily::ArtifactRevision,
+                        artifact_revision_key(root(), child.artifact_revision_id),
+                        vec![0xff],
+                    )
+                    .unwrap();
+                }
+                3 | 4 => {
+                    let kind = if damage == 3 {
+                        OperationKind::Append
+                    } else {
+                        OperationKind::Publish
+                    };
+                    let id = if damage == 3 {
+                        parent.operation_id
+                    } else {
+                        child.operation_id
+                    };
+                    let key = operation_key(root(), kind, id);
+                    let old = service
+                        .read_payload(context, MetadataFamily::Operation, &key)
+                        .unwrap()
+                        .unwrap();
+                    plan.delete(MetadataFamily::Operation, key, old).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let mut command =
+                fence_command(&store, context.request_id, RootFenceAction::RequireActive);
+            command.predicates = plan.predicates;
+            command.mutations = plan.mutations;
+            command.history_projection = plan.history;
+            store.execute(&command.seal()).unwrap();
+            let before = store.current_read_version().unwrap();
+            assert!(service
+                .retry_append_cleanup(
+                    publication_context(&store, &mut counter),
+                    parent.operation_id,
+                    token
+                )
+                .is_err());
+            assert_eq!(store.current_read_version().unwrap(), before);
+            assert!(service
+                .read_payload(
+                    publication_context(&store, &mut counter),
+                    MetadataFamily::Operation,
+                    &operation_key(root(), OperationKind::ActivePublish, child.operation_id)
+                )
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn append_cleanup_retry_ignores_retired_workspace_but_preserves_exact_cleanup_authority() {
+        for rebound in [false, true] {
+            let mut counter = 1;
+            let store = ready_store(&mut counter);
+            let service = PublicationService::new(&store);
+            let (child, staged) = quarantined_append_fixture(&store, &mut counter, 1, 0);
+            let parent = read_append_parent(&service, &store, &mut counter);
+            let token = append_operation_state_digest(&parent, &child).unwrap();
+            let key = workspace_current_key(root(), &workbench());
+            let context = publication_context(&store, &mut counter);
+            let old = service
+                .read_payload(context, MetadataFamily::WorkspaceCurrent, &key)
+                .unwrap()
+                .unwrap();
+            let replacement = if rebound {
+                let mut workspace = WorkspaceRecord::decode(&old).unwrap();
+                workspace.incarnation_id = incarnation(900);
+                Some(workspace.encode().unwrap())
+            } else {
+                None
+            };
+            let mut plan = CommandPlan::default();
+            match &replacement {
+                Some(new) => plan
+                    .replace(
+                        MetadataFamily::WorkspaceCurrent,
+                        key.clone(),
+                        old,
+                        new.clone(),
+                    )
+                    .unwrap(),
+                None => plan
+                    .delete(MetadataFamily::WorkspaceCurrent, key.clone(), old)
+                    .unwrap(),
+            }
+            let mut command =
+                fence_command(&store, context.request_id, RootFenceAction::RequireActive);
+            command.predicates = plan.predicates;
+            command.mutations = plan.mutations;
+            command.history_projection = plan.history;
+            store.execute(&command.seal()).unwrap();
+            service
+                .retry_append_cleanup(
+                    publication_context(&store, &mut counter),
+                    parent.operation_id,
+                    token,
+                )
+                .unwrap();
+            let child = read_append_child_at(
+                &service,
+                publication_context(&store, &mut counter),
+                child.operation_id,
+            );
+            service
+                .validate_append_cleanup_authority(
+                    publication_context(&store, &mut counter),
+                    &child,
+                )
+                .unwrap();
+            let mut sealed = staged[0].clone();
+            sealed.provider_state = StagedProviderState::Aborted;
+            sealed.cleanup_state = StagedCleanupState::Sealed;
+            let child = service
+                .cleanup_publish_batch(CleanupPublishBatchRequest {
+                    context: publication_context(&store, &mut counter),
+                    expected_operation: child,
+                    staged_object_updates: vec![StagedObjectUpdate {
+                        expected: staged[0].clone(),
+                        next: sealed,
+                    }],
+                })
+                .unwrap()
+                .operation;
+            service
+                .transition_publish(TransitionPublishRequest {
+                    context: publication_context(&store, &mut counter),
+                    expected_operation: child,
+                    transition: PublishTransition::FinishCleanup,
+                })
+                .unwrap();
+            assert_eq!(
+                service
+                    .read_payload(
+                        publication_context(&store, &mut counter),
+                        MetadataFamily::WorkspaceCurrent,
+                        &key
+                    )
+                    .unwrap(),
+                replacement
+            );
         }
     }
 
@@ -7980,7 +8623,10 @@ mod tests {
         assert_eq!(replaced.result.path_generation, Generation::new(2).unwrap());
         let replace_bytes =
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
-        assert_eq!(replace_bytes, 11_799_783);
+        // The 8-byte retry epoch occurs in the operation check, mutation,
+        // history value and dedupe result, plus their recovery-command copies.
+        assert_eq!(replace_bytes, 11_799_847);
+        assert!(replace_bytes < super::super::store_limits().max_transaction_bytes);
 
         let removed = remove_path(
             &store,
@@ -8241,7 +8887,7 @@ mod tests {
 
         assert_eq!(
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes),
-            9_861_056
+            9_861_120
         );
     }
 

@@ -2568,7 +2568,7 @@ fn decode_list_cursor(
         _ => {
             return Err(invalid_backend_input(
                 "list cursor has an unknown fence kind",
-            ))
+            ));
         }
     };
     let (scope_digest, anchor) = payload
@@ -2783,10 +2783,37 @@ pub(crate) fn map_append_client_error(error: ClientError) -> agent::BackendError
             json!({}),
         );
     }
+    if matches!(&error, ClientError::Rpc(failure) if failure.code == wire::ErrorCode::InvalidArgument)
+    {
+        let mut mapped = map_client_error(error);
+        mapped.kind = agent::BackendErrorKind::Other("InvalidArgument".to_owned());
+        return mapped;
+    }
     map_client_error(error)
 }
 
 fn map_client_error(error: ClientError) -> agent::BackendError {
+    if let ClientError::AppendCleanupUnresolved {
+        operation_id,
+        expected_token,
+        receipt,
+        source,
+    } = error
+    {
+        let mut mapped = map_client_error(*source);
+        mapped.kind = agent::BackendErrorKind::Other("AppendCleanupUnresolved".to_owned());
+        mapped.retryable = false;
+        mapped.details["operation_id"] = json!(super::encode_lowercase_hex(&operation_id.0));
+        mapped.details["expected_state_digest"] =
+            json!(super::encode_lowercase_hex(&expected_token.state_digest.0));
+        mapped.details["next_action"] = json!("retry_same_cleanup");
+        mapped.details["publication_operation_id"] = json!(receipt
+            .as_ref()
+            .map(|value| super::encode_lowercase_hex(&value.publication_operation_id.0)));
+        mapped.details["recovery_receipt"] =
+            json!(receipt.as_deref().map(super::cleanup_retry_receipt_json));
+        return mapped;
+    }
     if let ClientError::AppendUnresolved {
         operation_id,
         state,
@@ -2835,7 +2862,9 @@ fn map_client_error(error: ClientError) -> agent::BackendError {
             ClientError::ArtifactPublishFailed { .. } | ClientError::RetryExhausted { .. } => {
                 agent::BackendErrorKind::Other("ClientFailure".to_owned())
             }
-            ClientError::AppendUnresolved { .. } => unreachable!("append failure returned above"),
+            ClientError::AppendUnresolved { .. } | ClientError::AppendCleanupUnresolved { .. } => {
+                unreachable!("append failure returned above")
+            }
             ClientError::Rpc(_) => unreachable!("RPC failures returned above"),
         }
     };
@@ -7136,6 +7165,74 @@ mod tests {
         assert_eq!(error.details["state"], "Running");
         assert_eq!(error.details["code"], "Conflict");
         assert!(!error.retryable);
+    }
+
+    #[test]
+    fn unresolved_cleanup_retains_exact_request_and_known_historical_receipt() {
+        let operation_id = wire::OperationIdentity([0xaa; 16]);
+        let token = wire::OperationToken {
+            operation_id,
+            state_digest: wire::Digest([0xbb; 32]),
+        };
+        let source = || {
+            ClientError::Rpc(wire::RpcFailure {
+                code: wire::ErrorCode::NotOwner,
+                message: "owner changed".to_owned(),
+                retryable: true,
+                conflict: None,
+                current_generation: None,
+                route_hint: None,
+            })
+        };
+        for receipt in [
+            None,
+            Some(Box::new(wire::AppendCleanupRetryResult {
+                operation_id,
+                publication_operation_id: wire::OperationIdentity([0xcc; 16]),
+                cleanup_retry_count: 1,
+                expected_state_digest: token.state_digest,
+            })),
+        ] {
+            let known = receipt.is_some();
+            let mapped = map_append_client_error(ClientError::AppendCleanupUnresolved {
+                operation_id,
+                expected_token: token,
+                receipt,
+                source: Box::new(source()),
+            });
+            assert_eq!(
+                mapped.kind,
+                agent::BackendErrorKind::Other("AppendCleanupUnresolved".to_owned())
+            );
+            assert_eq!(mapped.details["expected_state_digest"], "bb".repeat(32));
+            assert_eq!(mapped.details["next_action"], "retry_same_cleanup");
+            assert_eq!(mapped.details["code"], "NotOwner");
+            assert_eq!(mapped.details["recovery_receipt"].is_null(), !known);
+            assert!(!mapped.retryable);
+            let error = super::super::append_error_json(
+                operation_id,
+                super::super::agent_error(mapped.into()),
+            );
+            let json: Value = serde_json::from_str(&error).unwrap();
+            assert_eq!(json["details"]["next_action"], "retry_same_cleanup");
+            assert_eq!(json["details"]["cause_code"], "NotOwner");
+            assert_eq!(
+                json["details"]["publication_operation_id"].is_null(),
+                !known
+            );
+        }
+        let invalid = map_append_client_error(ClientError::Rpc(wire::RpcFailure {
+            code: wire::ErrorCode::InvalidArgument,
+            message: "invalid inspection cursor".to_owned(),
+            retryable: false,
+            conflict: None,
+            current_generation: None,
+            route_hint: None,
+        }));
+        assert_eq!(
+            invalid.kind,
+            agent::BackendErrorKind::Other("InvalidArgument".to_owned())
+        );
     }
 
     #[test]

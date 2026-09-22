@@ -10,7 +10,7 @@ use crate::request::WorkspaceRpcRequest;
 use crate::response::WorkspaceRpcResponse;
 
 /// The exact and only accepted wire schema.
-pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v11";
+pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v12";
 /// Exact schema for the versioned workspace RPC preflight exchange.
 pub const WORKSPACE_PREFLIGHT_SCHEMA: &str = "nokv.workspace.rpc_preflight.v1";
 /// Exact schema for the advertised workspace RPC capability set.
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn request_round_trips_with_exact_schema() {
-        assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v11");
+        assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v12");
         let expected = request();
         let encoded = encode_request(&expected).unwrap();
         assert!(encoded
@@ -283,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn get_path_read_version_fence_has_one_exact_v11_encoding() {
+    fn get_path_read_version_fence_has_one_exact_v12_encoding() {
         let expected = WorkspaceRpcRequest {
             route: route(),
             request_id: RequestIdentity([0x41; 16]),
@@ -305,15 +305,15 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(&encoded)),
             [
-                151, 149, 192, 126, 198, 107, 89, 133, 25, 106, 99, 70, 118, 191, 55, 180, 115, 9,
-                187, 76, 58, 192, 124, 202, 204, 164, 144, 69, 134, 119, 155, 116
+                179, 220, 36, 137, 57, 170, 16, 113, 127, 121, 12, 54, 66, 112, 180, 80, 1, 16, 34,
+                48, 206, 193, 195, 10, 114, 163, 6, 16, 114, 126, 230, 28
             ],
-            "update only for an intentional GetPath v11 wire change"
+            "update only for an intentional GetPath v12 wire change"
         );
     }
 
     #[test]
-    fn artifact_v1_query_and_catalog_keep_one_exact_v11_encoding() {
+    fn artifact_v1_query_and_catalog_keep_one_exact_v12_encoding() {
         let search = WorkspaceRpcRequest {
             route: route(),
             request_id: RequestIdentity([0x3a; 16]),
@@ -431,10 +431,10 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(golden.finalize()),
             [
-                224, 19, 176, 101, 32, 19, 101, 57, 154, 117, 159, 21, 186, 94, 186, 159, 240, 26,
-                238, 69, 44, 255, 243, 228, 71, 30, 182, 159, 24, 169, 164, 44
+                48, 253, 178, 231, 50, 193, 139, 175, 49, 139, 216, 226, 90, 13, 27, 136, 102, 252,
+                27, 175, 160, 165, 77, 14, 209, 86, 251, 151, 56, 101, 21, 136
             ],
-            "update only for an intentional ArtifactV1 v11 wire change"
+            "update only for an intentional ArtifactV1 v12 wire change"
         );
         assert_eq!(decode_request(&encoded_search).unwrap(), search);
         assert_eq!(
@@ -448,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_exact_catalog_path_match_has_one_exact_v11_encoding() {
+    fn generic_exact_catalog_path_match_has_one_exact_v12_encoding() {
         let expected = WorkspaceRpcRequest {
             route: route(),
             request_id: RequestIdentity([0x42; 16]),
@@ -475,15 +475,15 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(&encoded)),
             [
-                236, 170, 91, 173, 234, 150, 77, 102, 131, 72, 85, 116, 45, 218, 121, 129, 54, 46,
-                38, 40, 52, 116, 161, 232, 249, 129, 85, 69, 223, 111, 102, 199
+                202, 3, 155, 179, 204, 51, 168, 138, 4, 124, 170, 103, 61, 71, 150, 159, 227, 65,
+                149, 73, 201, 142, 66, 149, 59, 115, 150, 253, 238, 154, 39, 33
             ],
-            "update only for an intentional Catalog Exact v11 wire change"
+            "update only for an intentional Catalog Exact v12 wire change"
         );
     }
 
     #[test]
-    fn generic_registration_surface_has_one_exact_v11_encoding() {
+    fn generic_registration_surface_has_one_exact_v12_encoding() {
         let begin = generic_begin_request();
         let append = generic_append_request();
         let finalize = WorkspaceRpcRequest {
@@ -593,10 +593,10 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(golden.finalize()),
             [
-                185, 53, 175, 164, 133, 145, 72, 71, 43, 190, 231, 221, 240, 3, 18, 74, 81, 106,
-                55, 71, 148, 46, 123, 205, 194, 11, 46, 44, 167, 235, 163, 164
+                76, 148, 117, 180, 52, 151, 228, 127, 234, 140, 75, 192, 248, 29, 46, 94, 196, 4,
+                57, 122, 242, 12, 110, 16, 48, 93, 115, 120, 236, 102, 84, 128
             ],
-            "update only for an intentional Generic registration v11 wire change"
+            "update only for an intentional Generic registration v12 wire change"
         );
         for request in [&begin, &append, &finalize, &abort, &get] {
             assert_eq!(
@@ -975,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_v11_late_binding_and_source_manifest_read_round_trip() {
+    fn restore_v12_late_binding_and_source_manifest_read_round_trip() {
         let restore_identity = RestoreManifestIdentity {
             publication_operation_id: OperationIdentity([0x21; 16]),
             artifact_revision_id: ArtifactRevisionIdentity([0x22; 16]),
@@ -1003,10 +1003,10 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(&encoded_prepare)),
             [
-                165, 58, 202, 67, 148, 85, 50, 21, 84, 12, 61, 62, 78, 30, 153, 174, 182, 119, 214,
-                16, 29, 98, 204, 66, 241, 225, 130, 254, 58, 121, 97, 83
+                19, 184, 126, 255, 221, 167, 62, 204, 167, 139, 10, 50, 60, 97, 62, 227, 184, 120,
+                216, 104, 208, 37, 254, 45, 160, 157, 145, 121, 149, 84, 66, 80
             ],
-            "update only for an intentional restore-v11 wire change"
+            "update only for an intentional restore-v12 wire change"
         );
 
         let bind = WorkspaceRpcRequest {
@@ -1118,7 +1118,7 @@ mod tests {
             source_manifest
         );
 
-        let mut complete_v11_golden = Sha256::new();
+        let mut complete_v12_golden = Sha256::new();
         for encoded in [
             encoded_prepare,
             encoded_bind,
@@ -1126,16 +1126,16 @@ mod tests {
             encoded_prepared,
             encoded_source_manifest,
         ] {
-            complete_v11_golden.update((encoded.len() as u64).to_be_bytes());
-            complete_v11_golden.update(encoded);
+            complete_v12_golden.update((encoded.len() as u64).to_be_bytes());
+            complete_v12_golden.update(encoded);
         }
         assert_eq!(
-            <[u8; 32]>::from(complete_v11_golden.finalize()),
+            <[u8; 32]>::from(complete_v12_golden.finalize()),
             [
-                196, 15, 64, 182, 228, 178, 23, 245, 169, 244, 22, 242, 215, 154, 19, 155, 168,
-                188, 201, 101, 214, 92, 215, 160, 221, 205, 51, 247, 186, 249, 83, 31
+                67, 211, 249, 84, 52, 53, 130, 176, 253, 198, 101, 67, 121, 119, 167, 220, 59, 152,
+                156, 165, 126, 213, 114, 37, 229, 198, 254, 20, 94, 148, 15, 3
             ],
-            "update only for an intentional restore-v11 wire change"
+            "update only for an intentional restore-v12 wire change"
         );
     }
 
@@ -1254,18 +1254,20 @@ mod tests {
 
     #[test]
     fn schema_mismatch_fails_closed() {
-        let encoded = rmp_serde::to_vec_named(&Frame {
-            schema: "nokv.workspace.rpc.v8".to_owned(),
-            payload: request(),
-        })
-        .unwrap();
-        assert_eq!(
-            decode_request(&encoded),
-            Err(ProtocolError::SchemaMismatch {
-                actual: "nokv.workspace.rpc.v8".to_owned(),
-                expected: "nokv.workspace.rpc.v11",
+        for previous in ["nokv.workspace.rpc.v8", "nokv.workspace.rpc.v11"] {
+            let encoded = rmp_serde::to_vec_named(&Frame {
+                schema: previous.to_owned(),
+                payload: request(),
             })
-        );
+            .unwrap();
+            assert_eq!(
+                decode_request(&encoded),
+                Err(ProtocolError::SchemaMismatch {
+                    actual: previous.to_owned(),
+                    expected: "nokv.workspace.rpc.v12",
+                })
+            );
+        }
 
         #[derive(Serialize)]
         #[serde(deny_unknown_fields)]
@@ -1316,7 +1318,7 @@ mod tests {
             decode_request(&actual_v4),
             Err(ProtocolError::SchemaMismatch {
                 actual: "nokv.workspace.rpc.v4".to_owned(),
-                expected: "nokv.workspace.rpc.v11",
+                expected: "nokv.workspace.rpc.v12",
             })
         );
 
@@ -1344,7 +1346,7 @@ mod tests {
             decode_response(&encoded),
             Err(ProtocolError::SchemaMismatch {
                 actual: "nokv.workspace.rpc.v4".to_owned(),
-                expected: "nokv.workspace.rpc.v11",
+                expected: "nokv.workspace.rpc.v12",
             })
         );
     }
@@ -1458,8 +1460,8 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(encode_request(&expected).unwrap())),
             [
-                1, 199, 172, 241, 75, 114, 194, 208, 36, 153, 86, 191, 63, 217, 252, 231, 179, 144,
-                197, 77, 51, 2, 137, 102, 136, 205, 100, 119, 58, 134, 223, 72
+                136, 147, 125, 201, 247, 93, 58, 26, 17, 129, 123, 181, 179, 183, 26, 230, 10, 178,
+                187, 91, 218, 24, 107, 190, 100, 8, 47, 131, 64, 28, 68, 16
             ],
             "update only for an intentional capability-v2 wire change"
         );

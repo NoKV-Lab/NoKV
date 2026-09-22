@@ -23,6 +23,11 @@ They share the Rust client state machine. Owner preflight advertises
 `artifact_append_v1` so downstream clients can require the logical append
 contract explicitly. `nokv operation status` and Python
 `Client.operation_status` query the logical operation using metadata only.
+`nokv operation inspect` / `Client.operation_inspect` inspect the current child's
+retained staged ledger. `nokv operation recover` / `Client.operation_recover`
+request owner-executed cleanup through `artifact_append_recovery_v1`. Neither
+operation requires the delta, a current workspace binding, object credentials
+on the caller, or a transcript captured before the failure.
 The frozen Workbench tool schemas remain unchanged.
 
 The caller must durably retain the following before its first submission:
@@ -96,6 +101,12 @@ active child cannot be replaced by a newly planned child.
    retiring their staging rows. Its revision claim remains reserved so that
    neither delayed uploads nor later reuse of that revision can revive its
    payload. Parent receipts do not pin historical artifact bytes.
+8. Retrying quarantined cleanup increments the child's durable
+   `cleanup_retry_count` exactly once. The exact expected logical state token
+   identifies a recovery request, whose original admission receipt remains
+   replayable after another quarantine, owner restart, or logical successor.
+   The counter prevents a cleanup failure from returning the child to the same
+   state bytes and accepting a delayed old request as a new recovery round.
 
 A definitive generation conflict during completion can put the exact losing
 child into fenced abort/cleanup after proving it did not publish. The client
@@ -110,7 +121,7 @@ that this order matches caller start times or external queue order.
 | `committed` | Parent and child have an atomic successful receipt. | `none`; acknowledge the queued action. |
 | `pending` | The current child is uploading, finalizing, aborting, or cleaning. | `poll`; keep the same action and payload. |
 | `ready_to_retry` | The predecessor is durably cleaned and cannot publish. | `resubmit_same`; send the original logical ID, delta, and options. |
-| `quarantined` | Automatic recovery cannot prove a safe transition. | `operator_reconcile`; preserve evidence and the original ID. |
+| `quarantined` | Automatic recovery cannot prove a safe transition. | `retry_cleanup`; inspect the operation, resolve the dependency failure, and request owner cleanup using the saved state token. |
 | Query error or unknown transport outcome | No authoritative recovery observation was obtained. | Query the same ID again; do not infer absence or allocate a replacement action. |
 | Intent mismatch | The ID belongs to a different intent or lifecycle. | Correct the caller's persisted action mapping; do not mutate that ID's intent. |
 
@@ -119,7 +130,7 @@ code, and observed wire state where known. An error envelope's conservative
 `query_same` action does not claim knowledge of the current child. The metadata
 status result supplies authoritative attempt, child ID, phase, activity
 deadline, original incarnation/target, current attempt failure when present,
-and receipt. An attempt failure describes its child, not a terminal failure of
+cleanup retry count, and receipt. An attempt failure describes its child, not a terminal failure of
 the logical action. Applications must use
 structured fields, not parse human-readable messages.
 
@@ -155,25 +166,10 @@ exact empty-body replay still cannot authorize publication by a terminal child.
 revision claim remains permanently associated with its terminal operation,
 including after a logical successor succeeds. The ordinary collector for
 published revisions cannot claim that unpublished reserved revision. The
-operator reconciliation API requires the append-specific `provider_objects_sealed`
-verdict; its older absence verdict cannot bypass this contract. An ambiguous
-provider result cannot be converted into an unproved successful cleanup.
-
-For a quarantined append, the operator first captures the logical status and
-exact quarantined child token, then inspects that child's persisted staged
-records and reserved revision in the metadata snapshot. Every registered key
-must be addressed in its bound object namespace; guessing keys from a live
-file listing is insufficient. For each key, record HEAD evidence. If absent,
-conditionally PUT an empty body with `If-None-Match: *`; otherwise use its ETag
-with `If-Match`. Reobserve on a conditional conflict, and require a final HEAD
-showing an existing zero-byte object. Do not DELETE during this procedure.
-Preserve the key-by-key transcript and its SHA-256 digest. Submit
-`ReconcileQuarantinedArtifactPublish` with that exact child token,
-`provider_objects_sealed`, a reason, and the transcript's `evidence_digest`.
-The RPC checks the metadata half of the verdict; it does not execute the
-provider repair or independently certify the operator's transcript. A changed
-token or any unproved key requires a fresh inspection. Finally query the
-logical ID and follow its returned action using the original intent.
+generic publication reconciliation API cannot resolve a stable append by
+accepting a caller's claim of absence or publication. The earlier unreleased
+append-specific sealed-object verdict is removed. An ambiguous provider result
+cannot be converted into an unproved successful cleanup.
 
 Object-provider admission for stable append includes sealing conformance in
 addition to immutable creation. Provider receipt verification is bound to the
@@ -194,6 +190,75 @@ separately qualified retention policy. The acceptance configuration and this
 feature do not certify deletion of historical provider versions. Ordinary
 publication cleanup remains a separate lifecycle contract; this feature's seal
 semantics apply to stable append attempts.
+
+## Public inspection and recovery
+
+Inspection starts with the logical operation ID and returns its exact logical
+token, current publication token, object namespace, phase, and counters. The
+`registered_count` is the actual staged cursor, not the publication plan's
+intended object count. The `cleanup_cursor` counts rows retired after proven
+sealing; `remaining_count = registered_count - cleanup_cursor`. Each entry
+contains its sequence, complete object identity, expected length and digest,
+and multipart token when applicable. These entries describe currently retained
+staging metadata, not a history of every object ever used by the logical action.
+Published attempts can still retain their staging rows: an inspection result
+alone does not authorize cleanup of those live objects.
+
+The default page limit is 32 and the maximum is 192. A page has exactly the
+bounded contiguous portion of `[cleanup_cursor, registered_count)` selected by
+its cursor. The opaque continuation binds the root, logical ID, exact state
+token and last ordinal. Every page checks the current parent, current child
+and ledger rows. Unpublished children also require their exact revision
+reservation; successful publication has already released that reservation.
+State or child changes invalidate the
+continuation; the caller must restart from the first page. Missing or mismatched
+rows fail closed instead of producing an incomplete page described as complete.
+Cursor checksums detect accidental damage; server-side fencing supplies the
+authority. Inspection performs no provider I/O or metadata mutation.
+
+For example, an operator investigates action `ab...` after a provider outage:
+
+```text
+nokv <routing arguments> operation inspect ab... --limit 32
+nokv <routing arguments> operation recover ab... --expected-state-digest <saved digest>
+nokv <routing arguments> operation status ab...
+```
+
+Use full 32-character operation IDs and the full 64-character state digest.
+Persist `operation_token.state_digest` from inspection before requesting
+recovery. Repeating `recover` with that same digest replays the same durable
+cleanup admission, even if the first response was lost and the owner has since
+failed cleanup again. The response's `recovery_receipt` identifies that original
+round, while its operation fields report the current observation. `requested`
+means the request has a durable admission receipt, including replay;
+`replayed` distinguishes replay from fresh admission. Neither field means the
+append committed or cleanup finished.
+
+Omitting the expected digest explicitly requests recovery against the currently
+observed state. Active, cleaned and committed attempts return an observation
+with `requested=false` and no recovery receipt. A quarantined attempt can start
+one new round. One invocation never silently selects another state token after
+a race or uncertain response. For queue-driven operator automation, retain the
+explicit digest so retrying a request cannot accidentally start a later round.
+An unresolved request error preserves the logical ID, expected digest and any
+known admission receipt, with `retry_same_cleanup` as the next action.
+
+The owner verifies the exact parent/child binding, permanent revision claim,
+revision absence and root/owner fences before atomically re-enqueuing cleanup.
+The durable command receipt retains the original failure for audit. The
+existing lifecycle worker performs and verifies conditional seals, advances
+cleanup cursors, and records durable proof. Operator clients do not write seals
+or supply a provider verdict. Cleanup of an abandoned old incarnation uses
+these operation/revision fences even after the workspace name disappears or
+is rebound; it cannot publish into the replacement workspace. Generic
+publication cleanup retains its existing authorization rules.
+
+After the owner reports `ready_to_retry`, the caller redelivers the original
+append ID, delta and complete intent. Recovery without the payload only makes
+that safe redelivery possible; it cannot synthesize the logical append result.
+Repeated provider ambiguity returns the same child to quarantine with a new
+retry count. A new inspection and a deliberate new token can request another
+round after the underlying problem is corrected.
 
 ## Example recovery timelines
 
@@ -277,6 +342,8 @@ functional demand, not a benchmark target or a promised commercial SLA.
 | Delete failed objects and forget their keys | Rejected for stable append: a delayed PUT can recreate an untracked payload after deletion. |
 | Periodically rescan all failed keys forever | Can eventually reclaim finite delayed writes, but retains an ongoing history-sized scan and leaves a reopening window after every DELETE. |
 | Monotonic zero-byte seals plus revision reservations | Selected for failed append objects. Requires qualified conditional replacement and permanent small reservations; avoids delayed DELETE/PUT reopening races. |
+| Caller seals keys and submits a trusted provider verdict | Rejected for the public append recovery workflow. Requires callers to execute storage repair correctly and cannot independently verify their claimed evidence. |
+| Owner-executed cleanup with exact-token retry receipts | Selected. Reuses fenced lifecycle proofs, requires no caller payload or provider configuration, and distinguishes replaying one recovery request from starting another. |
 | Separate parent advance and child admission | Creates a missing-child interval and requires another recovery protocol. Atomic Begin keeps the predecessor proof and successor admission together. |
 | Logical parent plus fenced immutable attempts | Selected. Reuses publication durability, cleanup, reference lifetime, and owner fencing while adding durable redelivery completion. |
 | Content hash as the identity | Suppresses two intentional actions with the same bytes. Hashes authenticate intent; they do not identify business actions. |
@@ -284,8 +351,10 @@ functional demand, not a benchmark target or a promised commercial SLA.
 
 ## Version and deployment boundary
 
-The workspace RPC schema is `nokv.workspace.rpc.v11`, the system format is 12,
-and the publication value format is 6. A parent row is a new operation kind.
+The workspace RPC schema is `nokv.workspace.rpc.v12`, the system format is 13,
+and the publication value format is 7. A parent row is a new operation kind;
+the child includes the monotonic cleanup retry counter. These version gates
+also reject the preceding unreleased append candidate's v11/system-12 layout.
 Older stores and protocol clients are rejected explicitly. Existing Holt stores
 are inspected through the locked backend's read-only open path before writable
 recovery, so a format rejection does not rewrite their files. There is no silent
@@ -303,8 +372,10 @@ backend linked into the tested NoKV binary.
 
 ## Functional acceptance requirements
 
-The product gate is
+The core product gate is
 [`append_product_acceptance_gate.py`](../../scripts/workbench/append_product_acceptance_gate.py).
+Public operator workflows are covered by
+[`append_operations_acceptance_gate.py`](../../scripts/workbench/append_operations_acceptance_gate.py).
 Run its `--help` for the exact invocation. Preserve the previous frozen binary
 for red tests and use a separately frozen candidate binary and matching Python
 wheel for green tests. Do not replace a red failure oracle with a weaker green
@@ -320,8 +391,8 @@ The functional matrix must include:
 - Staged-object and manifest boundaries, object-provider faults, actual delayed
   PUT arrival after cleanup, monotonic zero-byte seals, and recovery from proven
   failed attempts without an additional user action ID. A seal with an
-  unprovable outcome must quarantine, reject the old absence verdict, and
-  complete only after exact-token reconciliation with sealed-object evidence.
+  unprovable outcome must quarantine, reject caller-supplied provider verdicts,
+  and complete only after exact-token recovery through the fenced owner.
 - Metadata-only status with the delta file gone; historical append replay
   with its original bytes while the object provider is unavailable, after a
   newer live generation, removal, and workspace name reuse.
@@ -330,6 +401,20 @@ The functional matrix must include:
 - CLI/Python/Rust semantic parity, incompatible-client/store rejection without
   mutation, and deterministic metadata tests for predecessor holes, parent
   receipt atomicity, cross-kind collisions, and maximum legal command shape.
+- Public metadata-only inspection across multiple pages, a genuinely sealed
+  prefix, missing-row rejection, stale/cross-root/cross-child cursors, and
+  inspection without access to earlier transport transcripts.
+- Cleanup admission response loss, fresh processes, owner reopen, concurrent
+  requests and repeated quarantine. The same saved token must retain its
+  original receipt and counter; a deliberate new token may start another round.
+  Active and committed attempts must remain untouched.
+- A durable downstream queue retains the complete intent before dispatch and
+  acknowledges only the stored NoKV receipt. Kill its actual consumer after
+  append commit but before queue acknowledgement, then redeliver through its
+  actual storage adapter. Identify the harness and integration actually run.
+- Old-incarnation cleanup after workspace deletion/rebinding, using metadata
+  integration tests where no corresponding public lifecycle entry point exists.
+  Do not mislabel fixture-only transitions as public black-box coverage.
 
 Each scenario checks both safety and completion. Compare the entire ordered
 content, expected generation increments, stable historical receipt fields,

@@ -731,8 +731,9 @@ impl LifecycleRunner {
                 let sequence = operation.cleanup_staged_object_cursor
                     + u32::try_from(offset).expect("bounded batch offset fits u32");
                 let expected = self.read_staged_object(operation.operation_id, sequence)?;
-                if matches!(expected.provider_state, StagedProviderState::Ambiguous)
-                    || matches!(expected.cleanup_state, StagedCleanupState::Quarantined)
+                if operation.append_attempt.is_none()
+                    && (matches!(expected.provider_state, StagedProviderState::Ambiguous)
+                        || matches!(expected.cleanup_state, StagedCleanupState::Quarantined))
                 {
                     return self.quarantine_publication(
                         operation,
@@ -741,6 +742,21 @@ impl LifecycleRunner {
                     );
                 }
                 let append = operation.append_attempt.is_some();
+                if expected.object_sequence != sequence
+                    || expected.artifact_revision_id != operation.artifact_revision_id
+                    || expected.object_key
+                        != meta::object_block_key(
+                            self.route.logical_shard_id.into(),
+                            self.root_id(),
+                            operation.artifact_revision_id,
+                            u64::from(sequence),
+                        )
+                {
+                    return Err(corrupt(
+                        "staged object",
+                        "cleanup key is outside the admitted root/revision/sequence",
+                    ));
+                }
                 let completed_cleanup = if append {
                     StagedCleanupState::Sealed
                 } else {
@@ -754,6 +770,23 @@ impl LifecycleRunner {
                     #[cfg(test)]
                     self.run_before_provider_delete_test_hook();
                     let _operation_permit = self.enter_destructive_operation()?;
+                    if append {
+                        let encoded = operation
+                            .encode()
+                            .map_err(|error| corrupt("publish operation", error.to_string()))?;
+                        let context = self
+                            .publication_context(b"append-cleanup-provider-authority", &encoded)?;
+                        match service.validate_append_cleanup_authority(context, &operation) {
+                            Ok(()) => {}
+                            Err(error) if publication_concurrent(&error) => {
+                                report.deferred_operations += 1;
+                                return Ok(());
+                            }
+                            Err(error) => {
+                                return Err(state("authorize append object sealing", error))
+                            }
+                        }
+                    }
                     let request = LifecycleCleanupRequest {
                         purpose: if append {
                             LifecycleCleanupPurpose::AbortedAppend
@@ -3106,6 +3139,7 @@ mod tests {
             dependency_digest: meta::dependency_owner_digest(&[]).unwrap(),
             cleanup_staged_object_cursor: 0,
             cleanup_manifest_cursor: 0,
+            cleanup_retry_count: 0,
             publication_absence_proof: None,
             result: None,
             terminal_error: None,
@@ -3417,6 +3451,7 @@ mod tests {
             dependency_digest: meta::dependency_owner_digest(&[]).unwrap(),
             cleanup_staged_object_cursor: 0,
             cleanup_manifest_cursor: 0,
+            cleanup_retry_count: 0,
             publication_absence_proof: None,
             result: None,
             terminal_error: None,
@@ -3704,6 +3739,7 @@ mod tests {
                 dependency_digest: meta::dependency_owner_digest(&[]).unwrap(),
                 cleanup_staged_object_cursor: 0,
                 cleanup_manifest_cursor: 0,
+                cleanup_retry_count: 0,
                 publication_absence_proof: None,
                 result: None,
                 terminal_error: None,
@@ -4002,6 +4038,7 @@ mod tests {
                 dependency_digest: meta::dependency_owner_digest(&[]).unwrap(),
                 cleanup_staged_object_cursor: 0,
                 cleanup_manifest_cursor: 0,
+                cleanup_retry_count: 0,
                 publication_absence_proof: None,
                 result: None,
                 terminal_error: None,

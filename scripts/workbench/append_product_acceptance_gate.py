@@ -48,11 +48,13 @@ class PublicationProxy(base.EvidenceDropProxy):
     def __init__(self, port, timeout, stack):
         super().__init__(port, timeout, stack)
         self.rendezvous = None
+        self.rendezvous_operation = "begin_artifact_publish"
         self.rendezvous_entries = []
 
-    def begin_rendezvous(self, count):
+    def begin_rendezvous(self, count, *, operation_name="begin_artifact_publish"):
         require(self.rendezvous is None, "only one admission rendezvous")
         self.rendezvous = threading.Barrier(count)
+        self.rendezvous_operation = operation_name
         self.rendezvous_entries = []
 
     def _forward(self, client):
@@ -76,7 +78,7 @@ class PublicationProxy(base.EvidenceDropProxy):
                         barrier = None
                         with self._lock:
                             if (
-                                operation == "begin_artifact_publish"
+                                operation == self.rendezvous_operation
                                 and self.rendezvous is not None
                             ):
                                 if (
@@ -161,6 +163,8 @@ class ObjectProxy:
         self.held = threading.Event()
         self.release = threading.Event()
         self.released_response = threading.Event()
+        self.seal_held = threading.Event()
+        self.seal_release = threading.Event()
         self.held_request = None
         self.reject_matching = None
         self.rejected_requests = []
@@ -277,7 +281,15 @@ class ObjectProxy:
                                 and "/nokv/artifacts/" in self.path
                                 and 200 <= response.status < 300
                                 and (
-                                    outer.rule["action"] != "seal_ack_loss_head_failure"
+                                    not outer.rule.get("path_suffix")
+                                    or self.path.endswith(outer.rule["path_suffix"])
+                                )
+                                and (
+                                    outer.rule["action"]
+                                    not in (
+                                        "seal_ack_loss_head_failure",
+                                        "hold_seal_success",
+                                    )
                                     or (
                                         self.headers.get("Content-Length") == "0"
                                         and self.headers.get("If-Match") is not None
@@ -313,6 +325,12 @@ class ObjectProxy:
                         if rule:
                             with outer.lock:
                                 outer.fired.append(event)
+                            if rule["action"] == "hold_seal_success":
+                                outer.seal_held.set()
+                                require(
+                                    outer.seal_release.wait(2 * outer.stack.timeout),
+                                    "held real seal response was released within the gate deadline",
+                                )
                             if rule["action"] in (
                                 "drop_success",
                                 "seal_ack_loss_head_failure",
@@ -403,6 +421,7 @@ class ObjectProxy:
 
     def close(self):
         self.release.set()
+        self.seal_release.set()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
@@ -456,7 +475,9 @@ class ProductStack(base.IsolatedStack):
             env=env,
         )
         self.processes.append(process)
-        if "workspace-path" in command and "append" in command:
+        if ("workspace-path" in command and "append" in command) or (
+            "operation" in command and "recover" in command
+        ):
             with self.lock:
                 self.callers[label] = process
         timed_out = False
@@ -1776,281 +1797,12 @@ def late_put_after_cleanup(stack, deadline):
 
 
 def seal_quarantine_operator_recovery(stack, deadline):
-    """Resolve one real provider ambiguity using an inspected child token."""
-    workbench, operation_id = "product-seal-quarantine", "fd" * 16
-    payload, label = b"operator-recovered-event\n", "seal-quarantine-caller"
-    stack.cli("workbench_create", {"id": workbench})
-    owner_pid = stack.owner.pid
-    stack.object_proxy.rule = {"method": "PUT", "action": "seal_ack_loss_head_failure"}
-    stack.proxy.arm("mark_artifact_objects_uploaded", lambda: stack.kill_caller(label))
-    try:
-        first = append(
-            stack,
-            workbench,
-            operation_id,
-            payload,
-            label=label,
-            max_size=1024 * 1024,
-            block_size=65536,
-        )
-        stack.proxy.wait_dropped()
-        require(first.get("status") == "caller_killed", "uploaded caller killed", first)
-        require(
-            stack.owner.pid == owner_pid and stack.owner.poll() is None,
-            "owner survives the uploaded caller",
-        )
-        until, observations = time.monotonic() + deadline, []
-        while True:
-            status = operation_status(
-                stack, operation_id, f"seal-quarantine-poll-{len(observations):03d}"
-            )
-            observations.append(status)
-            if status.get("state") == "quarantined":
-                break
-            require(
-                time.monotonic() < until,
-                "seal ambiguity durably quarantines",
-                observations,
-            )
-            time.sleep(0.5)
-        require(
-            status.get("next_action") == "operator_reconcile"
-            and status.get("receipt") is None
-            and status.get("cause_code"),
-            "quarantine is actionable and has no success receipt",
-            status,
-        )
-        child = status["publication_operation_id"]
-        faults = [
-            event
-            for event in stack.object_proxy.fired
-            if event.get("fault") == "seal_ack_loss_head_failure"
-        ]
-        require(
-            len(faults) == 1
-            and faults[0]["request_bytes"] == 0
-            and faults[0]["if_match"]
-            and 200 <= faults[0]["upstream_status"] < 300,
-            "a conditional empty seal really persisted before its ACK was lost",
-            faults,
-        )
-        require(
-            any(
-                event["method"] == "HEAD" and event["path"] == faults[0]["path"]
-                for event in stack.object_proxy.rejected_requests
-            ),
-            "post-seal HEAD really failed",
-        )
-        query = {
-            "operation": "get_operation",
-            "request": {"operation_id": list(bytes.fromhex(child))},
-        }
-        inspected = base.raw_rpc(stack, query, "quarantine-inspected-child")
-        require(
-            inspected.get("status") == "success"
-            and inspected["body"]["value"]["state"] == "quarantined",
-            "exact quarantined publication child is inspectable",
-            inspected,
-        )
-        token = inspected["body"]["value"]["token"]
-        retry = append(
-            stack,
-            workbench,
-            operation_id,
-            payload,
-            label="quarantined-same-id-cannot-advance",
-            max_size=1024 * 1024,
-            block_size=65536,
-        )
-        require(
-            retry.get("status") == "error" and retry.get("code") == "AppendUnresolved",
-            "quarantined append cannot silently create a successor",
-            retry,
-        )
-        after_retry = operation_status(
-            stack, operation_id, "quarantine-parent-after-retry"
-        )
-        require(
-            after_retry.get("state") == "quarantined"
-            and after_retry.get("publication_operation_id") == child
-            and after_retry.get("attempt") == status["attempt"],
-            "same logical identity remains on the quarantined child",
-            after_retry,
-        )
+    """Recover through public inspection and owner-driven sealed cleanup."""
+    if __name__ == "__main__":
+        sys.modules.setdefault("append_product_acceptance_gate", sys.modules[__name__])
+    import append_operations_acceptance_gate as operations
 
-        # This controlled fault uses the acknowledged public staging transcript
-        # as its complete ledger. Status does not expose a staged-key listing API.
-        rows, counts = {}, set()
-        for line in (
-            (stack.evidence_dir / "publication-rpc-trace.jsonl")
-            .read_text()
-            .splitlines()
-        ):
-            event = json.loads(line)
-            if event["response"]["payload"]["outcome"]["status"] != "success":
-                continue
-            request = event["request"]["payload"]["operation"]["request"]
-            if (
-                event["operation"] == "begin_artifact_publish"
-                and bytes(request["operation_id"]).hex() == child
-            ):
-                counts.add(request["staged_object_count"])
-            if (
-                event["operation"] == "stage_artifact_objects"
-                and bytes(request["token"]["operation_id"]).hex() == child
-            ):
-                for row in request["objects"]:
-                    require(
-                        row["sequence"] not in rows or rows[row["sequence"]] == row,
-                        "acknowledged staged sequence has one immutable identity",
-                        row,
-                    )
-                    rows[row["sequence"]] = row
-        require(
-            counts == {1} and set(rows) == {0},
-            "acknowledged Begin and staging prove the complete single-key ledger",
-            (counts, rows),
-        )
-        stack.json(
-            "operator-acknowledged-staged-ledger.json",
-            {
-                "child": child,
-                "rows": list(rows.values()),
-                "source": "Successful Begin and StageArtifactObjects public RPC transcript; controlled one-key fixture.",
-            },
-        )
-        with stack.object_proxy.lock:
-            stack.object_proxy.reject_matching = None
-        verified = []
-        for sequence, row in sorted(rows.items()):
-            key = stack.object_root.rstrip("/") + "/" + row["object_identity"]
-            output = stack.evidence_dir / f"operator-sealed-key-{sequence}.data"
-            read = stack.run(
-                base.infra.aws_command(
-                    stack.aws,
-                    stack.object_endpoint,
-                    "s3api",
-                    "get-object",
-                    "--bucket",
-                    stack.bucket,
-                    "--key",
-                    key,
-                    str(output),
-                ),
-                label=f"operator-provider-read-{sequence}",
-                env=stack.aws_env,
-            )
-            metadata = json.loads(read.stdout)
-            require(
-                output.read_bytes() == b"" and metadata["ContentLength"] == 0,
-                "every acknowledged staged key is permanently sealed at the real provider",
-                metadata,
-            )
-            verified.append(
-                {
-                    "sequence": sequence,
-                    "key": key,
-                    "size": 0,
-                    "etag": metadata["ETag"],
-                    "sha256": hashlib.sha256(b"").hexdigest(),
-                }
-            )
-        evidence = json.dumps(
-            {"child": child, "token": token, "verified_keys": verified}, sort_keys=True
-        ).encode()
-        (stack.evidence_dir / "operator-provider-verification.json").write_bytes(
-            evidence
-        )
-        verdict = {
-            "operation": "reconcile_quarantined_artifact_publish",
-            "request": {
-                "token": token,
-                "resolution": "provider_objects_absent",
-                "reason": "Controlled acceptance verifies the complete acknowledged key ledger as permanently sealed.",
-                "evidence_digest": list(hashlib.sha256(evidence).digest()),
-            },
-        }
-        wrong = base.raw_rpc(stack, verdict, "operator-obsolete-absence-verdict")
-        require(
-            wrong.get("status") == "failure"
-            and wrong.get("body", {}).get("code") == "precondition_failed"
-            and wrong.get("body", {}).get("conflict") == "operation_state"
-            and wrong.get("body", {}).get("retryable") is False,
-            "obsolete absence verdict is precisely rejected for append",
-            wrong,
-        )
-        unchanged = base.raw_rpc(stack, query, "operator-child-after-wrong-verdict")
-        require(
-            unchanged == inspected,
-            "rejected verdict does not change inspected child/token",
-            unchanged,
-        )
-        verdict["request"]["resolution"] = "provider_objects_sealed"
-        resolved = base.raw_rpc(stack, verdict, "operator-exact-sealed-verdict")
-        require(
-            resolved.get("status") == "success",
-            "exact inspected child token accepts sealed proof",
-            resolved,
-        )
-        ready = operation_status(stack, operation_id, "operator-parent-ready")
-        require(
-            ready.get("state") == "ready_to_retry"
-            and ready.get("next_action") == "resubmit_same",
-            "operator reconciliation makes the original logical ID resumable",
-            ready,
-        )
-        # Keep identical block geometry and bound in the immutable append intent.
-        recovered = append(
-            stack,
-            workbench,
-            operation_id,
-            payload,
-            label="operator-same-id-completion",
-            max_size=1024 * 1024,
-            block_size=65536,
-        )
-        require(
-            recovered.get("status") == "success"
-            and recovered["publication_operation_id"] != child,
-            "same logical ID completes through its next child",
-            recovered,
-        )
-        exact_body(stack, workbench, payload, "operator-exact-one-effect")
-        final_inventory = inventory(stack, "operator-final-inventory")
-        require(
-            all(final_inventory.get(row["key"], [None])[0] == 0 for row in verified),
-            "operator recovery retains all old zero guards",
-            final_inventory,
-        )
-        replay = replay_unchanged(
-            stack,
-            workbench,
-            operation_id,
-            payload,
-            recovered,
-            "operator-completed-replay",
-            max_size=1024 * 1024,
-            block_size=65536,
-        )
-        return case_result(
-            safety="PASS",
-            completion="PASS",
-            caller_sigkill=True,
-            same_owner_pid=owner_pid,
-            quarantine_status=status,
-            fault=faults[0],
-            status_observations=observations,
-            inspected_child=inspected,
-            verified_provider_keys=verified,
-            obsolete_verdict=wrong,
-            sealed_verdict=resolved,
-            terminal_receipt=recovered,
-            replay=replay,
-        )
-    finally:
-        with stack.object_proxy.lock:
-            stack.object_proxy.reject_matching = None
-            stack.object_proxy.rule = None
+    return operations.public_quarantine_recovery(stack, deadline)
 
 
 def identity_errors_and_status(stack):

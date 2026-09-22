@@ -10799,6 +10799,7 @@ mod tests {
             dependency_digest: dependency_owner_digest(&[]).unwrap(),
             cleanup_staged_object_cursor: 0,
             cleanup_manifest_cursor: 0,
+            cleanup_retry_count: 0,
             publication_absence_proof: None,
             result: None,
             terminal_error: None,

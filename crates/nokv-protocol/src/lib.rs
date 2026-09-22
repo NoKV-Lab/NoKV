@@ -24,8 +24,9 @@ pub const MAX_ARTIFACT_DEPENDENCY_OWNERS: u32 = 64;
 pub const MAX_ARTIFACT_DEPENDENCY_DEPTH: u8 = 8;
 
 pub use append::{
-    stable_append_attempt_identities, AppendAttemptBinding, AppendAttemptPhase, AppendPreparation,
-    AppendResult,
+    stable_append_attempt_identities, AppendAttemptBinding, AppendAttemptPhase,
+    AppendCleanupInspection, AppendCleanupRetryResult, AppendPreparation, AppendResult,
+    InspectAppendCleanupRequest, RetryAppendCleanupRequest,
 };
 pub use artifact_publish::{
     parse_sha256_digest_uri, seal_artifact_publish_plan, sha256_digest_uri,

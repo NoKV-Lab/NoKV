@@ -19,7 +19,7 @@ use nokv_types::{
 };
 
 /// Durable value format for publication-owned payloads.
-pub const PUBLISH_VALUE_FORMAT_VERSION: u8 = 6;
+pub const PUBLISH_VALUE_FORMAT_VERSION: u8 = 7;
 
 /// Hard safety bound for one publish operation's staged-object ledger.
 pub const MAX_STAGED_OBJECTS: u32 = 1_048_576;
@@ -188,6 +188,8 @@ pub struct PublishOperationRecord {
     /// Number of staged-object and manifest rows durably removed by cleanup.
     pub cleanup_staged_object_cursor: u32,
     pub cleanup_manifest_cursor: u32,
+    /// Accepted owner cleanup retries; monotonic even when the same failure recurs.
+    pub cleanup_retry_count: u64,
 
     /// Required only when cleanup takes over a `Finalizing` operation.
     pub publication_absence_proof: Option<[u8; SHA256_BYTES]>,
@@ -633,6 +635,18 @@ impl PublishOperationRecord {
             self.cleanup_manifest_cursor,
             self.manifest_cursor,
         )?;
+        if self.cleanup_retry_count != 0
+            && (self.append_attempt.is_none()
+                || matches!(
+                    self.phase,
+                    PublishPhase::Uploading | PublishPhase::Finalizing | PublishPhase::Published
+                ))
+        {
+            return Err(PublishRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "cleanup retries belong only to failed logical append attempts",
+            });
+        }
         validate_progress_digest(
             "staged_object",
             self.staged_object_count,
@@ -884,6 +898,7 @@ impl PublishOperationRecord {
         encoded.extend_from_slice(&self.dependency_digest);
         encoded.extend_from_slice(&self.cleanup_staged_object_cursor.to_be_bytes());
         encoded.extend_from_slice(&self.cleanup_manifest_cursor.to_be_bytes());
+        encoded.extend_from_slice(&self.cleanup_retry_count.to_be_bytes());
         push_optional_fixed(&mut encoded, &self.publication_absence_proof);
         push_optional_result(&mut encoded, self.result.as_ref())?;
         push_optional_terminal_error(&mut encoded, self.terminal_error.as_ref())?;
@@ -997,6 +1012,7 @@ impl PublishOperationRecord {
         let dependency_digest = decoder.fixed("dependency_digest")?;
         let cleanup_staged_object_cursor = decoder.u32("cleanup_staged_object_cursor")?;
         let cleanup_manifest_cursor = decoder.u32("cleanup_manifest_cursor")?;
+        let cleanup_retry_count = decoder.u64("cleanup_retry_count")?;
         let publication_absence_proof = decoder.optional_fixed("publication_absence_proof")?;
         let result = decode_optional_result(&mut decoder)?;
         let terminal_error = decode_optional_terminal_error(&mut decoder)?;
@@ -1033,6 +1049,7 @@ impl PublishOperationRecord {
             dependency_digest,
             cleanup_staged_object_cursor,
             cleanup_manifest_cursor,
+            cleanup_retry_count,
             publication_absence_proof,
             result,
             terminal_error,
@@ -1142,6 +1159,33 @@ impl PublishOperationRecord {
         next.phase = PublishPhase::Aborting;
         next.publication_absence_proof = Some(publication_absence_proof);
         next.terminal_error = Some(terminal_error);
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+
+    pub(super) fn retry_append_cleanup(&mut self) -> Result<(), PublishRecordError> {
+        self.validate()?;
+        if self.phase != PublishPhase::Quarantined {
+            return Err(PublishRecordError::PhaseMismatch {
+                expected: PublishPhase::Quarantined,
+                actual: self.phase,
+            });
+        }
+        if self.append_attempt.is_none() {
+            return Err(PublishRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "owner cleanup retry requires a logical append child",
+            });
+        }
+        let mut next = self.clone();
+        next.cleanup_retry_count = next.cleanup_retry_count.checked_add(1).ok_or(
+            PublishRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "cleanup retry count exhausted",
+            },
+        )?;
+        next.phase = PublishPhase::Cleaning;
         next.validate()?;
         *self = next;
         Ok(())
@@ -1928,6 +1972,64 @@ impl<'a> Decoder<'a> {
     }
 }
 
+/// Durable acceptance receipt for one exact logical append cleanup state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppendCleanupRetryReceipt {
+    pub operation_id: OperationId,
+    pub publication_operation_id: OperationId,
+    pub expected_state_digest: [u8; SHA256_BYTES],
+    pub cleanup_retry_count: u64,
+    pub original_failure: PublishTerminalError,
+}
+
+impl AppendCleanupRetryReceipt {
+    pub fn encode(&self) -> Result<Vec<u8>, PublishRecordError> {
+        validate_terminal_error(&self.original_failure)?;
+        if self.cleanup_retry_count == 0
+            || self.operation_id == self.publication_operation_id
+            || self.original_failure.evidence_digest.is_none()
+        {
+            return Err(PublishRecordError::InvalidPhasePayload { phase: PublishPhase::Quarantined,
+                reason: "cleanup retry receipt requires distinct identities, positive count, and original quarantine evidence" });
+        }
+        let mut bytes = b"nokv.append.cleanup-retry.v1\0".to_vec();
+        bytes.extend_from_slice(self.operation_id.as_bytes());
+        bytes.extend_from_slice(self.publication_operation_id.as_bytes());
+        bytes.extend_from_slice(&self.expected_state_digest);
+        bytes.extend_from_slice(&self.cleanup_retry_count.to_be_bytes());
+        push_optional_terminal_error(&mut bytes, Some(&self.original_failure))?;
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, PublishRecordError> {
+        let prefix = b"nokv.append.cleanup-retry.v1\0";
+        let mut decoder = Decoder::new(bytes);
+        if decoder.take("cleanup retry receipt tag", prefix.len())? != prefix {
+            return Err(PublishRecordError::InvalidPhasePayload {
+                phase: PublishPhase::Quarantined,
+                reason: "invalid cleanup retry receipt tag",
+            });
+        }
+        let receipt = Self {
+            operation_id: OperationId::from_bytes(decoder.fixed("operation_id")?),
+            publication_operation_id: OperationId::from_bytes(
+                decoder.fixed("publication_operation_id")?,
+            ),
+            expected_state_digest: decoder.fixed("expected_state_digest")?,
+            cleanup_retry_count: decoder.u64("cleanup_retry_count")?,
+            original_failure: decode_optional_terminal_error(&mut decoder)?.ok_or(
+                PublishRecordError::InvalidPhasePayload {
+                    phase: PublishPhase::Quarantined,
+                    reason: "cleanup retry receipt is missing original failure",
+                },
+            )?,
+        };
+        decoder.finish()?;
+        receipt.encode()?;
+        Ok(receipt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2003,6 +2105,7 @@ mod tests {
             dependency_digest: [0x18; SHA256_BYTES],
             cleanup_staged_object_cursor: 0,
             cleanup_manifest_cursor: 0,
+            cleanup_retry_count: 0,
             publication_absence_proof: None,
             result: None,
             terminal_error: None,
@@ -2090,6 +2193,7 @@ mod tests {
             &[0x18; SHA256_BYTES],
             &0_u32.to_be_bytes(),
             &0_u32.to_be_bytes(),
+            &0_u64.to_be_bytes(),
             &[0],
             &[1],
             &8_u64.to_be_bytes(),

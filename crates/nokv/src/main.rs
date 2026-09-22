@@ -61,7 +61,16 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let invocation = cli::parse(std::env::args().skip(1)).map_err(|error| error.to_string())?;
+    let invocation = cli::parse(std::env::args().skip(1)).map_err(|error| match error {
+        cli::CliError::OperationInput {
+            operation_id,
+            message,
+        } => append_error_json(
+            nokv_protocol::OperationIdentity(operation_id),
+            append_input_error(message),
+        ),
+        error => error.to_string(),
+    })?;
     if matches!(invocation.command, Command::Mcp { .. }) {
         // stderr only: stdout carries the line-delimited JSON-RPC stream.
         eprintln!(
@@ -149,6 +158,24 @@ fn run() -> Result<(), String> {
         Command::OperationStatus { operation_id } => {
             run_operation_status(&invocation, nokv_protocol::OperationIdentity(*operation_id))
         }
+        Command::OperationInspect {
+            operation_id,
+            limit,
+            cursor,
+        } => run_operation_inspect(
+            &invocation,
+            nokv_protocol::OperationIdentity(*operation_id),
+            *limit,
+            cursor.clone(),
+        ),
+        Command::OperationRecover {
+            operation_id,
+            expected_state_digest,
+        } => run_operation_recover(
+            &invocation,
+            nokv_protocol::OperationIdentity(*operation_id),
+            *expected_state_digest,
+        ),
     }
 }
 
@@ -548,9 +575,15 @@ fn run_operation_status(
 fn append_status_json(
     call: &nokv_client::ClientCall<nokv_protocol::OperationStatus>,
 ) -> Result<Value, String> {
-    let recovery = nokv_client::append_operation_recovery(&call.value)
+    let mut result = append_operation_json(&call.value)?;
+    result["commit_version"] = json!(call.commit_version);
+    result["replayed"] = json!(call.replayed);
+    Ok(result)
+}
+
+fn append_operation_json(status: &nokv_protocol::OperationStatus) -> Result<Value, String> {
+    let recovery = nokv_client::append_operation_recovery(status)
         .map_err(|error| agent_error(backend::map_append_client_error(error).into()))?;
-    let status = &call.value;
     let preparation = status
         .append_preparation
         .as_ref()
@@ -571,6 +604,7 @@ fn append_status_json(
         "observed_state": format!("{:?}", status.state),
         "publication_operation_id": encode_lowercase_hex(&preparation.publication_operation_id.0),
         "attempt": preparation.attempt,
+        "cleanup_retry_count": preparation.cleanup_retry_count,
         "attempt_phase": preparation.attempt_phase,
         "activity_deadline_ms": preparation.activity_deadline_ms,
         "workspace_incarnation_id": encode_lowercase_hex(&preparation.workspace_incarnation_id.0),
@@ -587,9 +621,94 @@ fn append_status_json(
             "current_generation": failure.current_generation,
         })),
         "receipt": receipt,
-        "commit_version": call.commit_version,
-        "replayed": call.replayed,
     }))
+}
+
+fn operation_token_json(token: nokv_protocol::OperationToken) -> Value {
+    json!({
+        "operation_id": encode_lowercase_hex(&token.operation_id.0),
+        "state_digest": encode_lowercase_hex(&token.state_digest.0),
+    })
+}
+
+fn cleanup_retry_receipt_json(receipt: &nokv_protocol::AppendCleanupRetryResult) -> Value {
+    json!({
+        "operation_id": encode_lowercase_hex(&receipt.operation_id.0),
+        "publication_operation_id": encode_lowercase_hex(&receipt.publication_operation_id.0),
+        "cleanup_retry_count": receipt.cleanup_retry_count,
+        "expected_state_digest": encode_lowercase_hex(&receipt.expected_state_digest.0),
+    })
+}
+
+fn append_inspection_json(
+    call: &nokv_client::ClientCall<nokv_client::AppendOperationInspection>,
+) -> Result<Value, String> {
+    let inspection = &call.value.inspection;
+    let mut result = append_operation_json(&inspection.operation)?;
+    result["action"] = json!("inspect");
+    result["operation_token"] = operation_token_json(inspection.operation.token);
+    result["publication_token"] = operation_token_json(inspection.publication_token);
+    result["object_namespace_id"] = json!(encode_lowercase_hex(&inspection.object_namespace_id.0));
+    result["registered_count"] = json!(inspection.registered_count);
+    result["cleanup_cursor"] = json!(inspection.cleanup_cursor);
+    result["remaining_count"] = json!(inspection.remaining_count);
+    result["entries"] = json!(inspection.entries);
+    result["next_cursor"] = json!(call
+        .value
+        .next_cursor
+        .as_ref()
+        .map(|cursor| STANDARD.encode(cursor)));
+    result["commit_version"] = json!(call.commit_version);
+    result["replayed"] = json!(call.replayed);
+    Ok(result)
+}
+
+fn append_recovery_json(
+    call: &nokv_client::ClientCall<nokv_client::AppendRecoveryRequestResult>,
+) -> Result<Value, String> {
+    let mut result = append_operation_json(&call.value.operation)?;
+    result["action"] = json!("recover");
+    result["operation_token"] = operation_token_json(call.value.operation.token);
+    result["requested"] = json!(call.value.requested);
+    result["recovery_receipt"] = json!(call.value.receipt.as_ref().map(cleanup_retry_receipt_json));
+    result["commit_version"] = json!(call.commit_version);
+    result["replayed"] = json!(call.replayed);
+    Ok(result)
+}
+
+fn run_operation_inspect(
+    invocation: &Invocation,
+    operation_id: nokv_protocol::OperationIdentity,
+    limit: u32,
+    cursor: Option<Vec<u8>>,
+) -> Result<(), String> {
+    (|| {
+        let client = build_workspace_path_client(invocation)?;
+        let call = client
+            .inspect_append_operation(operation_id, nokv_protocol::PageRequest { cursor, limit })
+            .map_err(|error| agent_error(backend::map_append_client_error(error).into()))?;
+        print_json(&append_inspection_json(&call)?)
+    })()
+    .map_err(|message| append_error_json(operation_id, message))
+}
+
+fn run_operation_recover(
+    invocation: &Invocation,
+    operation_id: nokv_protocol::OperationIdentity,
+    expected_state_digest: Option<[u8; 32]>,
+) -> Result<(), String> {
+    (|| {
+        let client = build_workspace_path_client(invocation)?;
+        let expected = expected_state_digest.map(|digest| nokv_protocol::OperationToken {
+            operation_id,
+            state_digest: nokv_protocol::Digest(digest),
+        });
+        let call = client
+            .recover_append_operation(operation_id, expected)
+            .map_err(|error| agent_error(backend::map_append_client_error(error).into()))?;
+        print_json(&append_recovery_json(&call)?)
+    })()
+    .map_err(|message| append_error_json(operation_id, message))
 }
 
 fn append_input_error(message: String) -> String {
@@ -618,9 +737,13 @@ fn append_error_json(operation_id: nokv_protocol::OperationIdentity, message: St
             nokv_agent::AgentError::backend("AppendFailed", message, false, json!({})).as_value()
         });
     error["details"]["operation_id"] = json!(encode_lowercase_hex(&operation_id.0));
-    error["details"]["next_action"] = json!("query_same");
+    if error["details"]["next_action"].is_null() {
+        error["details"]["next_action"] = json!("query_same");
+    }
     error["details"]["cause_code"] = error["details"]["code"].clone();
-    error["details"]["publication_operation_id"] = Value::Null;
+    if error["details"]["publication_operation_id"].is_null() {
+        error["details"]["publication_operation_id"] = Value::Null;
+    }
     serde_json::to_string(&error).expect("append error contains only JSON values")
 }
 
@@ -843,6 +966,8 @@ USAGE:
   nokv [connection/object options] materialize <workbench> <section> <path> <destination>
   nokv [connection/object options] collect <workbench> <section> <source> <path> [--replace] [--expected-generation N] [--content-type TYPE]
   nokv [route/agent options] operation status <HEX32>
+  nokv [route/agent options] operation inspect <HEX32> [--limit N] [--cursor BASE64]
+  nokv [route/agent options] operation recover <HEX32> [--expected-state-digest HEX64]
   nokv [route/agent options] workspace-path rename <workbench> <section> <source> <destination> --expected-generation N --request-id HEX32
   nokv [route/agent options] workspace-path remove <workbench> <section> <path> --expected-generation N --request-id HEX32
   nokv [route/agent/object options] workspace-path append <workbench> <section> <path> --operation-id HEX32 (--text TEXT | --base64 BASE64 | --file PATH) [--content-type TYPE] [--max-logical-size N] [--block-size N] [--expected-workspace-incarnation-id HEX32]
@@ -854,7 +979,7 @@ USAGE:
 
 AGENT CONTROL ROUTING:
   --root-id HEX32
-  --agent-id HEX32 is required by provision, workbench, mcp, materialize, collect, workspace-path, and operation status
+  --agent-id HEX32 is required by provision, workbench, mcp, materialize, collect, workspace-path, and operation commands
   AgentId is a durable deployment identity used to prevent root misconfiguration; it is not an authentication credential
   --metadata-address HOST:PORT --logical-shard-id HEX32 --object-namespace-id HEX32
     --placement-generation N --owner-epoch N
@@ -875,6 +1000,9 @@ AGENT PRESENTATION:
   workspace-path rename/remove require an explicit lowercase HEX32 request id for exact cross-process replay
   workspace-path append requires a stable lowercase HEX32 logical operation id
   operation status observes append recovery without a payload, workspace, or object-store connection
+  operation inspect returns retained staged entries, default 32 per page (maximum 192); reuse its opaque cursor
+  save inspect.operation_token.state_digest before operation recover and reuse it after an unknown reply
+  operation recover asks the owner to retry quarantined cleanup; it does not resubmit the append payload
   the first append requires an existing workspace; replays resolve its original incarnation
   append delta and default total body limits are 16 MiB; --max-logical-size raises the bound body limit
   append returns the original publication receipt on replay; retain the id and incarnation across restarts
@@ -1509,6 +1637,7 @@ mod tests {
                     attempt_phase: nokv_protocol::AppendAttemptPhase::Finalizing,
                     activity_deadline_ms: 123_000,
                     attempt_failure: None,
+                    cleanup_retry_count: 0,
                 })),
                 publish_preparation: None,
                 commit_preparation: None,
@@ -1562,8 +1691,82 @@ mod tests {
             .unwrap()
             .attempt_phase = nokv_protocol::AppendAttemptPhase::Quarantined;
         let quarantined = append_status_json(&call).unwrap();
-        assert_eq!(quarantined["next_action"], "operator_reconcile");
+        assert_eq!(quarantined["next_action"], "retry_cleanup");
         assert!(quarantined["receipt"].is_null());
+
+        let inspected = append_inspection_json(&nokv_client::ClientCall {
+            value: nokv_client::AppendOperationInspection {
+                inspection: nokv_protocol::AppendCleanupInspection {
+                    operation: Box::new(call.value.clone()),
+                    object_namespace_id: nokv_protocol::ObjectNamespaceIdentity([0xee; 16]),
+                    publication_token: nokv_protocol::OperationToken {
+                        operation_id: nokv_protocol::OperationIdentity([0xcc; 16]),
+                        state_digest: nokv_protocol::Digest([0x33; 32]),
+                    },
+                    registered_count: 3,
+                    cleanup_cursor: 1,
+                    remaining_count: 2,
+                    entries: vec![nokv_protocol::StagedObject {
+                        sequence: 1,
+                        object_identity: nokv_protocol::ObjectIdentity::new("objects/retained-1")
+                            .unwrap(),
+                        expected_length: 4,
+                        expected_digest: nokv_protocol::sha256_digest_uri(nokv_protocol::Digest(
+                            [0x44; 32],
+                        )),
+                        multipart_token: None,
+                    }],
+                    next_after: Some(1),
+                },
+                next_cursor: Some(vec![1, 2, 3]),
+            },
+            commit_version: None,
+            replayed: false,
+        })
+        .unwrap();
+        assert_eq!(
+            inspected["operation_token"]["state_digest"],
+            "11".repeat(32)
+        );
+        assert_eq!(
+            inspected["publication_token"]["operation_id"],
+            "cc".repeat(16)
+        );
+        assert_eq!(inspected["remaining_count"], 2);
+        assert_eq!(inspected["cleanup_cursor"], 1);
+        assert_eq!(inspected["entries"][0]["expected_length"], 4);
+        assert_eq!(inspected["next_cursor"], "AQID");
+
+        // A replayed cleanup receipt can be older than the current operation.
+        call.value
+            .append_preparation
+            .as_mut()
+            .unwrap()
+            .cleanup_retry_count = 2;
+        let recovery = append_recovery_json(&nokv_client::ClientCall {
+            value: nokv_client::AppendRecoveryRequestResult {
+                operation: call.value.clone(),
+                requested: true,
+                receipt: Some(nokv_protocol::AppendCleanupRetryResult {
+                    operation_id: call.value.token.operation_id,
+                    publication_operation_id: nokv_protocol::OperationIdentity([0xcc; 16]),
+                    cleanup_retry_count: 1,
+                    expected_state_digest: nokv_protocol::Digest([0x55; 32]),
+                }),
+            },
+            commit_version: None,
+            replayed: true,
+        })
+        .unwrap();
+        assert_eq!(recovery["cleanup_retry_count"], 2);
+        assert_eq!(recovery["recovery_receipt"]["cleanup_retry_count"], 1);
+        assert_eq!(
+            recovery["recovery_receipt"]["expected_state_digest"],
+            "55".repeat(32)
+        );
+        assert_eq!(recovery["requested"], true);
+        assert_eq!(recovery["replayed"], true);
+        assert!(recovery["receipt"].is_null());
     }
 
     #[test]

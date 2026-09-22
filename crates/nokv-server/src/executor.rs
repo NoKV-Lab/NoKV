@@ -36,7 +36,8 @@ const _: () = assert!(protocol::MAX_QUERY_PAGE_LIMIT as usize == meta::MAX_QUERY
 // reject the legacy 61..=64 gap at DTO-to-domain conversion as main does.
 const _: () =
     assert!(protocol::ArtifactDescriptor::MAX_INDEX_FIELDS >= meta::MAX_TYPED_PROJECTION_FIELDS);
-const SUPPORTED_WORKSPACE_CAPABILITIES: [protocol::WorkspaceCapability; 11] = [
+const SUPPORTED_WORKSPACE_CAPABILITIES: [protocol::WorkspaceCapability; 12] = [
+    protocol::WorkspaceCapability::ArtifactAppendRecoveryV1,
     protocol::WorkspaceCapability::ArtifactAppendV1,
     protocol::WorkspaceCapability::ArtifactPublishV1,
     protocol::WorkspaceCapability::ArtifactRangeReadV1,
@@ -284,6 +285,12 @@ impl MetadataWorkspaceRequestExecutor {
                 self.finalize_restore(request, finalize)
             }
             protocol::WorkspaceRequest::GetOperation(get) => self.get_operation(request, get),
+            protocol::WorkspaceRequest::InspectAppendCleanup(inspect) => {
+                self.inspect_append_cleanup(request, inspect)
+            }
+            protocol::WorkspaceRequest::RetryAppendCleanup(retry) => {
+                self.retry_append_cleanup(request, retry)
+            }
             protocol::WorkspaceRequest::BeginGenericIndexRegistration(begin) => {
                 self.begin_generic_index_registration(request, begin)
             }
@@ -2172,6 +2179,7 @@ impl MetadataWorkspaceRequestExecutor {
             dependency_digest,
             cleanup_staged_object_cursor: 0,
             cleanup_manifest_cursor: 0,
+            cleanup_retry_count: 0,
             publication_absence_proof: None,
             result: None,
             terminal_error: None,
@@ -2502,9 +2510,6 @@ impl MetadataWorkspaceRequestExecutor {
             protocol::QuarantineResolution::ProviderObjectsAbsent => {
                 meta::QuarantineReconcileResolution::RevisionUnpublished
             }
-            protocol::QuarantineResolution::ProviderObjectsSealed => {
-                meta::QuarantineReconcileResolution::RevisionUnpublishedSealed
-            }
             protocol::QuarantineResolution::RevisionPublished => {
                 meta::QuarantineReconcileResolution::RevisionPublished
             }
@@ -2788,6 +2793,185 @@ impl MetadataWorkspaceRequestExecutor {
         }
         Ok(ExecutedRequest {
             result: protocol::WorkspaceResult::Operation(status),
+            commit_version: Some(outcome.commit_version.get()),
+            replayed: outcome.replayed,
+        })
+    }
+
+    fn inspect_append_cleanup(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::InspectAppendCleanupRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        let context = self.read_context(rpc.route)?;
+        let logical_id: types::OperationId = request.token.operation_id.into();
+        let key = meta::operation_key(context.root_id, types::OperationKind::Append, logical_id);
+        let payload = self
+            .meta
+            .read_at(
+                context.root_id,
+                context.placement_generation,
+                context.owner_epoch,
+                meta::MetadataFamily::Operation,
+                &key,
+                context.read_version,
+            )
+            .map_err(meta_failure)?
+            .ok_or_else(|| not_found("logical append operation does not exist"))?;
+        let parent = meta::AppendOperationRecord::decode(&payload)
+            .map_err(|error| internal(format!("invalid append operation: {error}")))?;
+        if parent.operation_id != logical_id {
+            return Err(internal("append operation key and payload disagree"));
+        }
+        let child = self.load_publish_operation(
+            rpc.route,
+            context.read_version,
+            parent.publication_operation_id.into(),
+        )?;
+        let operation = append_operation_status(&parent, &child)?;
+        if child.phase != types::PublishPhase::Published {
+            let key =
+                meta::artifact_revision_claim_key(context.root_id, child.artifact_revision_id);
+            let payload = self
+                .meta
+                .read_at(
+                    context.root_id,
+                    context.placement_generation,
+                    context.owner_epoch,
+                    meta::MetadataFamily::ArtifactRevision,
+                    &key,
+                    context.read_version,
+                )
+                .map_err(meta_failure)?
+                .ok_or_else(|| internal("append revision reservation is missing"))?;
+            if meta::ArtifactRevisionClaimRecord::decode(&payload)
+                .map_err(|error| internal(error.to_string()))?
+                .operation_id
+                != child.operation_id
+            {
+                return Err(internal(
+                    "append revision reservation belongs to another operation",
+                ));
+            }
+        }
+        if operation.token != request.token {
+            return Err(conflict(
+                protocol::ConflictKind::OperationState,
+                "append state changed; restart inspection using its current logical token",
+                None,
+            ));
+        }
+        let start = match request.start_after {
+            None => child.cleanup_staged_object_cursor,
+            Some(after)
+                if after >= child.cleanup_staged_object_cursor
+                    && after < child.staged_object_cursor =>
+            {
+                after + 1
+            }
+            Some(_) => {
+                return Err(invalid_argument(
+                    "append cleanup cursor is outside the current retained ledger",
+                ))
+            }
+        };
+        let end = start
+            .saturating_add(request.limit)
+            .min(child.staged_object_cursor);
+        let mut entries = Vec::with_capacity((end - start) as usize);
+        let route = route_parts(rpc.route)?;
+        for sequence in start..end {
+            let key =
+                meta::staged_object_key(context.root_id, child.operation_id, u64::from(sequence));
+            let payload = self
+                .meta
+                .read_at(
+                    context.root_id,
+                    context.placement_generation,
+                    context.owner_epoch,
+                    meta::MetadataFamily::StagedObject,
+                    &key,
+                    context.read_version,
+                )
+                .map_err(meta_failure)?
+                .ok_or_else(|| internal(format!("retained staged object {sequence} is missing")))?;
+            let row = meta::StagedObjectRecord::decode(&payload)
+                .map_err(|error| internal(format!("invalid staged object: {error}")))?;
+            if row.object_sequence != sequence
+                || row.artifact_revision_id != child.artifact_revision_id
+                || row.object_key
+                    != meta::object_block_key(
+                        route.logical_shard_id,
+                        context.root_id,
+                        child.artifact_revision_id,
+                        u64::from(sequence),
+                    )
+            {
+                return Err(internal(
+                    "staged object key, sequence, revision, or root binding disagrees",
+                ));
+            }
+            entries.push(protocol::StagedObject {
+                sequence,
+                object_identity: protocol::ObjectIdentity::new(row.object_key)
+                    .map_err(|e| internal(e.to_string()))?,
+                expected_length: row.expected_length,
+                expected_digest: protocol::DigestUri::new(row.expected_digest_uri)
+                    .map_err(|e| internal(e.to_string()))?,
+                multipart_token: row.multipart_upload_id,
+            });
+        }
+        Ok(ExecutedRequest {
+            result: protocol::WorkspaceResult::AppendCleanupInspection(
+                protocol::AppendCleanupInspection {
+                    operation: Box::new(operation),
+                    object_namespace_id: rpc.route.object_namespace_id,
+                    publication_token: protocol::OperationToken {
+                        operation_id: child.operation_id.into(),
+                        state_digest: publish_state_digest(&child)?,
+                    },
+                    registered_count: child.staged_object_cursor,
+                    cleanup_cursor: child.cleanup_staged_object_cursor,
+                    remaining_count: child.staged_object_cursor
+                        - child.cleanup_staged_object_cursor,
+                    entries,
+                    next_after: (end < child.staged_object_cursor).then(|| end - 1),
+                },
+            ),
+            commit_version: None,
+            replayed: false,
+        })
+    }
+
+    fn retry_append_cleanup(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::RetryAppendCleanupRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        self.claim_mutation(rpc)?;
+        // The service derives its durable enqueue ID from the full logical token;
+        // the outer request ID is only the ordinary exact-RPC fencing boundary.
+        let context = self.publication_context(
+            rpc.route,
+            derived_request_id(rpc.request_id, b"append-cleanup-retry-context", 0),
+        )?;
+        let outcome = meta::PublicationService::new(&self.meta)
+            .retry_append_cleanup(
+                context,
+                request.token.operation_id.into(),
+                request.token.state_digest.0,
+            )
+            .map_err(publication_failure)?;
+        let receipt = outcome.receipt;
+        Ok(ExecutedRequest {
+            result: protocol::WorkspaceResult::AppendCleanupRetried(
+                protocol::AppendCleanupRetryResult {
+                    operation_id: receipt.operation_id.into(),
+                    publication_operation_id: receipt.publication_operation_id.into(),
+                    cleanup_retry_count: receipt.cleanup_retry_count,
+                    expected_state_digest: protocol::Digest(receipt.expected_state_digest),
+                },
+            ),
             commit_version: Some(outcome.commit_version.get()),
             replayed: outcome.replayed,
         })
@@ -4312,14 +4496,8 @@ fn append_operation_status(
     } else {
         protocol::OperationState::Running
     };
-    let mut hasher = Sha256::new();
-    hasher.update(b"nokv.append.state.v1\0");
-    hasher.update(
-        parent
-            .encode()
-            .map_err(|error| internal(error.to_string()))?,
-    );
-    hasher.update(child_status.token.state_digest.0);
+    let state_digest = meta::append_operation_state_digest(parent, child)
+        .map_err(|error| internal(error.to_string()))?;
     Ok(protocol::OperationStatus {
         append_preparation: Some(Box::new(protocol::AppendPreparation {
             intent_digest: protocol::Digest(parent.intent_digest),
@@ -4330,6 +4508,7 @@ fn append_operation_status(
             artifact_revision_id: parent.artifact_revision_id.into(),
             attempt_phase: phase,
             activity_deadline_ms: child.activity_deadline_ms,
+            cleanup_retry_count: child.cleanup_retry_count,
             attempt_failure: child_status.failure.clone().or_else(|| {
                 child
                     .terminal_error
@@ -4339,7 +4518,7 @@ fn append_operation_status(
         })),
         token: protocol::OperationToken {
             operation_id: parent.operation_id.into(),
-            state_digest: protocol::Digest(hasher.finalize().into()),
+            state_digest: protocol::Digest(state_digest),
         },
         kind: protocol::OperationKind::ArtifactAppend,
         publish_preparation: None,
@@ -10544,6 +10723,293 @@ mod tests {
                 matches!(observed.result, protocol::WorkspaceResult::Operation(ref status) if status.kind == expected_kind)
             );
         }
+    }
+
+    #[test]
+    fn append_cleanup_inspection_pages_only_retained_rows_and_retry_is_token_idempotent() {
+        let (store, executor) = ready_executor();
+        executor
+            .execute(&create_request(0x81, "stable-append", 0x82, 1))
+            .unwrap();
+        let mut begin = stable_append_begin_request();
+        let logical = begin.append_attempt.unwrap().operation_id;
+        let staged: Vec<_> = (0..65)
+            .map(|sequence| protocol::StagedObject {
+                sequence,
+                object_identity: protocol::ObjectIdentity::new(meta::object_block_key(
+                    shard(),
+                    root(),
+                    begin.artifact_revision_id.into(),
+                    u64::from(sequence),
+                ))
+                .unwrap(),
+                expected_length: 1,
+                expected_digest: protocol::sha256_digest_uri(protocol::Digest(
+                    [sequence as u8; 32],
+                )),
+                multipart_token: None,
+            })
+            .collect();
+        let seals =
+            protocol::seal_artifact_publish_plan(begin.artifact_revision_id, &staged, &[]).unwrap();
+        begin.staged_object_count = seals.staged_object_count;
+        begin.staged_object_seal = seals.staged_object_seal;
+        let begun = executor
+            .execute(&restore_rpc(
+                0x86,
+                protocol::WorkspaceRequest::BeginArtifactPublish(begin.clone()),
+            ))
+            .unwrap();
+        let protocol::WorkspaceResult::Operation(begun) = begun.result else {
+            panic!("expected publication status")
+        };
+        executor
+            .execute(&restore_rpc(
+                0x87,
+                protocol::WorkspaceRequest::StageArtifactObjects(
+                    protocol::StageArtifactObjectsRequest {
+                        token: begun.token,
+                        objects: staged.clone(),
+                    },
+                ),
+            ))
+            .unwrap();
+        let query = || {
+            let result = executor
+                .execute(&restore_rpc(
+                    0x88,
+                    protocol::WorkspaceRequest::GetOperation(protocol::GetOperationRequest {
+                        operation_id: logical,
+                    }),
+                ))
+                .unwrap();
+            let protocol::WorkspaceResult::Operation(status) = result.result else {
+                panic!("expected logical status")
+            };
+            status
+        };
+        let active = query();
+        let active_failure = executor
+            .execute(&restore_rpc(
+                0x89,
+                protocol::WorkspaceRequest::RetryAppendCleanup(
+                    protocol::RetryAppendCleanupRequest {
+                        token: active.token,
+                    },
+                ),
+            ))
+            .unwrap_err();
+        assert_eq!(
+            active_failure.conflict,
+            Some(protocol::ConflictKind::OperationState)
+        );
+        assert_eq!(query().token, active.token);
+        let service = meta::PublicationService::new(&store);
+        let mut child = executor
+            .load_publish_operation(
+                route(1),
+                store.current_read_version().unwrap(),
+                begin.operation_id,
+            )
+            .unwrap();
+        for (id, transition) in [
+            (
+                0x90,
+                meta::PublishTransition::BeginAbort {
+                    terminal_error: meta::PublishTerminalError {
+                        kind: meta::PublishTerminalErrorKind::ActivityLeaseExpired,
+                        message: "caller exited".to_owned(),
+                        evidence_digest: None,
+                    },
+                },
+            ),
+            (0x91, meta::PublishTransition::BeginCleaning),
+        ] {
+            child = service
+                .transition_publish(meta::TransitionPublishRequest {
+                    context: executor
+                        .publication_context(route(1), types::RequestId::from_bytes([id; 16]))
+                        .unwrap(),
+                    expected_operation: child,
+                    transition,
+                })
+                .unwrap()
+                .operation;
+        }
+        let rows = executor
+            .reconcile_staged_batch_rows(route(1), &child)
+            .unwrap();
+        child = service
+            .cleanup_publish_batch(meta::CleanupPublishBatchRequest {
+                context: executor
+                    .publication_context(route(1), types::RequestId::from_bytes([0x92; 16]))
+                    .unwrap(),
+                expected_operation: child,
+                staged_object_updates: rows[..32]
+                    .iter()
+                    .map(|expected| {
+                        let mut next = expected.clone();
+                        next.provider_state = types::StagedProviderState::Aborted;
+                        next.cleanup_state = types::StagedCleanupState::Sealed;
+                        meta::StagedObjectUpdate {
+                            expected: expected.clone(),
+                            next,
+                        }
+                    })
+                    .collect(),
+            })
+            .unwrap()
+            .operation;
+        let quarantine_error = meta::PublishTerminalError {
+            kind: meta::PublishTerminalErrorKind::CleanupFailed,
+            message: "seal outcome unknown".to_owned(),
+            evidence_digest: Some([0x93; 32]),
+        };
+        child = service
+            .transition_publish(meta::TransitionPublishRequest {
+                context: executor
+                    .publication_context(route(1), types::RequestId::from_bytes([0x94; 16]))
+                    .unwrap(),
+                expected_operation: child,
+                transition: meta::PublishTransition::Quarantine {
+                    terminal_error: quarantine_error.clone(),
+                },
+            })
+            .unwrap()
+            .operation;
+        let token = query().token;
+        let inspect = |after| {
+            restore_rpc(
+                0x95,
+                protocol::WorkspaceRequest::InspectAppendCleanup(
+                    protocol::InspectAppendCleanupRequest {
+                        token,
+                        start_after: after,
+                        limit: 32,
+                    },
+                ),
+            )
+        };
+        let version = store.current_read_version().unwrap();
+        let first = executor.execute(&inspect(None)).unwrap();
+        let protocol::WorkspaceResult::AppendCleanupInspection(first) = first.result else {
+            panic!("expected inspection")
+        };
+        assert_eq!(
+            (
+                first.registered_count,
+                first.cleanup_cursor,
+                first.remaining_count
+            ),
+            (65, 32, 33)
+        );
+        assert_eq!(first.entries, staged[32..64]);
+        assert_eq!(first.next_after, Some(63));
+        assert_eq!(first.operation.token, token);
+        assert_eq!(first.publication_token.operation_id, begin.operation_id);
+        let last = executor.execute(&inspect(first.next_after)).unwrap();
+        let protocol::WorkspaceResult::AppendCleanupInspection(last) = last.result else {
+            panic!("expected inspection")
+        };
+        assert_eq!(last.entries, staged[64..]);
+        assert_eq!(last.next_after, None);
+        assert_eq!(
+            store.current_read_version().unwrap(),
+            version,
+            "inspection must be metadata-only and read-only"
+        );
+        let mut invalid = inspect(None);
+        let protocol::WorkspaceRequest::InspectAppendCleanup(request) = &mut invalid.operation
+        else {
+            unreachable!()
+        };
+        request.limit = 193;
+        assert_eq!(
+            executor.execute(&invalid).unwrap_err().code,
+            protocol::ErrorCode::InvalidArgument
+        );
+        let old_verdict = executor
+            .execute(&restore_rpc(
+                0x96,
+                protocol::WorkspaceRequest::ReconcileQuarantinedArtifactPublish(
+                    protocol::ReconcileQuarantinedArtifactPublishRequest {
+                        token: first.publication_token,
+                        resolution: protocol::QuarantineResolution::ProviderObjectsAbsent,
+                        reason: "external claim is not owner sealing".to_owned(),
+                        evidence_digest: protocol::Digest([0x97; 32]),
+                    },
+                ),
+            ))
+            .unwrap_err();
+        assert_eq!(old_verdict.code, protocol::ErrorCode::PreconditionFailed);
+        assert_eq!(query().token, token);
+        let retry = restore_rpc(
+            0x98,
+            protocol::WorkspaceRequest::RetryAppendCleanup(protocol::RetryAppendCleanupRequest {
+                token,
+            }),
+        );
+        let mut redelivery = retry.clone();
+        redelivery.request_id = protocol::RequestIdentity([0x99; 16]);
+        let (left, right) = std::thread::scope(|scope| {
+            let left = scope.spawn(|| executor.execute(&retry));
+            let right = scope.spawn(|| executor.execute(&redelivery));
+            (
+                left.join().unwrap().unwrap(),
+                right.join().unwrap().unwrap(),
+            )
+        });
+        assert_ne!(
+            left.replayed, right.replayed,
+            "concurrent same-token requests must enqueue once"
+        );
+        assert_eq!(left.result, right.result);
+        assert_eq!(left.commit_version, right.commit_version);
+        let accepted = if left.replayed { right } else { left };
+        assert!(accepted.commit_version.is_some());
+        let replay = executor.execute(&redelivery).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.result, accepted.result);
+        assert_eq!(replay.commit_version, accepted.commit_version);
+        let stale = executor.execute(&inspect(first.next_after)).unwrap_err();
+        assert_eq!(stale.code, protocol::ErrorCode::Conflict);
+        assert_eq!(stale.conflict, Some(protocol::ConflictKind::OperationState));
+        let current = executor
+            .load_publish_operation(
+                route(1),
+                store.current_read_version().unwrap(),
+                child.operation_id.into(),
+            )
+            .unwrap();
+        assert_eq!(current.cleanup_staged_object_cursor, 32);
+        assert_eq!(current.cleanup_retry_count, 1);
+        service
+            .transition_publish(meta::TransitionPublishRequest {
+                context: executor
+                    .publication_context(route(1), types::RequestId::from_bytes([0x9a; 16]))
+                    .unwrap(),
+                expected_operation: current,
+                transition: meta::PublishTransition::Quarantine {
+                    terminal_error: quarantine_error,
+                },
+            })
+            .unwrap();
+        assert_ne!(query().token, token);
+        assert!(executor.execute(&redelivery).unwrap().replayed);
+        assert_eq!(
+            query().state,
+            protocol::OperationState::Quarantined,
+            "redelivery cannot restart a later quarantine"
+        );
+        let mut misuse = retry;
+        let protocol::WorkspaceRequest::RetryAppendCleanup(request) = &mut misuse.operation else {
+            unreachable!()
+        };
+        request.token = query().token;
+        assert_eq!(
+            executor.execute(&misuse).unwrap_err().code,
+            protocol::ErrorCode::RequestReplayMismatch
+        );
     }
 
     #[test]
