@@ -11,10 +11,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nokv_client::{
     ArtifactPublishOptions, ArtifactPublishOutcome, ArtifactRangeBatchRequest, ClientError,
-    ClientOptions, FramedTcpOptions, FramedTcpTransport, RouteResolver, SnapshotMintOptions,
-    SnapshotRenewOptions, SnapshotRetireOptions, WorkbenchCommitRequest, WorkbenchLifecycleFacade,
-    WorkbenchLifecycleOptions, WorkbenchRestoreOrigin, WorkbenchRestoreRequest,
-    WorkbenchRestoreSource, WorkbenchSnapshotSelector, WorkspaceClient,
+    ClientOptions, FramedTcpOptions, FramedTcpTransport, IdempotentAppendOptions, RouteResolver,
+    SnapshotMintOptions, SnapshotRenewOptions, SnapshotRetireOptions, WorkbenchCommitRequest,
+    WorkbenchLifecycleFacade, WorkbenchLifecycleOptions, WorkbenchRestoreOrigin,
+    WorkbenchRestoreRequest, WorkbenchRestoreSource, WorkbenchSnapshotSelector, WorkspaceClient,
 };
 use nokv_object::ArtifactObjectStore;
 use nokv_protocol::{
@@ -41,9 +41,9 @@ use crate::object_store::{ConfiguredObjectStore, PythonObjectStoreConfig};
 use crate::python_value::{
     aggregate_result_to_py, catalog_result_to_py, find_workspaces_result_to_py, hex,
     parse_aggregates, parse_field_specs, parse_fixed_hex, parse_predicates, parse_sort,
-    path_metadata_to_py, path_page_to_py, publish_outcome_to_py, read_outcome_to_py,
-    search_result_to_py, snapshot_result_to_py, workspace_summary_to_py, PythonAggregateSpec,
-    PythonFieldSpec, PythonPredicateSpec, PythonSortSpec,
+    path_metadata_to_py, path_page_to_py, publish_outcome_to_py, publish_result_to_py,
+    read_outcome_to_py, search_result_to_py, snapshot_result_to_py, workspace_summary_to_py,
+    PythonAggregateSpec, PythonFieldSpec, PythonPredicateSpec, PythonSortSpec,
 };
 use crate::routing::PythonRoutingConfig;
 
@@ -496,6 +496,90 @@ impl PythonWorkspaceClient {
             hex(&result.value.artifact_revision_id.0),
         )?;
         set_call_metadata(&dict, result.commit_version, result.replayed)?;
+        Ok(dict)
+    }
+
+    /// Append bytes once under a caller-owned operation identity.
+    ///
+    /// The workspace must already exist. Retain the identity and incarnation
+    /// across process restarts. Replays return the original publication receipt,
+    /// which may precede the current path head. Existing artifact metadata and
+    /// content type are inherited unless `content_type` explicitly overrides it.
+    #[pyo3(signature = (
+        workbench,
+        path,
+        data,
+        operation_id,
+        content_type = None,
+        block_size = 4_194_304,
+        max_logical_size = None,
+        expected_workspace_incarnation_id = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn append_bytes<'py>(
+        &self,
+        py: Python<'py>,
+        workbench: &str,
+        path: &str,
+        data: Vec<u8>,
+        operation_id: &str,
+        content_type: Option<&str>,
+        block_size: usize,
+        max_logical_size: Option<u64>,
+        expected_workspace_incarnation_id: Option<&str>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let operation_id = OperationIdentity(parse_fixed_hex("operation_id", operation_id)?);
+        let target = parse_workspace_path(workbench, path)?;
+        let content_type = content_type
+            .map(|value| ContentType::new(value.to_owned()))
+            .transpose()
+            .map_err(value_error)?;
+        let create_content_type = content_type
+            .clone()
+            .unwrap_or(ContentType::new("application/octet-stream").map_err(value_error)?);
+        let expected = expected_workspace_incarnation_id
+            .map(|value| {
+                parse_fixed_hex("expected_workspace_incarnation_id", value).map(WorkspaceIdentity)
+            })
+            .transpose()?;
+        let client = Arc::clone(&self.client);
+        let objects = Arc::clone(&self.objects);
+        let (call, incarnation) = py
+            .detach(move || {
+                let incarnation = match expected {
+                    Some(incarnation) => incarnation,
+                    None => {
+                        client
+                            .get_workspace(GetWorkspaceRequest {
+                                workbench: target.workbench.clone(),
+                            })
+                            .map_err(|error| (Box::new(error), None))?
+                            .value
+                            .workspace_incarnation_id
+                    }
+                };
+                let mut options = IdempotentAppendOptions::new(
+                    operation_id,
+                    target,
+                    incarnation,
+                    create_content_type,
+                )
+                .with_block_size(block_size);
+                if let Some(content_type) = content_type {
+                    options = options.with_content_type(content_type);
+                }
+                if let Some(max_logical_size) = max_logical_size {
+                    options = options.with_max_logical_size(max_logical_size);
+                }
+                client
+                    .append_artifact_idempotent(objects.as_ref(), options, &data)
+                    .map(|call| (call, incarnation))
+                    .map_err(|error| (Box::new(error), Some(incarnation)))
+            })
+            .map_err(|(error, expected)| append_error(py, *error, operation_id, expected))?;
+        let dict = publish_result_to_py(py, &call.value)?;
+        dict.set_item("workspace_incarnation_id", hex(&incarnation.0))?;
+        set_call_metadata(&dict, call.commit_version, call.replayed)?;
         Ok(dict)
     }
 
@@ -1480,10 +1564,50 @@ fn publish_error(py: Python<'_>, error: ClientError, expected: Option<&str>) -> 
     client_error(error)
 }
 
+fn append_error(
+    py: Python<'_>,
+    error: ClientError,
+    operation_id: OperationIdentity,
+    expected: Option<WorkspaceIdentity>,
+) -> PyErr {
+    let identity = hex(&operation_id.0);
+    let expected = expected.map(|value| hex(&value.0));
+    if expected.is_some()
+        && client_error_failure(&error).is_some_and(|failure| {
+            failure.conflict == Some(nokv_protocol::ConflictKind::WorkspaceIncarnation)
+        })
+    {
+        let mapped = publish_error(py, error, expected.as_deref());
+        let _ = mapped.value(py).setattr("operation_id", identity);
+        return mapped;
+    }
+    let state = match &error {
+        ClientError::AppendUnresolved { state, .. } => state.map(|state| format!("{state:?}")),
+        _ => None,
+    };
+    let cause_code = client_error_failure(&error).map(|failure| format!("{:?}", failure.code));
+    let code = if matches!(&error, ClientError::AppendUnresolved { .. }) {
+        "AppendUnresolved".to_owned()
+    } else {
+        client_error_failure(&error)
+            .map(|failure| format!("{:?}", failure.code))
+            .unwrap_or_else(|| "AppendFailed".to_owned())
+    };
+    let message = error.to_string();
+    py.import("nokv")
+        .and_then(|module| module.getattr("AppendError"))
+        .and_then(|class| {
+            class.call1((message.clone(), identity, state, code, expected, cause_code))
+        })
+        .map(PyErr::from_value)
+        .unwrap_or_else(|_| PyRuntimeError::new_err(message))
+}
+
 fn client_error_failure(error: &ClientError) -> Option<&nokv_protocol::RpcFailure> {
     match error {
         ClientError::Rpc(failure) => Some(failure),
         ClientError::ArtifactPublishFailed { source, .. }
+        | ClientError::AppendUnresolved { source, .. }
         | ClientError::RetryExhausted {
             last_error: source, ..
         } => client_error_failure(source),
@@ -1505,6 +1629,7 @@ fn client_error_code(error: &ClientError) -> Option<nokv_protocol::ErrorCode> {
     match error {
         ClientError::Rpc(failure) => Some(failure.code),
         ClientError::ArtifactPublishFailed { source, .. }
+        | ClientError::AppendUnresolved { source, .. }
         | ClientError::RetryExhausted {
             last_error: source, ..
         } => client_error_code(source),

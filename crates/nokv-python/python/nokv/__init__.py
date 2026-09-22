@@ -1,5 +1,7 @@
 """Versioned Python SDK for NoKV Workbenches and immutable artifacts."""
 
+from __future__ import annotations
+
 from importlib.metadata import PackageNotFoundError, version as _distribution_version
 
 from . import checkpoint
@@ -18,6 +20,7 @@ except PackageNotFoundError:  # pragma: no cover - source tree without metadata
 
 __all__ = [
     "API_VERSION",
+    "AppendError",
     "Client",
     "ObjectStoreConfig",
     "RoutingConfig",
@@ -25,6 +28,37 @@ __all__ = [
     "WorkspaceIncarnationMismatch",
     "checkpoint",
 ]
+
+
+class AppendError(RuntimeError):
+    """An append failed or needs recovery under its original operation identity.
+
+    ``state`` is the observed durable operation state, or ``None`` when it is
+    unknown. Neither a timeout nor an unknown state proves that nothing was
+    published. Retry the same intent with the same ``operation_id``; do not
+    generate a replacement identity to bypass an unresolved operation.
+    ``cause_code`` preserves the underlying RPC code, for example
+    ``RequestReplayMismatch`` for a permanently mismatched intent, or ``None``
+    when there is no RPC failure. ``retryable`` is always false: generic retry
+    handlers must not turn an unresolved operation into a new action.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        operation_id: str,
+        state: str | None,
+        code: str,
+        expected: str | None,
+        cause_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.operation_id = operation_id
+        self.state = state
+        self.code = code
+        self.expected = expected
+        self.cause_code = cause_code
+        self.retryable = False
 
 
 class WorkspaceIncarnationMismatch(RuntimeError):

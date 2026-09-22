@@ -19,7 +19,7 @@ use nokv_types::{
 };
 
 /// Durable value format for publication-owned payloads.
-pub const PUBLISH_VALUE_FORMAT_VERSION: u8 = 4;
+pub const PUBLISH_VALUE_FORMAT_VERSION: u8 = 5;
 
 /// Hard safety bound for one publish operation's staged-object ledger.
 pub const MAX_STAGED_OBJECTS: u32 = 1_048_576;
@@ -140,6 +140,8 @@ pub struct PublishTerminalError {
 /// and an exact-identity initialization mismatch remain distinguishable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishOperationRecord {
+    /// Full caller intent commitment for one stable append publication attempt.
+    pub append_intent_digest: Option<[u8; SHA256_BYTES]>,
     pub operation_id: OperationId,
     pub identity_digest: [u8; SHA256_BYTES],
     pub initialization_digest: [u8; SHA256_BYTES],
@@ -445,6 +447,15 @@ impl std::error::Error for PublishRecordError {}
 
 impl PublishOperationRecord {
     pub fn validate(&self) -> Result<(), PublishRecordError> {
+        if self.append_intent_digest.is_some()
+            && (!matches!(self.authority, PublishAuthority::Visible)
+                || matches!(self.claim, PublishClaim::ReplaceOnly { .. }))
+        {
+            return Err(PublishRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "stable append requires visible create-only or append authority",
+            });
+        }
         if self.activity_deadline_ms == 0 {
             return Err(PublishRecordError::ZeroScalar {
                 field: "activity_deadline_ms",
@@ -687,6 +698,7 @@ impl PublishOperationRecord {
         encoded.extend_from_slice(self.operation_id.as_bytes());
         encoded.extend_from_slice(&self.identity_digest);
         encoded.extend_from_slice(&self.initialization_digest);
+        push_optional_fixed(&mut encoded, &self.append_intent_digest);
         encoded.extend_from_slice(&self.initiating_owner_epoch.get().to_be_bytes());
         encoded.extend_from_slice(&self.activity_deadline_ms.to_be_bytes());
         match self.authority {
@@ -754,6 +766,7 @@ impl PublishOperationRecord {
         let operation_id = OperationId::from_bytes(decoder.fixed("operation_id")?);
         let identity_digest = decoder.fixed("identity_digest")?;
         let initialization_digest = decoder.fixed("initialization_digest")?;
+        let append_intent_digest = decoder.optional_fixed("append_intent_digest")?;
         let initiating_owner_epoch = OwnerEpoch::new(decoder.u64("initiating_owner_epoch")?)
             .map_err(|_| PublishRecordError::ZeroScalar {
                 field: "initiating_owner_epoch",
@@ -838,6 +851,7 @@ impl PublishOperationRecord {
             operation_id,
             identity_digest,
             initialization_digest,
+            append_intent_digest,
             initiating_owner_epoch,
             activity_deadline_ms,
             authority,
@@ -1797,6 +1811,7 @@ mod tests {
 
     fn uploading_operation() -> PublishOperationRecord {
         PublishOperationRecord {
+            append_intent_digest: None,
             operation_id: OperationId::from_bytes([0x10; 16]),
             identity_digest: [0x11; SHA256_BYTES],
             initialization_digest: [0x12; SHA256_BYTES],
@@ -1885,6 +1900,7 @@ mod tests {
             &[0x10; 16],
             &[0x11; SHA256_BYTES],
             &[0x12; SHA256_BYTES],
+            &[0],
             &5_u64.to_be_bytes(),
             &50_000_u64.to_be_bytes(),
             &[1],
@@ -1930,6 +1946,21 @@ mod tests {
         assert_eq!(PublishOperationRecord::decode(&expected).unwrap(), record);
         assert_every_proper_prefix_is_truncated(&expected, PublishOperationRecord::decode);
         assert_trailing_byte_is_rejected(expected, PublishOperationRecord::decode);
+    }
+
+    #[test]
+    fn stable_append_intent_round_trips_without_truncation_and_rejects_old_codec() {
+        let mut record = uploading_operation();
+        let mut digest = [0x61; SHA256_BYTES];
+        digest[SHA256_BYTES - 1] = 0x62;
+        record.append_intent_digest = Some(digest);
+        let mut encoded = record.encode().unwrap();
+        assert_eq!(PublishOperationRecord::decode(&encoded).unwrap(), record);
+        encoded[0] = PUBLISH_VALUE_FORMAT_VERSION - 1;
+        assert!(matches!(
+            PublishOperationRecord::decode(&encoded),
+            Err(PublishRecordError::UnsupportedValueVersion { .. })
+        ));
     }
 
     #[test]
@@ -2377,6 +2408,7 @@ mod tests {
             + 16
             + SHA256_BYTES
             + SHA256_BYTES
+            + 1 // absent append_intent_digest tag
             + 8
             + 8
             + 1
@@ -2441,6 +2473,7 @@ mod tests {
             + 16
             + SHA256_BYTES
             + SHA256_BYTES
+            + 1 // absent append_intent_digest tag
             + 8
             + 8
             + 1

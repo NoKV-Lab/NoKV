@@ -12,6 +12,7 @@
 mod artifact;
 mod error;
 mod generic_index;
+mod idempotent_append;
 mod route;
 mod sdk;
 mod snapshot_workflow;
@@ -30,6 +31,7 @@ pub use error::{ArtifactPublishStage, ClientError, TransportError};
 pub use generic_index::{
     GenericIndexAbortOutcome, GenericIndexRegistrationOutcome, GenericIndexRegistrationPlan,
 };
+pub use idempotent_append::IdempotentAppendOptions;
 #[cfg(feature = "control")]
 pub use route::ControlRouteResolver;
 #[cfg(feature = "etcd")]

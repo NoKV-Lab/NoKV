@@ -24,7 +24,7 @@ const GENERIC_INDEX_APPEND_RECEIPT_DISCRIMINATOR: u8 = 3;
 
 const FIXED_ID_BYTES: usize = 16;
 pub(crate) const SYSTEM_SCHEMA_KEY: &[u8] = b"schema";
-const SYSTEM_FORMAT_VERSION: u32 = 10;
+const SYSTEM_FORMAT_VERSION: u32 = 11;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SchemaMarkerVersion {
@@ -1308,7 +1308,7 @@ mod tests {
 
     #[test]
     fn schema_marker_is_exact_and_versioned() {
-        assert_eq!(SYSTEM_FORMAT_VERSION, 10);
+        assert_eq!(SYSTEM_FORMAT_VERSION, 11);
         let marker = encode_schema_marker();
         assert_eq!(marker[0], VALUE_FORMAT_VERSION);
         assert_eq!(
@@ -1321,7 +1321,7 @@ mod tests {
             SchemaMarkerVersion::Current
         );
 
-        let previous_layout = encode_schema_marker_version(9);
+        let previous_layout = encode_schema_marker_version(10);
         assert_eq!(
             validate_schema_marker(&previous_layout),
             Err(SchemaMarkerError)

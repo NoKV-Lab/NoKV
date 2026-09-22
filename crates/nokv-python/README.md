@@ -62,6 +62,26 @@ not for installing the SDK.
   `expected`) with nothing written. Callers that omit the argument keep the
   0.11.0 behaviour; a server older than 0.11.1 rejects a fenced request as an
   invalid argument instead of ignoring the fence.
+- `Client.append_bytes(workbench, path, data, operation_id, ...)` appends under a
+  caller-owned stable identity. The workspace must exist. Pass
+  `expected_workspace_incarnation_id` to pin the intended workspace across
+  restarts; omission observes the existing incarnation and fences the owner
+  request with it. Reuse the same identity and inputs after a lost reply.
+  The result contains the original `operation_id`, `artifact_revision_id`,
+  `generation`, `workspace_revision`, `logical_size`, `body_digest`, and
+  `workspace_incarnation_id`, not the latest path head. `replayed` and nullable
+  `commit_version` are call metadata rather than stable receipt fields.
+  `content_type=None` inherits an existing artifact's type and uses
+  `application/octet-stream` on creation; an explicit type applies to both.
+  `max_logical_size` optionally caps the resulting body. One identity owns one
+  attempt; CAS conflicts are not retried under automatically changed identities.
+  `AppendError` carries `operation_id`, `state`, `code`, and the expected
+  incarnation in `expected`. `cause_code` preserves an underlying RPC code
+  such as `RequestReplayMismatch`, or is `None` for failures without an RPC
+  cause; `retryable` is false. This distinguishes a permanently mismatched
+  intent from an uncertain reply without parsing the error message. An unknown
+  state does not prove nothing was published. Incarnation conflicts raise `WorkspaceIncarnationMismatch` with
+  the append's `operation_id` attached. Recover using the original identity.
 - `WorkbenchFileSystem` is an fsspec compatibility adapter bound to one explicit
   Workbench. Paths must be one of `input`, `scripts`, `outputs`, `logs`, or
   `metadata`, optionally followed by an artifact-relative path. Sections and

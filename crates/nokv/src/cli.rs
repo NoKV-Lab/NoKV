@@ -155,6 +155,16 @@ pub enum McpProfile {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspacePathCommand {
+    Append {
+        workbench: String,
+        section: String,
+        path: String,
+        operation_id: [u8; 16],
+        expected_workspace_incarnation_id: Option<[u8; 16]>,
+        payload: AppendPayload,
+        content_type: Option<String>,
+        max_logical_size: Option<u64>,
+    },
     Rename {
         workbench: String,
         section: String,
@@ -170,6 +180,13 @@ pub enum WorkspacePathCommand {
         expected_generation: u64,
         request_id: [u8; 16],
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppendPayload {
+    Text(String),
+    Base64(String),
+    File(PathBuf),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -636,6 +653,9 @@ fn parse_workspace_path(arguments: &mut impl Iterator<Item = String>) -> Result<
     let first_path = arguments
         .next()
         .ok_or(CliError::MissingArgument("workspace path"))?;
+    if operation == "append" {
+        return parse_workspace_append(arguments, workbench, section, first_path);
+    }
     let destination = match operation.as_str() {
         "rename" => Some(
             arguments
@@ -691,6 +711,82 @@ fn parse_workspace_path(arguments: &mut impl Iterator<Item = String>) -> Result<
             request_id,
         },
     }))
+}
+
+fn parse_workspace_append(
+    arguments: &mut impl Iterator<Item = String>,
+    workbench: String,
+    section: String,
+    path: String,
+) -> Result<Command, CliError> {
+    let mut operation_id = None;
+    let mut expected_workspace_incarnation_id = None;
+    let mut payload = None;
+    let mut content_type = None;
+    let mut max_logical_size = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--operation-id" if operation_id.is_none() => {
+                operation_id = Some(parse_append_identity(
+                    "--operation-id",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--expected-workspace-incarnation-id"
+                if expected_workspace_incarnation_id.is_none() =>
+            {
+                expected_workspace_incarnation_id = Some(parse_append_identity(
+                    "--expected-workspace-incarnation-id",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--text" if payload.is_none() => {
+                payload = Some(AppendPayload::Text(next_value(arguments, &argument)?));
+            }
+            "--base64" if payload.is_none() => {
+                payload = Some(AppendPayload::Base64(next_value(arguments, &argument)?));
+            }
+            "--file" if payload.is_none() => {
+                payload = Some(AppendPayload::File(PathBuf::from(next_value(
+                    arguments, &argument,
+                )?)));
+            }
+            "--content-type" if content_type.is_none() => {
+                content_type = Some(next_value(arguments, &argument)?);
+            }
+            "--max-logical-size" if max_logical_size.is_none() => {
+                max_logical_size = Some(parse_number(
+                    "--max-logical-size",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--operation-id"
+            | "--expected-workspace-incarnation-id"
+            | "--text"
+            | "--base64"
+            | "--file"
+            | "--content-type"
+            | "--max-logical-size" => return Err(CliError::UnexpectedArgument(argument)),
+            _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    Ok(Command::WorkspacePath(WorkspacePathCommand::Append {
+        workbench,
+        section,
+        path,
+        operation_id: operation_id.ok_or(CliError::MissingOption("--operation-id"))?,
+        expected_workspace_incarnation_id,
+        payload: payload.ok_or(CliError::MissingArgument(
+            "one of --text, --base64, or --file",
+        ))?,
+        content_type,
+        max_logical_size,
+    }))
+}
+
+fn parse_append_identity(option: &'static str, value: String) -> Result<[u8; 16], CliError> {
+    parse_request_id(value.clone()).map_err(|_| CliError::InvalidOption { option, value })
 }
 
 fn parse_provision(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
@@ -949,6 +1045,65 @@ mod tests {
             unpinned.is_err(),
             "expected-generation without --replace must fail"
         );
+    }
+
+    #[test]
+    fn workspace_append_requires_one_payload_and_stable_identity() {
+        let prefix = ["append", "run-42", "logs", "events.jsonl"];
+        let parse_append = |tail: &[&str]| {
+            let mut input = prefix.to_vec();
+            input.extend_from_slice(tail);
+            parse_workspace_path(&mut args(&input).into_iter())
+        };
+        assert_eq!(
+            parse_append(&["--text", "event"]),
+            Err(CliError::MissingOption("--operation-id"))
+        );
+        assert!(parse_append(&["--operation-id", "ABC", "--text", "event"]).is_err());
+        assert!(parse_append(&[
+            "--operation-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--text",
+            "event",
+            "--base64",
+            "ZXZlbnQ="
+        ])
+        .is_err());
+        let command = parse_append(&[
+            "--operation-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--expected-workspace-incarnation-id",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--text",
+            "event",
+            "--content-type",
+            "text/plain",
+            "--max-logical-size",
+            "1024",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::WorkspacePath(WorkspacePathCommand::Append {
+                workbench: "run-42".to_owned(),
+                section: "logs".to_owned(),
+                path: "events.jsonl".to_owned(),
+                operation_id: [0xaa; 16],
+                expected_workspace_incarnation_id: Some([0xbb; 16]),
+                payload: AppendPayload::Text("event".to_owned()),
+                content_type: Some("text/plain".to_owned()),
+                max_logical_size: Some(1024),
+            })
+        );
+        for payload in [["--base64", "ZXZlbnQ="], ["--file", "/tmp/delta.bin"]] {
+            assert!(parse_append(&[
+                "--operation-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                payload[0],
+                payload[1]
+            ])
+            .is_ok());
+        }
     }
 
     #[test]

@@ -1186,6 +1186,16 @@ pub fn begin_restore(
         owning_operation_id: Some(operation_id),
     };
     let mut plan = CommandPlan::default();
+    // Claim the root-scoped public operation identity in the same command as
+    // the hidden destination and source holds. A competing kind cannot make
+    // the eventual receipt unqueryable.
+    for kind in [OperationKind::Publish, OperationKind::BuildCommit] {
+        plan.assert_value(
+            MetadataFamily::Operation,
+            super::codec::operation_key(context.root_id, kind, operation_id),
+            None,
+        )?;
+    }
     plan.put_absent(
         MetadataFamily::WorkspaceIncarnationClaim,
         destination_claim_key,
@@ -8178,6 +8188,146 @@ mod tests {
     }
 
     #[test]
+    fn public_operation_identity_is_atomic_across_all_six_admission_orders() {
+        use super::super::build_commit_records::CommitManifestCondition;
+        use super::super::commit::{BeginBuildCommitRequest, CommitService};
+        for (first, second) in [
+            (OperationKind::Publish, OperationKind::BuildCommit),
+            (OperationKind::Publish, OperationKind::Restore),
+            (OperationKind::BuildCommit, OperationKind::Publish),
+            (OperationKind::BuildCommit, OperationKind::Restore),
+            (OperationKind::Restore, OperationKind::Publish),
+            (OperationKind::Restore, OperationKind::BuildCommit),
+        ] {
+            let mut counter = 0;
+            let owner_epoch = owner(1);
+            let store = crate::workspace::test_support::memory(shard()).unwrap();
+            activate_root(&store, &mut counter, owner_epoch);
+            let source = seed_source(&store, &mut counter, owner_epoch, 1);
+            let snapshot = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+            let restore = snapshot_restore_request(
+                &source,
+                snapshot,
+                "identity-restore",
+                incarnation(41),
+                0xd1,
+            );
+            let build_workbench = workbench("identity-build");
+            let build_incarnation = incarnation(42);
+            create_visible_workspace(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                &build_workbench,
+                build_incarnation,
+            )
+            .unwrap();
+            let publish = wire_publish_operation(
+                restore.operation_id,
+                revision(43),
+                &source.source_workbench,
+                source.source_incarnation,
+                NormalizedRelativePath::new("outputs/identity.bin").unwrap(),
+                PublishAuthority::Visible,
+                owner_epoch,
+                &[],
+                &[],
+            );
+            let mut admit = |kind| -> Result<(), String> {
+                match kind {
+                    OperationKind::Publish => PublicationService::new(&store)
+                        .begin_publish(BeginPublishRequest {
+                            context: publication_context(&store, &mut counter, owner_epoch),
+                            operation: publish.clone(),
+                        })
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                    OperationKind::BuildCommit => CommitService::new(&store)
+                        .begin_build(BeginBuildCommitRequest {
+                            context: write_context(&store, &mut counter, owner_epoch),
+                            operation_id: restore.operation_id,
+                            workbench_id: build_workbench.clone(),
+                            expected_source_workspace_incarnation_id: build_incarnation,
+                            commit_id: CommitId::from_bytes([44; SHA256_BYTES]),
+                            content_digest_uri: "sha256:identity-content".to_owned(),
+                            manifest_digest_uri: "sha256:identity-manifest".to_owned(),
+                            projection_input_digest: [45; SHA256_BYTES],
+                            tree_manifest_revision_id: revision(46),
+                            replace: false,
+                            run_manifest_condition: CommitManifestCondition::CreateOnly,
+                            committed_at_unix_seconds: 1,
+                            expected_head_generation: None,
+                            producer: None,
+                            lineage_projection: Vec::new(),
+                            parent_commits: Vec::new(),
+                        })
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                    OperationKind::Restore => begin_restore(
+                        &store,
+                        write_context(&store, &mut counter, owner_epoch),
+                        &restore,
+                    )
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                    _ => unreachable!(),
+                }
+            };
+            admit(first).unwrap();
+            // Every request is also exercised as a successful first admission
+            // in another order. The rejection oracle is the unchanged durable
+            // identity and absence of destination side effects below, not the
+            // wording used by each lifecycle to report a predicate conflict.
+            admit(second)
+                .expect_err("another lifecycle must not claim the first operation identity");
+            let read_version = store.current_read_version().unwrap();
+            for kind in [
+                OperationKind::Publish,
+                OperationKind::BuildCommit,
+                OperationKind::Restore,
+            ] {
+                let row = store
+                    .read_at(
+                        root(),
+                        placement(),
+                        owner_epoch,
+                        MetadataFamily::Operation,
+                        &operation_key(root(), kind, restore.operation_id),
+                        read_version,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    row.is_some(),
+                    kind == first,
+                    "unexpected {kind:?} row after {first:?} / {second:?}"
+                );
+            }
+            if second == OperationKind::Restore {
+                assert!(get_visible_workspace_at(
+                    &store,
+                    read_context(&store, owner_epoch),
+                    &restore.destination_workbench_id
+                )
+                .unwrap()
+                .is_none());
+                assert!(store
+                    .read_at(
+                        root(),
+                        placement(),
+                        owner_epoch,
+                        MetadataFamily::WorkspaceIncarnationClaim,
+                        &workspace_incarnation_claim_key(
+                            root(),
+                            restore.destination_workspace_incarnation_id
+                        ),
+                        read_version
+                    )
+                    .unwrap()
+                    .is_none());
+            }
+        }
+    }
+
+    #[test]
     fn mutated_snapshot_seals_against_base_commit_then_late_binds_exact_destination() {
         let mut counter = 0_u128;
         let owner_epoch = owner(1);
@@ -10616,6 +10766,7 @@ mod tests {
         manifest: &[ManifestRowInput],
     ) -> PublishOperationRecord {
         let mut operation = PublishOperationRecord {
+            append_intent_digest: None,
             operation_id,
             identity_digest: [0; SHA256_BYTES],
             initialization_digest: [0; SHA256_BYTES],

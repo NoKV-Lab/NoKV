@@ -542,6 +542,15 @@ impl<'a> CommitService<'a> {
         .encode();
 
         let mut plan = CommandPlan::default();
+        // Exclude publish/restore identities atomically with this build's
+        // admission so GetOperation can never become ambiguous after success.
+        for kind in [OperationKind::Publish, OperationKind::Restore] {
+            plan.assert_value(
+                MetadataFamily::Operation,
+                super::codec::operation_key(request.context.root_id, kind, request.operation_id),
+                None,
+            )?;
+        }
         plan.put_absent(
             MetadataFamily::Operation,
             operation_key,

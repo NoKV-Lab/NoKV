@@ -1899,6 +1899,49 @@ impl MetadataWorkspaceRequestExecutor {
         }
         let context = self.publication_context(rpc.route, step_id)?;
         let read = read_context_from_publication(context);
+        // Stable append identity authenticates the original intent before any
+        // live path or dependency read. A receipt describes historical success;
+        // a later writer or expired historical artifact cannot revoke it.
+        if let Some(existing) =
+            self.find_publish_operation(rpc.route, read.read_version, request.operation_id)?
+        {
+            if existing.append_intent_digest.is_some() || request.append_intent_digest.is_some() {
+                if existing.append_intent_digest
+                    != request.append_intent_digest.map(|value| value.0)
+                    || existing.authority != meta::PublishAuthority::Visible
+                    || request.authority != protocol::PublicationAuthority::Visible
+                    || existing.workbench_id != workbench_id(&request.target.workbench)?
+                    || existing.path != relative_path(&request.target.path)?
+                    || Some(existing.workspace_incarnation_id.into())
+                        != request.expected_workspace_incarnation_id
+                    || existing.artifact_revision_id
+                        != types::ArtifactRevisionId::from(request.artifact_revision_id)
+                {
+                    return Err(failure(
+                        protocol::ErrorCode::RequestReplayMismatch,
+                        "append operation identity is already bound to a different intent or target",
+                        false,
+                        None,
+                    ));
+                }
+                if existing.phase == types::PublishPhase::Published {
+                    return publish_operation_response(meta::PublishCommandOutcome {
+                        commit_version: types::CommitVersion::new(read.read_version.get())
+                            .expect("publication contexts have a non-zero read version"),
+                        operation: existing,
+                        replayed: true,
+                    });
+                }
+                // No alternate plan, attempt, owner takeover, or cleanup is
+                // authorized by a retry. GetOperation reports pending/terminal
+                // state; the existing lifecycle retains recovery authority.
+                return Err(conflict(
+                    protocol::ConflictKind::OperationState,
+                    "append operation is already admitted; query its durable state before retrying",
+                    None,
+                ));
+            }
+        }
         let (dependency_owner_revision_ids, dependency_depth, dependency_digest) = self
             .publication_dependencies(
                 read,
@@ -2049,6 +2092,7 @@ impl MetadataWorkspaceRequestExecutor {
             }
         };
         let mut operation = meta::PublishOperationRecord {
+            append_intent_digest: request.append_intent_digest.map(|value| value.0),
             operation_id: request.operation_id.into(),
             identity_digest: [0; types::SHA256_BYTES],
             initialization_digest: [0; types::SHA256_BYTES],
@@ -4187,6 +4231,12 @@ fn publish_operation_status(
         ),
     };
     Ok(protocol::OperationStatus {
+        publish_preparation: Some(Box::new(protocol::PublishPreparation {
+            append_intent_digest: operation.append_intent_digest.map(protocol::Digest),
+            target: workspace_path(&operation.workbench_id, &operation.path)?,
+            workspace_incarnation_id: operation.workspace_incarnation_id.into(),
+            artifact_revision_id: operation.artifact_revision_id.into(),
+        })),
         token: protocol::OperationToken {
             operation_id: operation.operation_id.into(),
             state_digest: publish_state_digest(operation)?,
@@ -4261,6 +4311,7 @@ fn build_commit_operation_status(
         ),
     };
     Ok(protocol::OperationStatus {
+        publish_preparation: None,
         token: protocol::OperationToken {
             operation_id: operation.operation_id.into(),
             state_digest: build_state_digest(operation)?,
@@ -5094,6 +5145,7 @@ fn restore_operation_status(
         ),
     };
     Ok(protocol::OperationStatus {
+        publish_preparation: None,
         token: protocol::OperationToken {
             operation_id: operation.operation_id.into(),
             state_digest: restore_state_digest(operation)?,
@@ -8159,6 +8211,7 @@ mod tests {
                     first_request_fill,
                     protocol::WorkspaceRequest::BeginArtifactPublish(
                         protocol::BeginArtifactPublishRequest {
+                            append_intent_digest: None,
                             operation_id,
                             artifact_revision_id,
                             target: target.clone(),
@@ -9344,6 +9397,7 @@ mod tests {
                 request_id: protocol::RequestIdentity([0x53; types::FIXED_ID_BYTES]),
                 operation: protocol::WorkspaceRequest::BeginArtifactPublish(
                     protocol::BeginArtifactPublishRequest {
+                        append_intent_digest: None,
                         operation_id,
                         artifact_revision_id,
                         target: target.clone(),
@@ -10091,6 +10145,7 @@ mod tests {
                 request_fill,
                 protocol::WorkspaceRequest::BeginArtifactPublish(
                     protocol::BeginArtifactPublishRequest {
+                        append_intent_digest: None,
                         operation_id,
                         artifact_revision_id,
                         target: protocol::WorkspacePath {
@@ -10207,6 +10262,273 @@ mod tests {
         assert!(same_operation_current_fence.replayed);
     }
 
+    fn stable_append_begin_request() -> protocol::BeginArtifactPublishRequest {
+        let artifact_revision_id =
+            protocol::ArtifactRevisionIdentity([0x84; types::FIXED_ID_BYTES]);
+        let seals = protocol::seal_artifact_publish_plan(artifact_revision_id, &[], &[]).unwrap();
+        protocol::BeginArtifactPublishRequest {
+            append_intent_digest: Some(protocol::Digest([0x85; types::SHA256_BYTES])),
+            operation_id: protocol::OperationIdentity([0x83; types::FIXED_ID_BYTES]),
+            artifact_revision_id,
+            target: protocol::WorkspacePath {
+                workbench: protocol::WorkbenchName::new("stable-append").unwrap(),
+                path: protocol::RelativePath::new("outputs/events.log").unwrap(),
+            },
+            authority: protocol::PublicationAuthority::Visible,
+            condition: protocol::PublishCondition::CreateOnly,
+            expected_workspace_incarnation_id: Some(protocol::WorkspaceIdentity(
+                [0x82; types::FIXED_ID_BYTES],
+            )),
+            staged_object_count: seals.staged_object_count,
+            staged_object_seal: seals.staged_object_seal,
+            manifest_row_count: seals.manifest_row_count,
+            manifest_seal: seals.manifest_seal,
+            dependency_owner_revision_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn public_operation_identity_remains_queryable_when_publish_and_commit_collide() {
+        for publish_first in [true, false] {
+            let (_store, executor) = ready_executor();
+            executor
+                .execute(&create_request(0x81, "stable-append", 0x82, 1))
+                .unwrap();
+            let begin = stable_append_begin_request();
+            let publish = restore_rpc(
+                0x86,
+                protocol::WorkspaceRequest::BeginArtifactPublish(begin.clone()),
+            );
+            let mut commit = commit_request(0x87);
+            let protocol::WorkspaceRequest::Commit(request) = &mut commit.operation else {
+                unreachable!()
+            };
+            request.operation_id = begin.operation_id;
+            request.workbench = begin.target.workbench.clone();
+            request.workspace_incarnation_id = begin.expected_workspace_incarnation_id.unwrap();
+            let query = restore_rpc(
+                0x88,
+                protocol::WorkspaceRequest::GetOperation(protocol::GetOperationRequest {
+                    operation_id: begin.operation_id,
+                }),
+            );
+            let expected_kind = if publish_first {
+                executor.execute(&publish).unwrap();
+                // Commit may stop after admission because this fixture has no
+                // canonical run manifest; its admitted row is what must fence.
+                let _ = executor.execute(&commit);
+                protocol::OperationKind::ArtifactPublish
+            } else {
+                let _ = executor.execute(&commit);
+                let before = executor.execute(&query).unwrap();
+                assert!(
+                    matches!(before.result, protocol::WorkspaceResult::Operation(ref status) if status.kind == protocol::OperationKind::Commit)
+                );
+                let _ = executor.execute(&publish);
+                protocol::OperationKind::Commit
+            };
+            let observed = executor.execute(&query).expect(
+                "cross-kind admission must preserve the first operation's queryable receipt",
+            );
+            assert!(
+                matches!(observed.result, protocol::WorkspaceResult::Operation(ref status) if status.kind == expected_kind)
+            );
+        }
+    }
+
+    #[test]
+    fn stable_append_rejects_pending_replans_and_intent_reuse_without_cleanup() {
+        let (store, executor) = ready_executor();
+        executor
+            .execute(&create_request(0x81, "stable-append", 0x82, 1))
+            .unwrap();
+        let begin = stable_append_begin_request();
+        let request = restore_rpc(
+            0x86,
+            protocol::WorkspaceRequest::BeginArtifactPublish(begin.clone()),
+        );
+        let begun = executor.execute(&request).unwrap();
+        let protocol::WorkspaceResult::Operation(status) = begun.result else {
+            panic!("missing status")
+        };
+        assert_eq!(
+            status
+                .publish_preparation
+                .as_ref()
+                .unwrap()
+                .append_intent_digest,
+            begin.append_intent_digest
+        );
+        assert!(executor.execute(&request).unwrap().replayed);
+
+        let mut changed = begin.clone();
+        changed.manifest_seal = protocol::Digest([0x91; types::SHA256_BYTES]);
+        let conflict = executor
+            .execute(&restore_rpc(
+                0x87,
+                protocol::WorkspaceRequest::BeginArtifactPublish(changed),
+            ))
+            .unwrap_err();
+        assert_eq!(
+            conflict.conflict,
+            Some(protocol::ConflictKind::OperationState)
+        );
+        for (index, digest) in [None, Some(protocol::Digest([0x92; types::SHA256_BYTES]))]
+            .into_iter()
+            .enumerate()
+        {
+            let mut changed = begin.clone();
+            changed.append_intent_digest = digest;
+            let mismatch = executor
+                .execute(&restore_rpc(
+                    0x88 + index as u8,
+                    protocol::WorkspaceRequest::BeginArtifactPublish(changed),
+                ))
+                .unwrap_err();
+            assert_eq!(mismatch.code, protocol::ErrorCode::RequestReplayMismatch);
+        }
+        let mut changed = begin.clone();
+        changed.append_intent_digest = Some(protocol::Digest([0x93; types::SHA256_BYTES]));
+        let mismatch = executor
+            .execute(&restore_rpc(
+                0x86,
+                protocol::WorkspaceRequest::BeginArtifactPublish(changed),
+            ))
+            .unwrap_err();
+        assert_eq!(mismatch.code, protocol::ErrorCode::RequestReplayMismatch);
+        let observed = executor
+            .execute(&restore_rpc(
+                0x8a,
+                protocol::WorkspaceRequest::GetOperation(protocol::GetOperationRequest {
+                    operation_id: begin.operation_id,
+                }),
+            ))
+            .unwrap();
+        assert_eq!(
+            observed.result,
+            protocol::WorkspaceResult::Operation(status)
+        );
+        store.advance_owner_epoch(Some(owner(1)), owner(2)).unwrap();
+        let stale = executor
+            .execute(&restore_rpc(
+                0x8b,
+                protocol::WorkspaceRequest::BeginArtifactPublish(begin),
+            ))
+            .unwrap_err();
+        assert_eq!(stale.code, protocol::ErrorCode::NotOwner);
+    }
+
+    #[test]
+    fn stable_append_terminal_replay_is_independent_of_live_head_and_plan() {
+        let (store, executor) = ready_executor();
+        executor
+            .execute(&create_request(0x81, "stable-append", 0x82, 1))
+            .unwrap();
+        let begin = stable_append_begin_request();
+        let begun = executor
+            .execute(&restore_rpc(
+                0x86,
+                protocol::WorkspaceRequest::BeginArtifactPublish(begin.clone()),
+            ))
+            .unwrap();
+        let protocol::WorkspaceResult::Operation(status) = begun.result else {
+            panic!("missing status")
+        };
+        let completed = executor
+            .execute(&restore_rpc(
+                0x87,
+                protocol::WorkspaceRequest::CompleteArtifactPublish(
+                    protocol::CompleteArtifactPublishRequest {
+                        token: status.token,
+                        artifact: protocol::ArtifactDescriptor {
+                            logical_size: 0,
+                            body_digest: protocol::sha256_digest_uri(protocol::Digest(
+                                Sha256::digest([]).into(),
+                            )),
+                            manifest_digest: protocol::sha256_digest_uri(begin.manifest_seal),
+                            content_type: protocol::ContentType::new("text/plain").unwrap(),
+                            producer: None,
+                            manifest_identity: None,
+                            index_fields: Vec::new(),
+                        },
+                    },
+                ),
+            ))
+            .unwrap();
+        let protocol::WorkspaceResult::Published(original) = completed.result else {
+            panic!("missing receipt")
+        };
+        executor
+            .execute(&restore_rpc(
+                0x88,
+                protocol::WorkspaceRequest::RemovePath(protocol::RemovePathRequest {
+                    target: begin.target.clone(),
+                    expected_generation: original.generation,
+                }),
+            ))
+            .unwrap();
+        publish_one_byte_artifact(
+            &executor,
+            0xa0,
+            protocol::OperationIdentity([0xa1; types::FIXED_ID_BYTES]),
+            protocol::ArtifactRevisionIdentity([0xa2; types::FIXED_ID_BYTES]),
+            "stable-append",
+            "outputs/events.log",
+            protocol::PublicationAuthority::Visible,
+            7,
+        );
+        // Even a newly planned delta over the new head cannot replace the old
+        // logical result or cause provider/dependency reads before replay.
+        let mut replanned = begin.clone();
+        replanned.condition = protocol::PublishCondition::Append {
+            expected_generation: Some(999),
+        };
+        replanned.manifest_seal = protocol::Digest([0x94; types::SHA256_BYTES]);
+        replanned.dependency_owner_revision_ids = vec![protocol::ArtifactRevisionIdentity(
+            [0x95; types::FIXED_ID_BYTES],
+        )];
+        let replayed = executor
+            .execute(&restore_rpc(
+                0x89,
+                protocol::WorkspaceRequest::BeginArtifactPublish(replanned),
+            ))
+            .unwrap();
+        assert!(replayed.replayed);
+        let protocol::WorkspaceResult::Operation(replayed) = replayed.result else {
+            panic!("missing status")
+        };
+        assert_eq!(replayed.state, protocol::OperationState::Succeeded);
+        assert_eq!(
+            replayed.result,
+            Some(protocol::OperationResult::ArtifactPublish(original.clone()))
+        );
+        let mut wrong_incarnation = begin.clone();
+        wrong_incarnation.expected_workspace_incarnation_id =
+            Some(protocol::WorkspaceIdentity([0x96; types::FIXED_ID_BYTES]));
+        let mismatch = executor
+            .execute(&restore_rpc(
+                0x8a,
+                protocol::WorkspaceRequest::BeginArtifactPublish(wrong_incarnation),
+            ))
+            .unwrap_err();
+        assert_eq!(mismatch.code, protocol::ErrorCode::RequestReplayMismatch);
+
+        store.advance_owner_epoch(Some(owner(1)), owner(2)).unwrap();
+        let mut successor_request = restore_rpc(
+            0x8b,
+            protocol::WorkspaceRequest::BeginArtifactPublish(begin),
+        );
+        successor_request.route = route(2);
+        let successor = executor.execute(&successor_request).unwrap();
+        let protocol::WorkspaceResult::Operation(successor) = successor.result else {
+            panic!("missing successor receipt")
+        };
+        assert_eq!(
+            successor.result,
+            Some(protocol::OperationResult::ArtifactPublish(original))
+        );
+    }
+
     #[test]
     fn exact_publish_stage_retry_resumes_after_its_heartbeat_committed() {
         let (store, executor) = ready_executor();
@@ -10223,6 +10545,7 @@ mod tests {
                 request_id: protocol::RequestIdentity([0x64; types::FIXED_ID_BYTES]),
                 operation: protocol::WorkspaceRequest::BeginArtifactPublish(
                     protocol::BeginArtifactPublishRequest {
+                        append_intent_digest: None,
                         operation_id,
                         artifact_revision_id,
                         target: protocol::WorkspacePath {
@@ -10501,6 +10824,7 @@ mod tests {
                     0x74,
                     protocol::WorkspaceRequest::BeginArtifactPublish(
                         protocol::BeginArtifactPublishRequest {
+                            append_intent_digest: None,
                             operation_id: operation_identity,
                             artifact_revision_id: revision_identity,
                             target: protocol::WorkspacePath {
@@ -10734,6 +11058,7 @@ mod tests {
                     0x7C,
                     protocol::WorkspaceRequest::BeginArtifactPublish(
                         protocol::BeginArtifactPublishRequest {
+                            append_intent_digest: None,
                             operation_id: protocol::OperationIdentity(
                                 [0x7D; types::FIXED_ID_BYTES],
                             ),

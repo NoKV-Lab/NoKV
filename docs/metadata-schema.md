@@ -19,15 +19,15 @@ Every logical-shard store has one authoritative marker:
 System("schema")
   -> value_format_version = 1
      schema_id = "nokv_workspace"
-     format_version = 10
+     format_version = 11
 ```
 
 Startup is fail-closed:
 
 - an empty store is initialized with the exact supported marker and logical
   keyspace catalog;
-- format-9 and older stores are rejected without writes; there is no marker-only
-  upgrade because format 10 adds authoritative Generic index families;
+- format-10 and older stores are rejected without writes; there is no marker-only
+  upgrade because format 11 changes the durable publication operation codec;
 - a nonempty current store opens only when its marker, value format, and
   configured adapter catalog match this contract;
 - a missing, malformed, unknown-version, or inconsistent store is rejected.
@@ -84,7 +84,7 @@ exact key is a strict prefix of another valid path key. A child/subtree prefix
 appends NUL, so `a` cannot match `ab`. The empty path has no `PathCurrent`
 record; the workspace root is synthesized from `WorkspaceCurrent`. This path
 key layout was introduced by system format version 8 and is retained by
-version 10.
+version 11.
 
 The one shared normalizer enforces:
 
@@ -105,19 +105,22 @@ float, timestamp, bytes, and string values.
 
 ## Durable Format Registry
 
-`System.format_version` is `10`. Version 10 retains the format-9 RecoveryOutbox
-LSN encoding as
-canonical fixed-width decimal keys. Numeric ordering is unchanged, while the
-sequential key shape avoids pathological underfilled Holt frames. Logical
-recovery records, deterministic results, and hash-chain bytes are unchanged.
+`System.format_version` is `11`. Version 11 adds the optional full SHA-256
+append-intent commitment to the existing publication operation record. It
+retains the format-10 Generic index families and the format-9 RecoveryOutbox
+fixed-width decimal LSN keys. Existing logical recovery and object formats are
+unchanged.
 
-Ordinary open does not migrate a format-9 marker, even when its old catalog is
-otherwise internally consistent. Format 9 lacks the three authoritative
-Generic index families, so marker-only upgrade would advertise records and
-lifecycle invariants that were never installed. Migration remains not
-qualified; every older or unknown marker is fail-closed and unchanged.
+Ordinary open does not migrate a format-10 or older marker. A marker-only
+upgrade would reinterpret old publication records without their required codec
+version. Migration remains not qualified; every older or unknown marker is
+fail-closed and unchanged.
 
 Durable codecs are independently versioned:
+publish operation, staged-object, and manifest-row records use value version
+`5` and reject version `4`; the operation binds an optional 256-bit append
+intent before any object publication. Other publication rows retain their
+existing layouts.
 publication-owned workspace/path/revision records use value version `2`;
 `CommitRecord` uses version `3` and dual-decodes version `2`, while its member,
 consumer, head, and tag records remain version `2`; `ChangeEvent` and the
@@ -459,6 +462,14 @@ History
        | inverted_commit_version
   val: previous versioned value or tombstone
 ```
+
+Public operation IDs are root-scoped across Publish, BuildCommit, and Restore.
+Although their keys retain the lifecycle kind, each initial admission includes
+absent predicates for the other two kinds in the same command as its own
+operation insertion. A competing lifecycle cannot invalidate an acknowledged
+operation's later lookup by admitting the same identity. Internal manifest
+publications retain distinct operation IDs. Terminal operation retention keeps
+this exclusion after success or cleanup.
 
 `ReadChanges` treats `(commit_version, event_sequence)` as an append-only log
 position. Its opaque cursor is bound to the root, query scope, and optional

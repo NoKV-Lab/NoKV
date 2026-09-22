@@ -1239,8 +1239,15 @@ fn next_generation(
 
 fn publish_identity_digest(operation: &PublishOperationRecord) -> [u8; SHA256_BYTES] {
     let mut hasher = Sha256::new();
-    hasher.update(b"nokv.publish.operation.identity.v3\0");
+    hasher.update(b"nokv.publish.operation.identity.v4\0");
     hasher.update(operation.operation_id.as_bytes());
+    match operation.append_intent_digest {
+        Some(digest) => {
+            hasher.update([1]);
+            hasher.update(digest);
+        }
+        None => hasher.update([0]),
+    }
     hasher.update(operation.initiating_owner_epoch.get().to_be_bytes());
     match operation.authority {
         PublishAuthority::Visible => hasher.update([1]),
@@ -1296,7 +1303,14 @@ fn publish_identity_digest(operation: &PublishOperationRecord) -> [u8; SHA256_BY
 
 fn publish_initialization_digest(operation: &PublishOperationRecord) -> [u8; SHA256_BYTES] {
     let mut hasher = Sha256::new();
-    hasher.update(b"nokv.publish.operation.initialization.v3\0");
+    hasher.update(b"nokv.publish.operation.initialization.v4\0");
+    match operation.append_intent_digest {
+        Some(digest) => {
+            hasher.update([1]);
+            hasher.update(digest);
+        }
+        None => hasher.update([0]),
+    }
     hasher.update(operation.initiating_owner_epoch.get().to_be_bytes());
     match operation.authority {
         PublishAuthority::Visible => hasher.update([1]),
@@ -1662,6 +1676,20 @@ impl PublicationService<'_> {
         }
         let operation_payload = request.operation.encode()?;
         let mut plan = CommandPlan::default();
+        // Public operation lookup has one root-scoped identity across all
+        // three lifecycle kinds. Fence competing admissions in this same
+        // transaction, rather than trusting a prior lookup by the client.
+        for kind in [OperationKind::BuildCommit, OperationKind::Restore] {
+            plan.assert_value(
+                MetadataFamily::Operation,
+                super::codec::operation_key(
+                    request.context.root_id,
+                    kind,
+                    request.operation.operation_id,
+                ),
+                None,
+            )?;
+        }
         plan.put_absent(
             MetadataFamily::Operation,
             operation_key,
@@ -4495,6 +4523,7 @@ mod tests {
     ) -> PublishOperationRecord {
         let dependencies = Vec::new();
         let mut operation = PublishOperationRecord {
+            append_intent_digest: None,
             operation_id,
             identity_digest: [0; SHA256_BYTES],
             initialization_digest: [0; SHA256_BYTES],
@@ -5388,6 +5417,52 @@ mod tests {
             }),
             Err(PublicationError::OperationInputMismatch)
         );
+    }
+
+    #[test]
+    fn stable_append_identity_binds_all_256_intent_bits_and_cannot_drop_binding() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let revision_id = revision(91_090);
+        let staged = staged_rows(revision_id, 1);
+        let manifest = manifest_rows(&staged);
+        let mut initial = publish_operation(
+            operation_id(91_090),
+            revision_id,
+            path("outputs/intent.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        initial.append_intent_digest = Some([0x61; SHA256_BYTES]);
+        seal_publish_operation(&mut initial);
+        let begun = begin_operation(&service, &store, &mut counter, initial.clone());
+        assert_eq!(begun.append_intent_digest, initial.append_intent_digest);
+        let mut changed_digest = [0x61; SHA256_BYTES];
+        changed_digest[SHA256_BYTES - 1] = 0x62;
+        for intent in [Some(changed_digest), None] {
+            let mut changed = initial.clone();
+            changed.append_intent_digest = intent;
+            seal_publish_operation(&mut changed);
+            assert_ne!(changed.identity_digest, initial.identity_digest);
+            assert_ne!(changed.initialization_digest, initial.initialization_digest);
+            assert_eq!(
+                service.begin_publish(BeginPublishRequest {
+                    context: publication_context(&store, &mut counter),
+                    operation: changed,
+                }),
+                Err(PublicationError::OperationInputMismatch)
+            );
+        }
+        let replay = service
+            .begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter),
+                operation: initial,
+            })
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation, begun);
     }
 
     #[test]
@@ -6731,7 +6806,7 @@ mod tests {
         assert_eq!(replaced.result.path_generation, Generation::new(2).unwrap());
         let replace_bytes =
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
-        assert_eq!(replace_bytes, 11_799_434);
+        assert_eq!(replace_bytes, 11_799_442);
 
         let removed = remove_path(
             &store,
@@ -6910,7 +6985,7 @@ mod tests {
 
         assert_eq!(
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes),
-            9_860_707
+            9_860_715
         );
     }
 

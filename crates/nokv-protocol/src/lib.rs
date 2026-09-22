@@ -65,12 +65,12 @@ pub use response::{
     GenericIndexAppendResult, GenericIndexRegistrationPhase, GenericIndexRegistrationStatus,
     GenericNamespaceArtifact, GenericNamespaceHit, GenericNamespaceKind, OperationProgress,
     OperationResult, OperationState, OperationStatus, PathListEntry, PathPage, PathReadResult,
-    PublishResult, RemovePathResult, RenamePathResult, RestoreDestinationBinding,
-    RestoreDestinationManifestBindings, RestoreManifestBinding, RestoreOperationPreparation,
-    RestorePreparation, RestoreResult, RestoreSourceCommitBinding, SearchHit, SearchResult,
-    SearchRow, SnapshotPage, SnapshotResult, SnapshotStatus, WorkspacePreflightResult,
-    WorkspaceResult, WorkspaceRpcOutcome, WorkspaceRpcResponse, WorkspaceSummary,
-    WorkspaceSummaryWithCommit,
+    PublishPreparation, PublishResult, RemovePathResult, RenamePathResult,
+    RestoreDestinationBinding, RestoreDestinationManifestBindings, RestoreManifestBinding,
+    RestoreOperationPreparation, RestorePreparation, RestoreResult, RestoreSourceCommitBinding,
+    SearchHit, SearchResult, SearchRow, SnapshotPage, SnapshotResult, SnapshotStatus,
+    WorkspacePreflightResult, WorkspaceResult, WorkspaceRpcOutcome, WorkspaceRpcResponse,
+    WorkspaceSummary, WorkspaceSummaryWithCommit,
 };
 pub use types::{
     AppendSegment, ArtifactDescriptor, ArtifactManifestRow, ArtifactRevisionIdentity, ByteRange,

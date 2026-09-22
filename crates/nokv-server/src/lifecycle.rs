@@ -2921,6 +2921,7 @@ mod tests {
             cleanup_state: StagedCleanupState::Owned,
         }];
         let mut operation = meta::PublishOperationRecord {
+            append_intent_digest: None,
             operation_id: OperationId::from_bytes([0x74; FIXED_ID_BYTES]),
             identity_digest: [0; SHA256_BYTES],
             initialization_digest: [0; SHA256_BYTES],
@@ -3230,6 +3231,7 @@ mod tests {
 
         let operation_id = OperationId::from_bytes([0x44; FIXED_ID_BYTES]);
         let mut operation = meta::PublishOperationRecord {
+            append_intent_digest: None,
             operation_id,
             identity_digest: [0; SHA256_BYTES],
             initialization_digest: [0; SHA256_BYTES],
@@ -3515,6 +3517,7 @@ mod tests {
         }];
         let template = |operation_id_byte: u8| {
             let mut operation = meta::PublishOperationRecord {
+                append_intent_digest: None,
                 operation_id: OperationId::from_bytes([operation_id_byte; FIXED_ID_BYTES]),
                 identity_digest: [0; SHA256_BYTES],
                 initialization_digest: [0; SHA256_BYTES],
@@ -3811,6 +3814,7 @@ mod tests {
         }];
         let template = |operation_id_byte: u8| {
             let mut operation = meta::PublishOperationRecord {
+                append_intent_digest: None,
                 operation_id: OperationId::from_bytes([operation_id_byte; FIXED_ID_BYTES]),
                 identity_digest: [0; SHA256_BYTES],
                 initialization_digest: [0; SHA256_BYTES],

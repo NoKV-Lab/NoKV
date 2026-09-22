@@ -238,9 +238,40 @@ real-service acceptance gate is still **not qualified**.
 | `nokv materialize` | Copy a verified workspace artifact to a new local path. | The destination is disposable scratch, not a namespace or mount. |
 | `nokv collect` | Publish one bounded regular local file, create-only or generation-fenced replace. | Symlinks and unbounded/non-regular inputs fail closed. |
 | `nokv workspace-path rename` / `nokv workspace-path remove` | Apply an explicit generation- and request-id-fenced path mutation. | Custom CLI surface; not one of the 18 Workbench tools. |
+| `nokv workspace-path append` | Append bytes under a caller-owned operation identity and return the original publication on replay. | Requires an existing workspace; pin its incarnation across restarts. Custom CLI surface; the 18-tool schema is unchanged. |
 | `nokv provision` | Bind `RootId` to `AgentId`, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. |
 | `nokv serve` | Start one explicit metadata owner from create, same-namespace reopen, or recovery-log state. | Shared recovery publication is opt-in and not currently qualified. |
 | `nokv mcp` | Deprecated stdio transport retained only because qualification runners still use it. | **Unsupported for integration.** |
+
+For an append that must survive a lost reply or a harness restart, save one
+operation id before sending the request, then reuse it with the same inputs:
+
+```shell
+nokv [route/agent/object options] workspace-path append run-42 logs events.jsonl \
+  --operation-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --expected-workspace-incarnation-id bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  --text 'step-7-done' --content-type text/plain
+```
+
+Replace the example ids with the caller's stable operation id and the existing
+workspace's incarnation. Omit the incarnation only to observe and fence the
+existing workspace on this call; append never creates a missing workspace.
+Use `--text`, `--base64`, or `--file` for exactly one delta. Text defaults to
+`text/plain; charset=utf-8` on creation; binary and file input default to
+`application/octet-stream`. Existing content type is inherited unless
+`--content-type` overrides it. `--max-artifact-bytes` bounds the delta;
+`--max-logical-size` optionally bounds the resulting artifact.
+
+The receipt's operation/revision ids, generation, workspace revision, size,
+digest, and incarnation describe that publication, even if another writer has
+since advanced the path. `replayed` and optional `commit_version` describe this
+SDK call and are not stable receipt fields; a recovered receipt may have a null
+`commit_version`. An unresolved error retains the operation id and any observed
+durable state. Recover the same identity; a timeout does not authorize applying
+the delta under a new identity. One identity owns one publication attempt;
+this command does not silently create a new attempt after a CAS conflict.
+The older `workbench_append` tool retains per-invocation identities and does
+not provide cross-process caller-identity replay.
 
 ### Programmatic and non-CLI capabilities
 

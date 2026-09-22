@@ -15,8 +15,8 @@ use base64::Engine as _;
 use nokv_agent as agent;
 use nokv_client::{
     ArtifactAppendOptions, ArtifactPublishOptions, ArtifactReadAuthority, ClientError,
-    SnapshotMintOptions, SnapshotRenewOptions, SnapshotRetireOptions, WorkbenchAdmission,
-    WorkbenchCommitRequest, WorkbenchLifecycleError, WorkbenchLifecycleFacade,
+    IdempotentAppendOptions, SnapshotMintOptions, SnapshotRenewOptions, SnapshotRetireOptions,
+    WorkbenchAdmission, WorkbenchCommitRequest, WorkbenchLifecycleError, WorkbenchLifecycleFacade,
     WorkbenchLifecycleOptions, WorkbenchRestoreOrigin, WorkbenchRestoreRequest,
     WorkbenchRestoreSource, WorkbenchSnapshotSelector,
 };
@@ -103,6 +103,55 @@ impl CliWorkbenchBackend {
             objects,
             max_artifact_bytes,
         }
+    }
+
+    /// Append under a caller-owned identity, observing but never creating the workspace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_idempotent(
+        &self,
+        operation_id: wire::OperationIdentity,
+        target: wire::WorkspacePath,
+        expected_workspace_incarnation_id: Option<wire::WorkspaceIdentity>,
+        create_content_type: wire::ContentType,
+        content_type: Option<wire::ContentType>,
+        max_logical_size: Option<u64>,
+        delta: &[u8],
+    ) -> Result<
+        (
+            nokv_client::ClientCall<wire::PublishResult>,
+            wire::WorkspaceIdentity,
+        ),
+        agent::BackendError,
+    > {
+        let incarnation = match expected_workspace_incarnation_id {
+            Some(incarnation) => incarnation,
+            None => {
+                self.client
+                    .get_workspace(wire::GetWorkspaceRequest {
+                        workbench: target.workbench.clone(),
+                    })
+                    .map_err(map_client_error)?
+                    .value
+                    .workspace_incarnation_id
+            }
+        };
+        let mut options =
+            IdempotentAppendOptions::new(operation_id, target, incarnation, create_content_type);
+        if let Some(content_type) = content_type {
+            options = options.with_content_type(content_type);
+        }
+        if let Some(max_logical_size) = max_logical_size {
+            options = options.with_max_logical_size(max_logical_size);
+        }
+        self.client
+            .append_artifact_idempotent(self.objects.as_ref(), options, delta)
+            .map(|call| (call, incarnation))
+            .map_err(|error| {
+                let mut mapped = map_client_error(error);
+                mapped.details["workspace_incarnation_id"] =
+                    json!(super::encode_lowercase_hex(&incarnation.0));
+                mapped
+            })
     }
 
     fn workspace(
@@ -2758,6 +2807,20 @@ fn map_manifest_read_error(error: ClientError, path: &agent::ScopedPath) -> agen
 }
 
 fn map_client_error(error: ClientError) -> agent::BackendError {
+    if let ClientError::AppendUnresolved {
+        operation_id,
+        state,
+        source,
+    } = error
+    {
+        let mut mapped = map_client_error(*source);
+        mapped.kind = agent::BackendErrorKind::Other("AppendUnresolved".to_owned());
+        // Retrying means recovering this exact identity; it never authorizes a new append.
+        mapped.retryable = false;
+        mapped.details["operation_id"] = json!(super::encode_lowercase_hex(&operation_id.0));
+        mapped.details["state"] = json!(state.map(|state| format!("{state:?}")));
+        return mapped;
+    }
     if let Some(failure) = rpc_failure(&error).cloned() {
         let attempts = retry_attempts(&error);
         let mut mapped = map_rpc_failure(failure);
@@ -2792,6 +2855,7 @@ fn map_client_error(error: ClientError) -> agent::BackendError {
             ClientError::ArtifactPublishFailed { .. } | ClientError::RetryExhausted { .. } => {
                 agent::BackendErrorKind::Other("ClientFailure".to_owned())
             }
+            ClientError::AppendUnresolved { .. } => unreachable!("append failure returned above"),
             ClientError::Rpc(_) => unreachable!("RPC failures returned above"),
         }
     };
@@ -3631,6 +3695,7 @@ mod tests {
                 state_digest: wire::Digest([0x61; 32]),
             },
             kind: wire::OperationKind::Restore,
+            publish_preparation: None,
             commit_preparation: None,
             restore_preparation: Some(Box::new(wire::RestoreOperationPreparation {
                 request,
@@ -3795,6 +3860,7 @@ mod tests {
                 state_digest: wire::Digest([0x61; 32]),
             },
             kind: wire::OperationKind::Commit,
+            publish_preparation: None,
             commit_preparation: Some(Box::new(wire::CommitPreparation {
                 request: Box::new(exact_request.clone()),
                 committed_at_unix_seconds,
@@ -3824,6 +3890,12 @@ mod tests {
                 state_digest: wire::Digest([0x63; 32]),
             },
             kind: wire::OperationKind::ArtifactPublish,
+            publish_preparation: Some(Box::new(wire::PublishPreparation {
+                append_intent_digest: None,
+                target: manifest_target.clone(),
+                workspace_incarnation_id: binding.workspace_incarnation_id,
+                artifact_revision_id: binding.artifact_revision_id,
+            })),
             commit_preparation: None,
             restore_preparation: None,
             state: wire::OperationState::Succeeded,
@@ -7003,6 +7075,57 @@ mod tests {
         let mapped = query_predicate(&predicate).unwrap();
         assert_eq!(mapped.operator, wire::QueryOperator::In);
         assert!(matches!(mapped.operand, wire::QueryOperand::Set(values) if values.len() == 2));
+    }
+
+    #[test]
+    fn native_append_does_not_admit_a_missing_workspace() {
+        let (backend, requests, server) = scripted_backend(vec![not_found_failure()]);
+        let error = backend
+            .append_idempotent(
+                wire::OperationIdentity([0xaa; 16]),
+                wire::WorkspacePath {
+                    workbench: wire::WorkbenchName::new("absent").unwrap(),
+                    path: wire::RelativePath::new("logs/events.jsonl").unwrap(),
+                },
+                None,
+                wire::ContentType::new("text/plain").unwrap(),
+                None,
+                None,
+                b"event",
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, agent::BackendErrorKind::NotFound);
+        server.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            &requests[0].operation,
+            wire::WorkspaceRequest::GetWorkspace(_)
+        ));
+    }
+
+    #[test]
+    fn unresolved_append_error_preserves_identity_state_and_underlying_cause() {
+        let error = map_client_error(ClientError::AppendUnresolved {
+            operation_id: wire::OperationIdentity([0xaa; 16]),
+            state: Some(wire::OperationState::Running),
+            source: Box::new(ClientError::Rpc(wire::RpcFailure {
+                code: wire::ErrorCode::Conflict,
+                message: "path generation changed".to_owned(),
+                retryable: false,
+                conflict: Some(wire::ConflictKind::PathGeneration),
+                current_generation: Some(3),
+                route_hint: None,
+            })),
+        });
+        assert_eq!(
+            error.kind,
+            agent::BackendErrorKind::Other("AppendUnresolved".to_owned())
+        );
+        assert_eq!(error.details["operation_id"], "aa".repeat(16));
+        assert_eq!(error.details["state"], "Running");
+        assert_eq!(error.details["code"], "Conflict");
+        assert!(!error.retryable);
     }
 
     #[test]

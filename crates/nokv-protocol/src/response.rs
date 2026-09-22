@@ -1521,9 +1521,21 @@ impl OperationResult {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct PublishPreparation {
+    /// Caller intent bound to one append publication attempt, when present.
+    pub append_intent_digest: Option<Digest>,
+    pub target: WorkspacePath,
+    pub workspace_incarnation_id: WorkspaceIdentity,
+    pub artifact_revision_id: ArtifactRevisionIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct OperationStatus {
     pub token: OperationToken,
     pub kind: OperationKind,
+    /// Present exactly for artifact-publication operations, including terminal ones.
+    pub publish_preparation: Option<Box<PublishPreparation>>,
     /// Present exactly for commit operations, including terminal ones.
     pub commit_preparation: Option<Box<CommitPreparation>>,
     /// Present exactly for restore operations, including terminal ones.
@@ -1537,6 +1549,33 @@ pub struct OperationStatus {
 impl OperationStatus {
     fn validate(&self) -> Result<(), ProtocolError> {
         self.progress.validate()?;
+        match (self.kind, self.publish_preparation.as_ref()) {
+            (OperationKind::ArtifactPublish, Some(preparation)) => {
+                if let Some(OperationResult::ArtifactPublish(result)) = &self.result {
+                    if result.target != preparation.target
+                        || result.artifact_revision_id != preparation.artifact_revision_id
+                    {
+                        return Err(ProtocolError::invalid(
+                            "operation.publish_preparation",
+                            "must match the durable publication result",
+                        ));
+                    }
+                }
+            }
+            (OperationKind::ArtifactPublish, None) => {
+                return Err(ProtocolError::invalid(
+                    "operation.publish_preparation",
+                    "is required for artifact-publication operations",
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(ProtocolError::invalid(
+                    "operation.publish_preparation",
+                    "is only valid for artifact-publication operations",
+                ));
+            }
+            (_, None) => {}
+        }
         match (self.kind, self.commit_preparation.as_ref()) {
             (OperationKind::Commit, Some(preparation)) => preparation.validate()?,
             (OperationKind::Commit, None) => {
@@ -2297,6 +2336,17 @@ mod tests {
 
     fn running_status(kind: OperationKind) -> OperationStatus {
         OperationStatus {
+            publish_preparation: (kind == OperationKind::ArtifactPublish).then(|| {
+                Box::new(PublishPreparation {
+                    append_intent_digest: None,
+                    target: WorkspacePath {
+                        workbench: WorkbenchName::new("run").unwrap(),
+                        path: crate::RelativePath::new("outputs/result.bin").unwrap(),
+                    },
+                    workspace_incarnation_id: WorkspaceIdentity([3; 16]),
+                    artifact_revision_id: ArtifactRevisionIdentity([4; 16]),
+                })
+            }),
             token: OperationToken {
                 operation_id: OperationIdentity([1; 16]),
                 state_digest: Digest([2; 32]),
@@ -2450,6 +2500,32 @@ mod tests {
         let mut publish = running_status(OperationKind::ArtifactPublish);
         publish.commit_preparation = status.commit_preparation.clone();
         assert!(publish.validate().is_err());
+    }
+
+    #[test]
+    fn publish_status_requires_preparation_bound_to_its_historical_result() {
+        let mut status = running_status(OperationKind::ArtifactPublish);
+        status.validate().unwrap();
+        let preparation = status.publish_preparation.take().unwrap();
+        assert!(status.validate().is_err());
+        status.result = Some(OperationResult::ArtifactPublish(PublishResult {
+            operation_id: status.token.operation_id,
+            target: preparation.target.clone(),
+            workspace_revision: 7,
+            generation: 3,
+            artifact_revision_id: preparation.artifact_revision_id,
+            logical_size: 4,
+            body_digest: DigestUri::new(format!("sha256:{}", "ab".repeat(32))).unwrap(),
+        }));
+        status.state = OperationState::Succeeded;
+        status.publish_preparation = Some(preparation);
+        status.validate().unwrap();
+        status
+            .publish_preparation
+            .as_mut()
+            .unwrap()
+            .artifact_revision_id = ArtifactRevisionIdentity([5; 16]);
+        assert!(status.validate().is_err());
     }
 
     #[test]

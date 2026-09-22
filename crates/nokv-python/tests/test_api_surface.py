@@ -9,6 +9,7 @@ def test_versioned_workbench_surface():
     assert nokv.API_VERSION == 1
     assert nokv.__all__ == [
         "API_VERSION",
+        "AppendError",
         "Client",
         "ObjectStoreConfig",
         "RoutingConfig",
@@ -29,6 +30,12 @@ def test_versioned_workbench_surface():
     assert hasattr(nokv.Client, "rename")
     assert hasattr(nokv.Client, "publish_bytes")
     assert hasattr(nokv.Client, "publish_file")
+    assert hasattr(nokv.Client, "append_bytes")
+    append = inspect.signature(nokv.Client.append_bytes).parameters
+    assert append["operation_id"].default is inspect.Parameter.empty
+    assert append["content_type"].default is None
+    assert append["expected_workspace_incarnation_id"].default is None
+    assert append["max_logical_size"].default is None
     for method in (nokv.Client.publish_bytes, nokv.Client.publish_file):
         parameters = inspect.signature(method).parameters
         assert "expected_workspace_incarnation_id" in parameters
@@ -84,3 +91,22 @@ def test_retired_filesystem_types_stay_absent():
 
 def test_torch_adapter_is_lazy_and_optional():
     assert "torch" not in nokv.__all__
+
+
+def test_append_error_keeps_identity_and_observed_state():
+    error = nokv.AppendError("reply lost", "a" * 32, None, "AppendUnresolved", "b" * 32)
+    assert isinstance(error, RuntimeError)
+    assert error.operation_id == "a" * 32
+    assert error.state is None
+    assert error.code == "AppendUnresolved"
+    assert error.expected == "b" * 32
+    assert error.cause_code is None
+    assert error.retryable is False
+    assert str(error) == "reply lost"
+    mismatch = nokv.AppendError(
+        "different intent", "a" * 32, None, "AppendUnresolved", "b" * 32,
+        "RequestReplayMismatch",
+    )
+    assert mismatch.cause_code == "RequestReplayMismatch"
+    assert mismatch.code == "AppendUnresolved"
+    assert mismatch.retryable is False
