@@ -21,6 +21,8 @@ const MANIFEST_PLAN_CURSOR_BYTES: usize = 1 + types::FIXED_ID_BYTES * 2 + 8 * 3;
 // of spending the client's much smaller transport retry budget.
 const MAX_INTERNAL_METADATA_ATTEMPTS: u32 = 8;
 const PUBLISH_ACTIVITY_LEASE_MS: u64 = 30 * 60 * 1_000;
+/// Maximum configured inactivity budget before an append attempt can be recovered.
+pub const MAX_APPEND_ACTIVITY_LEASE_MS: u64 = 24 * 60 * 60 * 1_000;
 const RUN_MANIFEST_PATH: &str = "metadata/run_manifest.json";
 const _: () = assert!(protocol::MAX_ARTIFACT_DEPENDENCY_OWNERS == meta::MAX_REVISION_DEPENDENCIES);
 const _: () = assert!(MAX_INTERNAL_METADATA_ATTEMPTS > 0);
@@ -34,7 +36,8 @@ const _: () = assert!(protocol::MAX_QUERY_PAGE_LIMIT as usize == meta::MAX_QUERY
 // reject the legacy 61..=64 gap at DTO-to-domain conversion as main does.
 const _: () =
     assert!(protocol::ArtifactDescriptor::MAX_INDEX_FIELDS >= meta::MAX_TYPED_PROJECTION_FIELDS);
-const SUPPORTED_WORKSPACE_CAPABILITIES: [protocol::WorkspaceCapability; 10] = [
+const SUPPORTED_WORKSPACE_CAPABILITIES: [protocol::WorkspaceCapability; 11] = [
+    protocol::WorkspaceCapability::ArtifactAppendV1,
     protocol::WorkspaceCapability::ArtifactPublishV1,
     protocol::WorkspaceCapability::ArtifactRangeReadV1,
     protocol::WorkspaceCapability::ChangeFeedV1,
@@ -158,6 +161,7 @@ impl RestorePreparationCoordinator {
 #[derive(Clone)]
 pub struct MetadataWorkspaceRequestExecutor {
     meta: Arc<meta::MetaShard>,
+    append_activity_lease_ms: u64,
     restore_preparations: Arc<RestorePreparationCoordinator>,
     #[cfg(feature = "restore-crash-test-support")]
     restore_initialization_barrier: Option<RestoreInitializationBarrierRegistration>,
@@ -169,12 +173,26 @@ impl MetadataWorkspaceRequestExecutor {
     pub fn new(meta: Arc<meta::MetaShard>) -> Self {
         Self {
             meta,
+            append_activity_lease_ms: PUBLISH_ACTIVITY_LEASE_MS,
             restore_preparations: Arc::new(RestorePreparationCoordinator::default()),
             #[cfg(feature = "restore-crash-test-support")]
             restore_initialization_barrier: None,
             #[cfg(feature = "restore-crash-test-support")]
             restore_finalize_load_observer: None,
         }
+    }
+
+    pub fn with_append_activity_lease_ms(
+        mut self,
+        milliseconds: u64,
+    ) -> Result<Self, crate::ServerError> {
+        if !(1_000..=MAX_APPEND_ACTIVITY_LEASE_MS).contains(&milliseconds) {
+            return Err(crate::ServerError::InvalidOptions(
+                "append activity lease must be between 1000 and 86400000 milliseconds".to_owned(),
+            ));
+        }
+        self.append_activity_lease_ms = milliseconds;
+        Ok(self)
     }
 
     #[cfg(feature = "restore-crash-test-support")]
@@ -1889,6 +1907,18 @@ impl MetadataWorkspaceRequestExecutor {
         rpc: &protocol::WorkspaceRpcRequest,
         request: &protocol::BeginArtifactPublishRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        if let Some(binding) = request.append_attempt {
+            let (operation_id, revision_id) = protocol::stable_append_attempt_identities(
+                rpc.route.root_id,
+                binding.operation_id,
+                binding.attempt,
+            );
+            if request.operation_id != operation_id || request.artifact_revision_id != revision_id {
+                return Err(invalid_argument(
+                    "append publication identities must match the logical operation and attempt",
+                ));
+            }
+        }
         self.claim_mutation(rpc)?;
         let step_id = derived_request_id(rpc.request_id, b"publish-begin", 0);
         if let Some(outcome) = self.replayed_publish(rpc.route, step_id)? {
@@ -1906,8 +1936,15 @@ impl MetadataWorkspaceRequestExecutor {
             self.find_publish_operation(rpc.route, read.read_version, request.operation_id)?
         {
             if existing.append_intent_digest.is_some() || request.append_intent_digest.is_some() {
-                if existing.append_intent_digest
-                    != request.append_intent_digest.map(|value| value.0)
+                if existing
+                    .append_attempt
+                    .map(|binding| protocol::AppendAttemptBinding {
+                        operation_id: binding.operation_id.into(),
+                        attempt: binding.attempt,
+                    })
+                    != request.append_attempt
+                    || existing.append_intent_digest
+                        != request.append_intent_digest.map(|value| value.0)
                     || existing.authority != meta::PublishAuthority::Visible
                     || request.authority != protocol::PublicationAuthority::Visible
                     || existing.workbench_id != workbench_id(&request.target.workbench)?
@@ -2092,12 +2129,25 @@ impl MetadataWorkspaceRequestExecutor {
             }
         };
         let mut operation = meta::PublishOperationRecord {
+            append_attempt: request
+                .append_attempt
+                .map(|binding| meta::AppendAttemptBinding {
+                    operation_id: binding.operation_id.into(),
+                    attempt: binding.attempt,
+                }),
             append_intent_digest: request.append_intent_digest.map(|value| value.0),
             operation_id: request.operation_id.into(),
             identity_digest: [0; types::SHA256_BYTES],
             initialization_digest: [0; types::SHA256_BYTES],
             initiating_owner_epoch: context.owner_epoch,
-            activity_deadline_ms: publish_activity_deadline_ms(&self.meta)?,
+            activity_deadline_ms: publish_activity_deadline_ms(
+                &self.meta,
+                if request.append_attempt.is_some() {
+                    self.append_activity_lease_ms
+                } else {
+                    PUBLISH_ACTIVITY_LEASE_MS
+                },
+            )?,
             authority,
             workbench_id: workbench,
             workspace_incarnation_id,
@@ -2362,14 +2412,37 @@ impl MetadataWorkspaceRequestExecutor {
             manifest_id: request.artifact.manifest_identity.clone(),
             typed_index_projection: encode_index_fields(&request.artifact.index_fields)?,
         };
-        let outcome = meta::PublicationService::new(&self.meta)
-            .finalize_publish(meta::FinalizePublishRequest {
-                context,
-                expected_operation: finalizing_operation,
-                artifact,
-                dependency_owner_revision_ids,
-            })
-            .map_err(publication_failure)?;
+        let service = meta::PublicationService::new(&self.meta);
+        let outcome = match service.finalize_publish(meta::FinalizePublishRequest {
+            context,
+            expected_operation: finalizing_operation.clone(),
+            artifact,
+            dependency_owner_revision_ids,
+        }) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if finalizing_operation.append_attempt.is_some()
+                    && matches!(
+                        error,
+                        meta::PublicationError::PathAlreadyExists
+                            | meta::PublicationError::PathNotFound
+                            | meta::PublicationError::PathGenerationMismatch { .. }
+                            | meta::PublicationError::AppendBaseRevisionMismatch
+                    )
+                {
+                    let cleanup_id = derived_request_id(rpc.request_id, b"append-path-conflict", 0);
+                    let cleanup_context = self.publication_context(rpc.route, cleanup_id)?;
+                    // Only the same exact Finalizing state may become Aborting.
+                    // A concurrent winner remains authoritative and is queried by
+                    // the client; unknown finalization outcomes never enter here.
+                    match service.fail_append_conflict(cleanup_context, finalizing_operation) {
+                        Ok(_) | Err(meta::PublicationError::ConcurrentMutation) => {}
+                        Err(cleanup_error) => return Err(publication_failure(cleanup_error)),
+                    }
+                }
+                return Err(publication_failure(error));
+            }
+        };
         published_response(
             outcome.operation,
             outcome.result,
@@ -2428,6 +2501,9 @@ impl MetadataWorkspaceRequestExecutor {
         let resolution = match request.resolution {
             protocol::QuarantineResolution::ProviderObjectsAbsent => {
                 meta::QuarantineReconcileResolution::RevisionUnpublished
+            }
+            protocol::QuarantineResolution::ProviderObjectsSealed => {
+                meta::QuarantineReconcileResolution::RevisionUnpublishedSealed
             }
             protocol::QuarantineResolution::RevisionPublished => {
                 meta::QuarantineReconcileResolution::RevisionPublished
@@ -2729,6 +2805,7 @@ impl MetadataWorkspaceRequestExecutor {
             types::OperationKind::Publish,
             types::OperationKind::BuildCommit,
             types::OperationKind::Restore,
+            types::OperationKind::Append,
         ] {
             let key = meta::operation_key(context.root_id, kind, operation_id);
             if let Some(payload) = self
@@ -2755,6 +2832,19 @@ impl MetadataWorkspaceRequestExecutor {
             return Err(not_found("operation does not exist"));
         };
         let status = match kind {
+            types::OperationKind::Append => {
+                let parent = meta::AppendOperationRecord::decode(&payload)
+                    .map_err(|error| internal(format!("invalid append operation: {error}")))?;
+                if parent.operation_id != operation_id {
+                    return Err(internal("append operation key and payload disagree"));
+                }
+                let child = self.load_publish_operation(
+                    rpc.route,
+                    context.read_version,
+                    parent.publication_operation_id.into(),
+                )?;
+                append_operation_status(&parent, &child)?
+            }
             types::OperationKind::Publish => {
                 let operation = meta::PublishOperationRecord::decode(&payload)
                     .map_err(|error| internal(format!("invalid publish operation: {error}")))?;
@@ -3277,7 +3367,14 @@ impl MetadataWorkspaceRequestExecutor {
             token.operation_id,
         )?;
         require_publish_token(&operation, token)?;
-        let activity_deadline_ms = publish_activity_deadline_ms(&self.meta)?;
+        let activity_deadline_ms = publish_activity_deadline_ms(
+            &self.meta,
+            if operation.append_attempt.is_some() {
+                self.append_activity_lease_ms
+            } else {
+                PUBLISH_ACTIVITY_LEASE_MS
+            },
+        )?;
         if activity_deadline_ms <= operation.activity_deadline_ms {
             return Ok(operation);
         }
@@ -3947,7 +4044,10 @@ fn decode_manifest_plan_cursor(
     ))
 }
 
-fn publish_activity_deadline_ms(meta: &meta::MetaShard) -> Result<u64, protocol::RpcFailure> {
+fn publish_activity_deadline_ms(
+    meta: &meta::MetaShard,
+    lease_ms: u64,
+) -> Result<u64, protocol::RpcFailure> {
     let wall_clock_ms = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3958,7 +4058,7 @@ fn publish_activity_deadline_ms(meta: &meta::MetaShard) -> Result<u64, protocol:
     let lease_clock_ms = meta.lease_clock_high_water().map_err(meta_failure)?;
     wall_clock_ms
         .max(lease_clock_ms)
-        .checked_add(PUBLISH_ACTIVITY_LEASE_MS)
+        .checked_add(lease_ms)
         .ok_or_else(|| internal("publish activity deadline overflows u64"))
 }
 
@@ -4164,6 +4264,96 @@ fn published_response(
     })
 }
 
+fn append_operation_status(
+    parent: &meta::AppendOperationRecord,
+    child: &meta::PublishOperationRecord,
+) -> Result<protocol::OperationStatus, protocol::RpcFailure> {
+    if !parent.matches_publication(child)
+        || parent.result != child.result
+        || parent.result.is_some() != (child.phase == types::PublishPhase::Published)
+    {
+        return Err(internal("append parent and current publication disagree"));
+    }
+    let child_status = publish_operation_status(child)?;
+    let phase = match child.phase {
+        types::PublishPhase::Uploading => protocol::AppendAttemptPhase::Uploading,
+        types::PublishPhase::Finalizing => protocol::AppendAttemptPhase::Finalizing,
+        types::PublishPhase::Published => protocol::AppendAttemptPhase::Published,
+        types::PublishPhase::Aborting => protocol::AppendAttemptPhase::Aborting,
+        types::PublishPhase::Cleaning => protocol::AppendAttemptPhase::Cleaning,
+        types::PublishPhase::Cleaned => protocol::AppendAttemptPhase::Cleaned,
+        types::PublishPhase::Quarantined => protocol::AppendAttemptPhase::Quarantined,
+    };
+    let target = workspace_path(&parent.workbench_id, &parent.path)?;
+    let result = parent
+        .result
+        .as_ref()
+        .map(|published| -> Result<_, protocol::RpcFailure> {
+            Ok(protocol::OperationResult::ArtifactAppend(
+                protocol::AppendResult {
+                    operation_id: parent.operation_id.into(),
+                    publication_operation_id: parent.publication_operation_id.into(),
+                    target: target.clone(),
+                    workspace_incarnation_id: parent.workspace_incarnation_id.into(),
+                    workspace_revision: published.workspace_revision.get(),
+                    generation: published.path_generation.get(),
+                    artifact_revision_id: parent.artifact_revision_id.into(),
+                    logical_size: published.logical_size,
+                    body_digest: protocol::DigestUri::new(published.body_digest_uri.clone())
+                        .map_err(|error| internal(error.to_string()))?,
+                },
+            ))
+        })
+        .transpose()?;
+    let state = if result.is_some() {
+        protocol::OperationState::Succeeded
+    } else if child.phase == types::PublishPhase::Quarantined {
+        protocol::OperationState::Quarantined
+    } else {
+        protocol::OperationState::Running
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.append.state.v1\0");
+    hasher.update(
+        parent
+            .encode()
+            .map_err(|error| internal(error.to_string()))?,
+    );
+    hasher.update(child_status.token.state_digest.0);
+    Ok(protocol::OperationStatus {
+        append_preparation: Some(Box::new(protocol::AppendPreparation {
+            intent_digest: protocol::Digest(parent.intent_digest),
+            target,
+            workspace_incarnation_id: parent.workspace_incarnation_id.into(),
+            attempt: parent.attempt,
+            publication_operation_id: parent.publication_operation_id.into(),
+            artifact_revision_id: parent.artifact_revision_id.into(),
+            attempt_phase: phase,
+            activity_deadline_ms: child.activity_deadline_ms,
+            attempt_failure: child_status.failure.clone().or_else(|| {
+                child
+                    .terminal_error
+                    .as_ref()
+                    .map(|error| operation_terminal_failure(&error.message))
+            }),
+        })),
+        token: protocol::OperationToken {
+            operation_id: parent.operation_id.into(),
+            state_digest: protocol::Digest(hasher.finalize().into()),
+        },
+        kind: protocol::OperationKind::ArtifactAppend,
+        publish_preparation: None,
+        commit_preparation: None,
+        restore_preparation: None,
+        state,
+        progress: child_status.progress,
+        result,
+        failure: (state == protocol::OperationState::Quarantined)
+            .then_some(child_status.failure)
+            .flatten(),
+    })
+}
+
 fn publish_operation_status(
     operation: &meta::PublishOperationRecord,
 ) -> Result<protocol::OperationStatus, protocol::RpcFailure> {
@@ -4231,7 +4421,14 @@ fn publish_operation_status(
         ),
     };
     Ok(protocol::OperationStatus {
+        append_preparation: None,
         publish_preparation: Some(Box::new(protocol::PublishPreparation {
+            append_attempt: operation.append_attempt.map(|binding| {
+                protocol::AppendAttemptBinding {
+                    operation_id: binding.operation_id.into(),
+                    attempt: binding.attempt,
+                }
+            }),
             append_intent_digest: operation.append_intent_digest.map(protocol::Digest),
             target: workspace_path(&operation.workbench_id, &operation.path)?,
             workspace_incarnation_id: operation.workspace_incarnation_id.into(),
@@ -4311,6 +4508,7 @@ fn build_commit_operation_status(
         ),
     };
     Ok(protocol::OperationStatus {
+        append_preparation: None,
         publish_preparation: None,
         token: protocol::OperationToken {
             operation_id: operation.operation_id.into(),
@@ -5145,6 +5343,7 @@ fn restore_operation_status(
         ),
     };
     Ok(protocol::OperationStatus {
+        append_preparation: None,
         publish_preparation: None,
         token: protocol::OperationToken {
             operation_id: operation.operation_id.into(),
@@ -8211,6 +8410,7 @@ mod tests {
                     first_request_fill,
                     protocol::WorkspaceRequest::BeginArtifactPublish(
                         protocol::BeginArtifactPublishRequest {
+                            append_attempt: None,
                             append_intent_digest: None,
                             operation_id,
                             artifact_revision_id,
@@ -9397,6 +9597,7 @@ mod tests {
                 request_id: protocol::RequestIdentity([0x53; types::FIXED_ID_BYTES]),
                 operation: protocol::WorkspaceRequest::BeginArtifactPublish(
                     protocol::BeginArtifactPublishRequest {
+                        append_attempt: None,
                         append_intent_digest: None,
                         operation_id,
                         artifact_revision_id,
@@ -10145,6 +10346,7 @@ mod tests {
                 request_fill,
                 protocol::WorkspaceRequest::BeginArtifactPublish(
                     protocol::BeginArtifactPublishRequest {
+                        append_attempt: None,
                         append_intent_digest: None,
                         operation_id,
                         artifact_revision_id,
@@ -10263,12 +10465,20 @@ mod tests {
     }
 
     fn stable_append_begin_request() -> protocol::BeginArtifactPublishRequest {
-        let artifact_revision_id =
-            protocol::ArtifactRevisionIdentity([0x84; types::FIXED_ID_BYTES]);
+        let binding = protocol::AppendAttemptBinding {
+            operation_id: protocol::OperationIdentity([0x83; types::FIXED_ID_BYTES]),
+            attempt: 0,
+        };
+        let (operation_id, artifact_revision_id) = protocol::stable_append_attempt_identities(
+            root().into(),
+            binding.operation_id,
+            binding.attempt,
+        );
         let seals = protocol::seal_artifact_publish_plan(artifact_revision_id, &[], &[]).unwrap();
         protocol::BeginArtifactPublishRequest {
+            append_attempt: Some(binding),
             append_intent_digest: Some(protocol::Digest([0x85; types::SHA256_BYTES])),
-            operation_id: protocol::OperationIdentity([0x83; types::FIXED_ID_BYTES]),
+            operation_id,
             artifact_revision_id,
             target: protocol::WorkspacePath {
                 workbench: protocol::WorkbenchName::new("stable-append").unwrap(),
@@ -10379,6 +10589,9 @@ mod tests {
         {
             let mut changed = begin.clone();
             changed.append_intent_digest = digest;
+            if digest.is_none() {
+                changed.append_attempt = None;
+            }
             let mismatch = executor
                 .execute(&restore_rpc(
                     0x88 + index as u8,
@@ -10545,6 +10758,7 @@ mod tests {
                 request_id: protocol::RequestIdentity([0x64; types::FIXED_ID_BYTES]),
                 operation: protocol::WorkspaceRequest::BeginArtifactPublish(
                     protocol::BeginArtifactPublishRequest {
+                        append_attempt: None,
                         append_intent_digest: None,
                         operation_id,
                         artifact_revision_id,
@@ -10824,6 +11038,7 @@ mod tests {
                     0x74,
                     protocol::WorkspaceRequest::BeginArtifactPublish(
                         protocol::BeginArtifactPublishRequest {
+                            append_attempt: None,
                             append_intent_digest: None,
                             operation_id: operation_identity,
                             artifact_revision_id: revision_identity,
@@ -11058,6 +11273,7 @@ mod tests {
                     0x7C,
                     protocol::WorkspaceRequest::BeginArtifactPublish(
                         protocol::BeginArtifactPublishRequest {
+                            append_attempt: None,
                             append_intent_digest: None,
                             operation_id: protocol::OperationIdentity(
                                 [0x7D; types::FIXED_ID_BYTES],

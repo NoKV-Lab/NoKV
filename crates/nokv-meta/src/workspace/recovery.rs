@@ -15,14 +15,13 @@ use sha2::{Digest, Sha256};
 use super::codec::SCHEMA_ID;
 use super::engine::{
     CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetadataCommand,
-    RootFenceAction,
+    RootFenceAction, MAX_COMMAND_ITEMS,
 };
 use super::keyspace::MetadataFamily;
 
 pub const RECOVERY_OUTBOX_VALUE_FORMAT_VERSION: u8 = 3;
 const LEGACY_RECOVERY_OUTBOX_VALUE_FORMAT_VERSION: u8 = 2;
 pub const RECOVERY_CHAIN_DIGEST_BYTES: usize = 32;
-const MAX_ITEMS: usize = 256;
 pub(crate) const MAX_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_RECOVERY_SEGMENT_BYTES: usize = MAX_RECOVERY_BYTES;
 pub const MAX_RECOVERY_SEGMENT_RECORDS: usize = 1024;
@@ -1488,11 +1487,11 @@ fn put_count(
     field: &'static str,
     count: usize,
 ) -> Result<(), RecoveryCodecError> {
-    if count > MAX_ITEMS {
+    if count > MAX_COMMAND_ITEMS {
         return Err(RecoveryCodecError::LengthBound {
             field,
             length: count,
-            max: MAX_ITEMS,
+            max: MAX_COMMAND_ITEMS,
         });
     }
     bytes.extend_from_slice(&u32_len(field, count)?.to_be_bytes());
@@ -1566,11 +1565,11 @@ impl<'a> Decoder<'a> {
 
     fn count(&mut self, field: &'static str) -> Result<usize, RecoveryCodecError> {
         let count = self.u32(field)? as usize;
-        if count > MAX_ITEMS {
+        if count > MAX_COMMAND_ITEMS {
             return Err(RecoveryCodecError::LengthBound {
                 field,
                 length: count,
-                max: MAX_ITEMS,
+                max: MAX_COMMAND_ITEMS,
             });
         }
         Ok(count)
@@ -1704,6 +1703,65 @@ mod tests {
             deterministic_result: b"result".to_vec(),
         }
         .seal()
+    }
+
+    #[test]
+    fn recovery_command_codec_shares_engine_item_limit_in_both_directions() {
+        let mut command = command();
+        command.predicates = vec![command.predicates[0].clone(); MAX_COMMAND_ITEMS];
+        command.mutations = vec![command.mutations[0].clone(); MAX_COMMAND_ITEMS];
+        command.history_projection = vec![command.history_projection[0].clone(); MAX_COMMAND_ITEMS];
+        command.event_projection = vec![command.event_projection[0].clone(); MAX_COMMAND_ITEMS];
+        let mutation = RecoveryMutationV1::MetadataCommand {
+            command: Box::new(command.clone().seal()),
+            lease_deadline_ms: None,
+        };
+        let encoded = mutation.encode_canonical().unwrap();
+        assert_eq!(
+            RecoveryMutationV1::decode_canonical(&encoded).unwrap(),
+            mutation
+        );
+        let fields = [
+            "predicates",
+            "mutations",
+            "history_projection",
+            "event_projection",
+        ];
+        for field in fields {
+            let mut oversized = command.clone();
+            match field {
+                "predicates" => oversized.predicates.push(oversized.predicates[0].clone()),
+                "mutations" => oversized.mutations.push(oversized.mutations[0].clone()),
+                "history_projection" => oversized
+                    .history_projection
+                    .push(oversized.history_projection[0].clone()),
+                "event_projection" => oversized
+                    .event_projection
+                    .push(oversized.event_projection[0].clone()),
+                _ => unreachable!(),
+            }
+            let mutation = RecoveryMutationV1::MetadataCommand {
+                command: Box::new(oversized.seal()),
+                lease_deadline_ms: None,
+            };
+            assert_eq!(
+                mutation.encode_canonical(),
+                Err(RecoveryCodecError::LengthBound {
+                    field,
+                    length: MAX_COMMAND_ITEMS + 1,
+                    max: MAX_COMMAND_ITEMS,
+                })
+            );
+        }
+        let oversized_count = ((MAX_COMMAND_ITEMS + 1) as u32).to_be_bytes();
+        assert_eq!(
+            Decoder::new(&oversized_count).count("predicates"),
+            Err(RecoveryCodecError::LengthBound {
+                field: "predicates",
+                length: MAX_COMMAND_ITEMS + 1,
+                max: MAX_COMMAND_ITEMS,
+            })
+        );
     }
 
     #[test]

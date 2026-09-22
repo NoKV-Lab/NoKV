@@ -139,6 +139,7 @@ impl RootRoute {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceCapability {
+    ArtifactAppendV1,
     ArtifactPublishV1,
     ArtifactRangeReadV1,
     ChangeFeedV1,
@@ -152,7 +153,8 @@ pub enum WorkspaceCapability {
 }
 
 impl WorkspaceCapability {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
+        Self::ArtifactAppendV1,
         Self::ArtifactPublishV1,
         Self::ArtifactRangeReadV1,
         Self::ChangeFeedV1,
@@ -821,6 +823,7 @@ pub struct OperationToken {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
+    ArtifactAppend,
     ArtifactPublish,
     Commit,
     Restore,

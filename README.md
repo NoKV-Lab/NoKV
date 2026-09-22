@@ -104,7 +104,7 @@ same conformance and fault evidence:
 
 | I need to... | Use | What the caller gets |
 | --- | --- | --- |
-| Persist one run | `workbench_create`, `workbench_put_file`, `workbench_append`, `workbench_edit`, `workbench_commit` | Five-section workspace, explicit write modes, immutable revisions, and a sealed run manifest |
+| Persist one run | `workbench_create`, `workbench_put_file`, `workspace-path append`, `workbench_edit`, `workbench_commit` | Five-section workspace, explicit write modes, immutable revisions, and a sealed run manifest |
 | Reopen work from another process | `workbench_list`, `workbench_stat`, `workbench_read`, `workbench_find` | Path-shaped discovery and verified reads without retaining the original sandbox |
 | Prevent stale or duplicate writes | generations, explicit request identity, exact replay | Typed conflict for stale state; the same outcome for an exact retry after response loss |
 | Search many artifacts or runs | `workbench_grep`, `workbench_search`, `workbench_aggregate`, `workbench_catalog`, `workbench_find` | Literal body search plus typed indexed metadata query and aggregation |
@@ -238,7 +238,8 @@ real-service acceptance gate is still **not qualified**.
 | `nokv materialize` | Copy a verified workspace artifact to a new local path. | The destination is disposable scratch, not a namespace or mount. |
 | `nokv collect` | Publish one bounded regular local file, create-only or generation-fenced replace. | Symlinks and unbounded/non-regular inputs fail closed. |
 | `nokv workspace-path rename` / `nokv workspace-path remove` | Apply an explicit generation- and request-id-fenced path mutation. | Custom CLI surface; not one of the 18 Workbench tools. |
-| `nokv workspace-path append` | Append bytes under a caller-owned operation identity and return the original publication on replay. | Requires an existing workspace; pin its incarnation across restarts. Custom CLI surface; the 18-tool schema is unchanged. |
+| `nokv workspace-path append` | Append bytes under a durable logical identity and recover the original receipt across process restarts. | The first admission requires an existing workspace. Retries use fenced publication attempts under the same identity; the 18-tool schema is unchanged. |
+| `nokv operation status` | Query an append by its logical identity and report its receipt or next recovery action. | Metadata only: no payload, current workspace, or object-store connection is required. |
 | `nokv provision` | Bind `RootId` to `AgentId`, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. |
 | `nokv serve` | Start one explicit metadata owner from create, same-namespace reopen, or recovery-log state. | Shared recovery publication is opt-in and not currently qualified. |
 | `nokv mcp` | Deprecated stdio transport retained only because qualification runners still use it. | **Unsupported for integration.** |
@@ -253,25 +254,61 @@ nokv [route/agent/object options] workspace-path append run-42 logs events.jsonl
   --text 'step-7-done' --content-type text/plain
 ```
 
-Replace the example ids with the caller's stable operation id and the existing
-workspace's incarnation. Omit the incarnation only to observe and fence the
-existing workspace on this call; append never creates a missing workspace.
-Use `--text`, `--base64`, or `--file` for exactly one delta. Text defaults to
+Replace the example ids with the caller's stable logical operation id and the
+intended workspace's incarnation. On the first call, omitting the incarnation
+observes and fences the existing workspace. On recovery, omission resolves the
+original durable operation first, even if the workspace was deleted or recreated.
+Append never creates a missing workspace.
+
+Use exactly one of `--text`, `--base64`, or `--file`. Text defaults to
 `text/plain; charset=utf-8` on creation; binary and file input default to
 `application/octet-stream`. Existing content type is inherited unless
-`--content-type` overrides it. `--max-artifact-bytes` bounds the delta;
-`--max-logical-size` optionally bounds the resulting artifact.
+`--content-type` overrides it. Explicitly use the same type when replaying across
+text, file, and Python inputs. The delta limit is 16 MiB; `--max-artifact-bytes`
+may lower it. The resulting body also defaults to a 16 MiB limit;
+`--max-logical-size` raises that bound and is part of the stable intent.
+`--block-size` defaults to 4 MiB and matches Python's `block_size` argument;
+retain the same value across retries and surface changes.
 
-The receipt's operation/revision ids, generation, workspace revision, size,
-digest, and incarnation describe that publication, even if another writer has
-since advanced the path. `replayed` and optional `commit_version` describe this
-SDK call and are not stable receipt fields; a recovered receipt may have a null
-`commit_version`. An unresolved error retains the operation id and any observed
-durable state. Recover the same identity; a timeout does not authorize applying
-the delta under a new identity. One identity owns one publication attempt;
-this command does not silently create a new attempt after a CAS conflict.
-The older `workbench_append` tool retains per-invocation identities and does
-not provide cross-process caller-identity replay.
+The receipt identifies both the logical `operation_id` and its successful
+`publication_operation_id`. Its revision, generation, workspace revision, size,
+digest, and incarnation describe the original publication, even if another
+writer has advanced or removed the path. `replayed` and nullable `commit_version`
+describe this SDK call and are not stable receipt fields.
+
+Query a result without resending the delta or contacting the object store:
+
+```shell
+nokv [route/agent options] operation status aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+```
+
+The response supplies a machine-readable recovery action:
+
+| `state` | `next_action` | Caller action |
+| --- | --- | --- |
+| `committed` | `none` | Consume the original `receipt`. |
+| `pending` | `poll` | Query the same logical identity again after waiting. |
+| `ready_to_retry` | `resubmit_same` | Resubmit the original append inputs under the same logical identity. |
+| `quarantined` | `operator_reconcile` | Keep the identity and escalate the recorded inconsistency for operator reconciliation. |
+
+Status also retains the current physical attempt's `cause_code`,
+`failure_message`, and structured `attempt_failure`, including when the logical
+operation is `ready_to_retry`.
+
+An interrupted publication must be fenced and cleaned before a successor
+attempt can start. Status queries only observe this lifecycle. Persist the delta
+or a way to reproduce the exact bytes until the operation commits. An unknown
+result or `NotFound` observation is not proof that a concurrent request cannot
+commit; errors preserve the logical id and use `next_action=query_same`.
+`cause_code=RequestReplayMismatch` means the identity belongs to different
+inputs or a different lifecycle: recover the original intent before retrying.
+Never generate a replacement id merely to bypass an uncertain outcome.
+
+The older `workbench_append` tool retains per-invocation identities and cannot
+recover one action across separate processes. Use `workspace-path append` for
+new retrying harness integrations. The fixed 18-tool contract remains unchanged.
+The [append product specification](docs/development/append-product-spec.md)
+defines the supported recovery, size, retention, and release boundaries.
 
 ### Programmatic and non-CLI capabilities
 
@@ -280,14 +317,15 @@ do not expose identical method shapes.
 
 | Surface | Current public capability | Additional boundary |
 | --- | --- | --- |
-| Direct Python `Client` | 23 methods covering create/stat/exists/list/remove/rename, byte/file publish, whole/range/batch reads, query/aggregate/catalog/find, commit/restore, snapshot lifecycle, materialize, and collect | Direct SDK, not a tool-for-tool copy of the 18-name CLI facade |
+| Direct Python `Client` | Create/stat/exists/list/remove/rename, byte/file publish, stable append and its operation status, whole/range/batch reads, query/aggregate/catalog/find, commit/restore, snapshot lifecycle, materialize, and collect | Direct SDK, not a tool-for-tool copy of the 18-name CLI facade |
 | Python adapters | Workbench-scoped fsspec, checkpoint helpers, and optional torch Distributed Checkpoint reader/writer | Bounded to an explicit Workbench; not arbitrary-root POSIX or FUSE |
 | Rust `WorkspaceClient` | Lower-level typed workspace, publication, query, lifecycle, routing, and batch-range workflows | Recommended when the caller must own typed retry and recovery integration |
-| Rust-only extensions | Polling change feed, generic custom-index registration, raw operation status, and phased publish/restore primitives | No native CLI or Python method today; change feed is polling, not push |
+| Rust-only extensions | Polling change feed, generic custom-index registration, raw non-append operation status, and phased publish/restore primitives | No native CLI or Python method today; change feed is polling, not push |
 | Metadata and server lifecycle | snapshot reap, commit/tag holds, reference-fenced GC, quarantine reconciliation, Holt reopen, and optional shared recovery records | Internal/operator mechanisms, not independent end-user commands |
 
-The Python SDK does not currently expose CLI-equivalent append, exact-string
-edit, or body grep methods. Use the CLI contract for those exact behaviors.
+Python `append_bytes` and `operation_status` share the native stable append
+contract. The SDK does not expose the legacy 18-tool append facade, exact-string
+edit, or body grep methods; use the CLI for those exact behaviors.
 Custom SDK compositions are caller-owned and are not equivalent qualification
 evidence.
 
@@ -295,7 +333,7 @@ evidence.
 
 ```text
 Downstream skill or shell harness
-  -> native nokv workbench CLI       exact 18-operation contract
+  -> native nokv CLI                 workspace operations and stable append recovery
 
 Embedded Python application
   -> nokv Python Client/adapters     direct path/artifact/lifecycle API
@@ -325,8 +363,10 @@ option and are rejected by the agent-facing CLI.
   authoritative.
 - Every published body has a never-reused artifact revision id, immutable
   revision-owned blocks, a whole-body digest, and a caller-visible generation.
-- Append is not a server-side lock. It reads the current head, attempts a
-  generation-fenced immutable publication, and retries bounded conflicts.
+- Append reads the current head and publishes an immutable generation-fenced
+  revision. Stable append records a logical operation before publication; a
+  successor attempt is allowed only after its predecessor cannot publish and
+  has completed cleanup. One logical append has at most one committed result.
 
 ### Commit, snapshot, and restore
 

@@ -62,26 +62,49 @@ not for installing the SDK.
   `expected`) with nothing written. Callers that omit the argument keep the
   0.11.0 behaviour; a server older than 0.11.1 rejects a fenced request as an
   invalid argument instead of ignoring the fence.
-- `Client.append_bytes(workbench, path, data, operation_id, ...)` appends under a
-  caller-owned stable identity. The workspace must exist. Pass
-  `expected_workspace_incarnation_id` to pin the intended workspace across
-  restarts; omission observes the existing incarnation and fences the owner
-  request with it. Reuse the same identity and inputs after a lost reply.
-  The result contains the original `operation_id`, `artifact_revision_id`,
+- `Client.append_bytes(workbench, path, data, operation_id, ...)` accepts Python
+  `bytes` under a caller-owned stable logical identity. The first admission
+  requires an existing workspace. An omitted `expected_workspace_incarnation_id`
+  first resolves a recorded operation's original incarnation, then observes the
+  live workspace only when no operation was found. Explicit incarnation fences
+  are always checked. Save the identity before the first call and reuse the
+  exact inputs after a lost reply.
+  The result matches native `workspace-path append`: `status`, `operation`,
+  `state=committed`, `next_action=none`, logical `operation_id`, successful
+  `publication_operation_id`, `workbench_id`, `path`, `artifact_revision_id`,
   `generation`, `workspace_revision`, `logical_size`, `body_digest`, and
-  `workspace_incarnation_id`, not the latest path head. `replayed` and nullable
-  `commit_version` are call metadata rather than stable receipt fields.
+  `workspace_incarnation_id`. These describe the original publication.
+  `replayed` and nullable `commit_version` are call metadata.
   `content_type=None` inherits an existing artifact's type and uses
   `application/octet-stream` on creation; an explicit type applies to both.
-  `max_logical_size` optionally caps the resulting body. One identity owns one
-  attempt; CAS conflicts are not retried under automatically changed identities.
-  `AppendError` carries `operation_id`, `state`, `code`, and the expected
-  incarnation in `expected`. `cause_code` preserves an underlying RPC code
-  such as `RequestReplayMismatch`, or is `None` for failures without an RPC
-  cause; `retryable` is false. This distinguishes a permanently mismatched
-  intent from an uncertain reply without parsing the error message. An unknown
-  state does not prove nothing was published. Incarnation conflicts raise `WorkspaceIncarnationMismatch` with
-  the append's `operation_id` attached. Recover using the original identity.
+  Use an explicit matching type when replaying between Python and CLI text.
+  The delta limit is 16 MiB, checked before copying the Python bytes.
+  `max_logical_size=None` means a 16 MiB resulting-body limit; an explicit larger
+  bound is part of the intent and must be retained across retries. The default
+  block size is 4 MiB and maps to CLI `--block-size`. A retry may start a successor publication only after the
+  predecessor is fenced and cleaned; the logical identity never changes.
+- `Client.operation_status(operation_id)` queries an append without resending
+  its payload or depending on a current workspace. `Client(root_id, routing)`
+  needs no object-store configuration; configured object stores are initialized
+  lazily on object operations, so a fresh status client works during an S3
+  outage. The result reports `state` and `next_action` from the shared Rust SDK:
+  `committed/none` with the original `receipt`, `pending/poll`,
+  `ready_to_retry/resubmit_same`, or `quarantined/operator_reconcile`. It also
+  contains the logical and publication identities, attempt number and phase,
+  activity deadline, original target and incarnation, progress, `cause_code`,
+  `failure_message`, and `attempt_failure` for a failed physical attempt. The
+  logical operation may still be `ready_to_retry` while retaining that failure.
+  A query never advances an attempt. Retain or reproduce the original delta
+  until commitment; follow `resubmit_same` using `append_bytes`.
+- Append and status failures carry `operation_id`, observed `state`, `code`,
+  expected incarnation in `expected`, `cause_code`, and `next_action=query_same`.
+  `publication_operation_id` is `None` until status supplies an observed
+  publication. `AppendError` is a `RuntimeError`; incarnation conflicts retain
+  the `WorkspaceIncarnationMismatch` subtype with the same recovery attributes.
+  `cause_code=RequestReplayMismatch` identifies changed inputs or another
+  lifecycle, so recover the original intent instead of blindly resubmitting.
+  `retryable` is false for generic retry handlers. An unknown result or a
+  `NotFound` observation never authorizes a replacement logical identity.
 - `WorkbenchFileSystem` is an fsspec compatibility adapter bound to one explicit
   Workbench. Paths must be one of `input`, `scripts`, `outputs`, `logs`, or
   `metadata`, optionally followed by an artifact-relative path. Sections and
@@ -102,3 +125,9 @@ types are not part of version 1.
 Snapshots require a committed Workbench. Commit and restore must be driven by
 the canonical Workbench lifecycle facade; clients must not synthesize a
 run-manifest or duplicate the durable workflow locally.
+
+Stable append's size, retention, owner recovery, and release contract is specified
+in [the append product specification](../../docs/development/append-product-spec.md).
+The fsspec adapter's append mode remains outside this contract; retrying harnesses
+should use native `nokv workspace-path append` first, or `Client.append_bytes`
+when embedded Python execution is required.

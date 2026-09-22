@@ -36,7 +36,10 @@ class AppendError(RuntimeError):
     ``state`` is the observed durable operation state, or ``None`` when it is
     unknown. Neither a timeout nor an unknown state proves that nothing was
     published. Retry the same intent with the same ``operation_id``; do not
-    generate a replacement identity to bypass an unresolved operation.
+    generate a replacement identity to bypass an unresolved operation. Query
+    ``Client.operation_status`` and follow its ``next_action``; the exception's
+    ``next_action`` is conservatively ``query_same``. A publication identity is
+    not inferred from an error and remains ``None`` until observed by a query.
     ``cause_code`` preserves the underlying RPC code, for example
     ``RequestReplayMismatch`` for a permanently mismatched intent, or ``None``
     when there is no RPC failure. ``retryable`` is always false: generic retry
@@ -51,6 +54,8 @@ class AppendError(RuntimeError):
         code: str,
         expected: str | None,
         cause_code: str | None = None,
+        next_action: str = "query_same",
+        publication_operation_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.operation_id = operation_id
@@ -59,6 +64,8 @@ class AppendError(RuntimeError):
         self.expected = expected
         self.cause_code = cause_code
         self.retryable = False
+        self.next_action = next_action
+        self.publication_operation_id = publication_operation_id
 
 
 class WorkspaceIncarnationMismatch(RuntimeError):

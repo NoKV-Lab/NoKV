@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nokv_client::{
@@ -29,7 +29,7 @@ use nokv_types::WorkbenchId;
 use nokv_workbench_projection::CanonicalWorkbenchProjection;
 use pyo3::exceptions::{PyFileExistsError, PyFileNotFoundError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAnyMethods, PyDictMethods, PyListMethods};
+use pyo3::types::{PyAnyMethods, PyBytesMethods, PyDictMethods, PyListMethods};
 use pyo3::types::{PyBytes, PyDict, PyList};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -39,15 +39,16 @@ use crate::local_adapter::{
 };
 use crate::object_store::{ConfiguredObjectStore, PythonObjectStoreConfig};
 use crate::python_value::{
-    aggregate_result_to_py, catalog_result_to_py, find_workspaces_result_to_py, hex,
-    parse_aggregates, parse_field_specs, parse_fixed_hex, parse_predicates, parse_sort,
-    path_metadata_to_py, path_page_to_py, publish_outcome_to_py, publish_result_to_py,
+    aggregate_result_to_py, append_result_to_py, catalog_result_to_py,
+    find_workspaces_result_to_py, hex, parse_aggregates, parse_field_specs, parse_fixed_hex,
+    parse_predicates, parse_sort, path_metadata_to_py, path_page_to_py, publish_outcome_to_py,
     read_outcome_to_py, search_result_to_py, snapshot_result_to_py, workspace_summary_to_py,
     PythonAggregateSpec, PythonFieldSpec, PythonPredicateSpec, PythonSortSpec,
 };
 use crate::routing::PythonRoutingConfig;
 
 type RustWorkspaceClient = WorkspaceClient<FramedTcpTransport, Arc<dyn RouteResolver>>;
+type BoundPythonObjectStore = Arc<nokv_object::BoundArtifactStore<ConfiguredObjectStore>>;
 type PythonRangeBatchRequest = (String, Vec<(u64, u64)>, Option<u64>, Option<u64>);
 
 const DEFAULT_SNAPSHOT_LEASE_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -70,7 +71,8 @@ struct CollectedFile {
 #[pyclass(name = "Client")]
 pub(crate) struct PythonWorkspaceClient {
     client: Arc<RustWorkspaceClient>,
-    objects: Arc<nokv_object::BoundArtifactStore<ConfiguredObjectStore>>,
+    objects: Mutex<Option<BoundPythonObjectStore>>,
+    object_store: Option<PythonObjectStoreConfig>,
     /// Presentation root the durable run manifest records, for example
     /// `/agents/<agent-id>/wb`. It is not addressing: artifacts resolve by
     /// workbench name either way. But it is hashed into the commit
@@ -86,7 +88,7 @@ impl PythonWorkspaceClient {
     #[pyo3(signature = (
         root_id,
         routing,
-        object_store,
+        object_store = None,
         max_attempts = 3,
         connect_timeout_ms = 5_000,
         read_timeout_ms = 30_000,
@@ -99,7 +101,7 @@ impl PythonWorkspaceClient {
         py: Python<'_>,
         root_id: &str,
         routing: PyRef<'_, PythonRoutingConfig>,
-        object_store: PyRef<'_, PythonObjectStoreConfig>,
+        object_store: Option<PyRef<'_, PythonObjectStoreConfig>>,
         max_attempts: u32,
         connect_timeout_ms: u64,
         read_timeout_ms: u64,
@@ -122,22 +124,12 @@ impl PythonWorkspaceClient {
         let client =
             WorkspaceClient::new(root_id, transport, resolver, ClientOptions { max_attempts })
                 .map_err(value_error)?;
-        let object_store = (*object_store).clone();
-        let objects = py
-            .detach(move || object_store.build())
-            .map_err(value_error)?;
-        let preflight = py
-            .detach(|| client.preflight(std::iter::empty()))
+        py.detach(|| client.preflight(std::iter::empty()))
             .map_err(runtime_error)?;
-        let namespace_id = preflight.value.route.object_namespace_id.into();
-        if objects.is_memory() {
-            nokv_object::ensure_object_namespace(&objects, namespace_id).map_err(value_error)?;
-        }
-        let objects =
-            nokv_object::BoundArtifactStore::open(objects, namespace_id).map_err(value_error)?;
         Ok(Self {
             client: Arc::new(client),
-            objects: Arc::new(objects),
+            objects: Mutex::new(None),
+            object_store: object_store.map(|config| (*config).clone()),
             workbench_root,
         })
     }
@@ -180,7 +172,7 @@ impl PythonWorkspaceClient {
             replace,
         };
         let client = Arc::clone(&self.client);
-        let objects = Arc::clone(&self.objects);
+        let objects = self.bound_objects(py)?;
         let max_artifact_bytes = LIFECYCLE_MAX_MANIFEST_BYTES;
         let outcome = py
             .detach(move || {
@@ -256,7 +248,7 @@ impl PythonWorkspaceClient {
             destination_workbench_id,
         };
         let client = Arc::clone(&self.client);
-        let objects = Arc::clone(&self.objects);
+        let objects = self.bound_objects(py)?;
         let outcome = py
             .detach(move || {
                 let options = WorkbenchLifecycleOptions::new(LIFECYCLE_MAX_MANIFEST_BYTES)
@@ -501,8 +493,9 @@ impl PythonWorkspaceClient {
 
     /// Append bytes once under a caller-owned operation identity.
     ///
-    /// The workspace must already exist. Retain the identity and incarnation
-    /// across process restarts. Replays return the original publication receipt,
+    /// The workspace must exist on first admission. Retain the logical identity
+    /// across process restarts; recovery resolves its original incarnation.
+    /// Replays return the original publication receipt,
     /// which may precede the current path head. Existing artifact metadata and
     /// content type are inherited unless `content_type` explicitly overrides it.
     #[pyo3(signature = (
@@ -521,7 +514,7 @@ impl PythonWorkspaceClient {
         py: Python<'py>,
         workbench: &str,
         path: &str,
-        data: Vec<u8>,
+        data: &Bound<'py, PyBytes>,
         operation_id: &str,
         content_type: Option<&str>,
         block_size: usize,
@@ -529,11 +522,44 @@ impl PythonWorkspaceClient {
         expected_workspace_incarnation_id: Option<&str>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let operation_id = OperationIdentity(parse_fixed_hex("operation_id", operation_id)?);
-        let target = parse_workspace_path(workbench, path)?;
+        if data.as_bytes().len() > nokv_client::MAX_APPEND_DELTA_BYTES {
+            return Err(append_local_error(
+                py,
+                format!(
+                    "append delta is {} bytes, maximum is {}",
+                    data.as_bytes().len(),
+                    nokv_client::MAX_APPEND_DELTA_BYTES,
+                ),
+                operation_id,
+                None,
+                "InvalidArgument",
+                None,
+            ));
+        }
+        let data = data.as_bytes().to_vec();
+        let target = parse_workspace_path(workbench, path).map_err(|error| {
+            append_local_error(
+                py,
+                error.to_string(),
+                operation_id,
+                None,
+                "InvalidArgument",
+                None,
+            )
+        })?;
         let content_type = content_type
             .map(|value| ContentType::new(value.to_owned()))
             .transpose()
-            .map_err(value_error)?;
+            .map_err(|error| {
+                append_local_error(
+                    py,
+                    error.to_string(),
+                    operation_id,
+                    None,
+                    "InvalidArgument",
+                    None,
+                )
+            })?;
         let create_content_type = content_type
             .clone()
             .unwrap_or(ContentType::new("application/octet-stream").map_err(value_error)?);
@@ -543,21 +569,11 @@ impl PythonWorkspaceClient {
             })
             .transpose()?;
         let client = Arc::clone(&self.client);
-        let objects = Arc::clone(&self.objects);
-        let (call, incarnation) = py
-            .detach(move || {
-                let incarnation = match expected {
-                    Some(incarnation) => incarnation,
-                    None => {
-                        client
-                            .get_workspace(GetWorkspaceRequest {
-                                workbench: target.workbench.clone(),
-                            })
-                            .map_err(|error| (Box::new(error), None))?
-                            .value
-                            .workspace_incarnation_id
-                    }
-                };
+        let (options, recovered, incarnation) = py
+            .detach(|| {
+                let incarnation = client
+                    .resolve_append_workspace_incarnation(operation_id, &target, expected)
+                    .map_err(|error| (Box::new(error), expected))?;
                 let mut options = IdempotentAppendOptions::new(
                     operation_id,
                     target,
@@ -571,14 +587,131 @@ impl PythonWorkspaceClient {
                 if let Some(max_logical_size) = max_logical_size {
                     options = options.with_max_logical_size(max_logical_size);
                 }
-                client
-                    .append_artifact_idempotent(objects.as_ref(), options, &data)
-                    .map(|call| (call, incarnation))
-                    .map_err(|error| (Box::new(error), Some(incarnation)))
+                let recovered = client
+                    .recover_append_receipt(&mut options, &data)
+                    .map_err(|error| (Box::new(error), Some(incarnation)))?;
+                Ok((options, recovered, incarnation))
             })
             .map_err(|(error, expected)| append_error(py, *error, operation_id, expected))?;
-        let dict = publish_result_to_py(py, &call.value)?;
-        dict.set_item("workspace_incarnation_id", hex(&incarnation.0))?;
+        let call = match recovered {
+            Some(call) => call,
+            None => {
+                let objects = self.bound_objects(py).map_err(|error| {
+                    append_local_error(
+                        py,
+                        error.to_string(),
+                        operation_id,
+                        Some(incarnation),
+                        "AppendFailed",
+                        None,
+                    )
+                })?;
+                py.detach(|| objects.inner().validate_append_capabilities())
+                    .map_err(|error| {
+                        append_local_error(
+                            py,
+                            error.to_string(),
+                            operation_id,
+                            Some(incarnation),
+                            "AppendFailed",
+                            Some(error.code()),
+                        )
+                    })?;
+                py.detach(move || {
+                    client.append_artifact_idempotent(objects.as_ref(), options, &data)
+                })
+                .map_err(|error| append_error(py, error, operation_id, Some(incarnation)))?
+            }
+        };
+        let dict = append_result_to_py(py, &call.value)?;
+        dict.set_item("status", "success")?;
+        dict.set_item("operation", "append")?;
+        dict.set_item("state", "committed")?;
+        dict.set_item("next_action", "none")?;
+        set_call_metadata(&dict, call.commit_version, call.replayed)?;
+        Ok(dict)
+    }
+
+    /// Query a logical append without its payload, workspace, or object store.
+    ///
+    /// This only observes state. Follow `next_action`; a missing operation or
+    /// unavailable owner does not authorize replacement of the logical identity.
+    fn operation_status<'py>(
+        &self,
+        py: Python<'py>,
+        operation_id: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let operation_id = OperationIdentity(parse_fixed_hex("operation_id", operation_id)?);
+        let client = Arc::clone(&self.client);
+        let call = py
+            .detach(move || client.get_append_operation(operation_id))
+            .map_err(|error| append_error(py, error, operation_id, None))?;
+        let recovery = nokv_client::append_operation_recovery(&call.value)
+            .map_err(|error| append_error(py, error, operation_id, None))?;
+        let status = &call.value;
+        let preparation = status
+            .append_preparation
+            .as_ref()
+            .ok_or_else(|| runtime_error("append status has no preparation"))?;
+        let dict = PyDict::new(py);
+        dict.set_item("status", "success")?;
+        dict.set_item("operation", "append")?;
+        dict.set_item("operation_id", hex(&status.token.operation_id.0))?;
+        dict.set_item("state", recovery.state.as_str())?;
+        dict.set_item("next_action", recovery.next_action.as_str())?;
+        dict.set_item("observed_state", format!("{:?}", status.state))?;
+        dict.set_item(
+            "publication_operation_id",
+            hex(&preparation.publication_operation_id.0),
+        )?;
+        dict.set_item("attempt", preparation.attempt)?;
+        dict.set_item(
+            "attempt_phase",
+            format!("{:?}", preparation.attempt_phase).to_ascii_lowercase(),
+        )?;
+        dict.set_item("activity_deadline_ms", preparation.activity_deadline_ms)?;
+        dict.set_item(
+            "workspace_incarnation_id",
+            hex(&preparation.workspace_incarnation_id.0),
+        )?;
+        dict.set_item("workbench_id", preparation.target.workbench.as_str())?;
+        dict.set_item("path", preparation.target.path.as_str())?;
+        let progress = PyDict::new(py);
+        progress.set_item("completed_rows", status.progress.completed_rows)?;
+        progress.set_item("total_rows", status.progress.total_rows)?;
+        progress.set_item("completed_bytes", status.progress.completed_bytes)?;
+        progress.set_item("total_bytes", status.progress.total_bytes)?;
+        dict.set_item("progress", progress)?;
+        let attempt_failure = preparation.attempt_failure.as_ref();
+        dict.set_item(
+            "cause_code",
+            attempt_failure.map(|failure| format!("{:?}", failure.code)),
+        )?;
+        dict.set_item(
+            "failure_message",
+            attempt_failure.map(|failure| failure.message.as_str()),
+        )?;
+        match attempt_failure {
+            Some(failure) => {
+                let details = PyDict::new(py);
+                details.set_item("code", format!("{:?}", failure.code))?;
+                details.set_item("message", &failure.message)?;
+                details.set_item("retryable", failure.retryable)?;
+                details.set_item(
+                    "conflict",
+                    failure.conflict.map(|conflict| format!("{conflict:?}")),
+                )?;
+                details.set_item("current_generation", failure.current_generation)?;
+                dict.set_item("attempt_failure", details)?;
+            }
+            None => dict.set_item("attempt_failure", py.None())?,
+        }
+        match &status.result {
+            Some(nokv_protocol::OperationResult::ArtifactAppend(result)) => {
+                dict.set_item("receipt", append_result_to_py(py, result)?)?;
+            }
+            _ => dict.set_item("receipt", py.None())?,
+        }
         set_call_metadata(&dict, call.commit_version, call.replayed)?;
         Ok(dict)
     }
@@ -631,7 +764,7 @@ impl PythonWorkspaceClient {
             expected_workspace_incarnation_id,
         )?;
         let client = Arc::clone(&self.client);
-        let objects = Arc::clone(&self.objects);
+        let objects = self.bound_objects(py)?;
         let outcome = py
             .detach(move || client.publish_artifact(objects.as_ref(), options, &data))
             .map_err(|error| publish_error(py, error, expected_workspace_incarnation_id))?;
@@ -685,7 +818,7 @@ impl PythonWorkspaceClient {
         )?;
         let local_file = PathBuf::from(local_file);
         let client = Arc::clone(&self.client);
-        let objects = Arc::clone(&self.objects);
+        let objects = self.bound_objects(py)?;
         let outcome = py
             .detach(move || {
                 let bytes = read_regular_file(&local_file)
@@ -714,7 +847,7 @@ impl PythonWorkspaceClient {
         let target = parse_workspace_path(workbench, path)?;
         let view = parse_read_view(snapshot_id)?;
         let client = Arc::clone(&self.client);
-        let objects = Arc::clone(&self.objects);
+        let objects = self.bound_objects(py)?;
         let outcome = py
             .detach(move || client.read_artifact(objects.as_ref(), None, target, view))
             .map_err(client_error)?;
@@ -734,7 +867,7 @@ impl PythonWorkspaceClient {
         let target = parse_workspace_path(workbench, path)?;
         let view = parse_read_view(snapshot_id)?;
         let client = Arc::clone(&self.client);
-        let objects = Arc::clone(&self.objects);
+        let objects = self.bound_objects(py)?;
         let outcome = py
             .detach(move || {
                 client.read_artifact_range(objects.as_ref(), None, target, view, offset, length)
@@ -772,7 +905,7 @@ impl PythonWorkspaceClient {
             })
             .collect::<PyResult<Vec<_>>>()?;
         let client = Arc::clone(&self.client);
-        let objects = Arc::clone(&self.objects);
+        let objects = self.bound_objects(py)?;
         let outcome = py
             .detach(move || {
                 client.read_artifact_ranges_batch(objects.as_ref(), None, requests, view)
@@ -1044,7 +1177,7 @@ impl PythonWorkspaceClient {
         let view = parse_read_view(snapshot_id)?;
         let local_directory = PathBuf::from(local_directory);
         let client = Arc::clone(&self.client);
-        let objects = Arc::clone(&self.objects);
+        let objects = self.bound_objects(py)?;
         let files = py
             .detach(move || {
                 materialize_workspace(
@@ -1095,7 +1228,7 @@ impl PythonWorkspaceClient {
         let prefix = parse_optional_relative_path(prefix)?;
         let content_type = ContentType::new(content_type.to_owned()).map_err(value_error)?;
         let client = Arc::clone(&self.client);
-        let objects = Arc::clone(&self.objects);
+        let objects = self.bound_objects(py)?;
         let files = py
             .detach(move || {
                 collect_workspace(
@@ -1121,6 +1254,40 @@ impl PythonWorkspaceClient {
 }
 
 impl PythonWorkspaceClient {
+    fn bound_objects(&self, py: Python<'_>) -> PyResult<BoundPythonObjectStore> {
+        py.detach(|| {
+            let mut cached = self
+                .objects
+                .lock()
+                .map_err(|_| runtime_error("object store initialization lock was poisoned"))?;
+            if let Some(objects) = cached.as_ref() {
+                return Ok(Arc::clone(objects));
+            }
+            let config = self.object_store.as_ref().ok_or_else(|| {
+                value_error("this operation requires an object_store configuration")
+            })?;
+            let objects = config.build().map_err(value_error)?;
+            let namespace_id = self
+                .client
+                .preflight(std::iter::empty())
+                .map_err(runtime_error)?
+                .value
+                .route
+                .object_namespace_id
+                .into();
+            if objects.is_memory() {
+                nokv_object::ensure_object_namespace(&objects, namespace_id)
+                    .map_err(value_error)?;
+            }
+            let objects = Arc::new(
+                nokv_object::BoundArtifactStore::open(objects, namespace_id)
+                    .map_err(value_error)?,
+            );
+            *cached = Some(Arc::clone(&objects));
+            Ok(objects)
+        })
+    }
+
     fn lifecycle_workbench_path(&self, workbench_id: &WorkbenchId) -> PyResult<String> {
         let root = self.workbench_root.as_deref().ok_or_else(|| {
             value_error(
@@ -1572,15 +1739,6 @@ fn append_error(
 ) -> PyErr {
     let identity = hex(&operation_id.0);
     let expected = expected.map(|value| hex(&value.0));
-    if expected.is_some()
-        && client_error_failure(&error).is_some_and(|failure| {
-            failure.conflict == Some(nokv_protocol::ConflictKind::WorkspaceIncarnation)
-        })
-    {
-        let mapped = publish_error(py, error, expected.as_deref());
-        let _ = mapped.value(py).setattr("operation_id", identity);
-        return mapped;
-    }
     let state = match &error {
         ClientError::AppendUnresolved { state, .. } => state.map(|state| format!("{state:?}")),
         _ => None,
@@ -1588,16 +1746,59 @@ fn append_error(
     let cause_code = client_error_failure(&error).map(|failure| format!("{:?}", failure.code));
     let code = if matches!(&error, ClientError::AppendUnresolved { .. }) {
         "AppendUnresolved".to_owned()
+    } else if matches!(&error, ClientError::InvalidOptions(_)) {
+        "InvalidArgument".to_owned()
     } else {
         client_error_failure(&error)
             .map(|failure| format!("{:?}", failure.code))
             .unwrap_or_else(|| "AppendFailed".to_owned())
     };
+    if expected.is_some()
+        && client_error_failure(&error).is_some_and(|failure| {
+            failure.conflict == Some(nokv_protocol::ConflictKind::WorkspaceIncarnation)
+        })
+    {
+        let mapped = publish_error(py, error, expected.as_deref());
+        let _ = mapped.value(py).setattr("operation_id", identity);
+        let _ = mapped.value(py).setattr("state", state);
+        let _ = mapped.value(py).setattr("code", code);
+        let _ = mapped.value(py).setattr("cause_code", cause_code);
+        let _ = mapped.value(py).setattr("next_action", "query_same");
+        let _ = mapped
+            .value(py)
+            .setattr("publication_operation_id", py.None());
+        let _ = mapped.value(py).setattr("retryable", false);
+        return mapped;
+    }
     let message = error.to_string();
     py.import("nokv")
         .and_then(|module| module.getattr("AppendError"))
         .and_then(|class| {
             class.call1((message.clone(), identity, state, code, expected, cause_code))
+        })
+        .map(PyErr::from_value)
+        .unwrap_or_else(|_| PyRuntimeError::new_err(message))
+}
+
+fn append_local_error(
+    py: Python<'_>,
+    message: String,
+    operation_id: OperationIdentity,
+    expected: Option<WorkspaceIdentity>,
+    code: &str,
+    cause_code: Option<&str>,
+) -> PyErr {
+    py.import("nokv")
+        .and_then(|module| module.getattr("AppendError"))
+        .and_then(|class| {
+            class.call1((
+                message.clone(),
+                hex(&operation_id.0),
+                None::<String>,
+                code,
+                expected.map(|value| hex(&value.0)),
+                cause_code,
+            ))
         })
         .map(PyErr::from_value)
         .unwrap_or_else(|_| PyRuntimeError::new_err(message))

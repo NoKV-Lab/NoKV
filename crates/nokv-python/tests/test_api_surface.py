@@ -31,6 +31,11 @@ def test_versioned_workbench_surface():
     assert hasattr(nokv.Client, "publish_bytes")
     assert hasattr(nokv.Client, "publish_file")
     assert hasattr(nokv.Client, "append_bytes")
+    assert hasattr(nokv.Client, "operation_status")
+    assert list(inspect.signature(nokv.Client.operation_status).parameters) == [
+        "self", "operation_id"
+    ]
+    assert "object_store=None" in (nokv.Client.__text_signature__ or "")
     append = inspect.signature(nokv.Client.append_bytes).parameters
     assert append["operation_id"].default is inspect.Parameter.empty
     assert append["content_type"].default is None
@@ -102,6 +107,8 @@ def test_append_error_keeps_identity_and_observed_state():
     assert error.expected == "b" * 32
     assert error.cause_code is None
     assert error.retryable is False
+    assert error.next_action == "query_same"
+    assert error.publication_operation_id is None
     assert str(error) == "reply lost"
     mismatch = nokv.AppendError(
         "different intent", "a" * 32, None, "AppendUnresolved", "b" * 32,
@@ -110,3 +117,22 @@ def test_append_error_keeps_identity_and_observed_state():
     assert mismatch.cause_code == "RequestReplayMismatch"
     assert mismatch.code == "AppendUnresolved"
     assert mismatch.retryable is False
+
+
+def test_append_provider_admission_errors_preserve_recovery_contract():
+    for cause in (
+        "ProviderAdmissionRejected",
+        "ProviderAdmissionUnavailable",
+        "ProviderAdmissionInconclusive",
+    ):
+        error = nokv.AppendError(
+            "provider admission did not complete", "a" * 32, None,
+            "AppendFailed", "b" * 32, cause,
+        )
+        assert error.code == "AppendFailed"
+        assert error.cause_code == cause
+        assert error.state is None
+        assert error.operation_id == "a" * 32
+        assert error.next_action == "query_same"
+        assert error.publication_operation_id is None
+        assert error.retryable is False

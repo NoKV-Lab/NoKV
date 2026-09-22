@@ -19,15 +19,16 @@ Every logical-shard store has one authoritative marker:
 System("schema")
   -> value_format_version = 1
      schema_id = "nokv_workspace"
-     format_version = 11
+     format_version = 12
 ```
 
 Startup is fail-closed:
 
 - an empty store is initialized with the exact supported marker and logical
   keyspace catalog;
-- format-10 and older stores are rejected without writes; there is no marker-only
-  upgrade because format 11 changes the durable publication operation codec;
+- format-11 and older stores are rejected without writes; there is no marker-only
+  upgrade because format 12 adds logical append records and changes the durable
+  publication operation codec;
 - a nonempty current store opens only when its marker, value format, and
   configured adapter catalog match this contract;
 - a missing, malformed, unknown-version, or inconsistent store is rejected.
@@ -84,7 +85,7 @@ exact key is a strict prefix of another valid path key. A child/subtree prefix
 appends NUL, so `a` cannot match `ab`. The empty path has no `PathCurrent`
 record; the workspace root is synthesized from `WorkspaceCurrent`. This path
 key layout was introduced by system format version 8 and is retained by
-version 11.
+version 12.
 
 The one shared normalizer enforces:
 
@@ -105,22 +106,24 @@ float, timestamp, bytes, and string values.
 
 ## Durable Format Registry
 
-`System.format_version` is `11`. Version 11 adds the optional full SHA-256
-append-intent commitment to the existing publication operation record. It
-retains the format-10 Generic index families and the format-9 RecoveryOutbox
-fixed-width decimal LSN keys. Existing logical recovery and object formats are
-unchanged.
+`System.format_version` is `12`. Version 12 adds logical append parents,
+publication-attempt bindings, and the active-publication recovery index in the
+existing Operation family. It retains the format-11 full SHA-256 append intent,
+format-10 Generic index families, and format-9 RecoveryOutbox fixed-width decimal
+LSN keys. Existing logical recovery and object formats are unchanged.
 
-Ordinary open does not migrate a format-10 or older marker. A marker-only
-upgrade would reinterpret old publication records without their required codec
-version. Migration remains not qualified; every older or unknown marker is
-fail-closed and unchanged.
+Ordinary open does not migrate a format-11 or older marker. A marker-only
+upgrade would reinterpret publication records without their required codec and
+omit the active index. Migration remains not qualified; every older or unknown
+marker is fail-closed and unchanged.
 
 Durable codecs are independently versioned:
 publish operation, staged-object, and manifest-row records use value version
-`5` and reject version `4`; the operation binds an optional 256-bit append
-intent before any object publication. Other publication rows retain their
-existing layouts.
+`6` and reject version `5`; an append publication binds both the full 256-bit
+intent and logical parent/attempt. `AppendOperationRecord` uses value version
+`1` and retains the current attempt and optional compact receipt. An
+`Operation(ActivePublish)` marker has the exact one-byte value `[1]`. Other
+publication rows retain their existing layouts.
 publication-owned workspace/path/revision records use value version `2`;
 `CommitRecord` uses version `3` and dual-decodes version `2`, while its member,
 consumer, head, and tag records remain version `2`; `ChangeEvent` and the
@@ -463,13 +466,27 @@ History
   val: previous versioned value or tombstone
 ```
 
-Public operation IDs are root-scoped across Publish, BuildCommit, and Restore.
-Although their keys retain the lifecycle kind, each initial admission includes
-absent predicates for the other two kinds in the same command as its own
+Public operation IDs are root-scoped across Append, Publish, BuildCommit, and
+Restore. Although their keys retain the lifecycle kind, each initial admission
+includes absent predicates for the other three kinds in the same command as its own
 operation insertion. A competing lifecycle cannot invalidate an acknowledged
 operation's later lookup by admitting the same identity. Internal manifest
 publications retain distinct operation IDs. Terminal operation retention keeps
 this exclusion after success or cleanup.
+
+A logical append parent and its child publication are admitted together. Only a
+current child proven `Cleaned` permits atomically advancing the parent and
+admitting a successor. Final publication writes the parent receipt together
+with the child `Published` result and visible path/revision/index/reference
+changes. Parent and child records are retained for replay; they do not create
+an extra body-retention reference. See the
+[append product contract](development/append-product-spec.md).
+
+`Operation(ActivePublish)` is an internal recovery index keyed by the physical
+publication ID. It contains only Uploading, Finalizing, Aborting, and Cleaning
+children. Publication transitions add or remove it in the same command that
+changes the child. The lifecycle scans this index instead of retained terminal
+history. A malformed marker or missing referenced child fails closed.
 
 `ReadChanges` treats `(commit_version, event_sequence)` as an append-only log
 position. Its opaque cursor is bound to the root, query scope, and optional
@@ -702,6 +719,17 @@ through the shown `Finalizing -> Aborting` CAS after proving that no
 path/dedupe publication exists. Publication and takeover both change the same
 operation row, so one wins. Cleanup may mutate the ledger or issue external
 DELETE only while it owns `Aborting`/`Cleaning`.
+
+For a stable append child, successful cleanup is `Aborted/Sealed`, not
+`Aborted/Deleted`. Its exact staged keys become permanent zero-byte objects
+through conditional creation or ETag-conditional replacement, without DELETE.
+Only after sealing may cleanup remove their staging rows and reach `Cleaned`.
+The child's `ArtifactRevisionClaim` is retained permanently, including when a
+successor becomes current, to reserve and explain those provider keys. A late
+immutable PUT cannot replace the seal. Reconciliation of a quarantined append
+requires the distinct `ProviderObjectsSealed` verdict and preserves that claim;
+`ProviderObjectsAbsent` is insufficient. Generic publications and published
+revision GC retain their existing deletion semantics.
 
 A late upload completion must observe the operation state; after abort it joins
 cleanup instead of publishing. Ambiguous multipart completion, late PUT, or

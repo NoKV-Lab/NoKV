@@ -55,12 +55,13 @@ pub struct WorkspaceIncarnationClaimRecord {
     pub workbench_id: WorkbenchId,
 }
 
-/// In-flight exclusive publish ownership of one artifact revision identity.
+/// Exclusive publish ownership of one artifact revision identity.
 ///
 /// Created atomically by `begin_publish` and deleted in the same command that
-/// publishes the revision or finishes the owning operation's cleanup, so two
-/// operations can never simultaneously own the revision's permanent object
-/// keys.
+/// publishes the revision or finishes generic publication cleanup. Failed
+/// append cleanup retains this claim permanently to reserve its sealed object
+/// keys, including after a successor succeeds. Two operations can never own
+/// the same revision's permanent object keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArtifactRevisionClaimRecord {
     pub operation_id: OperationId,

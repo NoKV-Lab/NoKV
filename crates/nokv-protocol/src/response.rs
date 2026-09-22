@@ -1504,6 +1504,7 @@ impl OperationProgress {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "result", rename_all = "snake_case")]
 pub enum OperationResult {
+    ArtifactAppend(crate::AppendResult),
     ArtifactPublish(PublishResult),
     Commit(CommitResult),
     Restore(RestoreResult),
@@ -1512,6 +1513,7 @@ pub enum OperationResult {
 impl OperationResult {
     fn validate(&self) -> Result<(), ProtocolError> {
         match self {
+            Self::ArtifactAppend(result) => result.validate(),
             Self::ArtifactPublish(result) => result.validate(),
             Self::Commit(result) => result.validate(),
             Self::Restore(result) => result.validate(),
@@ -1522,6 +1524,7 @@ impl OperationResult {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PublishPreparation {
+    pub append_attempt: Option<crate::AppendAttemptBinding>,
     /// Caller intent bound to one append publication attempt, when present.
     pub append_intent_digest: Option<Digest>,
     pub target: WorkspacePath,
@@ -1532,6 +1535,7 @@ pub struct PublishPreparation {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OperationStatus {
+    pub append_preparation: Option<Box<crate::AppendPreparation>>,
     pub token: OperationToken,
     pub kind: OperationKind,
     /// Present exactly for artifact-publication operations, including terminal ones.
@@ -1549,6 +1553,37 @@ pub struct OperationStatus {
 impl OperationStatus {
     fn validate(&self) -> Result<(), ProtocolError> {
         self.progress.validate()?;
+        match (self.kind, self.append_preparation.as_ref()) {
+            (OperationKind::ArtifactAppend, Some(preparation)) => {
+                preparation.validate()?;
+                if let Some(OperationResult::ArtifactAppend(result)) = &self.result {
+                    if result.target != preparation.target
+                        || result.workspace_incarnation_id != preparation.workspace_incarnation_id
+                        || result.publication_operation_id != preparation.publication_operation_id
+                        || result.artifact_revision_id != preparation.artifact_revision_id
+                        || preparation.attempt_phase != crate::AppendAttemptPhase::Published
+                    {
+                        return Err(ProtocolError::invalid(
+                            "operation.append_preparation",
+                            "does not match the durable append result",
+                        ));
+                    }
+                }
+            }
+            (OperationKind::ArtifactAppend, None) => {
+                return Err(ProtocolError::invalid(
+                    "operation.append_preparation",
+                    "is required for append operations",
+                ))
+            }
+            (_, Some(_)) => {
+                return Err(ProtocolError::invalid(
+                    "operation.append_preparation",
+                    "is only valid for append operations",
+                ))
+            }
+            (_, None) => {}
+        }
         match (self.kind, self.publish_preparation.as_ref()) {
             (OperationKind::ArtifactPublish, Some(preparation)) => {
                 if let Some(OperationResult::ArtifactPublish(result)) = &self.result {
@@ -1636,6 +1671,9 @@ impl OperationStatus {
         if let Some(result) = &self.result {
             result.validate()?;
             let (expected_kind, result_operation_id) = match result {
+                OperationResult::ArtifactAppend(result) => {
+                    (OperationKind::ArtifactAppend, result.operation_id)
+                }
                 OperationResult::ArtifactPublish(result) => {
                     (OperationKind::ArtifactPublish, result.operation_id)
                 }
@@ -2336,8 +2374,10 @@ mod tests {
 
     fn running_status(kind: OperationKind) -> OperationStatus {
         OperationStatus {
+            append_preparation: None,
             publish_preparation: (kind == OperationKind::ArtifactPublish).then(|| {
                 Box::new(PublishPreparation {
+                    append_attempt: None,
                     append_intent_digest: None,
                     target: WorkspacePath {
                         workbench: WorkbenchName::new("run").unwrap(),

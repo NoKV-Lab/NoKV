@@ -32,7 +32,7 @@ use super::codec::{
 use super::commit::RUN_MANIFEST_PATH;
 use super::engine::{
     CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError, MetaShard,
-    MetadataCommand, MetadataCommandResult, RootFenceAction,
+    MetadataCommand, MetadataCommandResult, RootFenceAction, MAX_COMMAND_ITEMS,
 };
 use super::event_projection::change_event_projection;
 use super::keyspace::MetadataFamily;
@@ -41,10 +41,10 @@ use super::publication_records::{
     PublicationRecordCodecError, RevisionRefRecord, WorkspaceRecord,
 };
 use super::publish_operation_records::{
-    ArtifactManifestRow, ManifestPosition, PublishAuthority, PublishClaim, PublishOperationRecord,
-    PublishRecordError, PublishResult, PublishTerminalError, PublishTerminalErrorKind,
-    PublishTransition, StagedObjectRecord, MAX_DEPENDENCY_COUNT, MAX_MANIFEST_ROWS,
-    MAX_STAGED_OBJECTS,
+    AppendOperationRecord, ArtifactManifestRow, ManifestPosition, PublishAuthority, PublishClaim,
+    PublishOperationRecord, PublishRecordError, PublishResult, PublishTerminalError,
+    PublishTerminalErrorKind, PublishTransition, StagedObjectRecord, MAX_DEPENDENCY_COUNT,
+    MAX_MANIFEST_ROWS, MAX_STAGED_OBJECTS,
 };
 use super::query_records::{
     secondary_index_key, ChangeEventKind, ChangeEventRecord, QueryRecordError,
@@ -57,12 +57,11 @@ use super::restore_records::{
     RESTORE_MANIFEST_CONTENT_TYPE,
 };
 
-const MAX_COMMAND_ITEMS: usize = 256;
 /// Maximum rows admitted by one recoverable publication batch.
 pub const MAX_PUBLICATION_BATCH_ROWS: usize = 192;
 const _: () = assert!(MAX_PUBLICATION_BATCH_ROWS + 2 <= MAX_COMMAND_ITEMS);
 const _: () = assert!(
-    2 * super::query_records::MAX_TYPED_PROJECTION_FIELDS + 2 * MAX_DEPENDENCY_COUNT as usize + 8
+    2 * super::query_records::MAX_TYPED_PROJECTION_FIELDS + 2 * MAX_DEPENDENCY_COUNT as usize + 10
         <= MAX_COMMAND_ITEMS
 );
 
@@ -180,6 +179,9 @@ pub enum QuarantineReconcileResolution {
     /// was never published. Reconciliation releases the revision identity for
     /// a fresh begin.
     RevisionUnpublished,
+    /// Every failed append key is permanently sealed against delayed immutable
+    /// creates. The unpublished revision identity remains reserved forever.
+    RevisionUnpublishedSealed,
     /// The artifact revision is already published, so the staged provider
     /// keys are the published revision's live objects and must not be touched.
     /// Only this operation's private bookkeeping rows are removed.
@@ -953,6 +955,7 @@ fn validate_operation_seals(operation: &PublishOperationRecord) -> Result<(), Pu
 fn validate_cleanup_update(
     expected: &StagedObjectRecord,
     next: &StagedObjectRecord,
+    append: bool,
 ) -> Result<(), PublicationError> {
     expected.validate()?;
     next.validate()?;
@@ -963,7 +966,12 @@ fn validate_cleanup_update(
         || expected.expected_length != next.expected_length
         || expected.expected_digest_uri != next.expected_digest_uri
         || next.provider_state != StagedProviderState::Aborted
-        || next.cleanup_state != StagedCleanupState::Deleted
+        || next.cleanup_state
+            != if append {
+                StagedCleanupState::Sealed
+            } else {
+                StagedCleanupState::Deleted
+            }
     {
         return Err(PublicationError::InvalidStagedObjectTransition {
             sequence: expected.object_sequence,
@@ -1239,7 +1247,7 @@ fn next_generation(
 
 fn publish_identity_digest(operation: &PublishOperationRecord) -> [u8; SHA256_BYTES] {
     let mut hasher = Sha256::new();
-    hasher.update(b"nokv.publish.operation.identity.v4\0");
+    hasher.update(b"nokv.publish.operation.identity.v5\0");
     hasher.update(operation.operation_id.as_bytes());
     match operation.append_intent_digest {
         Some(digest) => {
@@ -1247,6 +1255,14 @@ fn publish_identity_digest(operation: &PublishOperationRecord) -> [u8; SHA256_BY
             hasher.update(digest);
         }
         None => hasher.update([0]),
+    }
+    match operation.append_attempt {
+        None => hasher.update([0]),
+        Some(binding) => {
+            hasher.update([1]);
+            hasher.update(binding.operation_id.as_bytes());
+            hasher.update(binding.attempt.to_be_bytes());
+        }
     }
     hasher.update(operation.initiating_owner_epoch.get().to_be_bytes());
     match operation.authority {
@@ -1303,13 +1319,21 @@ fn publish_identity_digest(operation: &PublishOperationRecord) -> [u8; SHA256_BY
 
 fn publish_initialization_digest(operation: &PublishOperationRecord) -> [u8; SHA256_BYTES] {
     let mut hasher = Sha256::new();
-    hasher.update(b"nokv.publish.operation.initialization.v4\0");
+    hasher.update(b"nokv.publish.operation.initialization.v5\0");
     match operation.append_intent_digest {
         Some(digest) => {
             hasher.update([1]);
             hasher.update(digest);
         }
         None => hasher.update([0]),
+    }
+    match operation.append_attempt {
+        None => hasher.update([0]),
+        Some(binding) => {
+            hasher.update([1]);
+            hasher.update(binding.operation_id.as_bytes());
+            hasher.update(binding.attempt.to_be_bytes());
+        }
     }
     hasher.update(operation.initiating_owner_epoch.get().to_be_bytes());
     match operation.authority {
@@ -1391,6 +1415,7 @@ fn finalization_takeover_absence_proof(
 fn reconcile_resolution_label(resolution: QuarantineReconcileResolution) -> &'static str {
     match resolution {
         QuarantineReconcileResolution::RevisionUnpublished => "revision-unpublished",
+        QuarantineReconcileResolution::RevisionUnpublishedSealed => "revision-unpublished-sealed",
         QuarantineReconcileResolution::RevisionPublished => "revision-published",
     }
 }
@@ -1413,6 +1438,7 @@ fn reconcile_evidence_digest(
     hasher.update(b"nokv.publish.reconcile-evidence.v1\0");
     hasher.update([match resolution {
         QuarantineReconcileResolution::RevisionUnpublished => 1,
+        QuarantineReconcileResolution::RevisionUnpublishedSealed => 3,
         QuarantineReconcileResolution::RevisionPublished => 2,
     }]);
     match original_evidence_digest {
@@ -1640,6 +1666,20 @@ impl PublicationService<'_> {
             // successful initialization/complete must remain replayable only
             // when the live path and exact destination binding still agree.
             self.validate_existing_publish_replay_authority(request.context, &operation)?;
+            if let Some(binding) = operation.append_attempt {
+                let key = super::codec::operation_key(
+                    request.context.root_id,
+                    OperationKind::Append,
+                    binding.operation_id,
+                );
+                let payload = self
+                    .read_payload(request.context, MetadataFamily::Operation, &key)?
+                    .ok_or(PublicationError::OperationInputMismatch)?;
+                let parent = AppendOperationRecord::decode(&payload)?;
+                if !parent.matches_publication(&operation) || parent.result != operation.result {
+                    return Err(PublicationError::OperationInputMismatch);
+                }
+            }
             return Ok(PublishCommandOutcome {
                 commit_version: CommitVersion::new(request.context.read_version.get())
                     .expect("publication contexts always have a non-zero read version"),
@@ -1677,9 +1717,13 @@ impl PublicationService<'_> {
         let operation_payload = request.operation.encode()?;
         let mut plan = CommandPlan::default();
         // Public operation lookup has one root-scoped identity across all
-        // three lifecycle kinds. Fence competing admissions in this same
+        // four public lifecycle kinds. Fence competing admissions in this same
         // transaction, rather than trusting a prior lookup by the client.
-        for kind in [OperationKind::BuildCommit, OperationKind::Restore] {
+        for kind in [
+            OperationKind::BuildCommit,
+            OperationKind::Restore,
+            OperationKind::Append,
+        ] {
             plan.assert_value(
                 MetadataFamily::Operation,
                 super::codec::operation_key(
@@ -1690,6 +1734,7 @@ impl PublicationService<'_> {
                 None,
             )?;
         }
+        self.prepare_append_admission(request.context, &request.operation, &mut plan)?;
         plan.put_absent(
             MetadataFamily::Operation,
             operation_key,
@@ -2220,16 +2265,23 @@ impl PublicationService<'_> {
             expected_operation_payload,
             next_operation_payload.clone(),
         )?;
-        // Cleanup completion is the terminal owner transition for an aborted
-        // operation: its provider objects are durably gone, so the revision
-        // identity becomes claimable again in the same command.
+        // Failed append keys remain permanently sealed. Retain their revision
+        // reservation so no later publisher can reuse the sealed key namespace.
         if matches!(request.transition, PublishTransition::FinishCleanup) {
-            self.release_revision_claim(
-                request.context,
-                request.expected_operation.artifact_revision_id,
-                request.expected_operation.operation_id,
-                &mut plan,
-            )?;
+            if request.expected_operation.append_attempt.is_some() {
+                self.predicate_append_revision_reservation(
+                    request.context,
+                    &request.expected_operation,
+                    &mut plan,
+                )?;
+            } else {
+                self.release_revision_claim(
+                    request.context,
+                    request.expected_operation.artifact_revision_id,
+                    request.expected_operation.operation_id,
+                    &mut plan,
+                )?;
+            }
         }
 
         let result = self.execute_plan(
@@ -2388,6 +2440,77 @@ impl PublicationService<'_> {
         decode_operation_outcome(result, next_operation.operation_id)
     }
 
+    /// End an append attempt whose frozen path claim is definitively invalid.
+    /// The exact Finalizing CAS, absent revision, and current logical parent
+    /// jointly prove that this attempt cannot publish after cleanup wins.
+    pub fn fail_append_conflict(
+        &self,
+        context: PublicationContext,
+        operation: PublishOperationRecord,
+    ) -> Result<PublishCommandOutcome, PublicationError> {
+        validate_operation_seals(&operation)?;
+        if operation.append_attempt.is_none() || operation.phase != PublishPhase::Finalizing {
+            return Err(PublicationError::InvalidOperationPhase {
+                expected: PublishPhase::Finalizing,
+                actual: operation.phase,
+            });
+        }
+        self.require_current_operation(context, &operation)?;
+        let path_key = path_current_key(
+            context.root_id,
+            operation.workspace_incarnation_id,
+            &operation.path,
+        );
+        let current = self.read_publication_record(
+            context,
+            MetadataFamily::PathCurrent,
+            &path_key,
+            PathEntry::decode,
+        )?;
+        match validate_path_claim(&operation.claim, current.as_ref()) {
+            Err(
+                PublicationError::PathAlreadyExists
+                | PublicationError::PathNotFound
+                | PublicationError::PathGenerationMismatch { .. }
+                | PublicationError::AppendBaseRevisionMismatch,
+            ) => {}
+            Err(error) => return Err(error),
+            Ok(_) => return Err(PublicationError::ConcurrentMutation),
+        }
+        let expected_payload = operation.encode()?;
+        let proof = finalization_takeover_absence_proof(context, &expected_payload)?;
+        let mut next = operation;
+        next.take_over_finalization(
+            proof,
+            PublishTerminalError {
+                kind: PublishTerminalErrorKind::PublishConflict,
+                message: "append attempt lost its frozen path claim".to_owned(),
+                evidence_digest: None,
+            },
+        )?;
+        let payload = next.encode()?;
+        let mut plan = CommandPlan::default();
+        plan.replace(
+            MetadataFamily::Operation,
+            operation_key(context.root_id, OperationKind::Publish, next.operation_id),
+            expected_payload,
+            payload.clone(),
+        )?;
+        plan.assert_value(
+            MetadataFamily::ArtifactRevision,
+            artifact_revision_key(context.root_id, next.artifact_revision_id),
+            None,
+        )?;
+        plan.assert_value(
+            MetadataFamily::PathCurrent,
+            path_key,
+            current.map(|loaded| loaded.payload),
+        )?;
+        let result =
+            self.execute_plan(context, plan, payload, PublicationAuthorityPurpose::Cleanup)?;
+        decode_operation_outcome(result, next.operation_id)
+    }
+
     pub fn cleanup_publish_batch(
         &self,
         request: CleanupPublishBatchRequest,
@@ -2425,7 +2548,11 @@ impl PublicationService<'_> {
                         count: request.staged_object_updates.len(),
                         planned: next_operation.staged_object_cursor,
                     })?;
-                validate_cleanup_update(&update.expected, &update.next)?;
+                validate_cleanup_update(
+                    &update.expected,
+                    &update.next,
+                    next_operation.append_attempt.is_some(),
+                )?;
                 if update.expected.object_sequence != sequence {
                     return Err(PublicationError::StagedObjectSequenceMismatch {
                         expected: sequence,
@@ -2694,8 +2821,9 @@ impl PublicationService<'_> {
 
     /// Atomically resolve one fully-swept quarantined operation: CAS the
     /// operator terminal error in, transition `Quarantined -> Cleaned`, and
-    /// release the revision claim when this operation owns it. The verdict's
-    /// revision predicate is pinned by the same command.
+    /// release a generic publication's revision claim. Failed append claims
+    /// stay reserved because their provider keys remain permanently sealed.
+    /// The verdict's revision predicate is pinned by the same command.
     pub fn finish_reconcile_quarantined_publish(
         &self,
         request: FinishReconcileQuarantinedPublishRequest,
@@ -2740,15 +2868,20 @@ impl PublicationService<'_> {
             expected_payload,
             next_payload.clone(),
         )?;
-        // Reconciliation is the operator path the quarantine fail-closed
-        // default was waiting for: with the staged liability durably resolved,
-        // the revision identity becomes claimable again in the same command.
-        self.release_revision_claim(
-            request.context,
-            request.expected_operation.artifact_revision_id,
-            request.expected_operation.operation_id,
-            &mut plan,
-        )?;
+        if request.expected_operation.append_attempt.is_some() {
+            self.predicate_append_revision_reservation(
+                request.context,
+                &request.expected_operation,
+                &mut plan,
+            )?;
+        } else {
+            self.release_revision_claim(
+                request.context,
+                request.expected_operation.artifact_revision_id,
+                request.expected_operation.operation_id,
+                &mut plan,
+            )?;
+        }
         let result = self.execute_reconcile_plan(request.context, plan, next_payload)?;
         decode_operation_outcome(result, next_operation.operation_id)
     }
@@ -2766,8 +2899,23 @@ impl PublicationService<'_> {
         let revision_key = artifact_revision_key(context.root_id, operation.artifact_revision_id);
         let payload =
             self.read_payload(context, MetadataFamily::ArtifactRevision, &revision_key)?;
+        if operation.append_attempt.is_some()
+            != matches!(
+                resolution,
+                QuarantineReconcileResolution::RevisionUnpublishedSealed
+            )
+        {
+            return Err(PublicationError::ReconcileResolutionMismatch {
+                resolution,
+                revision_published: payload.is_some(),
+            });
+        }
         match (resolution, payload) {
-            (QuarantineReconcileResolution::RevisionUnpublished, None) => {
+            (
+                QuarantineReconcileResolution::RevisionUnpublished
+                | QuarantineReconcileResolution::RevisionUnpublishedSealed,
+                None,
+            ) => {
                 plan.assert_value(MetadataFamily::ArtifactRevision, revision_key, None)?;
             }
             (QuarantineReconcileResolution::RevisionPublished, Some(payload)) => {
@@ -3065,9 +3213,12 @@ impl PublicationService<'_> {
     fn execute_reconcile_plan(
         &self,
         context: PublicationContext,
-        plan: CommandPlan,
+        mut plan: CommandPlan,
         deterministic_result: Vec<u8>,
     ) -> Result<MetadataCommandResult, PublicationError> {
+        let operation = PublishOperationRecord::decode(&deterministic_result)?;
+        self.predicate_append_authority(context, &operation, &mut plan)?;
+        self.synchronize_active_publication(context, &operation, &mut plan)?;
         plan.validate_bounds()?;
         let command = MetadataCommand {
             schema_id: SCHEMA_ID.to_owned(),
@@ -3284,6 +3435,382 @@ impl PublicationService<'_> {
         Ok(())
     }
 
+    /// Keep failed append object keys owned by the original immutable child.
+    fn predicate_append_revision_reservation(
+        &self,
+        context: PublicationContext,
+        operation: &PublishOperationRecord,
+        plan: &mut CommandPlan,
+    ) -> Result<(), PublicationError> {
+        let key = artifact_revision_claim_key(context.root_id, operation.artifact_revision_id);
+        let payload = self
+            .read_payload(context, MetadataFamily::ArtifactRevision, &key)?
+            .ok_or(PublicationError::InvalidOperationSeal {
+                seal: "append revision reservation",
+            })?;
+        if ArtifactRevisionClaimRecord::decode(&payload)?.operation_id != operation.operation_id {
+            return Err(PublicationError::InvalidOperationSeal {
+                seal: "append revision reservation",
+            });
+        }
+        plan.assert_value(MetadataFamily::ArtifactRevision, key, Some(payload))
+    }
+
+    /// Check the complete publication index and logical-parent graph at one
+    /// read version. This diagnoses missing/orphan markers without repairing
+    /// state or inferring that an unindexed operation is safe to abandon.
+    pub fn verify_append_publication_state(
+        &self,
+        context: PublicationContext,
+    ) -> Result<(), PublicationError> {
+        let corrupt = |reason: &str| {
+            PublicationError::Meta(MetaError::CorruptRecord {
+                record: "append publication state",
+                reason: reason.to_owned(),
+            })
+        };
+        for kind in [
+            OperationKind::Publish,
+            OperationKind::Append,
+            OperationKind::ActivePublish,
+        ] {
+            let prefix = super::codec::operation_prefix(context.root_id, kind);
+            let mut cursor = None;
+            loop {
+                let rows = self.store.scan_prefix_at(
+                    context.root_id,
+                    context.placement_generation,
+                    context.owner_epoch,
+                    MetadataFamily::Operation,
+                    &prefix,
+                    context.read_version,
+                    cursor.as_deref(),
+                    256,
+                )?;
+                for row in &rows {
+                    let identity =
+                        super::codec::decode_operation_key(context.root_id, kind, &row.key)
+                            .ok_or_else(|| corrupt("invalid operation key"))?;
+                    match kind {
+                        OperationKind::Publish => {
+                            let operation = PublishOperationRecord::decode(&row.value)?;
+                            validate_operation_seals(&operation)?;
+                            if operation.operation_id != identity {
+                                return Err(corrupt("publication key and identity disagree"));
+                            }
+                            let active = matches!(
+                                operation.phase,
+                                PublishPhase::Uploading
+                                    | PublishPhase::Finalizing
+                                    | PublishPhase::Aborting
+                                    | PublishPhase::Cleaning
+                            );
+                            let marker = self.read_payload(
+                                context,
+                                MetadataFamily::Operation,
+                                &operation_key(
+                                    context.root_id,
+                                    OperationKind::ActivePublish,
+                                    identity,
+                                ),
+                            )?;
+                            if marker.as_deref() != active.then_some(&[1][..]) {
+                                return Err(corrupt("publication activity marker is missing, unexpected, or malformed"));
+                            }
+                            if let Some(binding) = operation.append_attempt {
+                                if operation.phase != PublishPhase::Published {
+                                    let claim = self
+                                        .read_payload(
+                                            context,
+                                            MetadataFamily::ArtifactRevision,
+                                            &artifact_revision_claim_key(
+                                                context.root_id,
+                                                operation.artifact_revision_id,
+                                            ),
+                                        )?
+                                        .ok_or_else(|| {
+                                            corrupt("append revision reservation is missing")
+                                        })?;
+                                    if ArtifactRevisionClaimRecord::decode(&claim)?.operation_id
+                                        != identity
+                                    {
+                                        return Err(corrupt("append revision reservation belongs to another operation"));
+                                    }
+                                }
+                                let payload = self
+                                    .read_payload(
+                                        context,
+                                        MetadataFamily::Operation,
+                                        &operation_key(
+                                            context.root_id,
+                                            OperationKind::Append,
+                                            binding.operation_id,
+                                        ),
+                                    )?
+                                    .ok_or_else(|| corrupt("append child has no logical parent"))?;
+                                let mut parent = AppendOperationRecord::decode(&payload)?;
+                                if parent.publication_operation_id != identity {
+                                    if operation.phase != PublishPhase::Cleaned
+                                        || parent.attempt <= binding.attempt
+                                    {
+                                        return Err(corrupt(
+                                            "superseded append child is not safely cleaned",
+                                        ));
+                                    }
+                                    parent.attempt = binding.attempt;
+                                    parent.publication_operation_id = identity;
+                                    parent.artifact_revision_id = operation.artifact_revision_id;
+                                }
+                                if !parent.matches_publication(&operation) {
+                                    return Err(corrupt(
+                                        "append child identity differs from its parent",
+                                    ));
+                                }
+                            }
+                        }
+                        OperationKind::Append => {
+                            let parent = AppendOperationRecord::decode(&row.value)?;
+                            if parent.operation_id != identity {
+                                return Err(corrupt("append parent key and identity disagree"));
+                            }
+                            let payload = self
+                                .read_payload(
+                                    context,
+                                    MetadataFamily::Operation,
+                                    &operation_key(
+                                        context.root_id,
+                                        OperationKind::Publish,
+                                        parent.publication_operation_id,
+                                    ),
+                                )?
+                                .ok_or_else(|| corrupt("append parent has no current child"))?;
+                            let child = PublishOperationRecord::decode(&payload)?;
+                            if !parent.matches_publication(&child)
+                                || parent.result != child.result
+                                || parent.result.is_some()
+                                    != (child.phase == PublishPhase::Published)
+                            {
+                                return Err(corrupt(
+                                    "append parent result and current child disagree",
+                                ));
+                            }
+                            for other in [
+                                OperationKind::Publish,
+                                OperationKind::BuildCommit,
+                                OperationKind::Restore,
+                            ] {
+                                if self
+                                    .read_payload(
+                                        context,
+                                        MetadataFamily::Operation,
+                                        &operation_key(context.root_id, other, identity),
+                                    )?
+                                    .is_some()
+                                {
+                                    return Err(corrupt(
+                                        "logical append identity is occupied by another lifecycle",
+                                    ));
+                                }
+                            }
+                        }
+                        OperationKind::ActivePublish => {
+                            if row.value != [1] {
+                                return Err(corrupt("unknown active publication marker"));
+                            }
+                            let payload = self
+                                .read_payload(
+                                    context,
+                                    MetadataFamily::Operation,
+                                    &operation_key(
+                                        context.root_id,
+                                        OperationKind::Publish,
+                                        identity,
+                                    ),
+                                )?
+                                .ok_or_else(|| {
+                                    corrupt("active marker has no canonical publication")
+                                })?;
+                            let operation = PublishOperationRecord::decode(&payload)?;
+                            if !matches!(
+                                operation.phase,
+                                PublishPhase::Uploading
+                                    | PublishPhase::Finalizing
+                                    | PublishPhase::Aborting
+                                    | PublishPhase::Cleaning
+                            ) {
+                                return Err(corrupt("terminal publication remains active"));
+                            }
+                        }
+                        _ => unreachable!("only publication graph kinds are scanned"),
+                    }
+                }
+                if rows.len() < 256 {
+                    break;
+                }
+                cursor = rows.last().map(|row| row.key.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_append_admission(
+        &self,
+        context: PublicationContext,
+        operation: &PublishOperationRecord,
+        plan: &mut CommandPlan,
+    ) -> Result<(), PublicationError> {
+        let Some(binding) = operation.append_attempt else {
+            return Ok(());
+        };
+        let intent_digest = operation
+            .append_intent_digest
+            .ok_or(PublicationError::OperationInputMismatch)?;
+        let key = operation_key(context.root_id, OperationKind::Append, binding.operation_id);
+        let parent = AppendOperationRecord {
+            operation_id: binding.operation_id,
+            intent_digest,
+            workbench_id: operation.workbench_id.clone(),
+            workspace_incarnation_id: operation.workspace_incarnation_id,
+            path: operation.path.clone(),
+            attempt: binding.attempt,
+            publication_operation_id: operation.operation_id,
+            artifact_revision_id: operation.artifact_revision_id,
+            result: None,
+        };
+        match self.read_payload(context, MetadataFamily::Operation, &key)? {
+            None => {
+                if binding.attempt != 0 {
+                    return Err(PublicationError::OperationInputMismatch);
+                }
+                for kind in [
+                    OperationKind::Publish,
+                    OperationKind::BuildCommit,
+                    OperationKind::Restore,
+                ] {
+                    plan.assert_value(
+                        MetadataFamily::Operation,
+                        operation_key(context.root_id, kind, binding.operation_id),
+                        None,
+                    )?;
+                }
+                plan.put_absent(MetadataFamily::Operation, key, parent.encode()?)?;
+            }
+            Some(payload) => {
+                let previous = AppendOperationRecord::decode(&payload)?;
+                if previous.operation_id != binding.operation_id
+                    || previous.intent_digest != intent_digest
+                    || previous.workbench_id != operation.workbench_id
+                    || previous.path != operation.path
+                    || previous.workspace_incarnation_id != operation.workspace_incarnation_id
+                    || previous.result.is_some()
+                    || previous.attempt.checked_add(1) != Some(binding.attempt)
+                {
+                    return Err(PublicationError::OperationInputMismatch);
+                }
+                let child_key = operation_key(
+                    context.root_id,
+                    OperationKind::Publish,
+                    previous.publication_operation_id,
+                );
+                let child_payload = self
+                    .read_payload(context, MetadataFamily::Operation, &child_key)?
+                    .ok_or(PublicationError::OperationInputMismatch)?;
+                let child = PublishOperationRecord::decode(&child_payload)?;
+                validate_operation_seals(&child)?;
+                if !previous.matches_publication(&child)
+                    || child.phase != PublishPhase::Cleaned
+                    || child.result.is_some()
+                {
+                    return Err(PublicationError::ConcurrentMutation);
+                }
+                self.predicate_append_revision_reservation(context, &child, plan)?;
+                plan.assert_value(MetadataFamily::Operation, child_key, Some(child_payload))?;
+                plan.assert_value(
+                    MetadataFamily::ArtifactRevision,
+                    artifact_revision_key(context.root_id, previous.artifact_revision_id),
+                    None,
+                )?;
+                plan.replace(MetadataFamily::Operation, key, payload, parent.encode()?)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn predicate_append_authority(
+        &self,
+        context: PublicationContext,
+        operation: &PublishOperationRecord,
+        plan: &mut CommandPlan,
+    ) -> Result<(), PublicationError> {
+        let Some(binding) = operation.append_attempt else {
+            return Ok(());
+        };
+        let key = operation_key(context.root_id, OperationKind::Append, binding.operation_id);
+        // Begin and final publication replace parent and child together. Validate
+        // their planned parent; all other transitions fence the current parent.
+        let planned = plan.mutations.iter().find_map(|mutation| match mutation {
+            CommandMutation::Put {
+                family: MetadataFamily::Operation,
+                key: candidate,
+                value,
+            } if candidate == &key => Some(value),
+            _ => None,
+        });
+        if let Some(payload) = planned {
+            if !AppendOperationRecord::decode(payload)?.matches_publication(operation) {
+                return Err(PublicationError::OperationInputMismatch);
+            }
+        } else {
+            let payload = self
+                .read_payload(context, MetadataFamily::Operation, &key)?
+                .ok_or(PublicationError::OperationInputMismatch)?;
+            let parent = AppendOperationRecord::decode(&payload)?;
+            if !parent.matches_publication(operation) || parent.result.is_some() {
+                return Err(PublicationError::ConcurrentMutation);
+            }
+            if !plan
+                .exact_keys
+                .contains(&(MetadataFamily::Operation, key.clone()))
+            {
+                plan.assert_value(MetadataFamily::Operation, key, Some(payload))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn synchronize_active_publication(
+        &self,
+        context: PublicationContext,
+        operation: &PublishOperationRecord,
+        plan: &mut CommandPlan,
+    ) -> Result<(), PublicationError> {
+        let key = operation_key(
+            context.root_id,
+            OperationKind::ActivePublish,
+            operation.operation_id,
+        );
+        let current = self.read_payload(context, MetadataFamily::Operation, &key)?;
+        if current.as_ref().is_some_and(|payload| payload != &[1]) {
+            return Err(PublicationError::OperationInputMismatch);
+        }
+        let active = matches!(
+            operation.phase,
+            PublishPhase::Uploading
+                | PublishPhase::Finalizing
+                | PublishPhase::Aborting
+                | PublishPhase::Cleaning
+        );
+        match (active, current) {
+            (true, None) => plan.put_absent(MetadataFamily::Operation, key, vec![1])?,
+            (false, Some(payload)) => plan.delete(MetadataFamily::Operation, key, payload)?,
+            (_, Some(payload)) if payload != [1] => {
+                return Err(PublicationError::OperationInputMismatch)
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn execute_plan(
         &self,
         context: PublicationContext,
@@ -3328,6 +3855,8 @@ impl PublicationService<'_> {
         authority_purpose: PublicationAuthorityPurpose,
     ) -> Result<MetadataCommand, PublicationError> {
         let operation = PublishOperationRecord::decode(&deterministic_result)?;
+        self.predicate_append_authority(context, &operation, &mut plan)?;
+        self.synchronize_active_publication(context, &operation, &mut plan)?;
         self.predicate_publication_authority(context, &operation, authority_purpose, &mut plan)?;
         plan.validate_bounds()?;
         Ok(MetadataCommand {
@@ -3769,6 +4298,23 @@ impl PublicationService<'_> {
             expected_operation_payload,
             published_operation_payload.clone(),
         )?;
+        if let Some(binding) = published_operation.append_attempt {
+            let key = super::codec::operation_key(
+                request.context.root_id,
+                OperationKind::Append,
+                binding.operation_id,
+            );
+            let payload = self
+                .read_payload(request.context, MetadataFamily::Operation, &key)?
+                .ok_or(PublicationError::OperationInputMismatch)?;
+            let mut parent = AppendOperationRecord::decode(&payload)?;
+            if !parent.matches_publication(&published_operation) || parent.result.is_some() {
+                return Err(PublicationError::OperationInputMismatch);
+            }
+            parent.result = Some(publish_result.clone());
+            plan.replace(MetadataFamily::Operation, key, payload, parent.encode()?)?;
+        }
+
         if let Some(next_workspace) = next_workspace {
             plan.replace(
                 MetadataFamily::WorkspaceCurrent,
@@ -4523,6 +5069,7 @@ mod tests {
     ) -> PublishOperationRecord {
         let dependencies = Vec::new();
         let mut operation = PublishOperationRecord {
+            append_attempt: None,
             append_intent_digest: None,
             operation_id,
             identity_digest: [0; SHA256_BYTES],
@@ -5252,8 +5799,15 @@ mod tests {
         claim: PublishClaim,
         dependencies: &[ArtifactRevisionId],
         projection: TypedProjection,
+        append_attempt: Option<super::super::AppendAttemptBinding>,
     ) -> FinalizePublishOutcome {
-        let staged = staged_rows(artifact_revision_id, 1);
+        let row_count = match claim {
+            PublishClaim::Append { append_offset, .. } => {
+                usize::try_from(append_offset + 1).unwrap()
+            }
+            _ => 1,
+        };
+        let staged = staged_rows(artifact_revision_id, row_count);
         let manifest = manifest_rows(&staged);
         let mut operation = publish_operation(
             operation_id,
@@ -5263,6 +5817,8 @@ mod tests {
             &staged,
             &manifest,
         );
+        operation.append_attempt = append_attempt;
+        operation.append_intent_digest = append_attempt.map(|_| [0xb1; SHA256_BYTES]);
         operation.dependency_count = u8::try_from(dependencies.len()).unwrap();
         operation.dependency_depth = u8::from(!dependencies.is_empty());
         operation.dependency_digest = dependency_owner_digest(dependencies).unwrap();
@@ -5419,6 +5975,617 @@ mod tests {
         );
     }
 
+    fn logical_append_child(attempt: u64) -> PublishOperationRecord {
+        let mut operation = publish_operation(
+            operation_id(92_000 + u128::from(attempt)),
+            revision(92_000 + u128::from(attempt)),
+            path("outputs/logical-append.log"),
+            PublishClaim::CreateOnly,
+            &[],
+            &[],
+        );
+        operation.append_attempt = Some(super::super::AppendAttemptBinding {
+            operation_id: operation_id(93_000),
+            attempt,
+        });
+        operation.append_intent_digest = Some([0xa7; SHA256_BYTES]);
+        seal_publish_operation(&mut operation);
+        operation
+    }
+
+    fn read_append_parent(
+        service: &PublicationService<'_>,
+        store: &MetaShard,
+        counter: &mut u128,
+    ) -> AppendOperationRecord {
+        let payload = service
+            .read_payload(
+                publication_context(store, counter),
+                MetadataFamily::Operation,
+                &operation_key(root(), OperationKind::Append, operation_id(93_000)),
+            )
+            .unwrap()
+            .unwrap();
+        AppendOperationRecord::decode(&payload).unwrap()
+    }
+
+    #[test]
+    fn append_cleanup_requires_seals_and_reserves_failed_revision_after_successor_admission() {
+        for reconcile in [false, true] {
+            let mut counter = 1;
+            let store = ready_store(&mut counter);
+            let service = PublicationService::new(&store);
+            let template = logical_append_child(0);
+            let staged = staged_rows(template.artifact_revision_id, 1);
+            let manifest = manifest_rows(&staged);
+            let mut initial = publish_operation(
+                template.operation_id,
+                template.artifact_revision_id,
+                template.path.clone(),
+                PublishClaim::CreateOnly,
+                &staged,
+                &manifest,
+            );
+            initial.append_attempt = template.append_attempt;
+            initial.append_intent_digest = template.append_intent_digest;
+            seal_publish_operation(&mut initial);
+            let child = begin_operation(&service, &store, &mut counter, initial);
+            let mut child = service
+                .stage_objects_batch(StageObjectsBatchRequest {
+                    context: publication_context(&store, &mut counter),
+                    expected_operation: child,
+                    staged_objects: staged.clone(),
+                })
+                .unwrap()
+                .operation;
+            for transition in [
+                PublishTransition::BeginAbort {
+                    terminal_error: PublishTerminalError {
+                        kind: PublishTerminalErrorKind::ActivityLeaseExpired,
+                        message: "abandoned append upload".to_owned(),
+                        evidence_digest: None,
+                    },
+                },
+                PublishTransition::BeginCleaning,
+            ] {
+                child = service
+                    .transition_publish(TransitionPublishRequest {
+                        context: publication_context(&store, &mut counter),
+                        expected_operation: child,
+                        transition,
+                    })
+                    .unwrap()
+                    .operation;
+            }
+            if reconcile {
+                child = service
+                    .transition_publish(TransitionPublishRequest {
+                        context: publication_context(&store, &mut counter),
+                        expected_operation: child,
+                        transition: PublishTransition::Quarantine {
+                            terminal_error: PublishTerminalError {
+                                kind: PublishTerminalErrorKind::CleanupFailed,
+                                message: "seal acknowledgement lost".to_owned(),
+                                evidence_digest: Some([0xc1; 32]),
+                            },
+                        },
+                    })
+                    .unwrap()
+                    .operation;
+                let before = store.current_read_version().unwrap();
+                assert!(matches!(
+                    service.reconcile_quarantined_publish_batch(
+                        ReconcileQuarantinedPublishBatchRequest {
+                            context: publication_context(&store, &mut counter),
+                            expected_operation: child.clone(),
+                            resolution: QuarantineReconcileResolution::RevisionUnpublished,
+                            staged_object_rows: staged.clone(),
+                        }
+                    ),
+                    Err(PublicationError::ReconcileResolutionMismatch { .. })
+                ));
+                assert_eq!(store.current_read_version().unwrap(), before);
+                child = service
+                    .reconcile_quarantined_publish_batch(ReconcileQuarantinedPublishBatchRequest {
+                        context: publication_context(&store, &mut counter),
+                        expected_operation: child,
+                        resolution: QuarantineReconcileResolution::RevisionUnpublishedSealed,
+                        staged_object_rows: staged.clone(),
+                    })
+                    .unwrap()
+                    .operation;
+                assert!(service
+                    .finish_reconcile_quarantined_publish(
+                        FinishReconcileQuarantinedPublishRequest {
+                            context: publication_context(&store, &mut counter),
+                            expected_operation: child.clone(),
+                            resolution: QuarantineReconcileResolution::RevisionUnpublished,
+                            reason: "absent is insufficient".to_owned(),
+                            operator_evidence_digest: [0xc2; 32],
+                        }
+                    )
+                    .is_err());
+                child = service
+                    .finish_reconcile_quarantined_publish(
+                        FinishReconcileQuarantinedPublishRequest {
+                            context: publication_context(&store, &mut counter),
+                            expected_operation: child,
+                            resolution: QuarantineReconcileResolution::RevisionUnpublishedSealed,
+                            reason: "each immutable key is permanently sealed".to_owned(),
+                            operator_evidence_digest: [0xc3; 32],
+                        },
+                    )
+                    .unwrap()
+                    .operation;
+            } else {
+                let mut next = staged[0].clone();
+                next.provider_state = StagedProviderState::Aborted;
+                next.cleanup_state = StagedCleanupState::Deleted;
+                let before = store.current_read_version().unwrap();
+                assert!(matches!(
+                    service.cleanup_publish_batch(CleanupPublishBatchRequest {
+                        context: publication_context(&store, &mut counter),
+                        expected_operation: child.clone(),
+                        staged_object_updates: vec![StagedObjectUpdate {
+                            expected: staged[0].clone(),
+                            next: next.clone()
+                        }],
+                    }),
+                    Err(PublicationError::InvalidStagedObjectTransition { .. })
+                ));
+                assert_eq!(store.current_read_version().unwrap(), before);
+                next.cleanup_state = StagedCleanupState::Sealed;
+                child = service
+                    .cleanup_publish_batch(CleanupPublishBatchRequest {
+                        context: publication_context(&store, &mut counter),
+                        expected_operation: child,
+                        staged_object_updates: vec![StagedObjectUpdate {
+                            expected: staged[0].clone(),
+                            next,
+                        }],
+                    })
+                    .unwrap()
+                    .operation;
+                child = service
+                    .transition_publish(TransitionPublishRequest {
+                        context: publication_context(&store, &mut counter),
+                        expected_operation: child,
+                        transition: PublishTransition::FinishCleanup,
+                    })
+                    .unwrap()
+                    .operation;
+            }
+            assert_eq!(child.phase, PublishPhase::Cleaned);
+            let claim_key = artifact_revision_claim_key(root(), child.artifact_revision_id);
+            let claim = service
+                .read_payload(
+                    publication_context(&store, &mut counter),
+                    MetadataFamily::ArtifactRevision,
+                    &claim_key,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                ArtifactRevisionClaimRecord::decode(&claim)
+                    .unwrap()
+                    .operation_id,
+                child.operation_id
+            );
+            let successor =
+                begin_operation(&service, &store, &mut counter, logical_append_child(1));
+            assert_eq!(
+                read_append_parent(&service, &store, &mut counter).publication_operation_id,
+                successor.operation_id
+            );
+            service
+                .verify_append_publication_state(publication_context(&store, &mut counter))
+                .unwrap();
+            let reused_revision = publish_operation(
+                operation_id(94_000),
+                child.artifact_revision_id,
+                path("outputs/reuse-must-fail"),
+                PublishClaim::CreateOnly,
+                &[],
+                &[],
+            );
+            assert!(matches!(
+                service.begin_publish(BeginPublishRequest {
+                    context: publication_context(&store, &mut counter),
+                    operation: reused_revision,
+                }),
+                Err(PublicationError::RevisionClaimHeld { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn append_parent_and_child_admit_and_advance_atomically_without_empty_attempts() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let first = begin_operation(&service, &store, &mut counter, logical_append_child(0));
+        let parent = read_append_parent(&service, &store, &mut counter);
+        assert!(parent.matches_publication(&first));
+        assert!(parent.result.is_none());
+        let active_prefix = super::super::operation_prefix(root(), OperationKind::ActivePublish);
+        assert_eq!(
+            count_prefix(&store, MetadataFamily::Operation, &active_prefix),
+            1
+        );
+        for attempt in [1, 2] {
+            assert!(service
+                .begin_publish(BeginPublishRequest {
+                    context: publication_context(&store, &mut counter),
+                    operation: logical_append_child(attempt)
+                })
+                .is_err());
+            assert_eq!(read_append_parent(&service, &store, &mut counter), parent);
+            assert!(service
+                .read_payload(
+                    publication_context(&store, &mut counter),
+                    MetadataFamily::Operation,
+                    &operation_key(
+                        root(),
+                        OperationKind::Publish,
+                        operation_id(92_000 + u128::from(attempt))
+                    )
+                )
+                .unwrap()
+                .is_none());
+        }
+        let mut child = first.clone();
+        for transition in [
+            PublishTransition::BeginAbort {
+                terminal_error: PublishTerminalError {
+                    kind: PublishTerminalErrorKind::AbortedByCaller,
+                    message: "abandoned upload".to_owned(),
+                    evidence_digest: None,
+                },
+            },
+            PublishTransition::BeginCleaning,
+            PublishTransition::FinishCleanup,
+        ] {
+            child = service
+                .transition_publish(TransitionPublishRequest {
+                    context: publication_context(&store, &mut counter),
+                    expected_operation: child,
+                    transition,
+                })
+                .unwrap()
+                .operation;
+        }
+        assert_eq!(child.phase, PublishPhase::Cleaned);
+        assert_eq!(
+            count_prefix(&store, MetadataFamily::Operation, &active_prefix),
+            0
+        );
+        let next = begin_operation(&service, &store, &mut counter, logical_append_child(1));
+        let advanced = read_append_parent(&service, &store, &mut counter);
+        assert!(advanced.matches_publication(&next));
+        assert_eq!(advanced.attempt, 1);
+        assert!(service
+            .begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter),
+                operation: first
+            })
+            .is_err());
+        assert_eq!(
+            count_prefix(&store, MetadataFamily::Operation, &active_prefix),
+            1
+        );
+    }
+
+    #[test]
+    fn append_parent_receipt_commits_with_child_and_can_never_advance_after_success() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let child = begin_operation(&service, &store, &mut counter, logical_append_child(0));
+        let child = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: child,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        let outcome = service
+            .finalize_publish(FinalizePublishRequest {
+                context: publication_context(&store, &mut counter),
+                artifact: published_artifact(&child),
+                expected_operation: child,
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .unwrap();
+        let parent = read_append_parent(&service, &store, &mut counter);
+        assert!(parent.matches_publication(&outcome.operation));
+        assert_eq!(parent.result, Some(outcome.result));
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::Operation,
+                &super::super::operation_prefix(root(), OperationKind::ActivePublish)
+            ),
+            0
+        );
+        assert!(service
+            .begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter),
+                operation: logical_append_child(1)
+            })
+            .is_err());
+        assert_eq!(read_append_parent(&service, &store, &mut counter), parent);
+    }
+
+    #[test]
+    fn append_known_path_conflict_proves_absence_before_cleanup_without_lease_expiry() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let child = begin_operation(&service, &store, &mut counter, logical_append_child(0));
+        let child = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: child,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        // A valid frozen claim cannot be cancelled by this recovery command.
+        assert!(service
+            .fail_append_conflict(publication_context(&store, &mut counter), child.clone())
+            .is_err());
+        publish_full(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(94_000),
+            revision(94_000),
+            child.path.clone(),
+            PublishClaim::CreateOnly,
+            1,
+        );
+        let aborted = service
+            .fail_append_conflict(publication_context(&store, &mut counter), child.clone())
+            .unwrap()
+            .operation;
+        assert_eq!(aborted.phase, PublishPhase::Aborting);
+        assert!(aborted.publication_absence_proof.is_some());
+        assert!(service
+            .finalize_publish(FinalizePublishRequest {
+                context: publication_context(&store, &mut counter),
+                artifact: published_artifact(&child),
+                expected_operation: child,
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .is_err());
+        assert!(read_append_parent(&service, &store, &mut counter)
+            .result
+            .is_none());
+    }
+
+    #[test]
+    fn logical_append_finalizing_and_atomic_receipt_survive_holt_reopen() {
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("append-finalizing-recovery");
+        let mut counter = 1;
+        let store = ready_file_store(&database_path, &mut counter);
+        let service = PublicationService::new(&store);
+        let child = begin_operation(&service, &store, &mut counter, logical_append_child(0));
+        let finalizing = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: child,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        assert!(read_append_parent(&service, &store, &mut counter)
+            .result
+            .is_none());
+        drop(store);
+
+        let store = crate::workspace::test_support::open_file(&database_path, shard()).unwrap();
+        let service = PublicationService::new(&store);
+        let parent = read_append_parent(&service, &store, &mut counter);
+        assert!(parent.matches_publication(&finalizing));
+        service
+            .verify_append_publication_state(publication_context(&store, &mut counter))
+            .unwrap();
+        let mut child = service
+            .take_over_orphaned_publish(TakeOverOrphanedPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: finalizing.clone(),
+                observed_now_ms: 1_000_000,
+                maximum_clock_skew_ms: 0,
+                terminal_error: PublishTerminalError {
+                    kind: PublishTerminalErrorKind::ActivityLeaseExpired,
+                    message: "caller exited at Finalizing".to_owned(),
+                    evidence_digest: None,
+                },
+            })
+            .unwrap()
+            .operation;
+        assert!(child.publication_absence_proof.is_some());
+        for transition in [
+            PublishTransition::BeginCleaning,
+            PublishTransition::FinishCleanup,
+        ] {
+            child = service
+                .transition_publish(TransitionPublishRequest {
+                    context: publication_context(&store, &mut counter),
+                    expected_operation: child,
+                    transition,
+                })
+                .unwrap()
+                .operation;
+        }
+        let mut successor = logical_append_child(1);
+        successor.activity_deadline_ms = 2_000_000;
+        seal_publish_operation(&mut successor);
+        let successor = begin_operation(&service, &store, &mut counter, successor);
+        let successor = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: successor,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        let projection = TypedProjection::new(
+            [(
+                QueryFieldId::new("append.kind").unwrap(),
+                QueryScalar::String("recovered".to_owned()),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        let mut artifact = published_artifact(&successor);
+        artifact.typed_index_projection = projection.encode().unwrap();
+        let published = service
+            .finalize_publish(FinalizePublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: successor,
+                artifact,
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .unwrap();
+        let receipt = read_append_parent(&service, &store, &mut counter);
+        assert_eq!(receipt.result.as_ref(), Some(&published.result));
+        drop(store);
+
+        let store = crate::workspace::test_support::open_file(&database_path, shard()).unwrap();
+        let service = PublicationService::new(&store);
+        assert_eq!(read_append_parent(&service, &store, &mut counter), receipt);
+        service
+            .verify_append_publication_state(publication_context(&store, &mut counter))
+            .unwrap();
+        let version = store.current_read_version().unwrap();
+        let visible = get_visible_path_at(
+            &store,
+            RootReadContext::current(&store, root(), placement(), owner()).unwrap(),
+            &workbench(),
+            &receipt.path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(visible.artifact_revision_id, receipt.artifact_revision_id);
+        assert_eq!(visible.generation, published.result.path_generation);
+        let revision_record = ArtifactRevisionRecord::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::ArtifactRevision,
+                &artifact_revision_key(root(), receipt.artifact_revision_id),
+                version,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(revision_record.strong_reference_count, 1);
+        assert!(payload_at(
+            &store,
+            MetadataFamily::RevisionRef,
+            &path_revision_ref_key(
+                root(),
+                receipt.workspace_incarnation_id,
+                &receipt.path,
+                receipt.artifact_revision_id
+            ),
+            version
+        )
+        .is_some());
+        for (key, value) in secondary_index_rows(
+            root(),
+            receipt.workspace_incarnation_id,
+            &receipt.path,
+            published.result.path_generation,
+            &projection,
+        )
+        .unwrap()
+        {
+            assert_eq!(
+                payload_at(&store, MetadataFamily::SecondaryIndex, &key, version),
+                Some(value)
+            );
+        }
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::Operation,
+                &super::super::operation_prefix(root(), OperationKind::ActivePublish)
+            ),
+            0
+        );
+        assert!(service
+            .finalize_publish(FinalizePublishRequest {
+                context: publication_context(&store, &mut counter),
+                artifact: published_artifact(&finalizing),
+                expected_operation: finalizing,
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn append_publication_fsck_rejects_missing_or_orphan_activity_markers_without_repair() {
+        for orphan in [false, true] {
+            let mut counter = 1;
+            let store = ready_store(&mut counter);
+            let service = PublicationService::new(&store);
+            let child = begin_operation(&service, &store, &mut counter, logical_append_child(0));
+            service
+                .verify_append_publication_state(publication_context(&store, &mut counter))
+                .unwrap();
+            let key = operation_key(
+                root(),
+                OperationKind::ActivePublish,
+                if orphan {
+                    operation_id(99_000)
+                } else {
+                    child.operation_id
+                },
+            );
+            let mut command = fence_command(
+                &store,
+                next_request(&mut counter),
+                RootFenceAction::RequireActive,
+            );
+            command.predicates.push(CommandPredicate::Value {
+                family: MetadataFamily::Operation,
+                key: key.clone(),
+                expected: (!orphan).then(|| vec![1]),
+            });
+            // Only deleting an existing marker replaces a current value.
+            // An absent-key insertion must not request a history projection.
+            if !orphan {
+                command.history_projection.push(HistoryProjection {
+                    family: MetadataFamily::Operation,
+                    key: key.clone(),
+                });
+            }
+            command.mutations.push(if orphan {
+                CommandMutation::Put {
+                    family: MetadataFamily::Operation,
+                    key,
+                    value: vec![1],
+                }
+            } else {
+                CommandMutation::Delete {
+                    family: MetadataFamily::Operation,
+                    key,
+                }
+            });
+            store.execute(&command.seal()).unwrap();
+            let before = store.current_read_version().unwrap();
+            assert!(matches!(
+                service.verify_append_publication_state(publication_context(&store, &mut counter)),
+                Err(PublicationError::Meta(MetaError::CorruptRecord { .. }))
+            ));
+            assert_eq!(store.current_read_version().unwrap(), before);
+        }
+    }
+
     #[test]
     fn stable_append_identity_binds_all_256_intent_bits_and_cannot_drop_binding() {
         let mut counter = 1;
@@ -5436,6 +6603,10 @@ mod tests {
             &manifest,
         );
         initial.append_intent_digest = Some([0x61; SHA256_BYTES]);
+        initial.append_attempt = Some(super::super::AppendAttemptBinding {
+            operation_id: operation_id(91_091),
+            attempt: 0,
+        });
         seal_publish_operation(&mut initial);
         let begun = begin_operation(&service, &store, &mut counter, initial.clone());
         assert_eq!(begun.append_intent_digest, initial.append_intent_digest);
@@ -5444,6 +6615,9 @@ mod tests {
         for intent in [Some(changed_digest), None] {
             let mut changed = initial.clone();
             changed.append_intent_digest = intent;
+            if intent.is_none() {
+                changed.append_attempt = None;
+            }
             seal_publish_operation(&mut changed);
             assert_ne!(changed.identity_digest, initial.identity_digest);
             assert_ne!(changed.initialization_digest, initial.initialization_digest);
@@ -6806,7 +7980,7 @@ mod tests {
         assert_eq!(replaced.result.path_generation, Generation::new(2).unwrap());
         let replace_bytes =
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
-        assert_eq!(replace_bytes, 11_799_442);
+        assert_eq!(replace_bytes, 11_799_783);
 
         let removed = remove_path(
             &store,
@@ -6856,6 +8030,7 @@ mod tests {
             PublishClaim::CreateOnly,
             &dependencies,
             projection.clone(),
+            None,
         );
         let removed_path = maximum_path(101);
         publish_with_dependencies_and_projection(
@@ -6868,6 +8043,7 @@ mod tests {
             PublishClaim::CreateOnly,
             &dependencies,
             projection,
+            None,
         );
         drop(store);
 
@@ -6885,6 +8061,7 @@ mod tests {
             },
             &[],
             TypedProjection::empty(),
+            None,
         );
         assert_eq!(replaced.result.path_generation, Generation::new(2).unwrap());
         let removed = remove_path(
@@ -6907,6 +8084,85 @@ mod tests {
         )
         .unwrap();
         assert_eq!(removed.removed_artifact_revision_id, revision(40_001));
+    }
+
+    #[test]
+    fn logical_append_parent_and_active_index_fit_maximum_path_fields_and_dependencies() {
+        let mut counter = 1;
+        let (store, capture) = ready_capturing_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let dependencies = seed_maximum_dependencies(&service, &store, &mut counter);
+        let target = maximum_path(222);
+        let before = budget_projection_with_prefix("oldset", 400);
+        let after = budget_projection_with_prefix("newset", 400);
+        assert_eq!(before.fields().len(), 60);
+        assert_eq!(after.fields().len(), 60);
+        assert_eq!(dependencies.len(), 64);
+        publish_with_dependencies_and_projection(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(95_000),
+            revision(95_000),
+            target.clone(),
+            PublishClaim::CreateOnly,
+            &dependencies,
+            before,
+            None,
+        );
+        let logical_id = operation_id(95_002);
+        let published = publish_with_dependencies_and_projection(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(95_001),
+            revision(95_001),
+            target.clone(),
+            PublishClaim::Append {
+                expected_generation: Generation::new(1).unwrap(),
+                base_revision_id: revision(95_000),
+                append_offset: 1,
+            },
+            &dependencies,
+            after,
+            Some(super::super::AppendAttemptBinding {
+                operation_id: logical_id,
+                attempt: 0,
+            }),
+        );
+        assert_eq!(published.result.path_generation.get(), 2);
+        let bytes = capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
+        assert!(
+            bytes < super::super::store_limits().max_transaction_bytes,
+            "complete derived transaction uses {bytes} bytes"
+        );
+        capture.with_last_commit(|transaction| {
+            assert!(transaction.checks.len() <= super::super::store_limits().max_checks);
+            assert!(transaction.mutations.len() <= super::super::store_limits().max_mutations);
+        });
+        let parent = AppendOperationRecord::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::Operation,
+                &operation_key(root(), OperationKind::Append, logical_id),
+                store.current_read_version().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(parent.matches_publication(&published.operation));
+        assert_eq!(parent.result, Some(published.result));
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::Operation,
+                &super::super::operation_prefix(root(), OperationKind::ActivePublish)
+            ),
+            0
+        );
+        service
+            .verify_append_publication_state(publication_context(&store, &mut counter))
+            .unwrap();
     }
 
     #[test]
@@ -6985,7 +8241,7 @@ mod tests {
 
         assert_eq!(
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes),
-            9_860_715
+            9_861_056
         );
     }
 

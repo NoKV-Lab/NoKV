@@ -49,7 +49,8 @@ const SYSTEM_RECOVERY_CHAIN_DIGEST_KEY: &[u8] = b"recovery_chain_digest";
 const SYSTEM_VALUE_FORMAT_VERSION: u8 = 1;
 const INITIAL_COMMIT_VERSION: u64 = 1;
 
-const MAX_COMMAND_ITEMS: usize = 256;
+/// Shared admission and recovery-codec item budget for one metadata command.
+pub(super) const MAX_COMMAND_ITEMS: usize = 260;
 const MAX_DELIMITED_SCAN_ITEMS: usize = MAX_COMMAND_ITEMS * 2;
 const MAX_HISTORICAL_SCAN_PAGE_ROWS: usize = MAX_COMMAND_ITEMS;
 const MAX_HISTORICAL_SCAN_ATTEMPTS: usize = 4;

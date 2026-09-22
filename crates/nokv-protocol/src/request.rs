@@ -425,6 +425,8 @@ impl RemovePathRequest {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BeginArtifactPublishRequest {
+    /// Logical append identity and monotonic attempt owning this publication.
+    pub append_attempt: Option<crate::AppendAttemptBinding>,
     /// Exact caller intent for a stable append; binds one publication attempt.
     pub append_intent_digest: Option<Digest>,
     pub operation_id: OperationIdentity,
@@ -451,6 +453,21 @@ pub struct BeginArtifactPublishRequest {
 impl BeginArtifactPublishRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
         self.condition.validate()?;
+        if self.append_attempt.is_some() != self.append_intent_digest.is_some() {
+            return Err(ProtocolError::invalid(
+                "begin_artifact_publish.append_attempt",
+                "attempt binding and intent digest must be supplied together",
+            ));
+        }
+        if self
+            .append_attempt
+            .is_some_and(|binding| binding.operation_id == self.operation_id)
+        {
+            return Err(ProtocolError::invalid(
+                "begin_artifact_publish.append_attempt",
+                "logical and publication identities must differ",
+            ));
+        }
         if self.append_intent_digest.is_some()
             && (!matches!(self.authority, PublicationAuthority::Visible)
                 || self.expected_workspace_incarnation_id.is_none()
@@ -701,6 +718,8 @@ pub enum QuarantineResolution {
     /// revision was never published; the revision identity is released for a
     /// fresh publication.
     ProviderObjectsAbsent,
+    /// Failed append keys are permanently sealed against delayed immutable creates.
+    ProviderObjectsSealed,
     /// The artifact revision is already published; staged provider keys are
     /// the published revision's live objects and only this operation's
     /// private bookkeeping rows are removed.
@@ -2181,6 +2200,7 @@ mod tests {
         condition: PublishCondition,
     ) -> BeginArtifactPublishRequest {
         BeginArtifactPublishRequest {
+            append_attempt: None,
             append_intent_digest: None,
             operation_id: OperationIdentity([1; 16]),
             artifact_revision_id: ArtifactRevisionIdentity([2; 16]),
@@ -2235,6 +2255,10 @@ mod tests {
             PublishCondition::CreateOnly,
         );
         request.append_intent_digest = Some(Digest([0x61; 32]));
+        request.append_attempt = Some(crate::AppendAttemptBinding {
+            operation_id: OperationIdentity([0x62; 16]),
+            attempt: 0,
+        });
         assert!(request.validate().is_err());
         request.expected_workspace_incarnation_id = Some(WorkspaceIdentity([9; 16]));
         request.validate().unwrap();

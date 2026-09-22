@@ -46,7 +46,7 @@ use super::commit_records::{
 };
 use super::engine::{
     CommandFit, CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError,
-    MetaShard, MetadataCommand, MetadataScanItem, RootFenceAction,
+    MetaShard, MetadataCommand, MetadataScanItem, RootFenceAction, MAX_COMMAND_ITEMS,
 };
 use super::event_projection::change_event_projection;
 use super::generic_index::{
@@ -91,7 +91,6 @@ pub const MAX_RESTORE_BATCH_MEMBERS: usize = 48;
 /// Exact Workbench initialization path published before publication.
 pub const RESTORE_MANIFEST_PATH: &str = "metadata/restore_manifest.json";
 const RESTORE_OUTCOME_FORMAT: u8 = 1;
-const MAX_COMMAND_ITEMS: usize = 256;
 const CAPACITY_EXCEEDED_MESSAGE: &str =
     "restore source member exceeds the serving metadata transaction budget";
 const CLEANUP_CAPACITY_EXCEEDED_MESSAGE: &str =
@@ -1189,7 +1188,11 @@ pub fn begin_restore(
     // Claim the root-scoped public operation identity in the same command as
     // the hidden destination and source holds. A competing kind cannot make
     // the eventual receipt unqueryable.
-    for kind in [OperationKind::Publish, OperationKind::BuildCommit] {
+    for kind in [
+        OperationKind::Publish,
+        OperationKind::BuildCommit,
+        OperationKind::Append,
+    ] {
         plan.assert_value(
             MetadataFamily::Operation,
             super::codec::operation_key(context.root_id, kind, operation_id),
@@ -10766,6 +10769,7 @@ mod tests {
         manifest: &[ManifestRowInput],
     ) -> PublishOperationRecord {
         let mut operation = PublishOperationRecord {
+            append_attempt: None,
             append_intent_digest: None,
             operation_id,
             identity_digest: [0; SHA256_BYTES],

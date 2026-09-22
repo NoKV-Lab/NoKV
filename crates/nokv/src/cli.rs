@@ -16,6 +16,7 @@ pub const DEFAULT_MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_ETCD_KEY_PREFIX: &str = "/nokv/control";
 pub const DEFAULT_ETCD_LEASE_TTL_SECONDS: i64 = 10;
 pub const DEFAULT_LIFECYCLE_INTERVAL_MILLIS: u64 = 1_000;
+pub const DEFAULT_APPEND_ACTIVITY_LEASE_MS: u64 = 1_800_000;
 pub const DEFAULT_HANDSHAKE_TIMEOUT_MILLIS: u64 = 5_000;
 pub const DEFAULT_MAX_INFLIGHT_CONNECTIONS: usize = 256;
 
@@ -74,6 +75,7 @@ pub struct ServerConfig {
     pub node_id: Option<String>,
     pub metadata_store: Option<MetadataStoreConfig>,
     pub lifecycle_interval_millis: u64,
+    pub append_activity_lease_ms: u64,
     pub recovery_publication: RecoveryPublicationConfig,
 }
 
@@ -133,6 +135,9 @@ pub enum Command {
         content_type: Option<String>,
     },
     WorkspacePath(WorkspacePathCommand),
+    OperationStatus {
+        operation_id: [u8; 16],
+    },
     Provision {
         logical_shard_id: String,
         adopt_legacy_object_namespace: bool,
@@ -164,6 +169,7 @@ pub enum WorkspacePathCommand {
         payload: AppendPayload,
         content_type: Option<String>,
         max_logical_size: Option<u64>,
+        block_size: usize,
     },
     Rename {
         workbench: String,
@@ -314,6 +320,7 @@ impl Default for ServerConfig {
             node_id: None,
             metadata_store: None,
             lifecycle_interval_millis: DEFAULT_LIFECYCLE_INTERVAL_MILLIS,
+            append_activity_lease_ms: DEFAULT_APPEND_ACTIVITY_LEASE_MS,
             recovery_publication: RecoveryPublicationConfig::LocalOnly,
         }
     }
@@ -324,6 +331,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     let mut client = ClientConfig::default();
     let mut server = ServerConfig::default();
     let mut recovery_publication_explicit = false;
+    let mut append_activity_lease_explicit = false;
     let mut static_routing = StaticRoutingConfig::default();
     let mut etcd_routing = EtcdRoutingConfig::default();
     let mut routing_kind = None;
@@ -426,6 +434,20 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             "--bind" => {
                 server.bind = parse_address("--bind", next_value(&mut arguments, &argument)?)?;
             }
+            "--append-activity-lease-ms" => {
+                let value = next_value(&mut arguments, &argument)?;
+                server.append_activity_lease_ms =
+                    parse_number("--append-activity-lease-ms", value.clone())?;
+                if !(1_000..=nokv_server::MAX_APPEND_ACTIVITY_LEASE_MS)
+                    .contains(&server.append_activity_lease_ms)
+                {
+                    return Err(CliError::InvalidOption {
+                        option: "--append-activity-lease-ms",
+                        value,
+                    });
+                }
+                append_activity_lease_explicit = true;
+            }
             "--handshake-timeout-millis" => {
                 server.handshake_timeout_millis = parse_number(
                     "--handshake-timeout-millis",
@@ -516,6 +538,11 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     if let Some(argument) = arguments.next() {
         return Err(CliError::UnexpectedArgument(argument));
     }
+    if append_activity_lease_explicit && !matches!(command, Command::Serve) {
+        return Err(CliError::UnexpectedArgument(
+            "--append-activity-lease-ms is only valid with serve".to_owned(),
+        ));
+    }
     if matches!(
         &command,
         Command::Workbench { .. } | Command::Mcp { .. } | Command::Collect { .. }
@@ -530,6 +557,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             | Command::Materialize { .. }
             | Command::Collect { .. }
             | Command::WorkspacePath(_)
+            | Command::OperationStatus { .. }
             | Command::Provision { .. }
     ) && agent_id.is_none()
     {
@@ -605,6 +633,7 @@ fn parse_command(
         }),
         "collect" => parse_collect(arguments),
         "workspace-path" => parse_workspace_path(arguments),
+        "operation" => parse_operation(arguments),
         "provision" => parse_provision(arguments),
         "serve" => Ok(Command::Serve),
         "schema" => Ok(Command::Schema),
@@ -612,6 +641,21 @@ fn parse_command(
         "help" => Ok(Command::Help),
         _ => Err(CliError::UnknownCommand(command)),
     }
+}
+
+fn parse_operation(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
+    let operation = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("operation command"))?;
+    if operation != "status" {
+        return Err(CliError::UnknownCommand(format!("operation {operation}")));
+    }
+    let identity = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("operation identity"))?;
+    Ok(Command::OperationStatus {
+        operation_id: parse_append_identity("operation identity", identity)?,
+    })
 }
 
 fn parse_mcp(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
@@ -724,6 +768,7 @@ fn parse_workspace_append(
     let mut payload = None;
     let mut content_type = None;
     let mut max_logical_size = None;
+    let mut block_size = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--operation-id" if operation_id.is_none() => {
@@ -760,13 +805,20 @@ fn parse_workspace_append(
                     next_value(arguments, &argument)?,
                 )?);
             }
+            "--block-size" if block_size.is_none() => {
+                block_size = Some(parse_number(
+                    "--block-size",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
             "--operation-id"
             | "--expected-workspace-incarnation-id"
             | "--text"
             | "--base64"
             | "--file"
             | "--content-type"
-            | "--max-logical-size" => return Err(CliError::UnexpectedArgument(argument)),
+            | "--max-logical-size"
+            | "--block-size" => return Err(CliError::UnexpectedArgument(argument)),
             _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
             _ => return Err(CliError::UnexpectedArgument(argument)),
         }
@@ -782,6 +834,7 @@ fn parse_workspace_append(
         ))?,
         content_type,
         max_logical_size,
+        block_size: block_size.unwrap_or(nokv_object::DEFAULT_ARTIFACT_BLOCK_SIZE),
     }))
 }
 
@@ -1048,6 +1101,60 @@ mod tests {
     }
 
     #[test]
+    fn append_activity_lease_is_an_explicit_bounded_server_option() {
+        assert_eq!(
+            parse(args(&["serve"]))
+                .unwrap()
+                .server
+                .append_activity_lease_ms,
+            1_800_000
+        );
+        assert_eq!(
+            parse(args(&["--append-activity-lease-ms", "1000", "serve"]))
+                .unwrap()
+                .server
+                .append_activity_lease_ms,
+            1000
+        );
+        assert!(parse(args(&["--append-activity-lease-ms", "999", "serve"])).is_err());
+        assert!(parse(args(&["--append-activity-lease-ms", "86400001", "serve"])).is_err());
+        assert!(parse(args(&["--append-activity-lease-ms", "86400000", "serve"])).is_ok());
+        assert!(parse(args(&["--append-activity-lease-ms", "1000", "schema"])).is_err());
+    }
+
+    #[test]
+    fn operation_status_needs_only_identity_and_agent_routing() {
+        let parsed = parse(args(&[
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "operation",
+            "status",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::OperationStatus {
+                operation_id: [0xaa; 16],
+            }
+        );
+        assert!(parsed.workbench_root.is_none());
+        assert!(parsed.client.object.bucket.is_none());
+        assert!(parse(args(&["operation", "status", "aa"])).is_err());
+        assert!(parse(args(&["operation", "status"])).is_err());
+        assert!(parse(args(&["operation", "resume", "aa"])).is_err());
+        assert!(parse(args(&[
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "operation",
+            "status",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "unexpected",
+        ]))
+        .is_err());
+    }
+
+    #[test]
     fn workspace_append_requires_one_payload_and_stable_identity() {
         let prefix = ["append", "run-42", "logs", "events.jsonl"];
         let parse_append = |tail: &[&str]| {
@@ -1080,6 +1187,8 @@ mod tests {
             "text/plain",
             "--max-logical-size",
             "1024",
+            "--block-size",
+            "1024",
         ])
         .unwrap();
         assert_eq!(
@@ -1093,6 +1202,7 @@ mod tests {
                 payload: AppendPayload::Text("event".to_owned()),
                 content_type: Some("text/plain".to_owned()),
                 max_logical_size: Some(1024),
+                block_size: 1024,
             })
         );
         for payload in [["--base64", "ZXZlbnQ="], ["--file", "/tmp/delta.bin"]] {

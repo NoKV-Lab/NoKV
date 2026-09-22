@@ -13,8 +13,8 @@ use nokv_object::{
 };
 use nokv_protocol::{
     parse_sha256_digest_uri, seal_artifact_publish_plan, sha256_digest_uri,
-    AbortArtifactPublishRequest, AppendSegment, ArtifactDescriptor, ArtifactManifestRow,
-    ArtifactRevisionIdentity, BeginArtifactPublishRequest, ByteRange,
+    AbortArtifactPublishRequest, AppendAttemptBinding, AppendSegment, ArtifactDescriptor,
+    ArtifactManifestRow, ArtifactRevisionIdentity, BeginArtifactPublishRequest, ByteRange,
     CompleteArtifactPublishRequest, ContentType, Digest, ErrorCode, FieldValue,
     GetOperationRequest, GetPathRequest, LogicalShardIdentity, MarkArtifactObjectsUploadedRequest,
     ObjectIdentity, ObjectUploadProof, OperationIdentity, OperationKind, OperationResult,
@@ -310,6 +310,7 @@ where
             options.condition,
             options.expected_workspace_incarnation_id,
             None,
+            None,
             object_plan,
             staged_objects,
             manifest_rows,
@@ -331,6 +332,7 @@ where
         condition: PublishCondition,
         expected_workspace_incarnation_id: Option<WorkspaceIdentity>,
         append_intent_digest: Option<Digest>,
+        append_attempt: Option<AppendAttemptBinding>,
         object_plan: ArtifactUploadPlan,
         staged_objects: Vec<StagedObject>,
         manifest_rows: Vec<ArtifactManifestRow>,
@@ -351,6 +353,7 @@ where
                 &condition,
                 expected_workspace_incarnation_id,
                 append_intent_digest,
+                append_attempt,
                 &object_plan,
                 &staged_objects,
                 &manifest_rows,
@@ -389,6 +392,7 @@ where
         condition: &PublishCondition,
         expected_workspace_incarnation_id: Option<WorkspaceIdentity>,
         append_intent_digest: Option<Digest>,
+        append_attempt: Option<AppendAttemptBinding>,
         object_plan: &ArtifactUploadPlan,
         staged_objects: &[StagedObject],
         manifest_rows: &[ArtifactManifestRow],
@@ -430,6 +434,7 @@ where
                 condition: *condition,
                 expected_workspace_incarnation_id,
                 append_intent_digest,
+                append_attempt,
                 staged_object_count: seals.staged_object_count,
                 staged_object_seal: seals.staged_object_seal,
                 manifest_row_count: seals.manifest_row_count,
@@ -704,6 +709,7 @@ where
                 delta,
                 None,
                 None,
+                None,
             ) {
                 Err(error)
                     if is_append_retry_error(&error) && attempt + 1 < self.max_attempts() =>
@@ -732,8 +738,16 @@ where
         delta: &[u8],
         expected_workspace_incarnation_id: Option<WorkspaceIdentity>,
         append_intent_digest: Option<Digest>,
+        append_attempt: Option<AppendAttemptBinding>,
     ) -> Result<ArtifactAppendOutcome, ClientError> {
         require_provider_admission(store, options.block_size)?;
+        if append_attempt.is_some()
+            && !store
+                .provider_admission_receipt()
+                .is_some_and(|receipt| receipt.admits_append_store(store, options.block_size))
+        {
+            return Err(ObjectError::ProviderAdmissionRequired.into());
+        }
         let route = self.resolve_artifact_route()?;
         require_object_namespace(store, route)?;
         let logical_shard = route.logical_shard_id;
@@ -969,6 +983,7 @@ where
             condition,
             expected_workspace_incarnation_id,
             append_intent_digest,
+            append_attempt,
             object_plan,
             staged_objects,
             manifest_rows,
@@ -2925,6 +2940,7 @@ mod tests {
             let begin = self.begin.as_ref().expect("publication has begun");
             Some(Box::new(nokv_protocol::PublishPreparation {
                 append_intent_digest: begin.append_intent_digest,
+                append_attempt: begin.append_attempt,
                 target: begin.target.clone(),
                 workspace_incarnation_id: WorkspaceIdentity([9; 16]),
                 artifact_revision_id: begin.artifact_revision_id,
@@ -2935,6 +2951,7 @@ mod tests {
             OperationStatus {
                 token: self.next_token(operation_id),
                 kind: OperationKind::ArtifactPublish,
+                append_preparation: None,
                 publish_preparation: self.publish_preparation(),
                 commit_preparation: None,
                 restore_preparation: None,
@@ -3036,6 +3053,7 @@ mod tests {
                     let status = OperationStatus {
                         token: state.next_token(stage.token.operation_id),
                         kind: OperationKind::ArtifactPublish,
+                        append_preparation: None,
                         publish_preparation: state.publish_preparation(),
                         commit_preparation: None,
                         restore_preparation: None,
@@ -3221,6 +3239,7 @@ mod tests {
                 let status = OperationStatus {
                     token: state.next_token(begin.operation_id),
                     kind: OperationKind::ArtifactPublish,
+                    append_preparation: None,
                     publish_preparation: state.publish_preparation(),
                     commit_preparation: None,
                     restore_preparation: None,
@@ -3259,6 +3278,7 @@ mod tests {
                 let status = OperationStatus {
                     token: state.next_token(abort.token.operation_id),
                     kind: OperationKind::ArtifactPublish,
+                    append_preparation: None,
                     publish_preparation: state.publish_preparation(),
                     commit_preparation: None,
                     restore_preparation: None,
@@ -4200,8 +4220,10 @@ mod tests {
                 state_digest: Digest([0x55; 32]),
             },
             kind: OperationKind::ArtifactPublish,
+            append_preparation: None,
             publish_preparation: Some(Box::new(nokv_protocol::PublishPreparation {
                 append_intent_digest: None,
+                append_attempt: None,
                 target: target(),
                 workspace_incarnation_id: WorkspaceIdentity([9; 16]),
                 artifact_revision_id: ArtifactRevisionIdentity([8; 16]),

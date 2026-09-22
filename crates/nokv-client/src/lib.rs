@@ -31,7 +31,10 @@ pub use error::{ArtifactPublishStage, ClientError, TransportError};
 pub use generic_index::{
     GenericIndexAbortOutcome, GenericIndexRegistrationOutcome, GenericIndexRegistrationPlan,
 };
-pub use idempotent_append::IdempotentAppendOptions;
+pub use idempotent_append::{
+    append_operation_recovery, AppendNextAction, AppendRecovery, AppendRecoveryState,
+    IdempotentAppendOptions, DEFAULT_APPEND_MAX_LOGICAL_SIZE, MAX_APPEND_DELTA_BYTES,
+};
 #[cfg(feature = "control")]
 pub use route::ControlRouteResolver;
 #[cfg(feature = "etcd")]

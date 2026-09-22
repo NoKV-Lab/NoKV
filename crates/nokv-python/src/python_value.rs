@@ -390,6 +390,30 @@ pub(crate) fn publish_result_to_py<'py>(
     Ok(dict)
 }
 
+pub(crate) fn append_result_to_py<'py>(
+    py: Python<'py>,
+    result: &nokv_protocol::AppendResult,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("operation_id", hex(&result.operation_id.0))?;
+    dict.set_item(
+        "publication_operation_id",
+        hex(&result.publication_operation_id.0),
+    )?;
+    dict.set_item("workbench_id", result.target.workbench.as_str())?;
+    dict.set_item("path", result.target.path.as_str())?;
+    dict.set_item(
+        "workspace_incarnation_id",
+        hex(&result.workspace_incarnation_id.0),
+    )?;
+    dict.set_item("workspace_revision", result.workspace_revision)?;
+    dict.set_item("generation", result.generation)?;
+    dict.set_item("artifact_revision_id", hex(&result.artifact_revision_id.0))?;
+    dict.set_item("logical_size", result.logical_size)?;
+    dict.set_item("body_digest", result.body_digest.as_str())?;
+    Ok(dict)
+}
+
 pub(crate) fn publish_outcome_to_py<'py>(
     py: Python<'py>,
     outcome: &ArtifactPublishOutcome,

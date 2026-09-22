@@ -105,49 +105,17 @@ impl CliWorkbenchBackend {
         }
     }
 
-    /// Append under a caller-owned identity, observing but never creating the workspace.
-    #[allow(clippy::too_many_arguments)]
+    /// Execute an append after metadata-only recovery and input validation.
     pub fn append_idempotent(
         &self,
-        operation_id: wire::OperationIdentity,
-        target: wire::WorkspacePath,
-        expected_workspace_incarnation_id: Option<wire::WorkspaceIdentity>,
-        create_content_type: wire::ContentType,
-        content_type: Option<wire::ContentType>,
-        max_logical_size: Option<u64>,
+        options: IdempotentAppendOptions,
         delta: &[u8],
-    ) -> Result<
-        (
-            nokv_client::ClientCall<wire::PublishResult>,
-            wire::WorkspaceIdentity,
-        ),
-        agent::BackendError,
-    > {
-        let incarnation = match expected_workspace_incarnation_id {
-            Some(incarnation) => incarnation,
-            None => {
-                self.client
-                    .get_workspace(wire::GetWorkspaceRequest {
-                        workbench: target.workbench.clone(),
-                    })
-                    .map_err(map_client_error)?
-                    .value
-                    .workspace_incarnation_id
-            }
-        };
-        let mut options =
-            IdempotentAppendOptions::new(operation_id, target, incarnation, create_content_type);
-        if let Some(content_type) = content_type {
-            options = options.with_content_type(content_type);
-        }
-        if let Some(max_logical_size) = max_logical_size {
-            options = options.with_max_logical_size(max_logical_size);
-        }
+    ) -> Result<nokv_client::ClientCall<wire::AppendResult>, agent::BackendError> {
+        let incarnation = options.expected_workspace_incarnation_id;
         self.client
             .append_artifact_idempotent(self.objects.as_ref(), options, delta)
-            .map(|call| (call, incarnation))
             .map_err(|error| {
-                let mut mapped = map_client_error(error);
+                let mut mapped = map_append_client_error(error);
                 mapped.details["workspace_incarnation_id"] =
                     json!(super::encode_lowercase_hex(&incarnation.0));
                 mapped
@@ -2806,6 +2774,18 @@ fn map_manifest_read_error(error: ClientError, path: &agent::ScopedPath) -> agen
     map_client_error(error)
 }
 
+pub(crate) fn map_append_client_error(error: ClientError) -> agent::BackendError {
+    if let ClientError::InvalidOptions(message) = error {
+        return agent::BackendError::new(
+            agent::BackendErrorKind::Other("InvalidArgument".to_owned()),
+            message,
+            false,
+            json!({}),
+        );
+    }
+    map_client_error(error)
+}
+
 fn map_client_error(error: ClientError) -> agent::BackendError {
     if let ClientError::AppendUnresolved {
         operation_id,
@@ -3690,6 +3670,7 @@ mod tests {
     fn running_restore_status(fixture: &RestorePlanFixture) -> wire::OperationStatus {
         let request = prepare_restore_request(fixture);
         wire::OperationStatus {
+            append_preparation: None,
             token: wire::OperationToken {
                 operation_id: fixture.preparation.operation_id,
                 state_digest: wire::Digest([0x61; 32]),
@@ -3855,6 +3836,7 @@ mod tests {
             lineage_projection: Vec::new(),
         };
         let commit_status = wire::OperationStatus {
+            append_preparation: None,
             token: wire::OperationToken {
                 operation_id: identities.operation_id,
                 state_digest: wire::Digest([0x61; 32]),
@@ -3885,12 +3867,14 @@ mod tests {
             failure: None,
         };
         let publish_status = wire::OperationStatus {
+            append_preparation: None,
             token: wire::OperationToken {
                 operation_id: identities.manifest_publish_operation_id,
                 state_digest: wire::Digest([0x63; 32]),
             },
             kind: wire::OperationKind::ArtifactPublish,
             publish_preparation: Some(Box::new(wire::PublishPreparation {
+                append_attempt: None,
                 append_intent_digest: None,
                 target: manifest_target.clone(),
                 workspace_incarnation_id: binding.workspace_incarnation_id,
@@ -7079,29 +7063,55 @@ mod tests {
 
     #[test]
     fn native_append_does_not_admit_a_missing_workspace() {
-        let (backend, requests, server) = scripted_backend(vec![not_found_failure()]);
+        let (backend, requests, server) =
+            scripted_backend(vec![not_found_failure(), not_found_failure()]);
         let error = backend
-            .append_idempotent(
+            .client
+            .resolve_append_workspace_incarnation(
                 wire::OperationIdentity([0xaa; 16]),
-                wire::WorkspacePath {
+                &wire::WorkspacePath {
                     workbench: wire::WorkbenchName::new("absent").unwrap(),
                     path: wire::RelativePath::new("logs/events.jsonl").unwrap(),
                 },
                 None,
-                wire::ContentType::new("text/plain").unwrap(),
-                None,
-                None,
-                b"event",
             )
+            .map_err(map_client_error)
             .unwrap_err();
         assert_eq!(error.kind, agent::BackendErrorKind::NotFound);
         server.join().unwrap();
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         assert!(matches!(
             &requests[0].operation,
+            wire::WorkspaceRequest::GetOperation(_)
+        ));
+        assert!(matches!(
+            &requests[1].operation,
             wire::WorkspaceRequest::GetWorkspace(_)
         ));
+    }
+
+    #[test]
+    fn append_local_options_use_input_errors_without_reclassifying_uncertain_results() {
+        let error =
+            map_append_client_error(ClientError::InvalidOptions("block size is zero".to_owned()));
+        assert_eq!(
+            error.kind,
+            agent::BackendErrorKind::Other("InvalidArgument".to_owned())
+        );
+        assert!(!error.retryable);
+        let unresolved = map_append_client_error(ClientError::AppendUnresolved {
+            operation_id: wire::OperationIdentity([0xaa; 16]),
+            state: None,
+            source: Box::new(ClientError::InvalidOptions(
+                "unknown publication outcome".to_owned(),
+            )),
+        });
+        assert_eq!(
+            unresolved.kind,
+            agent::BackendErrorKind::Other("AppendUnresolved".to_owned())
+        );
+        assert_eq!(unresolved.details["operation_id"], "aa".repeat(16));
     }
 
     #[test]
