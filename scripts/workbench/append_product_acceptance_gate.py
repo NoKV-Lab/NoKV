@@ -2885,7 +2885,24 @@ def exact_body(stack, workbench, expected, label):
         check=False,
     )
     if stat.get("status") == "success":
-        body = base.materialize(stack, workbench, "logs", "effects.log", label)
+        require(expected is not None, "unexpected visible artifact", stat)
+        target = stack.evidence_dir / (label + ".data")
+        # The read contract has its own bound; an append case that explicitly
+        # admits a larger body must read exactly that expected size as well.
+        stack.run(
+            [
+                *stack.client_args,
+                "--max-artifact-bytes",
+                str(max(1, len(expected))),
+                "materialize",
+                workbench,
+                "logs",
+                "effects.log",
+                str(target),
+            ],
+            label=label,
+        )
+        body = target.read_bytes()
     else:
         require(stat.get("code") == "NotFound", "unexpected stat failure", stat)
         body = None
