@@ -62,6 +62,14 @@ The checked-in integration assets are deliberately small:
   immutable objects to prove zero-copy reuse.
 - `fork_restore_recovery_gate_test.py` freezes the fault classifier, 1 GiB
   profile, terminal evidence, and independent GitHub Actions job contract.
+- `loopx_stage2a_stack.py` brings up the single-node stack LoopX's Stage 2A
+  ladder rows expect (isolated etcd, the digest-pinned RustFS container or a
+  `moto` fallback, one provisioned owner, one workbench) and writes the ignored
+  client configuration and environment file those rows read; see
+  [LoopX Stage 2A Stack](../../docs/development/loopx-stage2a-stack.md).
+- `loopx_stage2a_stack_test.py` freezes the command shapes, the exact LoopX
+  helper/ladder key contracts, secret redaction, the privacy-collision check,
+  and the fail-closed `plan`/`down`/`status` behaviour without starting a process.
 - `start_rustfs.sh` starts the optional local S3-compatible artifact backend
   with a digest-pinned image and bounded AWS CLI readiness attempts. It uses a
   Docker-managed volume by default so RustFS's non-root UID owns `/data` on
@@ -91,6 +99,7 @@ python3 scripts/workbench/live_workbench_test.py
 python3 scripts/workbench/local_wal_recovery_gate_test.py
 python3 scripts/workbench/object_namespace_recovery_gate_test.py
 python3 scripts/workbench/restore_composition_gate_test.py
+python3 scripts/workbench/loopx_stage2a_stack_test.py
 PYTHONPATH=scripts/workbench python3 -m unittest \
   scripts/workbench/typed_live_qualification_test.py \
   scripts/workbench/live_gap_qualification_test.py \
