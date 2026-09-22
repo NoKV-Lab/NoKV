@@ -4,15 +4,14 @@
 
 # NoKV × LingTai：design-partner 合作正式启动
 
-> 状态说明：本文记录合作启动时的背景。当前集成以完整的
-> [Workbench 契约](../workbench-contract.md)为边界，
-> 优先通过原生全量 CLI，其次通过 Python SDK；仅在 host 明确需要时
-> 使用可选的 MCP sidecar。三者使用同一套 NoKV workspace 格式，
-> 不把 NoKV 作为 FUSE/POSIX mount；参见[产品设计](../product-design.md)。
+> 2026-09-22 状态更新：LingTai 已不再是 NoKV 的活跃合作伙伴或默认接入目标。
+> 本文保留历史合作记录，不代表当前采用情况、集成资格或开发方向。
+> 当前产品指导请参见[产品设计](../product-design.md)与
+> [Workbench 契约](../workbench-contract.md)。
 >
 > 2026-08 更新：本文提到的可选 Workbench MCP sidecar 已废弃，不是受支持的
 > NoKV 接入面。稳定边界过去是、现在仍然是 18-tool Workbench 语义契约，
-> 经由原生全量 CLI 与 Python SDK 使用。以下正文按发布原文保留。
+> 经由原生全量 CLI 与 Python SDK 使用。以下保留历史合作范围供参考。
 
 本文记录 **NoKV** 与 **LingTai**（[Lingtai-AI/lingtai](https://github.com/Lingtai-AI/lingtai)）启动 **design-partner（设计共建伙伴）合作**的起点。
 
@@ -23,7 +22,7 @@
 
 双方的集成点是 Workbench 契约，而不是共享 host-filesystem namespace。LingTai 负责本地运行时布局；NoKV 负责分布式 artifact 身份、发布、发现与恢复语义。
 
-## 我们正在一起构建什么
+## 当时提出的合作范围
 
 合作重点包括：
 
@@ -34,9 +33,9 @@
 
 上层路径语义保持稳定，同时明确存储边界。需要本地文件的可执行程序通过 materialize/collect adapter 交互；临时 sandbox 不是 NoKV namespace truth。
 
-## 当前方向
+## 公告发布时的方向
 
-稳定边界是完整的 18-tool Workbench 语义契约，而不是 MCP transport 本身。接入顺序是原生全量 CLI 优先、Python SDK 其次、MCP sidecar 可选。NoKV 保留面向 Agent 的路径形态语义，以 Holt 中的规范化全路径元数据和 S3 兼容对象存储中的不可变工件 revision 作为底层实现。LingTai 是当前活跃的 design partner 与首个 client 集成。
+当时提出的稳定边界是完整的 18-tool Workbench 语义契约，而不是 MCP transport 本身。接入顺序是原生全量 CLI 优先、Python SDK 其次、MCP sidecar 可选。NoKV 保留面向 Agent 的路径形态语义，以 Holt 中的规范化全路径元数据和 S3 兼容对象存储中的不可变工件 revision 作为底层实现。公告发布时，LingTai 是 design partner 与拟定的首个 client 集成目标。
 
 如果“一个有状态、可快照、可审计的 Agent 工作区”正是你一直想要的：给 NoKV 点个星，关注 [LingTai](https://github.com/Lingtai-AI/lingtai)，留意后续。
 

@@ -104,7 +104,7 @@ SPDX-License-Identifier: Apache-2.0
   [Path-Native Metadata Comparison](./development/path-native-metadata-comparison.md), and
   [LoopX Stage 2A Stack](./development/loopx-stage2a-stack.md).
 - Storage architecture: [Metadata Store Interface](./development/metadata-store-interface.md).
-- Collaboration record: [NoKV x LingTai](./announcements/nokv-lingtai-design-partner.md)
+- Historical collaboration record: [NoKV x LingTai](./announcements/nokv-lingtai-design-partner.md)
   and [Chinese version](./announcements/nokv-lingtai-design-partner.zh-CN.md).
 
 <div class="nokv-section nokv-section--tight">
