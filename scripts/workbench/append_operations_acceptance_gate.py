@@ -876,6 +876,12 @@ def recovery_ack_loss_and_aba(stack, deadline):
     try:
         first_pages = inspect_all(stack, fixture, label + "-first-inspection", limit=1)
         first_digest = first_pages["pages"][0]["operation_token"]["state_digest"]
+        first_cursor = first_pages["pages"][0]["next_cursor"]
+        require(
+            isinstance(first_cursor, str) and bool(first_cursor),
+            "the original attempt supplies a real non-final inspection cursor",
+            first_pages["pages"][0],
+        )
         caller = label + "-recover-caller"
         stack.proxy.arm("retry_append_cleanup", lambda: stack.kill_caller(caller))
         lost = operation(
@@ -978,7 +984,7 @@ def recovery_ack_loss_and_aba(stack, deadline):
             "inspect",
             operation_id,
             label + "-stale-first-round-cursor",
-            cursor=first_pages["pages"][0]["next_cursor"],
+            cursor=first_cursor,
         )
         exact_input_error(
             stale,
@@ -1032,6 +1038,99 @@ def recovery_ack_loss_and_aba(stack, deadline):
             ready,
         )
         finished = finish_append(stack, fixture, label + "-complete")
+
+        def successor_observation(stage):
+            status = product.operation_status(
+                stack, operation_id, label + "-successor-cursor-status-" + stage
+            )
+            objects = product.inventory(
+                stack, label + "-successor-cursor-objects-" + stage
+            )
+            # This independent public read includes the root metadata clock,
+            # so even an unintended write that preserves visible fields fails.
+            paths = base.raw_rpc(
+                stack,
+                {
+                    "operation": "list_paths",
+                    "request": {
+                        "workbench": fixture["workbench"],
+                        "prefix": None,
+                        "recursive": True,
+                        "view": "live",
+                        "expected_read_version": None,
+                        "workspace_continuation_fence": None,
+                        "page": {"cursor": None, "limit": 32},
+                    },
+                },
+                label + "-successor-cursor-paths-" + stage,
+            )
+            require(
+                paths.get("status") == "success"
+                and paths["body"]["result"] == "paths"
+                and paths["body"]["value"]["read_version"] > 0
+                and len(paths["body"]["value"]["entries"]) == 1
+                and paths["body"]["value"]["next_cursor"] is None,
+                "a complete public path listing supplies the metadata read version",
+                paths,
+            )
+            return {"status": status, "objects": objects, "paths": paths["body"]}
+
+        before_rejections = successor_observation("before")
+        require(
+            before_rejections["status"]["state"] == "committed"
+            and before_rejections["status"]["attempt"] == ready["attempt"] + 1
+            and before_rejections["status"]["publication_operation_id"]
+            == finished["receipt"]["publication_operation_id"],
+            "old-cursor rejection is exercised after the successor has published",
+            before_rejections["status"],
+        )
+        successor_cli_rejection = operation(
+            stack,
+            "inspect",
+            operation_id,
+            label + "-old-cursor-after-successor-cli",
+            limit=1,
+            cursor=first_cursor,
+        )
+        exact_input_error(
+            successor_cli_rejection,
+            operation_id,
+            code="Conflict",
+            cause="Conflict",
+            conflict="OperationState",
+        )
+        require(
+            successor_cli_rejection.get("retryable") is False
+            and "entries" not in successor_cli_rejection,
+            "CLI rejects the old attempt cursor without returning successor ledger rows",
+            successor_cli_rejection,
+        )
+        successor_python_rejection = python_operation(
+            stack,
+            "inspect",
+            operation_id,
+            label + "-old-cursor-after-successor-python",
+            limit=1,
+            cursor=first_cursor,
+        )
+        require(
+            successor_python_rejection.get("status") == "error"
+            and successor_python_rejection.get("type") == "AppendError"
+            and successor_python_rejection.get("code") == "Conflict"
+            and successor_python_rejection.get("cause_code") == "Conflict"
+            and successor_python_rejection.get("operation_id") == operation_id
+            and successor_python_rejection.get("next_action") == "query_same"
+            and successor_python_rejection.get("retryable") is False
+            and "entries" not in successor_python_rejection,
+            "Python rejects the same old attempt cursor with the exact typed conflict",
+            successor_python_rejection,
+        )
+        after_rejections = successor_observation("after")
+        require(
+            after_rejections == before_rejections,
+            "old-cursor rejections preserve the metadata clock, append status, paths and object inventory",
+            {"before": before_rejections, "after": after_rejections},
+        )
         historical = operation(
             stack,
             "recover",
@@ -1082,6 +1181,13 @@ def recovery_ack_loss_and_aba(stack, deadline):
             historical_first_receipt=historical,
             committed_noop=no_op,
             stale_cursor_rejected=stale,
+            successor_cursor_rejections={
+                "cursor": first_cursor,
+                "cli": successor_cli_rejection,
+                "python": successor_python_rejection,
+                "before": before_rejections,
+                "after": after_rejections,
+            },
             **finished,
         )
     finally:

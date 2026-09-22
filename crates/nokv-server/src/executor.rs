@@ -11010,6 +11010,80 @@ mod tests {
             executor.execute(&misuse).unwrap_err().code,
             protocol::ErrorCode::RequestReplayMismatch
         );
+
+        // Remove a real retained row after the first entry of the next page.
+        // Inspection must discard any entries already read instead of
+        // returning a plausible but incomplete recovery ledger.
+        let before_corruption = query();
+        let key = meta::staged_object_key(root(), child.operation_id, 33);
+        let read_version = store.current_read_version().unwrap();
+        let retained = store
+            .read_at(
+                root(),
+                placement(),
+                owner(1),
+                meta::MetadataFamily::StagedObject,
+                &key,
+                read_version,
+            )
+            .unwrap()
+            .expect("remaining staged row exists before corruption");
+        assert_eq!(
+            meta::StagedObjectRecord::decode(&retained)
+                .unwrap()
+                .object_sequence,
+            33
+        );
+        store
+            .execute(
+                &meta::MetadataCommand {
+                    schema_id: meta::SCHEMA_ID.to_owned(),
+                    root_id: root(),
+                    logical_shard_id: shard(),
+                    object_namespace_id: Some(types::ObjectNamespaceId::from_bytes(
+                        [10; types::FIXED_ID_BYTES],
+                    )),
+                    placement_generation: placement(),
+                    owner_epoch: owner(1),
+                    request_id: request_id(0x9b),
+                    command_digest: types::CommandDigest::from_bytes([0; types::SHA256_BYTES]),
+                    read_version,
+                    root_fence_action: meta::RootFenceAction::RequireActive,
+                    predicates: vec![meta::CommandPredicate::Value {
+                        family: meta::MetadataFamily::StagedObject,
+                        key: key.clone(),
+                        expected: Some(retained),
+                    }],
+                    mutations: vec![meta::CommandMutation::Delete {
+                        family: meta::MetadataFamily::StagedObject,
+                        key: key.clone(),
+                    }],
+                    history_projection: vec![meta::HistoryProjection {
+                        family: meta::MetadataFamily::StagedObject,
+                        key,
+                    }],
+                    event_projection: Vec::new(),
+                    deterministic_result: Vec::new(),
+                }
+                .seal(),
+            )
+            .unwrap();
+        let corrupted_version = store.current_read_version().unwrap();
+        let mut corrupted_inspection = inspect(None);
+        let protocol::WorkspaceRequest::InspectAppendCleanup(request) =
+            &mut corrupted_inspection.operation
+        else {
+            unreachable!()
+        };
+        request.token = before_corruption.token;
+        let failure = executor.execute(&corrupted_inspection).unwrap_err();
+        assert_eq!(failure.code, protocol::ErrorCode::Internal);
+        assert_eq!(
+            store.current_read_version().unwrap(),
+            corrupted_version,
+            "failed inspection must not commit metadata or repair the missing row"
+        );
+        assert_eq!(query(), before_corruption);
     }
 
     #[test]
