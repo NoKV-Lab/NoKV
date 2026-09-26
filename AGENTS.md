@@ -11,7 +11,10 @@ safety review.
 
 ## Local Collaboration Direction
 
-Treat LingTai as the active partner and integration target for this repository.
+LingTai is no longer an active partner or a default integration target.
+Treat its collaboration announcements and qualification artifacts as historical
+records, not as instructions for new integration work. Choose downstream targets
+from the user's current scope and verified requirements.
 Do not preserve, debug, document, or route around Yanex-specific workflows unless
 the user explicitly asks for Yanex work. Yanex artifacts are historical
 benchmark/demo material only; they must not drive new NoKV behavior, scripts,
