@@ -7,6 +7,10 @@ SPDX-License-Identifier: Apache-2.0
 
 Status: normative workspace architecture.
 
+For the supported append workflow, start with the [durable append guide](append.md).
+The [append product contract](development/append-product-spec.md) defines its
+identity, recovery, and qualification boundaries.
+
 ## System Shape
 
 ```mermaid
@@ -236,6 +240,30 @@ Failed uploads never become visible. Response loss after commit returns the
 same result on retry. Generic random writes are absent; append is immutable
 segment publication plus stream-head CAS.
 
+Stable append adds a root-scoped logical operation above that publication
+pipeline. The caller retains one action ID and its complete intent, including
+the delta. The logical parent binds the full intent digest and original
+workspace incarnation; each numbered child owns one immutable publication
+plan. Parent advancement and child admission are one metadata command, and a
+successor is permitted only after the current child is durably `Cleaned`.
+An unknown result or active child is not permission to allocate another action.
+
+Successful publication installs the logical receipt in the same transaction as
+the child result, path, revision, indexes, and references. Replaying that action
+returns the stored result independently of a later live head or workspace-name
+reuse. A receipt retains the historical result metadata, not a permanent hold
+on the old body. The caller-facing `operation_id` remains the logical ID;
+`publication_operation_id` identifies the physical attempt that produced it.
+
+Public `operation status`, `operation inspect`, and `operation recover` use
+metadata only on the caller. Inspection pages bind the exact current parent
+and child. Recovery re-enqueues a quarantined child for the fenced owner; it
+does not append data or create a successor. A saved logical state token names
+one cleanup retry, so response-loss redelivery returns its original admission
+receipt even after another quarantine or a successor. The cleanup retry count
+belongs to the child and starts at zero for each new child. Full intent is
+still required when the caller resubmits the append after cleanup.
+
 Commit replay resolves its deterministic build-operation identity before any
 live workspace lookup. A terminal retry authenticates the complete stored
 request and commit-owned run-manifest binding, then verifies the corresponding
@@ -271,6 +299,15 @@ reference add/remove
 GC claims only the current zero-count epoch and atomically moves the revision
 from `Available` to `Deleting`. New references require `Available`, closing the
 restore/commit-versus-delete race.
+
+An abandoned stable-append revision follows a different lifetime rule. Its
+registered keys are conditionally replaced or created as permanent zero-byte
+seals; its revision claim remains bound to the failed child. This closes the
+window in which a delayed immutable PUT could recreate an orphan after DELETE.
+Ordinary published-revision GC does not delete these unpublished reservations.
+Their metadata and provider-key cost remains even after the logical append
+succeeds. Generic publication cleanup and published-revision GC retain their
+existing deletion behavior; see [Object Layout](object-layout.md).
 
 ## Snapshot And Commit Reads
 
@@ -347,9 +384,19 @@ durable distributed
   ACK after the configured shared logical-log boundary
 ```
 
-The two modes have separate SLOs and benchmark rows. Recovery uses checkpoint
-images plus the logical command log. Owner epoch prevents an old process from
-committing or deleting objects after failover.
+The two modes have separate acknowledgement and qualification boundaries.
+The serving local adapter is the locked Holt 0.8.6 dependency. Recovery uses
+the same exclusive Holt namespace or the admitted shared logical-log path
+described below. Owner epochs fence metadata commands; they cannot cancel a
+provider request already in flight. Stable append additionally uses monotonic
+seals to make late failed-child uploads harmless.
+
+The current workspace RPC schema is v12, system format is 13, and publication
+value format is 7. Existing stores are opened read-only and checked before
+writable Holt recovery. Incompatible stores are rejected without rewriting
+their files; this feature supplies no system-format migration or mixed-version
+write mode. Same-directory process recovery is not cross-host failover or
+machine power-loss qualification.
 
 Current implementation status: the local Holt WAL boundary and the
 object-backed shared-log boundary are executable. Every acknowledged metadata

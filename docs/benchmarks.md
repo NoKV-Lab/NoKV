@@ -210,6 +210,8 @@ Matrix:
 - create-only success and exists conflict;
 - replace-only success, missing path, and stale generation;
 - append head CAS;
+- stable logical-ID replay, same-ID contention and distinct-ID contention;
+- changed-intent rejection, including content-type override presence and limits;
 - byte-identical edit;
 - exact request replay;
 - request-id mismatch;
@@ -217,7 +219,12 @@ Matrix:
 - object upload and verification failure.
 
 Report object time and metadata time separately, plus the complete user-visible
-latency.
+latency. Separate the first publication from a committed receipt replay and
+from resumption after cleaned attempts; they perform different object and
+metadata work. Report operation-history size, retained seal/reservation counts
+and client/owner retry budgets for stable append. The
+[append qualification record](./development/append-qualification.md) proves
+listed functional outcomes, not a throughput, p99 or long-term capacity SLO.
 
 ### Query
 
@@ -241,6 +248,8 @@ Required workloads include:
 - commit-head/tag replacement and commit retirement;
 - restore across entry-count and shared-revision distributions;
 - publication abort and staged-object cleanup;
+- stable append failed-key sealing, bounded ledger inspection and exact-token
+  owner cleanup retry, including receipt replay after another attempt;
 - revision GC under create/replace/remove churn;
 - ambiguous provider deletion and quarantine reconciliation.
 

@@ -18,11 +18,22 @@ response loss, or later changes to the live file. An unfinished operation expose
 Status queries need neither the original payload nor an available object store.
 The native CLI is the primary interface, followed by the Python and Rust SDKs.
 
+Start with the [durable append guide](../append.md) for current submission and
+operator commands. Public inspection reads the current child's retained ledger;
+public recovery asks the owner to retry quarantined cleanup using a saved
+logical state token. It neither supplies the missing delta nor creates the
+next publication attempt. Failed child keys are permanently sealed, not
+deleted, before the same logical action can admit a successor.
+
 The earlier single-attempt implementation prevented duplicate appends after a
 lost success response but could not finish an action after an abandoned upload
 was cleaned. Its executable
 [identity recovery gate](../../scripts/workbench/append_identity_recovery_gate.py)
-is retained for reproducible historical evidence. Its safety-only pending cases
+is retained for reproducible historical evidence and shared harness fixtures.
+Its safety-only pending cases
 do not establish completion qualification for the current product contract.
-Use the [product acceptance gate](../../scripts/workbench/append_product_acceptance_gate.py)
+Use the [product acceptance gate](../../scripts/workbench/append_product_acceptance_gate.py),
+the [public operations gate](../../scripts/workbench/append_operations_acceptance_gate.py),
 and the normative contract's acceptance matrix for the current implementation.
+The [qualification record](append-qualification.md) states which versions and
+fault boundaries were executed; the presence of a harness is not a passing run.
