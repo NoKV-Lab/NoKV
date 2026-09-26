@@ -16,7 +16,7 @@ pub const MAX_ARTIFACT_PUBLISH_OBJECTS: usize = 1_048_576;
 /// Maximum provider-neutral manifest rows returned by one range-plan page.
 pub const MAX_ARTIFACT_READ_PLAN_ROWS: usize = 512;
 
-const PUBLICATION_RECORD_ENCODING: u8 = 4;
+const PUBLICATION_RECORD_ENCODING: u8 = 7;
 
 /// Canonical closure committed by `BeginArtifactPublish`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

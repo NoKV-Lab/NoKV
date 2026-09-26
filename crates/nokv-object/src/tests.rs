@@ -107,6 +107,120 @@ fn immutable_create_accepts_only_exact_replay() {
 }
 
 #[test]
+fn sealing_absent_and_uploaded_objects_permanently_rejects_late_payload() {
+    let store = MemoryArtifactStore::new();
+    let absent = ObjectKey::new("nokv/artifacts/absent").unwrap();
+    let uploaded = ObjectKey::new("nokv/artifacts/uploaded").unwrap();
+    store
+        .create_immutable(&uploaded, b"abandoned payload")
+        .unwrap();
+    for key in [&absent, &uploaded] {
+        assert_eq!(
+            store.seal_immutable(key).unwrap(),
+            ObjectSealOutcome::Sealed
+        );
+        assert_eq!(
+            store.seal_immutable(key).unwrap(),
+            ObjectSealOutcome::AlreadySealed
+        );
+        assert!(matches!(
+            store.create_immutable(key, b"abandoned payload"),
+            Err(ObjectError::ImmutableCollision { .. })
+        ));
+        assert_eq!(store.head(key).unwrap().unwrap().size, 0);
+        assert!(store.read(key, None).unwrap().is_empty());
+    }
+    let stats = store.stats().unwrap();
+    assert_eq!(stats.resident_bytes, 0);
+    assert_eq!(stats.resident_objects, 2);
+    assert_eq!(stats.seals, 2);
+    assert_eq!(stats.deletes, 0);
+    assert!(store
+        .provider_admission_receipt()
+        .unwrap()
+        .admits_append_store(&store, 4));
+}
+
+#[test]
+fn concurrent_sealers_and_late_writers_converge_without_deleting_the_key() {
+    let store = MemoryArtifactStore::new();
+    let key = ObjectKey::new("nokv/artifacts/seal-race").unwrap();
+    let barrier = std::sync::Barrier::new(9);
+    std::thread::scope(|scope| {
+        for index in 0..8 {
+            let store = &store;
+            let key = &key;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                if index % 2 == 0 {
+                    store.seal_immutable(key).unwrap();
+                } else {
+                    let result = store.create_immutable(key, b"payload");
+                    assert!(
+                        result.is_ok()
+                            || matches!(result, Err(ObjectError::ImmutableCollision { .. }))
+                    );
+                }
+            });
+        }
+        barrier.wait();
+    });
+    assert_eq!(store.head(&key).unwrap().unwrap().size, 0);
+    assert_eq!(store.stats().unwrap().deletes, 0);
+    assert!(matches!(
+        store.create_immutable(&key, b"late"),
+        Err(ObjectError::ImmutableCollision { .. })
+    ));
+}
+
+#[test]
+fn tiered_sealing_uses_the_durable_fence_and_invalidates_old_cache_bytes() {
+    let hot = MemoryArtifactStore::new();
+    let durable = MemoryArtifactStore::new();
+    let store = TieredArtifactStore::new(hot.clone(), durable.clone(), Default::default());
+    let key = ObjectKey::new("nokv/artifacts/tiered-seal").unwrap();
+    store.create_immutable(&key, b"old payload").unwrap();
+    assert_eq!(hot.read(&key, None).unwrap(), b"old payload");
+    store.seal_immutable(&key).unwrap();
+    assert!(hot.head(&key).unwrap().is_none());
+    assert_eq!(durable.head(&key).unwrap().unwrap().size, 0);
+    assert!(store.read(&key, None).unwrap().is_empty());
+    assert!(matches!(
+        store.create_immutable(&key, b"late payload"),
+        Err(ObjectError::ImmutableCollision { .. })
+    ));
+    assert_eq!(durable.stats().unwrap().deletes, 0);
+}
+
+#[test]
+fn namespace_and_arc_wrappers_preserve_sealing_and_its_receipt() {
+    let inner = std::sync::Arc::new(MemoryArtifactStore::new());
+    let namespace = nokv_types::ObjectNamespaceId::from_bytes([9; 16]);
+    ensure_object_namespace(&inner, namespace).unwrap();
+    let store = BoundArtifactStore::open(inner.clone(), namespace).unwrap();
+    let key = ObjectKey::new("nokv/artifacts/bound-seal").unwrap();
+    store.seal_immutable(&key).unwrap();
+    assert_eq!(inner.head(&key).unwrap().unwrap().size, 0);
+    assert!(store
+        .provider_admission_receipt()
+        .unwrap()
+        .admits_append_store(&store, 4));
+}
+
+#[test]
+fn an_evictable_local_cache_cannot_certify_permanent_sealing() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = LocalHotTier::new(LocalHotTierOptions::new(temp.path(), 4)).unwrap();
+    let key = ObjectKey::new("nokv/artifacts/cache-seal").unwrap();
+    assert_eq!(
+        store.seal_immutable(&key),
+        Err(ObjectError::ImmutableSealingUnsupported)
+    );
+    assert!(store.head(&key).unwrap().is_none());
+}
+
+#[test]
 fn upload_range_read_and_exact_replay_share_one_manifest() {
     let store = MemoryArtifactStore::new();
     let uploaded = execute_upload(&store, options(3), b"abcdefghij");

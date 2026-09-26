@@ -9,6 +9,7 @@ def test_versioned_workbench_surface():
     assert nokv.API_VERSION == 1
     assert nokv.__all__ == [
         "API_VERSION",
+        "AppendError",
         "Client",
         "ObjectStoreConfig",
         "RoutingConfig",
@@ -29,6 +30,25 @@ def test_versioned_workbench_surface():
     assert hasattr(nokv.Client, "rename")
     assert hasattr(nokv.Client, "publish_bytes")
     assert hasattr(nokv.Client, "publish_file")
+    assert hasattr(nokv.Client, "append_bytes")
+    assert hasattr(nokv.Client, "operation_status")
+    assert list(inspect.signature(nokv.Client.operation_status).parameters) == [
+        "self", "operation_id"
+    ]
+    inspection = inspect.signature(nokv.Client.operation_inspect).parameters
+    assert list(inspection) == ["self", "operation_id", "cursor", "limit"]
+    assert inspection["cursor"].default is None
+    assert inspection["cursor"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert inspection["limit"].default == 32
+    recovery = inspect.signature(nokv.Client.operation_recover).parameters
+    assert list(recovery) == ["self", "operation_id", "expected_state_digest"]
+    assert recovery["expected_state_digest"].default is None
+    assert "object_store=None" in (nokv.Client.__text_signature__ or "")
+    append = inspect.signature(nokv.Client.append_bytes).parameters
+    assert append["operation_id"].default is inspect.Parameter.empty
+    assert append["content_type"].default is None
+    assert append["expected_workspace_incarnation_id"].default is None
+    assert append["max_logical_size"].default is None
     for method in (nokv.Client.publish_bytes, nokv.Client.publish_file):
         parameters = inspect.signature(method).parameters
         assert "expected_workspace_incarnation_id" in parameters
@@ -84,3 +104,67 @@ def test_retired_filesystem_types_stay_absent():
 
 def test_torch_adapter_is_lazy_and_optional():
     assert "torch" not in nokv.__all__
+
+
+def test_append_error_keeps_identity_and_observed_state():
+    error = nokv.AppendError("reply lost", "a" * 32, None, "AppendUnresolved", "b" * 32)
+    assert isinstance(error, RuntimeError)
+    assert error.operation_id == "a" * 32
+    assert error.state is None
+    assert error.code == "AppendUnresolved"
+    assert error.expected == "b" * 32
+    assert error.cause_code is None
+    assert error.retryable is False
+    assert error.next_action == "query_same"
+    assert error.publication_operation_id is None
+    assert error.expected_state_digest is None
+    assert error.recovery_receipt is None
+    assert str(error) == "reply lost"
+    mismatch = nokv.AppendError(
+        "different intent", "a" * 32, None, "AppendUnresolved", "b" * 32,
+        "RequestReplayMismatch",
+    )
+    assert mismatch.cause_code == "RequestReplayMismatch"
+    assert mismatch.code == "AppendUnresolved"
+    assert mismatch.retryable is False
+
+
+def test_append_provider_admission_errors_preserve_recovery_contract():
+    for cause in (
+        "ProviderAdmissionRejected",
+        "ProviderAdmissionUnavailable",
+        "ProviderAdmissionInconclusive",
+    ):
+        error = nokv.AppendError(
+            "provider admission did not complete", "a" * 32, None,
+            "AppendFailed", "b" * 32, cause,
+        )
+        assert error.code == "AppendFailed"
+        assert error.cause_code == cause
+        assert error.state is None
+        assert error.operation_id == "a" * 32
+        assert error.next_action == "query_same"
+        assert error.publication_operation_id is None
+        assert error.retryable is False
+
+
+def test_cleanup_error_preserves_one_recovery_request_and_optional_receipt():
+    receipt = {
+        "operation_id": "a" * 32,
+        "publication_operation_id": "b" * 32,
+        "cleanup_retry_count": 1,
+        "expected_state_digest": "c" * 64,
+    }
+    for known in (None, receipt):
+        error = nokv.AppendError(
+            "cleanup reply unknown", "a" * 32, None, "AppendCleanupUnresolved",
+            None, "NotOwner", "retry_same_cleanup",
+            "b" * 32 if known else None, "c" * 64, known,
+        )
+        assert error.code == "AppendCleanupUnresolved"
+        assert error.cause_code == "NotOwner"
+        assert error.operation_id == "a" * 32
+        assert error.expected_state_digest == "c" * 64
+        assert error.next_action == "retry_same_cleanup"
+        assert error.recovery_receipt == known
+        assert error.retryable is False

@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     ArtifactObjectStore, ArtifactStoreCapabilities, ImmutableCreateOutcome, ObjectDeleteOutcome,
-    ObjectError, ObjectInfo, ObjectKey, ObjectRange, ProviderAdmissionReceipt,
+    ObjectError, ObjectInfo, ObjectKey, ObjectRange, ObjectSealOutcome, ProviderAdmissionReceipt,
     ProviderHandleIdentity,
 };
 
@@ -33,6 +33,7 @@ pub struct TieredArtifactStoreStats {
     pub durable_read_bytes: u64,
     pub durable_deletes: u64,
     pub hot_delete_errors: u64,
+    pub durable_seals: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +175,21 @@ where
 
     fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
         self.durable.head(key)
+    }
+
+    fn seal_immutable(&self, key: &ObjectKey) -> Result<ObjectSealOutcome, ObjectError> {
+        let outcome = self.durable.seal_immutable(key)?;
+        self.record(|stats| {
+            stats.durable_seals = stats.durable_seals.saturating_add(1);
+        })?;
+        // The hot tier is disposable and cannot certify a permanent fence.
+        // Only the durable key is sealed; invalidate any cached old payload.
+        if self.hot.delete(key).is_err() {
+            self.record(|stats| {
+                stats.hot_delete_errors = stats.hot_delete_errors.saturating_add(1);
+            })?;
+        }
+        Ok(outcome)
     }
 
     fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {

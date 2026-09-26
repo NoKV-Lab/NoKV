@@ -4,8 +4,9 @@ use std::sync::Mutex;
 use crate::{
     admit_artifact_provider, ArtifactObjectStore, ArtifactStoreCapabilities,
     ImmutableCreateOutcome, ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectKey, ObjectRange,
-    ProviderAdmissionCapability, ProviderAdmissionError, ProviderAdmissionProfile, S3ArtifactStore,
-    S3ArtifactStoreOptions, DEFAULT_ARTIFACT_BLOCK_SIZE, PROVIDER_ADMISSION_CONTRACT_VERSION,
+    ObjectSealOutcome, ProviderAdmissionCapability, ProviderAdmissionError,
+    ProviderAdmissionProfile, S3ArtifactStore, S3ArtifactStoreOptions, DEFAULT_ARTIFACT_BLOCK_SIZE,
+    PROVIDER_ADMISSION_CONTRACT_VERSION,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +21,10 @@ enum FakeBehavior {
     /// observed as `Replayed` (the S3 adapter's behavior under transient
     /// write errors).
     LandedResponseReplayed,
+    SealingUnsupported,
+    DeleteInsteadOfSeal,
+    RestoreSealedPayload,
+    LoseSealResponse,
 }
 
 #[derive(Debug)]
@@ -74,7 +79,20 @@ impl ArtifactObjectStore for FakeProvider {
         bytes: &[u8],
     ) -> Result<ImmutableCreateOutcome, ObjectError> {
         match self.behavior {
-            FakeBehavior::Correct => self.apply_create(key, bytes),
+            FakeBehavior::Correct
+            | FakeBehavior::SealingUnsupported
+            | FakeBehavior::DeleteInsteadOfSeal
+            | FakeBehavior::LoseSealResponse => self.apply_create(key, bytes),
+            FakeBehavior::RestoreSealedPayload => {
+                let mut objects = self.objects.lock().unwrap();
+                if objects.get(key).is_some_and(Vec::is_empty) {
+                    objects.insert(key.clone(), bytes.to_vec());
+                    Ok(ImmutableCreateOutcome::Created)
+                } else {
+                    drop(objects);
+                    self.apply_create(key, bytes)
+                }
+            }
             FakeBehavior::RejectConditional => Err(ObjectError::AtomicCreateUnsupported),
             FakeBehavior::Unavailable => Err(ObjectError::backend_failure(
                 "endpoint=https://sentinel.invalid is temporarily unavailable",
@@ -131,10 +149,78 @@ impl ArtifactObjectStore for FakeProvider {
             ObjectDeleteOutcome::Absent
         })
     }
+
+    fn seal_immutable(&self, key: &ObjectKey) -> Result<ObjectSealOutcome, ObjectError> {
+        if self.behavior == FakeBehavior::SealingUnsupported {
+            return Err(ObjectError::ImmutableSealingUnsupported);
+        }
+        let mut objects = self.objects.lock().unwrap();
+        if self.behavior == FakeBehavior::DeleteInsteadOfSeal {
+            objects.remove(key);
+            return Ok(ObjectSealOutcome::Sealed);
+        }
+        let previous = objects.insert(key.clone(), Vec::new());
+        if self.behavior == FakeBehavior::LoseSealResponse {
+            return Err(ObjectError::SealAmbiguous {
+                key: key.clone(),
+                detail: "endpoint=https://sentinel.invalid lost sealing response".to_owned(),
+            });
+        }
+        Ok(if previous.is_some_and(|bytes| bytes.is_empty()) {
+            ObjectSealOutcome::AlreadySealed
+        } else {
+            ObjectSealOutcome::Sealed
+        })
+    }
 }
 
 fn profile() -> ProviderAdmissionProfile {
     ProviderAdmissionProfile::single_put(64).unwrap()
+}
+
+#[test]
+fn generic_admission_does_not_grant_append_sealing() {
+    let store = FakeProvider::new(FakeBehavior::SealingUnsupported);
+    let receipt = admit_artifact_provider(&store, profile()).unwrap();
+    assert!(receipt.admits_store(&store, 64));
+    assert!(!receipt.append_sealing_verified());
+    assert!(!receipt.admits_append_store(&store, 64));
+    assert_eq!(
+        admit_artifact_provider(&store, profile().with_append_sealing()),
+        Err(ProviderAdmissionError::Rejected {
+            capability: ProviderAdmissionCapability::ImmutableSealing,
+        })
+    );
+}
+
+#[test]
+fn append_admission_proves_monotonic_sealing_and_handle_binding() {
+    for behavior in [FakeBehavior::Correct, FakeBehavior::LoseSealResponse] {
+        let store = FakeProvider::new(behavior);
+        let other = FakeProvider::new(behavior);
+        let receipt = admit_artifact_provider(&store, profile().with_append_sealing()).unwrap();
+        assert!(receipt.append_sealing_verified());
+        assert!(receipt.admits_append_store(&store, 64));
+        assert!(!receipt.admits_append_store(&other, 64));
+        assert!(!receipt.admits_append_store(&store, 65));
+        assert!(store.objects.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn append_admission_rejects_absence_and_payload_resurrection() {
+    for behavior in [
+        FakeBehavior::DeleteInsteadOfSeal,
+        FakeBehavior::RestoreSealedPayload,
+    ] {
+        let store = FakeProvider::new(behavior);
+        assert_eq!(
+            admit_artifact_provider(&store, profile().with_append_sealing()),
+            Err(ProviderAdmissionError::Rejected {
+                capability: ProviderAdmissionCapability::ImmutableSealing,
+            })
+        );
+    }
 }
 
 #[test]
@@ -249,6 +335,10 @@ fn public_provider_errors_never_render_endpoint_bucket_or_key_details() {
             key: key.clone(),
             detail: "endpoint=https://sentinel.invalid bucket=sentinel-bucket".to_owned(),
         },
+        ObjectError::SealAmbiguous {
+            key: key.clone(),
+            detail: "endpoint=https://sentinel.invalid bucket=sentinel-bucket".to_owned(),
+        },
         ObjectError::backend_failure(
             "endpoint=https://sentinel.invalid bucket=sentinel-bucket",
             true,
@@ -301,6 +391,18 @@ fn live_provider_admission_passes_the_single_put_profile() {
     );
     assert!(receipt.range_read_verified());
     assert!(receipt.admits_store(&store, DEFAULT_ARTIFACT_BLOCK_SIZE));
+}
+
+#[test]
+#[ignore = "requires an explicitly configured live S3-compatible endpoint"]
+fn live_provider_admission_proves_append_sealing() {
+    let store = live_s3_store();
+    let profile = ProviderAdmissionProfile::single_put(DEFAULT_ARTIFACT_BLOCK_SIZE)
+        .unwrap()
+        .with_append_sealing();
+    let receipt = admit_artifact_provider(&store, profile).expect("live append sealing admission");
+    assert!(receipt.append_sealing_verified());
+    assert!(receipt.admits_append_store(&store, DEFAULT_ARTIFACT_BLOCK_SIZE));
 }
 
 #[test]

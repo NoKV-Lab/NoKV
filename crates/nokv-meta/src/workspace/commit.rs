@@ -39,7 +39,7 @@ use super::commit_records::{
 };
 use super::engine::{
     CommandFit, CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError,
-    MetaShard, MetadataCommand, MetadataCommandResult, RootFenceAction,
+    MetaShard, MetadataCommand, MetadataCommandResult, RootFenceAction, MAX_COMMAND_ITEMS,
 };
 use super::event_projection::change_event_projection;
 use super::generic_index::{
@@ -71,7 +71,6 @@ use nokv_types::{
     FIXED_ID_BYTES, SHA256_BYTES,
 };
 
-const MAX_COMMAND_ITEMS: usize = 256;
 /// Canonical Workbench projection installed only with its typed commit head.
 pub const RUN_MANIFEST_PATH: &str = "metadata/run_manifest.json";
 /// Member batches reserve three command items per path plus the operation row.
@@ -542,6 +541,19 @@ impl<'a> CommitService<'a> {
         .encode();
 
         let mut plan = CommandPlan::default();
+        // Exclude publish/restore identities atomically with this build's
+        // admission so GetOperation can never become ambiguous after success.
+        for kind in [
+            OperationKind::Publish,
+            OperationKind::Restore,
+            OperationKind::Append,
+        ] {
+            plan.assert_value(
+                MetadataFamily::Operation,
+                super::codec::operation_key(request.context.root_id, kind, request.operation_id),
+                None,
+            )?;
+        }
         plan.put_absent(
             MetadataFamily::Operation,
             operation_key,
@@ -4357,7 +4369,7 @@ mod tests {
                 )
                 .unwrap()
                 .len(),
-            256
+            260
         );
 
         detach_head(&store, &mut counter, commit(1));

@@ -13,8 +13,8 @@ use nokv_object::{
 };
 use nokv_protocol::{
     parse_sha256_digest_uri, seal_artifact_publish_plan, sha256_digest_uri,
-    AbortArtifactPublishRequest, AppendSegment, ArtifactDescriptor, ArtifactManifestRow,
-    ArtifactRevisionIdentity, BeginArtifactPublishRequest, ByteRange,
+    AbortArtifactPublishRequest, AppendAttemptBinding, AppendSegment, ArtifactDescriptor,
+    ArtifactManifestRow, ArtifactRevisionIdentity, BeginArtifactPublishRequest, ByteRange,
     CompleteArtifactPublishRequest, ContentType, Digest, ErrorCode, FieldValue,
     GetOperationRequest, GetPathRequest, LogicalShardIdentity, MarkArtifactObjectsUploadedRequest,
     ObjectIdentity, ObjectUploadProof, OperationIdentity, OperationKind, OperationResult,
@@ -128,10 +128,9 @@ pub struct ArtifactPublishOutcome {
 
 /// Caller-owned identity seed and policy for one logical append.
 ///
-/// A conflicting create/append race derives deterministic attempt identities
-/// from the supplied identities. Retrying this method with the same options
-/// therefore replays the same attempt sequence instead of applying the delta a
-/// second time after response loss.
+/// A conflicting create/append race derives attempt identities within one
+/// invocation. This legacy API does not provide cross-process intent replay;
+/// use `WorkspaceClient::append_artifact_idempotent` for a caller-stable action.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactAppendOptions {
     pub operation_id: OperationIdentity,
@@ -310,6 +309,8 @@ where
             options.authority,
             options.condition,
             options.expected_workspace_incarnation_id,
+            None,
+            None,
             object_plan,
             staged_objects,
             manifest_rows,
@@ -330,6 +331,8 @@ where
         authority: PublicationAuthority,
         condition: PublishCondition,
         expected_workspace_incarnation_id: Option<WorkspaceIdentity>,
+        append_intent_digest: Option<Digest>,
+        append_attempt: Option<AppendAttemptBinding>,
         object_plan: ArtifactUploadPlan,
         staged_objects: Vec<StagedObject>,
         manifest_rows: Vec<ArtifactManifestRow>,
@@ -349,6 +352,8 @@ where
                 &authority,
                 &condition,
                 expected_workspace_incarnation_id,
+                append_intent_digest,
+                append_attempt,
                 &object_plan,
                 &staged_objects,
                 &manifest_rows,
@@ -386,6 +391,8 @@ where
         authority: &PublicationAuthority,
         condition: &PublishCondition,
         expected_workspace_incarnation_id: Option<WorkspaceIdentity>,
+        append_intent_digest: Option<Digest>,
+        append_attempt: Option<AppendAttemptBinding>,
         object_plan: &ArtifactUploadPlan,
         staged_objects: &[StagedObject],
         manifest_rows: &[ArtifactManifestRow],
@@ -394,6 +401,26 @@ where
         bytes: &[u8],
         upload_stats: &mut ArtifactUploadStats,
     ) -> Result<ArtifactPublishOutcome, ClientError> {
+        let fail = |known_token, stage, source| {
+            if append_intent_digest.is_some() {
+                publication_failure_without_abort(stage, source)
+            } else {
+                self.failed_publication(logical_shard, operation_id, known_token, stage, source)
+            }
+        };
+        let fail_or_resume = |token, stage, source| {
+            if append_intent_digest.is_some() {
+                publication_failure_without_abort(stage, source)
+            } else {
+                self.failed_or_resumable_publication(
+                    logical_shard,
+                    operation_id,
+                    token,
+                    stage,
+                    source,
+                )
+            }
+        };
         let seals =
             seal_artifact_publish_plan(artifact_revision_id, staged_objects, manifest_rows)?;
         descriptor.validate()?;
@@ -406,6 +433,8 @@ where
                 authority: *authority,
                 condition: *condition,
                 expected_workspace_incarnation_id,
+                append_intent_digest,
+                append_attempt,
                 staged_object_count: seals.staged_object_count,
                 staged_object_seal: seals.staged_object_seal,
                 manifest_row_count: seals.manifest_row_count,
@@ -419,13 +448,7 @@ where
                 let status = match validated_publish_status(call.value, operation_id) {
                     Ok(status) => status,
                     Err(source) => {
-                        return Err(self.failed_publication(
-                            logical_shard,
-                            operation_id,
-                            None,
-                            ArtifactPublishStage::Begin,
-                            source,
-                        ));
+                        return Err(fail(None, ArtifactPublishStage::Begin, source));
                     }
                 };
                 // Begin observes whichever durable state the operation row is
@@ -441,13 +464,7 @@ where
                         let value = match published_result_from_status(&status) {
                             Ok(value) => value,
                             Err(source) => {
-                                return Err(self.failed_publication(
-                                    logical_shard,
-                                    operation_id,
-                                    None,
-                                    ArtifactPublishStage::Begin,
-                                    source,
-                                ));
+                                return Err(fail(None, ArtifactPublishStage::Begin, source));
                             }
                         };
                         // The replay branch is the one path the engine takes
@@ -458,7 +475,9 @@ where
                         // live state before returning a replayed terminal
                         // result; publish does the same rather than handing
                         // back a generation the caller could CAS against.
-                        if matches!(authority, PublicationAuthority::Visible) {
+                        if append_intent_digest.is_none()
+                            && matches!(authority, PublicationAuthority::Visible)
+                        {
                             if let Err(source) =
                                 self.confirm_replayed_publication_is_live(logical_shard, &value)
                             {
@@ -502,13 +521,7 @@ where
                     ) {
                         Ok(resume) => (resume.token, resume, replayed),
                         Err(source) => {
-                            return Err(self.failed_publication(
-                                logical_shard,
-                                operation_id,
-                                None,
-                                ArtifactPublishStage::Begin,
-                                source,
-                            ));
+                            return Err(fail(None, ArtifactPublishStage::Begin, source));
                         }
                     },
                 }
@@ -536,9 +549,7 @@ where
                 Ok(status) => match running_publish_token(status.value, operation_id) {
                     Ok(next_token) => token = next_token,
                     Err(source) => {
-                        return Err(self.failed_publication(
-                            logical_shard,
-                            operation_id,
+                        return Err(fail(
                             Some(token),
                             ArtifactPublishStage::StageObjects,
                             source,
@@ -546,9 +557,7 @@ where
                     }
                 },
                 Err(source) => {
-                    return Err(self.failed_or_resumable_publication(
-                        logical_shard,
-                        operation_id,
+                    return Err(fail_or_resume(
                         token,
                         ArtifactPublishStage::StageObjects,
                         source,
@@ -561,9 +570,7 @@ where
             let upload = match upload_artifact_from_plan(store, object_plan, bytes) {
                 Ok(upload) => upload,
                 Err(source) => {
-                    return Err(self.failed_or_resumable_publication(
-                        logical_shard,
-                        operation_id,
+                    return Err(fail_or_resume(
                         token,
                         ArtifactPublishStage::UploadObjects,
                         ClientError::ArtifactUpload(Box::new(source)),
@@ -588,9 +595,7 @@ where
                 Ok(status) => match running_publish_token(status.value, operation_id) {
                     Ok(next_token) => token = next_token,
                     Err(source) => {
-                        return Err(self.failed_publication(
-                            logical_shard,
-                            operation_id,
+                        return Err(fail(
                             Some(token),
                             ArtifactPublishStage::MarkObjectsUploaded,
                             source,
@@ -598,9 +603,7 @@ where
                     }
                 },
                 Err(source) => {
-                    return Err(self.failed_or_resumable_publication(
-                        logical_shard,
-                        operation_id,
+                    return Err(fail_or_resume(
                         token,
                         ArtifactPublishStage::MarkObjectsUploaded,
                         source,
@@ -623,9 +626,7 @@ where
                 Ok(status) => match running_publish_token(status.value, operation_id) {
                     Ok(next_token) => token = next_token,
                     Err(source) => {
-                        return Err(self.failed_publication(
-                            logical_shard,
-                            operation_id,
+                        return Err(fail(
                             Some(token),
                             ArtifactPublishStage::StageManifest,
                             source,
@@ -633,9 +634,7 @@ where
                     }
                 },
                 Err(source) => {
-                    return Err(self.failed_or_resumable_publication(
-                        logical_shard,
-                        operation_id,
+                    return Err(fail_or_resume(
                         token,
                         ArtifactPublishStage::StageManifest,
                         source,
@@ -658,18 +657,14 @@ where
             Err(source) => match self.recover_completed_publish(logical_shard, operation_id) {
                 Ok(Some(recovered)) => recovered,
                 Ok(None) => {
-                    return Err(self.failed_or_resumable_publication(
-                        logical_shard,
-                        operation_id,
+                    return Err(fail_or_resume(
                         token,
                         ArtifactPublishStage::Complete,
                         source,
                     ));
                 }
                 Err(recovery_error) => {
-                    return Err(self.failed_or_resumable_publication(
-                        logical_shard,
-                        operation_id,
+                    return Err(fail_or_resume(
                         token,
                         ArtifactPublishStage::Complete,
                         recovery_error,
@@ -712,6 +707,9 @@ where
                 operation_id,
                 artifact_revision_id,
                 delta,
+                None,
+                None,
+                None,
             ) {
                 Err(error)
                     if is_append_retry_error(&error) && attempt + 1 < self.max_attempts() =>
@@ -730,14 +728,26 @@ where
         unreachable!("validated max_attempts is non-zero")
     }
 
-    fn append_artifact_attempt(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_artifact_attempt(
         &self,
         store: &dyn ArtifactObjectStore,
         options: &ArtifactAppendOptions,
         operation_id: OperationIdentity,
         artifact_revision_id: ArtifactRevisionIdentity,
         delta: &[u8],
+        expected_workspace_incarnation_id: Option<WorkspaceIdentity>,
+        append_intent_digest: Option<Digest>,
+        append_attempt: Option<AppendAttemptBinding>,
     ) -> Result<ArtifactAppendOutcome, ClientError> {
+        require_provider_admission(store, options.block_size)?;
+        if append_attempt.is_some()
+            && !store
+                .provider_admission_receipt()
+                .is_some_and(|receipt| receipt.admits_append_store(store, options.block_size))
+        {
+            return Err(ObjectError::ProviderAdmissionRequired.into());
+        }
         let route = self.resolve_artifact_route()?;
         require_object_namespace(store, route)?;
         let logical_shard = route.logical_shard_id;
@@ -971,7 +981,9 @@ where
             options.target.clone(),
             PublicationAuthority::Visible,
             condition,
-            None,
+            expected_workspace_incarnation_id,
+            append_intent_digest,
+            append_attempt,
             object_plan,
             staged_objects,
             manifest_rows,
@@ -2495,7 +2507,9 @@ fn is_append_retry_error(error: &ClientError) -> bool {
         | ClientError::MissingCapabilities(_)
         | ClientError::ArtifactIntegrity(_)
         | ClientError::Object(_)
-        | ClientError::ArtifactUpload(_) => false,
+        | ClientError::ArtifactUpload(_)
+        | ClientError::AppendUnresolved { .. }
+        | ClientError::AppendCleanupUnresolved { .. } => false,
     }
 }
 
@@ -2923,10 +2937,23 @@ mod tests {
             Some(status.clone())
         }
 
+        fn publish_preparation(&self) -> Option<Box<nokv_protocol::PublishPreparation>> {
+            let begin = self.begin.as_ref().expect("publication has begun");
+            Some(Box::new(nokv_protocol::PublishPreparation {
+                append_intent_digest: begin.append_intent_digest,
+                append_attempt: begin.append_attempt,
+                target: begin.target.clone(),
+                workspace_incarnation_id: WorkspaceIdentity([9; 16]),
+                artifact_revision_id: begin.artifact_revision_id,
+            }))
+        }
+
         fn running_status(&mut self, operation_id: OperationIdentity) -> OperationStatus {
             OperationStatus {
                 token: self.next_token(operation_id),
                 kind: OperationKind::ArtifactPublish,
+                append_preparation: None,
+                publish_preparation: self.publish_preparation(),
                 commit_preparation: None,
                 restore_preparation: None,
                 state: OperationState::Running,
@@ -3027,6 +3054,8 @@ mod tests {
                     let status = OperationStatus {
                         token: state.next_token(stage.token.operation_id),
                         kind: OperationKind::ArtifactPublish,
+                        append_preparation: None,
+                        publish_preparation: state.publish_preparation(),
                         commit_preparation: None,
                         restore_preparation: None,
                         state: OperationState::Running,
@@ -3211,6 +3240,8 @@ mod tests {
                 let status = OperationStatus {
                     token: state.next_token(begin.operation_id),
                     kind: OperationKind::ArtifactPublish,
+                    append_preparation: None,
+                    publish_preparation: state.publish_preparation(),
                     commit_preparation: None,
                     restore_preparation: None,
                     state: OperationState::Succeeded,
@@ -3248,6 +3279,8 @@ mod tests {
                 let status = OperationStatus {
                     token: state.next_token(abort.token.operation_id),
                     kind: OperationKind::ArtifactPublish,
+                    append_preparation: None,
+                    publish_preparation: state.publish_preparation(),
                     commit_preparation: None,
                     restore_preparation: None,
                     state: OperationState::Aborting,
@@ -4188,6 +4221,14 @@ mod tests {
                 state_digest: Digest([0x55; 32]),
             },
             kind: OperationKind::ArtifactPublish,
+            append_preparation: None,
+            publish_preparation: Some(Box::new(nokv_protocol::PublishPreparation {
+                append_intent_digest: None,
+                append_attempt: None,
+                target: target(),
+                workspace_incarnation_id: WorkspaceIdentity([9; 16]),
+                artifact_revision_id: ArtifactRevisionIdentity([8; 16]),
+            })),
             commit_preparation: None,
             restore_preparation: None,
             state: OperationState::Running,

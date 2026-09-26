@@ -883,17 +883,21 @@ mod tests {
 
     #[test]
     fn operation_first_v3_gets_a_readable_rejection_with_zero_dispatch() {
+        #[derive(Serialize)]
+        struct V3Frame {
+            schema: &'static str,
+            payload: WorkspaceRpcRequest,
+        }
+
         let (mut client, server) = streams();
         let (registry, executor) = registry();
         let serving = thread::spawn(move || serve_connection(server, registry, options()));
 
-        let mut legacy = encode_request(&request()).unwrap();
-        let position = legacy
-            .windows(WORKSPACE_PROTOCOL_SCHEMA.len())
-            .position(|window| window == WORKSPACE_PROTOCOL_SCHEMA.as_bytes())
-            .unwrap();
-        legacy[position..position + WORKSPACE_PROTOCOL_SCHEMA.len()]
-            .copy_from_slice(crate::legacy_rejection::LEGACY_V3_SCHEMA.as_bytes());
+        let legacy = rmp_serde::to_vec_named(&V3Frame {
+            schema: crate::legacy_rejection::LEGACY_V3_SCHEMA,
+            payload: request(),
+        })
+        .unwrap();
         write_frame(&mut client, &legacy).unwrap();
         let response = read_frame(&mut client).unwrap().unwrap();
         let response = decode_response(&response).unwrap();
@@ -901,6 +905,11 @@ mod tests {
             panic!("legacy operation-first request must be rejected");
         };
         assert_eq!(failure.code, nokv_protocol::ErrorCode::PreconditionFailed);
+        assert_eq!(
+            failure.message,
+            crate::legacy_rejection::LEGACY_CLIENT_UPGRADE_MESSAGE
+        );
+        assert!(!failure.retryable);
         serving.join().unwrap().unwrap();
         assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
     }
@@ -964,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_hello_gets_v9_incompatible_and_zero_dispatch() {
+    fn v7_hello_gets_v10_incompatible_and_zero_dispatch() {
         let (mut client, server) = streams();
         let (registry, executor) = registry();
         let serving = thread::spawn(move || serve_connection(server, registry, options()));

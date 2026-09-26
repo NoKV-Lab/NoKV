@@ -142,12 +142,13 @@ pub use namespace::{
     MAX_VISIBLE_PATH_LIST_PAGE_SIZE,
 };
 pub use publication::{
-    advance_manifest_rolling_digest, advance_staged_object_rolling_digest, dependency_owner_digest,
-    manifest_rows_digest, seal_publish_operation, staged_object_ledger_digest, BeginPublishRequest,
-    CleanupPublishBatchRequest, FinalizePublishOutcome, FinalizePublishRequest,
-    FinishReconcileQuarantinedPublishRequest, HeartbeatPublishRequest, ManifestRowInput,
-    MarkObjectsUploadedBatchRequest, PublicationContext, PublicationError, PublicationService,
-    PublishCommandOutcome, PublishedArtifact, QuarantineReconcileResolution,
+    advance_manifest_rolling_digest, advance_staged_object_rolling_digest,
+    append_operation_state_digest, dependency_owner_digest, manifest_rows_digest,
+    seal_publish_operation, staged_object_ledger_digest, AppendCleanupRetryOutcome,
+    BeginPublishRequest, CleanupPublishBatchRequest, FinalizePublishOutcome,
+    FinalizePublishRequest, FinishReconcileQuarantinedPublishRequest, HeartbeatPublishRequest,
+    ManifestRowInput, MarkObjectsUploadedBatchRequest, PublicationContext, PublicationError,
+    PublicationService, PublishCommandOutcome, PublishedArtifact, QuarantineReconcileResolution,
     ReconcileQuarantinedPublishBatchRequest, StageManifestBatchRequest, StageObjectsBatchRequest,
     StagedObjectUpdate, TakeOverOrphanedPublishRequest, TransitionPublishRequest,
     MAX_PUBLICATION_BATCH_ROWS,
@@ -161,10 +162,11 @@ pub use publication_records::{
     MAX_QUARANTINE_EVIDENCE_BYTES, PUBLICATION_VALUE_FORMAT_VERSION,
 };
 pub use publish_operation_records::{
-    AppendSegment, ArtifactManifestRow, ManifestPosition, PublishAuthority, PublishClaim,
-    PublishOperationRecord, PublishRecordError, PublishResult, PublishTerminalError,
-    PublishTerminalErrorKind, PublishTransition, StagedObjectRecord, MAX_APPEND_SEGMENTS,
-    MAX_MANIFEST_ROWS, MAX_MULTIPART_ID_BYTES, MAX_STAGED_OBJECTS, MAX_TERMINAL_ERROR_BYTES,
+    AppendAttemptBinding, AppendCleanupRetryReceipt, AppendOperationRecord, AppendSegment,
+    ArtifactManifestRow, ManifestPosition, PublishAuthority, PublishClaim, PublishOperationRecord,
+    PublishRecordError, PublishResult, PublishTerminalError, PublishTerminalErrorKind,
+    PublishTransition, StagedObjectRecord, MAX_APPEND_SEGMENTS, MAX_MANIFEST_ROWS,
+    MAX_MULTIPART_ID_BYTES, MAX_STAGED_OBJECTS, MAX_TERMINAL_ERROR_BYTES,
     PUBLISH_VALUE_FORMAT_VERSION,
 };
 pub use query::{

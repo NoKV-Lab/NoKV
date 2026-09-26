@@ -15,8 +15,8 @@ use base64::Engine as _;
 use nokv_agent as agent;
 use nokv_client::{
     ArtifactAppendOptions, ArtifactPublishOptions, ArtifactReadAuthority, ClientError,
-    SnapshotMintOptions, SnapshotRenewOptions, SnapshotRetireOptions, WorkbenchAdmission,
-    WorkbenchCommitRequest, WorkbenchLifecycleError, WorkbenchLifecycleFacade,
+    IdempotentAppendOptions, SnapshotMintOptions, SnapshotRenewOptions, SnapshotRetireOptions,
+    WorkbenchAdmission, WorkbenchCommitRequest, WorkbenchLifecycleError, WorkbenchLifecycleFacade,
     WorkbenchLifecycleOptions, WorkbenchRestoreOrigin, WorkbenchRestoreRequest,
     WorkbenchRestoreSource, WorkbenchSnapshotSelector,
 };
@@ -103,6 +103,23 @@ impl CliWorkbenchBackend {
             objects,
             max_artifact_bytes,
         }
+    }
+
+    /// Execute an append after metadata-only recovery and input validation.
+    pub fn append_idempotent(
+        &self,
+        options: IdempotentAppendOptions,
+        delta: &[u8],
+    ) -> Result<nokv_client::ClientCall<wire::AppendResult>, agent::BackendError> {
+        let incarnation = options.expected_workspace_incarnation_id;
+        self.client
+            .append_artifact_idempotent(self.objects.as_ref(), options, delta)
+            .map_err(|error| {
+                let mut mapped = map_append_client_error(error);
+                mapped.details["workspace_incarnation_id"] =
+                    json!(super::encode_lowercase_hex(&incarnation.0));
+                mapped
+            })
     }
 
     fn workspace(
@@ -2551,7 +2568,7 @@ fn decode_list_cursor(
         _ => {
             return Err(invalid_backend_input(
                 "list cursor has an unknown fence kind",
-            ))
+            ));
         }
     };
     let (scope_digest, anchor) = payload
@@ -2757,7 +2774,60 @@ fn map_manifest_read_error(error: ClientError, path: &agent::ScopedPath) -> agen
     map_client_error(error)
 }
 
+pub(crate) fn map_append_client_error(error: ClientError) -> agent::BackendError {
+    if let ClientError::InvalidOptions(message) = error {
+        return agent::BackendError::new(
+            agent::BackendErrorKind::Other("InvalidArgument".to_owned()),
+            message,
+            false,
+            json!({}),
+        );
+    }
+    if matches!(&error, ClientError::Rpc(failure) if failure.code == wire::ErrorCode::InvalidArgument)
+    {
+        let mut mapped = map_client_error(error);
+        mapped.kind = agent::BackendErrorKind::Other("InvalidArgument".to_owned());
+        return mapped;
+    }
+    map_client_error(error)
+}
+
 fn map_client_error(error: ClientError) -> agent::BackendError {
+    if let ClientError::AppendCleanupUnresolved {
+        operation_id,
+        expected_token,
+        receipt,
+        source,
+    } = error
+    {
+        let mut mapped = map_client_error(*source);
+        mapped.kind = agent::BackendErrorKind::Other("AppendCleanupUnresolved".to_owned());
+        mapped.retryable = false;
+        mapped.details["operation_id"] = json!(super::encode_lowercase_hex(&operation_id.0));
+        mapped.details["expected_state_digest"] =
+            json!(super::encode_lowercase_hex(&expected_token.state_digest.0));
+        mapped.details["next_action"] = json!("retry_same_cleanup");
+        mapped.details["publication_operation_id"] = json!(receipt
+            .as_ref()
+            .map(|value| super::encode_lowercase_hex(&value.publication_operation_id.0)));
+        mapped.details["recovery_receipt"] =
+            json!(receipt.as_deref().map(super::cleanup_retry_receipt_json));
+        return mapped;
+    }
+    if let ClientError::AppendUnresolved {
+        operation_id,
+        state,
+        source,
+    } = error
+    {
+        let mut mapped = map_client_error(*source);
+        mapped.kind = agent::BackendErrorKind::Other("AppendUnresolved".to_owned());
+        // Retrying means recovering this exact identity; it never authorizes a new append.
+        mapped.retryable = false;
+        mapped.details["operation_id"] = json!(super::encode_lowercase_hex(&operation_id.0));
+        mapped.details["state"] = json!(state.map(|state| format!("{state:?}")));
+        return mapped;
+    }
     if let Some(failure) = rpc_failure(&error).cloned() {
         let attempts = retry_attempts(&error);
         let mut mapped = map_rpc_failure(failure);
@@ -2791,6 +2861,9 @@ fn map_client_error(error: ClientError) -> agent::BackendError {
             }
             ClientError::ArtifactPublishFailed { .. } | ClientError::RetryExhausted { .. } => {
                 agent::BackendErrorKind::Other("ClientFailure".to_owned())
+            }
+            ClientError::AppendUnresolved { .. } | ClientError::AppendCleanupUnresolved { .. } => {
+                unreachable!("append failure returned above")
             }
             ClientError::Rpc(_) => unreachable!("RPC failures returned above"),
         }
@@ -3626,11 +3699,13 @@ mod tests {
     fn running_restore_status(fixture: &RestorePlanFixture) -> wire::OperationStatus {
         let request = prepare_restore_request(fixture);
         wire::OperationStatus {
+            append_preparation: None,
             token: wire::OperationToken {
                 operation_id: fixture.preparation.operation_id,
                 state_digest: wire::Digest([0x61; 32]),
             },
             kind: wire::OperationKind::Restore,
+            publish_preparation: None,
             commit_preparation: None,
             restore_preparation: Some(Box::new(wire::RestoreOperationPreparation {
                 request,
@@ -3790,11 +3865,13 @@ mod tests {
             lineage_projection: Vec::new(),
         };
         let commit_status = wire::OperationStatus {
+            append_preparation: None,
             token: wire::OperationToken {
                 operation_id: identities.operation_id,
                 state_digest: wire::Digest([0x61; 32]),
             },
             kind: wire::OperationKind::Commit,
+            publish_preparation: None,
             commit_preparation: Some(Box::new(wire::CommitPreparation {
                 request: Box::new(exact_request.clone()),
                 committed_at_unix_seconds,
@@ -3819,11 +3896,19 @@ mod tests {
             failure: None,
         };
         let publish_status = wire::OperationStatus {
+            append_preparation: None,
             token: wire::OperationToken {
                 operation_id: identities.manifest_publish_operation_id,
                 state_digest: wire::Digest([0x63; 32]),
             },
             kind: wire::OperationKind::ArtifactPublish,
+            publish_preparation: Some(Box::new(wire::PublishPreparation {
+                append_attempt: None,
+                append_intent_digest: None,
+                target: manifest_target.clone(),
+                workspace_incarnation_id: binding.workspace_incarnation_id,
+                artifact_revision_id: binding.artifact_revision_id,
+            })),
             commit_preparation: None,
             restore_preparation: None,
             state: wire::OperationState::Succeeded,
@@ -7003,6 +7088,151 @@ mod tests {
         let mapped = query_predicate(&predicate).unwrap();
         assert_eq!(mapped.operator, wire::QueryOperator::In);
         assert!(matches!(mapped.operand, wire::QueryOperand::Set(values) if values.len() == 2));
+    }
+
+    #[test]
+    fn native_append_does_not_admit_a_missing_workspace() {
+        let (backend, requests, server) =
+            scripted_backend(vec![not_found_failure(), not_found_failure()]);
+        let error = backend
+            .client
+            .resolve_append_workspace_incarnation(
+                wire::OperationIdentity([0xaa; 16]),
+                &wire::WorkspacePath {
+                    workbench: wire::WorkbenchName::new("absent").unwrap(),
+                    path: wire::RelativePath::new("logs/events.jsonl").unwrap(),
+                },
+                None,
+            )
+            .map_err(map_client_error)
+            .unwrap_err();
+        assert_eq!(error.kind, agent::BackendErrorKind::NotFound);
+        server.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            &requests[0].operation,
+            wire::WorkspaceRequest::GetOperation(_)
+        ));
+        assert!(matches!(
+            &requests[1].operation,
+            wire::WorkspaceRequest::GetWorkspace(_)
+        ));
+    }
+
+    #[test]
+    fn append_local_options_use_input_errors_without_reclassifying_uncertain_results() {
+        let error =
+            map_append_client_error(ClientError::InvalidOptions("block size is zero".to_owned()));
+        assert_eq!(
+            error.kind,
+            agent::BackendErrorKind::Other("InvalidArgument".to_owned())
+        );
+        assert!(!error.retryable);
+        let unresolved = map_append_client_error(ClientError::AppendUnresolved {
+            operation_id: wire::OperationIdentity([0xaa; 16]),
+            state: None,
+            source: Box::new(ClientError::InvalidOptions(
+                "unknown publication outcome".to_owned(),
+            )),
+        });
+        assert_eq!(
+            unresolved.kind,
+            agent::BackendErrorKind::Other("AppendUnresolved".to_owned())
+        );
+        assert_eq!(unresolved.details["operation_id"], "aa".repeat(16));
+    }
+
+    #[test]
+    fn unresolved_append_error_preserves_identity_state_and_underlying_cause() {
+        let error = map_client_error(ClientError::AppendUnresolved {
+            operation_id: wire::OperationIdentity([0xaa; 16]),
+            state: Some(wire::OperationState::Running),
+            source: Box::new(ClientError::Rpc(wire::RpcFailure {
+                code: wire::ErrorCode::Conflict,
+                message: "path generation changed".to_owned(),
+                retryable: false,
+                conflict: Some(wire::ConflictKind::PathGeneration),
+                current_generation: Some(3),
+                route_hint: None,
+            })),
+        });
+        assert_eq!(
+            error.kind,
+            agent::BackendErrorKind::Other("AppendUnresolved".to_owned())
+        );
+        assert_eq!(error.details["operation_id"], "aa".repeat(16));
+        assert_eq!(error.details["state"], "Running");
+        assert_eq!(error.details["code"], "Conflict");
+        assert!(!error.retryable);
+    }
+
+    #[test]
+    fn unresolved_cleanup_retains_exact_request_and_known_historical_receipt() {
+        let operation_id = wire::OperationIdentity([0xaa; 16]);
+        let token = wire::OperationToken {
+            operation_id,
+            state_digest: wire::Digest([0xbb; 32]),
+        };
+        let source = || {
+            ClientError::Rpc(wire::RpcFailure {
+                code: wire::ErrorCode::NotOwner,
+                message: "owner changed".to_owned(),
+                retryable: true,
+                conflict: None,
+                current_generation: None,
+                route_hint: None,
+            })
+        };
+        for receipt in [
+            None,
+            Some(Box::new(wire::AppendCleanupRetryResult {
+                operation_id,
+                publication_operation_id: wire::OperationIdentity([0xcc; 16]),
+                cleanup_retry_count: 1,
+                expected_state_digest: token.state_digest,
+            })),
+        ] {
+            let known = receipt.is_some();
+            let mapped = map_append_client_error(ClientError::AppendCleanupUnresolved {
+                operation_id,
+                expected_token: token,
+                receipt,
+                source: Box::new(source()),
+            });
+            assert_eq!(
+                mapped.kind,
+                agent::BackendErrorKind::Other("AppendCleanupUnresolved".to_owned())
+            );
+            assert_eq!(mapped.details["expected_state_digest"], "bb".repeat(32));
+            assert_eq!(mapped.details["next_action"], "retry_same_cleanup");
+            assert_eq!(mapped.details["code"], "NotOwner");
+            assert_eq!(mapped.details["recovery_receipt"].is_null(), !known);
+            assert!(!mapped.retryable);
+            let error = super::super::append_error_json(
+                operation_id,
+                super::super::agent_error(mapped.into()),
+            );
+            let json: Value = serde_json::from_str(&error).unwrap();
+            assert_eq!(json["details"]["next_action"], "retry_same_cleanup");
+            assert_eq!(json["details"]["cause_code"], "NotOwner");
+            assert_eq!(
+                json["details"]["publication_operation_id"].is_null(),
+                !known
+            );
+        }
+        let invalid = map_append_client_error(ClientError::Rpc(wire::RpcFailure {
+            code: wire::ErrorCode::InvalidArgument,
+            message: "invalid inspection cursor".to_owned(),
+            retryable: false,
+            conflict: None,
+            current_generation: None,
+            route_hint: None,
+        }));
+        assert_eq!(
+            invalid.kind,
+            agent::BackendErrorKind::Other("InvalidArgument".to_owned())
+        );
     }
 
     #[test]

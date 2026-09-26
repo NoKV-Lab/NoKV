@@ -5,8 +5,8 @@
 
 //! Explicit single-artifact transfer helpers for local executables.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub fn read_collect_source(source: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
@@ -35,7 +35,33 @@ pub fn read_collect_source(source: &Path, max_bytes: usize) -> Result<Vec<u8>, S
             metadata.len()
         ));
     }
-    let bytes = fs::read(source)
+    let input = File::open(source)
+        .map_err(|error| format!("cannot open collect source {}: {error}", source.display()))?;
+    if !input
+        .metadata()
+        .map_err(|error| format!("cannot inspect opened source {}: {error}", source.display()))?
+        .is_file()
+    {
+        return Err(format!(
+            "collect source {} is not a regular file",
+            source.display()
+        ));
+    }
+    read_collect_bytes(source, input, max_bytes)
+}
+
+fn read_collect_bytes(
+    source: &Path,
+    input: impl Read,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    input
+        .take(limit)
+        .read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read collect source {}: {error}", source.display()))?;
     if bytes.len() > max_bytes {
         return Err(format!(
@@ -114,6 +140,25 @@ mod tests {
         assert!(read_collect_source(root.path(), 1024)
             .unwrap_err()
             .contains("regular file"));
+    }
+
+    #[test]
+    fn collect_bounds_reads_when_the_source_grows_after_inspection() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("growing.bin");
+        fs::write(&source, b"first").unwrap();
+        let mut input = File::open(&source).unwrap();
+        assert_eq!(input.metadata().unwrap().len(), 5);
+        OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(&[b'x'; 1024])
+            .unwrap();
+        let error = read_collect_bytes(&source, &mut input, 5).unwrap_err();
+        assert!(error.contains("grew to 6 bytes, maximum is 5"));
+        use std::io::Seek;
+        assert_eq!(input.stream_position().unwrap(), 6);
     }
 
     #[test]

@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nokv_meta::workspace as meta;
-use nokv_object::{ArtifactObjectStore, ObjectDeleteOutcome, ObjectKey};
+use nokv_object::{ArtifactObjectStore, ObjectDeleteOutcome, ObjectKey, ObjectSealOutcome};
 use nokv_protocol::RootRoute;
 use nokv_types::{
     ArtifactRevisionId, BuildCommitPhase, CommitRetirePhase, CommitState, GcClaimState, GcPhase,
@@ -34,49 +34,59 @@ static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Why an authoritative metadata row requires provider deletion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LifecycleDeletePurpose {
+pub enum LifecycleCleanupPurpose {
     AbortedPublication,
+    AbortedAppend,
     RevisionGarbageCollection,
 }
 
-/// Provider-neutral deletion request. For an aborted multipart publication the
-/// provider implementation must abort the named upload and prove the final key
-/// absent before returning success.
+/// Provider-neutral cleanup request. Failed append keys must be permanently
+/// sealed; ordinary publication and revision GC require absence. Multipart
+/// cleanup must also fence the named upload before returning success.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LifecycleDeleteRequest {
-    pub purpose: LifecycleDeletePurpose,
+pub struct LifecycleCleanupRequest {
+    pub purpose: LifecycleCleanupPurpose,
     pub object_key: String,
     pub multipart_upload_id: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LifecycleDeleteDisposition {
+pub enum LifecycleCleanupDisposition {
     Deleted,
     AlreadyAbsent,
+    /// The key remains occupied permanently and rejects delayed immutable creates.
+    Sealed,
 }
 
 /// Stable provider evidence consumed by the durable metadata state machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LifecycleAbsenceProof {
-    pub disposition: LifecycleDeleteDisposition,
+pub struct LifecycleCleanupProof {
+    pub disposition: LifecycleCleanupDisposition,
     pub digest: [u8; SHA256_BYTES],
 }
 
-impl LifecycleAbsenceProof {
-    /// Build stable provider evidence for one authoritative delete request.
+impl LifecycleCleanupProof {
+    fn matches_request(&self, request: &LifecycleCleanupRequest) -> bool {
+        let sealed = self.disposition == LifecycleCleanupDisposition::Sealed;
+        sealed == (request.purpose == LifecycleCleanupPurpose::AbortedAppend)
+            && *self == Self::from_cleanup_request(request, self.disposition)
+    }
+
+    /// Build stable provider evidence for one authoritative cleanup request.
     /// The caller must pass the canonical object key received from the
     /// lifecycle worker; the digest binds the metadata schema, proof domain,
-    /// delete purpose, exact key, optional multipart id, and disposition.
-    pub fn from_delete_request(
-        request: &LifecycleDeleteRequest,
-        disposition: LifecycleDeleteDisposition,
+    /// cleanup purpose, exact key, optional multipart id, and disposition.
+    pub fn from_cleanup_request(
+        request: &LifecycleCleanupRequest,
+        disposition: LifecycleCleanupDisposition,
     ) -> Self {
         let mut hasher = Sha256::new();
-        hasher.update(b"nokv.lifecycle.object-absence-proof.v1\0");
+        hasher.update(b"nokv.lifecycle.object-cleanup-proof.v2\0");
         hash_part(&mut hasher, meta::SCHEMA_ID.as_bytes());
         hasher.update([match request.purpose {
-            LifecycleDeletePurpose::AbortedPublication => 1,
-            LifecycleDeletePurpose::RevisionGarbageCollection => 2,
+            LifecycleCleanupPurpose::AbortedPublication => 1,
+            LifecycleCleanupPurpose::RevisionGarbageCollection => 2,
+            LifecycleCleanupPurpose::AbortedAppend => 3,
         }]);
         hash_part(&mut hasher, request.object_key.as_bytes());
         match request.multipart_upload_id.as_deref() {
@@ -87,8 +97,9 @@ impl LifecycleAbsenceProof {
             }
         }
         hasher.update([match disposition {
-            LifecycleDeleteDisposition::Deleted => 1,
-            LifecycleDeleteDisposition::AlreadyAbsent => 2,
+            LifecycleCleanupDisposition::Deleted => 1,
+            LifecycleCleanupDisposition::AlreadyAbsent => 2,
+            LifecycleCleanupDisposition::Sealed => 3,
         }]);
         Self {
             disposition,
@@ -98,21 +109,21 @@ impl LifecycleAbsenceProof {
 }
 
 /// Provider failure classification. `Retryable` is legal only when the
-/// implementation knows deletion was not dispatched. Every uncertain outcome
+/// implementation knows cleanup was not dispatched. Every uncertain outcome
 /// must be `Ambiguous` so the owning metadata operation is quarantined.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LifecycleDeleteError {
+pub enum LifecycleCleanupError {
     Retryable { detail: String },
     Ambiguous { evidence: Vec<u8> },
 }
 
 /// Narrow provider boundary used by lifecycle workers. It deliberately has no
 /// list operation.
-pub trait LifecycleObjectDeleter: Send + Sync {
-    fn delete(
+pub trait LifecycleObjectCleaner: Send + Sync {
+    fn cleanup(
         &self,
-        request: &LifecycleDeleteRequest,
-    ) -> Result<LifecycleAbsenceProof, LifecycleDeleteError>;
+        request: &LifecycleCleanupRequest,
+    ) -> Result<LifecycleCleanupProof, LifecycleCleanupError>;
 }
 
 /// Required recovery barrier for background metadata mutations. A lifecycle
@@ -128,53 +139,68 @@ impl LifecycleDurabilityBarrier for RecoveryPublisher {
     }
 }
 
-/// Server-owned adapter from immutable object-store primitives to the durable
-/// lifecycle deletion contract.
+/// Server-owned adapter from object-store primitives to durable cleanup.
+/// Failed append cleanup permanently seals keys and never dispatches DELETE;
+/// ordinary publication and revision GC retain physical deletion semantics.
 ///
 /// The object boundary cannot prove that a failed destructive call was not
 /// dispatched, and it currently exposes no multipart-abort operation. Both
 /// cases therefore fail closed as ambiguous so the metadata operation is
 /// quarantined instead of retrying an uncertain deletion.
 #[derive(Clone)]
-pub struct ArtifactLifecycleDeleter<Store: ?Sized> {
+pub struct ArtifactLifecycleCleaner<Store: ?Sized> {
     store: Arc<Store>,
 }
 
-impl<Store: ?Sized> ArtifactLifecycleDeleter<Store> {
+impl<Store: ?Sized> ArtifactLifecycleCleaner<Store> {
     pub fn new(store: Arc<Store>) -> Self {
         Self { store }
     }
 }
 
-impl<Store> LifecycleObjectDeleter for ArtifactLifecycleDeleter<Store>
+impl<Store> LifecycleObjectCleaner for ArtifactLifecycleCleaner<Store>
 where
     Store: ArtifactObjectStore + Send + Sync + ?Sized,
 {
-    fn delete(
+    fn cleanup(
         &self,
-        request: &LifecycleDeleteRequest,
-    ) -> Result<LifecycleAbsenceProof, LifecycleDeleteError> {
+        request: &LifecycleCleanupRequest,
+    ) -> Result<LifecycleCleanupProof, LifecycleCleanupError> {
         if request.multipart_upload_id.is_some() {
-            return Err(LifecycleDeleteError::Ambiguous {
+            return Err(LifecycleCleanupError::Ambiguous {
                 evidence: b"configured object provider has no multipart-abort boundary".to_vec(),
             });
         }
         let key = ObjectKey::new(request.object_key.clone()).map_err(|error| {
-            LifecycleDeleteError::Ambiguous {
+            LifecycleCleanupError::Ambiguous {
                 evidence: format!("authoritative lifecycle object key is invalid: {error}")
                     .into_bytes(),
             }
         })?;
-        let disposition = match self.store.delete(&key) {
-            Ok(ObjectDeleteOutcome::Deleted) => LifecycleDeleteDisposition::Deleted,
-            Ok(ObjectDeleteOutcome::Absent) => LifecycleDeleteDisposition::AlreadyAbsent,
-            Err(error) => {
-                return Err(LifecycleDeleteError::Ambiguous {
-                    evidence: format!("object delete outcome is uncertain: {error}").into_bytes(),
-                });
+        let disposition = if request.purpose == LifecycleCleanupPurpose::AbortedAppend {
+            match self.store.seal_immutable(&key) {
+                Ok(ObjectSealOutcome::Sealed | ObjectSealOutcome::AlreadySealed) => {
+                    LifecycleCleanupDisposition::Sealed
+                }
+                Err(error) => {
+                    return Err(LifecycleCleanupError::Ambiguous {
+                        evidence: format!("object seal outcome is uncertain: {error}").into_bytes(),
+                    })
+                }
+            }
+        } else {
+            match self.store.delete(&key) {
+                Ok(ObjectDeleteOutcome::Deleted) => LifecycleCleanupDisposition::Deleted,
+                Ok(ObjectDeleteOutcome::Absent) => LifecycleCleanupDisposition::AlreadyAbsent,
+                Err(error) => {
+                    return Err(LifecycleCleanupError::Ambiguous {
+                        evidence: format!("object delete outcome is uncertain: {error}")
+                            .into_bytes(),
+                    })
+                }
             }
         };
-        Ok(LifecycleAbsenceProof::from_delete_request(
+        Ok(LifecycleCleanupProof::from_cleanup_request(
             request,
             disposition,
         ))
@@ -232,6 +258,7 @@ impl LifecycleRunnerOptions {
 pub struct LifecycleCycleReport {
     pub metadata_transitions: u64,
     pub provider_deletions: u64,
+    pub provider_seals: u64,
     pub quarantined_operations: u64,
     pub deferred_operations: u64,
 }
@@ -302,6 +329,7 @@ impl From<meta::MetaError> for LifecycleError {
 
 #[derive(Default)]
 struct LifecycleCursors {
+    publication_index_verified: bool,
     publish_operation: Option<Vec<u8>>,
     restore_operation: Option<Vec<u8>>,
     build_operation: Option<Vec<u8>>,
@@ -320,7 +348,7 @@ pub struct LifecycleRunner {
     registry: Arc<RootOwnerRegistry>,
     route: RootRoute,
     owner_loss: OwnerLossSignal,
-    objects: Arc<dyn LifecycleObjectDeleter>,
+    objects: Arc<dyn LifecycleObjectCleaner>,
     durability: Arc<dyn LifecycleDurabilityBarrier>,
     options: LifecycleRunnerOptions,
     cursors: Mutex<LifecycleCursors>,
@@ -334,7 +362,7 @@ impl LifecycleRunner {
         registry: Arc<RootOwnerRegistry>,
         route: RootRoute,
         owner_loss: OwnerLossSignal,
-        objects: Arc<dyn LifecycleObjectDeleter>,
+        objects: Arc<dyn LifecycleObjectCleaner>,
         durability: Arc<dyn LifecycleDurabilityBarrier>,
         options: LifecycleRunnerOptions,
     ) -> Result<Self, LifecycleError> {
@@ -401,6 +429,13 @@ impl LifecycleRunner {
                 .lock()
                 .map_err(|_| LifecycleError::WorkerLockPoisoned)?;
             let mut report = LifecycleCycleReport::default();
+            if !cursors.publication_index_verified {
+                let context = self.publication_context(b"verify-append-publication-state", &[])?;
+                meta::PublicationService::new(&self.meta)
+                    .verify_append_publication_state(context)
+                    .map_err(|error| state("verify append publication state", error))?;
+                cursors.publication_index_verified = true;
+            }
             self.recover_publications(&mut cursors, observed_now_ms, &mut report)?;
             self.reap_snapshots(&mut cursors, observed_now_ms, &mut report)?;
             self.recover_restores(&mut cursors, &mut report)?;
@@ -511,7 +546,7 @@ impl LifecycleRunner {
         observed_now_ms: u64,
         report: &mut LifecycleCycleReport,
     ) -> Result<(), LifecycleError> {
-        let prefix = meta::operation_prefix(self.root_id(), OperationKind::Publish);
+        let prefix = meta::operation_prefix(self.root_id(), OperationKind::ActivePublish);
         let rows = self.scan_page(
             meta::MetadataFamily::Operation,
             &prefix,
@@ -524,9 +559,25 @@ impl LifecycleRunner {
         );
         for item in rows {
             let operation_id =
-                meta::decode_operation_key(self.root_id(), OperationKind::Publish, &item.key)
+                meta::decode_operation_key(self.root_id(), OperationKind::ActivePublish, &item.key)
                     .ok_or_else(|| corrupt("publish operation key", "malformed root/kind key"))?;
-            let operation = meta::PublishOperationRecord::decode(&item.value)
+            if item.value != [1] {
+                return Err(corrupt("active publish index", "unknown marker encoding"));
+            }
+            let context = self.read_context()?;
+            let key = meta::operation_key(self.root_id(), OperationKind::Publish, operation_id);
+            let payload = self
+                .meta
+                .read_at(
+                    context.root_id,
+                    context.placement_generation,
+                    context.owner_epoch,
+                    meta::MetadataFamily::Operation,
+                    &key,
+                    context.read_version,
+                )?
+                .ok_or_else(|| corrupt("active publish index", "canonical operation is absent"))?;
+            let operation = meta::PublishOperationRecord::decode(&payload)
                 .map_err(|error| corrupt("publish operation", error.to_string()))?;
             if operation.operation_id != operation_id {
                 return Err(corrupt(
@@ -680,8 +731,9 @@ impl LifecycleRunner {
                 let sequence = operation.cleanup_staged_object_cursor
                     + u32::try_from(offset).expect("bounded batch offset fits u32");
                 let expected = self.read_staged_object(operation.operation_id, sequence)?;
-                if matches!(expected.provider_state, StagedProviderState::Ambiguous)
-                    || matches!(expected.cleanup_state, StagedCleanupState::Quarantined)
+                if operation.append_attempt.is_none()
+                    && (matches!(expected.provider_state, StagedProviderState::Ambiguous)
+                        || matches!(expected.cleanup_state, StagedCleanupState::Quarantined))
                 {
                     return self.quarantine_publication(
                         operation,
@@ -689,34 +741,89 @@ impl LifecycleRunner {
                         report,
                     );
                 }
-                if !matches!(
-                    (expected.provider_state, expected.cleanup_state),
-                    (StagedProviderState::Aborted, StagedCleanupState::Deleted)
-                ) {
+                let append = operation.append_attempt.is_some();
+                if expected.object_sequence != sequence
+                    || expected.artifact_revision_id != operation.artifact_revision_id
+                    || expected.object_key
+                        != meta::object_block_key(
+                            self.route.logical_shard_id.into(),
+                            self.root_id(),
+                            operation.artifact_revision_id,
+                            u64::from(sequence),
+                        )
+                {
+                    return Err(corrupt(
+                        "staged object",
+                        "cleanup key is outside the admitted root/revision/sequence",
+                    ));
+                }
+                let completed_cleanup = if append {
+                    StagedCleanupState::Sealed
+                } else {
+                    StagedCleanupState::Deleted
+                };
+                if expected.provider_state != StagedProviderState::Aborted
+                    || expected.cleanup_state != completed_cleanup
+                {
                     self.require_current_owner()?;
                     self.publish_current()?;
                     #[cfg(test)]
                     self.run_before_provider_delete_test_hook();
                     let _operation_permit = self.enter_destructive_operation()?;
-                    let request = LifecycleDeleteRequest {
-                        purpose: LifecycleDeletePurpose::AbortedPublication,
+                    if append {
+                        let encoded = operation
+                            .encode()
+                            .map_err(|error| corrupt("publish operation", error.to_string()))?;
+                        let context = self
+                            .publication_context(b"append-cleanup-provider-authority", &encoded)?;
+                        match service.validate_append_cleanup_authority(context, &operation) {
+                            Ok(()) => {}
+                            Err(error) if publication_concurrent(&error) => {
+                                report.deferred_operations += 1;
+                                return Ok(());
+                            }
+                            Err(error) => {
+                                return Err(state("authorize append object sealing", error))
+                            }
+                        }
+                    }
+                    let request = LifecycleCleanupRequest {
+                        purpose: if append {
+                            LifecycleCleanupPurpose::AbortedAppend
+                        } else {
+                            LifecycleCleanupPurpose::AbortedPublication
+                        },
                         object_key: expected.object_key.clone(),
                         multipart_upload_id: expected.multipart_upload_id.clone(),
                     };
-                    match self.objects.delete(&request) {
-                        Ok(_) => report.provider_deletions += 1,
-                        Err(LifecycleDeleteError::Retryable { .. }) => {
+                    match self.objects.cleanup(&request) {
+                        Ok(proof) if proof.matches_request(&request) => {
+                            if append {
+                                report.provider_seals += 1;
+                            } else {
+                                report.provider_deletions += 1;
+                            }
+                        }
+                        Ok(_) => {
+                            return self.quarantine_publication(
+                                operation,
+                                b"provider cleanup proof does not match the requested purpose"
+                                    .to_vec(),
+                                report,
+                            )
+                        }
+                        Err(LifecycleCleanupError::Retryable { .. }) => {
                             report.deferred_operations += 1;
                             return Ok(());
                         }
-                        Err(LifecycleDeleteError::Ambiguous { evidence }) => {
+                        Err(LifecycleCleanupError::Ambiguous { evidence }) => {
                             return self.quarantine_publication(operation, evidence, report);
                         }
                     }
                 }
                 let mut next = expected.clone();
                 next.provider_state = StagedProviderState::Aborted;
-                next.cleanup_state = StagedCleanupState::Deleted;
+                next.cleanup_state = completed_cleanup;
                 updates.push(meta::StagedObjectUpdate { expected, next });
             }
             let encoded = operation
@@ -1401,21 +1508,29 @@ impl LifecycleRunner {
                 #[cfg(test)]
                 self.run_before_provider_delete_test_hook();
                 let _operation_permit = self.enter_destructive_operation()?;
-                let request = LifecycleDeleteRequest {
-                    purpose: LifecycleDeletePurpose::RevisionGarbageCollection,
+                let request = LifecycleCleanupRequest {
+                    purpose: LifecycleCleanupPurpose::RevisionGarbageCollection,
                     object_key: entry.row.object_key.clone(),
                     multipart_upload_id: None,
                 };
-                match self.objects.delete(&request) {
-                    Ok(proof) => {
+                match self.objects.cleanup(&request) {
+                    Ok(proof) if proof.matches_request(&request) => {
                         report.provider_deletions += 1;
                         Some(proof.digest)
                     }
-                    Err(LifecycleDeleteError::Retryable { .. }) => {
+                    Ok(_) => {
+                        return self.quarantine_gc(
+                            operation,
+                            b"provider cleanup proof does not prove revision object absence"
+                                .to_vec(),
+                            report,
+                        )
+                    }
+                    Err(LifecycleCleanupError::Retryable { .. }) => {
                         report.deferred_operations += 1;
                         return Ok(());
                     }
-                    Err(LifecycleDeleteError::Ambiguous { evidence }) => {
+                    Err(LifecycleCleanupError::Ambiguous { evidence }) => {
                         return self.quarantine_gc(operation, evidence, report);
                     }
                 }
@@ -1886,11 +2001,51 @@ mod tests {
         }
     }
 
-    fn lifecycle_delete_request() -> LifecycleDeleteRequest {
-        LifecycleDeleteRequest {
-            purpose: LifecycleDeletePurpose::RevisionGarbageCollection,
+    fn lifecycle_delete_request() -> LifecycleCleanupRequest {
+        LifecycleCleanupRequest {
+            purpose: LifecycleCleanupPurpose::RevisionGarbageCollection,
             object_key: "nokv/artifacts/object".to_owned(),
             multipart_upload_id: None,
+        }
+    }
+
+    #[test]
+    fn aborted_append_cleanup_seals_without_delete_and_rejects_late_create() {
+        for already_uploaded in [false, true] {
+            let store = Arc::new(nokv_object::MemoryArtifactStore::new());
+            let key = ObjectKey::new("test/failed-append-key".to_owned()).unwrap();
+            if already_uploaded {
+                store.create_immutable(&key, b"delayed payload").unwrap();
+            }
+            let cleaner = ArtifactLifecycleCleaner::new(Arc::clone(&store));
+            let request = LifecycleCleanupRequest {
+                purpose: LifecycleCleanupPurpose::AbortedAppend,
+                object_key: key.as_str().to_owned(),
+                multipart_upload_id: None,
+            };
+            for _ in 0..2 {
+                let proof = cleaner.cleanup(&request).unwrap();
+                assert_eq!(proof.disposition, LifecycleCleanupDisposition::Sealed);
+                assert!(proof.matches_request(&request));
+                assert_eq!(store.head(&key).unwrap().unwrap().size, 0);
+                assert!(matches!(
+                    store.create_immutable(&key, b"delayed payload"),
+                    Err(ObjectError::ImmutableCollision { .. })
+                ));
+            }
+            assert_eq!(store.stats().unwrap().deletes, 0);
+            let absence = LifecycleCleanupProof::from_cleanup_request(
+                &request,
+                LifecycleCleanupDisposition::AlreadyAbsent,
+            );
+            assert!(!absence.matches_request(&request));
+            let mut gc = request.clone();
+            gc.purpose = LifecycleCleanupPurpose::RevisionGarbageCollection;
+            let sealed = LifecycleCleanupProof::from_cleanup_request(
+                &gc,
+                LifecycleCleanupDisposition::Sealed,
+            );
+            assert!(!sealed.matches_request(&gc));
         }
     }
 
@@ -1900,17 +2055,17 @@ mod tests {
             delete_result: Ok(ObjectDeleteOutcome::Deleted),
             delete_calls: AtomicUsize::new(0),
         });
-        let deleter = ArtifactLifecycleDeleter::new(Arc::clone(&store));
+        let deleter = ArtifactLifecycleCleaner::new(Arc::clone(&store));
         let request = lifecycle_delete_request();
 
-        let proof = deleter.delete(&request).unwrap();
+        let proof = deleter.cleanup(&request).unwrap();
 
-        assert_eq!(proof.disposition, LifecycleDeleteDisposition::Deleted);
+        assert_eq!(proof.disposition, LifecycleCleanupDisposition::Deleted);
         assert_eq!(
             proof,
-            LifecycleAbsenceProof::from_delete_request(
+            LifecycleCleanupProof::from_cleanup_request(
                 &request,
-                LifecycleDeleteDisposition::Deleted,
+                LifecycleCleanupDisposition::Deleted,
             )
         );
         assert_eq!(store.delete_calls.load(Ordering::SeqCst), 1);
@@ -1922,12 +2077,15 @@ mod tests {
             delete_result: Ok(ObjectDeleteOutcome::Absent),
             delete_calls: AtomicUsize::new(0),
         });
-        let deleter = ArtifactLifecycleDeleter::new(Arc::clone(&store));
+        let deleter = ArtifactLifecycleCleaner::new(Arc::clone(&store));
         let request = lifecycle_delete_request();
 
-        let proof = deleter.delete(&request).unwrap();
+        let proof = deleter.cleanup(&request).unwrap();
 
-        assert_eq!(proof.disposition, LifecycleDeleteDisposition::AlreadyAbsent);
+        assert_eq!(
+            proof.disposition,
+            LifecycleCleanupDisposition::AlreadyAbsent
+        );
         assert_eq!(store.delete_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -1937,13 +2095,13 @@ mod tests {
             delete_result: Ok(ObjectDeleteOutcome::Deleted),
             delete_calls: AtomicUsize::new(0),
         });
-        let deleter = ArtifactLifecycleDeleter::new(Arc::clone(&store));
+        let deleter = ArtifactLifecycleCleaner::new(Arc::clone(&store));
         let mut request = lifecycle_delete_request();
         request.multipart_upload_id = Some(b"upload-id".to_vec());
 
-        let error = deleter.delete(&request).unwrap_err();
+        let error = deleter.cleanup(&request).unwrap_err();
 
-        assert!(matches!(error, LifecycleDeleteError::Ambiguous { .. }));
+        assert!(matches!(error, LifecycleCleanupError::Ambiguous { .. }));
         assert_eq!(store.delete_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1957,11 +2115,11 @@ mod tests {
             }),
             delete_calls: AtomicUsize::new(0),
         });
-        let deleter = ArtifactLifecycleDeleter::new(Arc::clone(&store));
+        let deleter = ArtifactLifecycleCleaner::new(Arc::clone(&store));
 
-        let error = deleter.delete(&lifecycle_delete_request()).unwrap_err();
+        let error = deleter.cleanup(&lifecycle_delete_request()).unwrap_err();
 
-        assert!(matches!(error, LifecycleDeleteError::Ambiguous { .. }));
+        assert!(matches!(error, LifecycleCleanupError::Ambiguous { .. }));
         assert_eq!(store.delete_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -1971,11 +2129,11 @@ mod tests {
         object_keys: Mutex<Vec<String>>,
     }
 
-    impl LifecycleObjectDeleter for FakeDeleter {
-        fn delete(
+    impl LifecycleObjectCleaner for FakeDeleter {
+        fn cleanup(
             &self,
-            request: &LifecycleDeleteRequest,
-        ) -> Result<LifecycleAbsenceProof, LifecycleDeleteError> {
+            request: &LifecycleCleanupRequest,
+        ) -> Result<LifecycleCleanupProof, LifecycleCleanupError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.object_keys
                 .lock()
@@ -1983,16 +2141,16 @@ mod tests {
                 .push(request.object_key.clone());
             assert_eq!(
                 request.purpose,
-                LifecycleDeletePurpose::RevisionGarbageCollection
+                LifecycleCleanupPurpose::RevisionGarbageCollection
             );
             if self.ambiguous {
-                Err(LifecycleDeleteError::Ambiguous {
+                Err(LifecycleCleanupError::Ambiguous {
                     evidence: b"provider timed out after delete dispatch".to_vec(),
                 })
             } else {
-                Ok(LifecycleAbsenceProof::from_delete_request(
+                Ok(LifecycleCleanupProof::from_cleanup_request(
                     request,
-                    LifecycleDeleteDisposition::Deleted,
+                    LifecycleCleanupDisposition::Deleted,
                 ))
             }
         }
@@ -2043,8 +2201,38 @@ mod tests {
         store: &meta::MetaShard,
         request: u8,
         action: meta::RootFenceAction,
-        mutations: Vec<meta::CommandMutation>,
+        mut mutations: Vec<meta::CommandMutation>,
     ) -> meta::MetadataCommand {
+        // Fixtures seed complete current-format state, including the active
+        // publication index maintained atomically by production admission.
+        let active = mutations
+            .iter()
+            .filter_map(|mutation| {
+                let meta::CommandMutation::Put {
+                    family: meta::MetadataFamily::Operation,
+                    key,
+                    value,
+                } = mutation
+                else {
+                    return None;
+                };
+                let id = meta::decode_operation_key(root(), OperationKind::Publish, key)?;
+                let operation = meta::PublishOperationRecord::decode(value).ok()?;
+                matches!(
+                    operation.phase,
+                    PublishPhase::Uploading
+                        | PublishPhase::Finalizing
+                        | PublishPhase::Aborting
+                        | PublishPhase::Cleaning
+                )
+                .then(|| meta::CommandMutation::Put {
+                    family: meta::MetadataFamily::Operation,
+                    key: meta::operation_key(root(), OperationKind::ActivePublish, id),
+                    value: vec![1],
+                })
+            })
+            .collect::<Vec<_>>();
+        mutations.extend(active);
         let predicates = mutations
             .iter()
             .map(|mutation| match mutation {
@@ -2340,29 +2528,29 @@ mod tests {
     }
 
     #[test]
-    fn absence_proof_constructor_is_deterministic_and_domain_separated() {
-        let request = LifecycleDeleteRequest {
-            purpose: LifecycleDeletePurpose::AbortedPublication,
+    fn cleanup_proof_constructor_is_deterministic_and_domain_separated() {
+        let request = LifecycleCleanupRequest {
+            purpose: LifecycleCleanupPurpose::AbortedPublication,
             object_key: "nokv/artifacts/01010101010101010101010101010101/02020202020202020202020202020202/03030303030303030303030303030303/blocks/0000000000000007".to_owned(),
             multipart_upload_id: Some(b"multipart-7".to_vec()),
         };
-        let proof = LifecycleAbsenceProof::from_delete_request(
+        let proof = LifecycleCleanupProof::from_cleanup_request(
             &request,
-            LifecycleDeleteDisposition::Deleted,
+            LifecycleCleanupDisposition::Deleted,
         );
         assert_eq!(
             proof.digest,
             [
-                0xc0, 0x04, 0xeb, 0x4f, 0x8c, 0x10, 0x64, 0x40, 0x85, 0xfd, 0xce, 0x1a, 0xc8, 0x95,
-                0xd4, 0x94, 0xa2, 0xd0, 0x19, 0x4a, 0xd0, 0xa1, 0xcb, 0x64, 0xba, 0x03, 0x86, 0xa2,
-                0x21, 0x88, 0xb9, 0x85,
+                0xdd, 0xcf, 0x71, 0xa4, 0x41, 0x4e, 0x6c, 0x96, 0xc9, 0x0a, 0x30, 0xf1, 0xc2, 0x28,
+                0x78, 0x54, 0x50, 0x2e, 0x2c, 0x3f, 0x15, 0x56, 0x2c, 0xf8, 0xbd, 0xed, 0xd2, 0x69,
+                0xd0, 0x33, 0x7c, 0xe1
             ]
         );
         assert_eq!(
             proof,
-            LifecycleAbsenceProof::from_delete_request(
+            LifecycleCleanupProof::from_cleanup_request(
                 &request,
-                LifecycleDeleteDisposition::Deleted,
+                LifecycleCleanupDisposition::Deleted,
             )
         );
         let unbound_key_digest: [u8; SHA256_BYTES] =
@@ -2370,12 +2558,12 @@ mod tests {
         assert_ne!(proof.digest, unbound_key_digest);
 
         let mut changed = request.clone();
-        changed.purpose = LifecycleDeletePurpose::RevisionGarbageCollection;
+        changed.purpose = LifecycleCleanupPurpose::RevisionGarbageCollection;
         assert_ne!(
             proof.digest,
-            LifecycleAbsenceProof::from_delete_request(
+            LifecycleCleanupProof::from_cleanup_request(
                 &changed,
-                LifecycleDeleteDisposition::Deleted,
+                LifecycleCleanupDisposition::Deleted,
             )
             .digest
         );
@@ -2383,17 +2571,17 @@ mod tests {
         changed.multipart_upload_id = None;
         assert_ne!(
             proof.digest,
-            LifecycleAbsenceProof::from_delete_request(
+            LifecycleCleanupProof::from_cleanup_request(
                 &changed,
-                LifecycleDeleteDisposition::Deleted,
+                LifecycleCleanupDisposition::Deleted,
             )
             .digest
         );
         assert_ne!(
             proof.digest,
-            LifecycleAbsenceProof::from_delete_request(
+            LifecycleCleanupProof::from_cleanup_request(
                 &request,
-                LifecycleDeleteDisposition::AlreadyAbsent,
+                LifecycleCleanupDisposition::AlreadyAbsent,
             )
             .digest
         );
@@ -2640,14 +2828,14 @@ mod tests {
         calls: AtomicUsize,
     }
 
-    impl LifecycleObjectDeleter for BlockingDeleter {
-        fn delete(
+    impl LifecycleObjectCleaner for BlockingDeleter {
+        fn cleanup(
             &self,
-            request: &LifecycleDeleteRequest,
-        ) -> Result<LifecycleAbsenceProof, LifecycleDeleteError> {
+            request: &LifecycleCleanupRequest,
+        ) -> Result<LifecycleCleanupProof, LifecycleCleanupError> {
             assert_eq!(
                 request.purpose,
-                LifecycleDeletePurpose::RevisionGarbageCollection,
+                LifecycleCleanupPurpose::RevisionGarbageCollection,
             );
 
             if let Some(entered) = self
@@ -2669,9 +2857,9 @@ mod tests {
 
             self.calls.fetch_add(1, Ordering::SeqCst);
 
-            Ok(LifecycleAbsenceProof::from_delete_request(
+            Ok(LifecycleCleanupProof::from_cleanup_request(
                 request,
-                LifecycleDeleteDisposition::Deleted,
+                LifecycleCleanupDisposition::Deleted,
             ))
         }
     }
@@ -2849,16 +3037,16 @@ mod tests {
         calls: AtomicUsize,
     }
 
-    impl LifecycleObjectDeleter for AbortedCleanupRaceDeleter {
-        fn delete(
+    impl LifecycleObjectCleaner for AbortedCleanupRaceDeleter {
+        fn cleanup(
             &self,
-            request: &LifecycleDeleteRequest,
-        ) -> Result<LifecycleAbsenceProof, LifecycleDeleteError> {
-            assert_eq!(request.purpose, LifecycleDeletePurpose::AbortedPublication);
+            request: &LifecycleCleanupRequest,
+        ) -> Result<LifecycleCleanupProof, LifecycleCleanupError> {
+            assert_eq!(request.purpose, LifecycleCleanupPurpose::AbortedPublication);
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(LifecycleAbsenceProof::from_delete_request(
+            Ok(LifecycleCleanupProof::from_cleanup_request(
                 request,
-                LifecycleDeleteDisposition::Deleted,
+                LifecycleCleanupDisposition::Deleted,
             ))
         }
     }
@@ -2921,6 +3109,8 @@ mod tests {
             cleanup_state: StagedCleanupState::Owned,
         }];
         let mut operation = meta::PublishOperationRecord {
+            append_attempt: None,
+            append_intent_digest: None,
             operation_id: OperationId::from_bytes([0x74; FIXED_ID_BYTES]),
             identity_digest: [0; SHA256_BYTES],
             initialization_digest: [0; SHA256_BYTES],
@@ -2949,6 +3139,7 @@ mod tests {
             dependency_digest: meta::dependency_owner_digest(&[]).unwrap(),
             cleanup_staged_object_cursor: 0,
             cleanup_manifest_cursor: 0,
+            cleanup_retry_count: 0,
             publication_absence_proof: None,
             result: None,
             terminal_error: None,
@@ -3230,6 +3421,8 @@ mod tests {
 
         let operation_id = OperationId::from_bytes([0x44; FIXED_ID_BYTES]);
         let mut operation = meta::PublishOperationRecord {
+            append_attempt: None,
+            append_intent_digest: None,
             operation_id,
             identity_digest: [0; SHA256_BYTES],
             initialization_digest: [0; SHA256_BYTES],
@@ -3258,6 +3451,7 @@ mod tests {
             dependency_digest: meta::dependency_owner_digest(&[]).unwrap(),
             cleanup_staged_object_cursor: 0,
             cleanup_manifest_cursor: 0,
+            cleanup_retry_count: 0,
             publication_absence_proof: None,
             result: None,
             terminal_error: None,
@@ -3515,6 +3709,8 @@ mod tests {
         }];
         let template = |operation_id_byte: u8| {
             let mut operation = meta::PublishOperationRecord {
+                append_attempt: None,
+                append_intent_digest: None,
                 operation_id: OperationId::from_bytes([operation_id_byte; FIXED_ID_BYTES]),
                 identity_digest: [0; SHA256_BYTES],
                 initialization_digest: [0; SHA256_BYTES],
@@ -3543,6 +3739,7 @@ mod tests {
                 dependency_digest: meta::dependency_owner_digest(&[]).unwrap(),
                 cleanup_staged_object_cursor: 0,
                 cleanup_manifest_cursor: 0,
+                cleanup_retry_count: 0,
                 publication_absence_proof: None,
                 result: None,
                 terminal_error: None,
@@ -3693,7 +3890,7 @@ mod tests {
             registry,
             route(),
             OwnerLossSignal::default(),
-            Arc::new(ArtifactLifecycleDeleter::new(Arc::clone(&objects))),
+            Arc::new(ArtifactLifecycleCleaner::new(Arc::clone(&objects))),
             test_durability(),
             LifecycleRunnerOptions {
                 scan_page_size: 8,
@@ -3811,6 +4008,8 @@ mod tests {
         }];
         let template = |operation_id_byte: u8| {
             let mut operation = meta::PublishOperationRecord {
+                append_attempt: None,
+                append_intent_digest: None,
                 operation_id: OperationId::from_bytes([operation_id_byte; FIXED_ID_BYTES]),
                 identity_digest: [0; SHA256_BYTES],
                 initialization_digest: [0; SHA256_BYTES],
@@ -3839,6 +4038,7 @@ mod tests {
                 dependency_digest: meta::dependency_owner_digest(&[]).unwrap(),
                 cleanup_staged_object_cursor: 0,
                 cleanup_manifest_cursor: 0,
+                cleanup_retry_count: 0,
                 publication_absence_proof: None,
                 result: None,
                 terminal_error: None,
@@ -4015,7 +4215,7 @@ mod tests {
             registry,
             route(),
             OwnerLossSignal::default(),
-            Arc::new(ArtifactLifecycleDeleter::new(Arc::clone(&objects))),
+            Arc::new(ArtifactLifecycleCleaner::new(Arc::clone(&objects))),
             test_durability(),
             LifecycleRunnerOptions {
                 scan_page_size: 8,
