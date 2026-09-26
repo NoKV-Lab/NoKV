@@ -6,7 +6,8 @@ SPDX-License-Identifier: Apache-2.0
 # Metadata Store Interface
 
 Implemented: the storage-neutral interface, local Holt adapter, and `MetaShard`
-cutover. The serving local profile uses Holt through `TxnStore`. Pending:
+cutover. The serving local profile uses the pinned Holt 0.8.6 dependency through
+`TxnStore`. Pending:
 FoundationDB, replicated Holt, provider-neutral runtime admission, and
 owner-safe response delivery.
 
@@ -398,9 +399,15 @@ create/reopen/replace/remove for both a short path with a 61,203-byte typed
 projection and a maximum-length path with 64 dependencies and a 57,243-byte
 projection. A separate successful replacement changes all 60 index fields at
 once: the before/after event is 61,323 bytes and the fully derived transaction
-is 9,859,091 bytes. The short-path replace-to-empty and remove transactions are
-also pinned at 11,797,794 and 11,791,459 bytes. These are characterized storage
-and metadata-engine compatibility results, not a universal domain-size proof.
+is 9,861,120 bytes. The short-path replace-to-empty and remove transactions are
+also pinned at 11,799,847 and 11,793,075 bytes in the current source fixtures.
+Append's parent/child receipt, active-publication marker, and cleanup retry
+state participate in this same budget, including history and recovery-outbox
+amplification. The metadata command item bound is 260 and its recovery codec
+uses the same bound; the complete maximum-path/dependency/index append fixture
+checks the derived transaction against the unchanged serving limits. These are
+characterized storage and metadata-engine compatibility results, not a
+universal domain-size proof.
 The local-WAL server qualifies restart of the same exclusive namespace with an
 empty shared recovery frontier. It does not qualify rolling upgrade onto
 another store, copied-directory recovery, or checkpoint/log failover.
@@ -458,6 +465,13 @@ fresh location. The adapter does not complete a partial tree catalog.
 Existing mode requires the exact configured catalog. It must reject any
 unmarked namespace that contains domain records.
 
+For the current system format 13 and publication value format 7, the server
+first opens an existing Holt namespace read-only and asks `MetaShard` to verify
+its schema, identity, and recovery chain. Only a successful inspection permits
+writable recovery. Rejection during this read-only inspection does not trigger
+writable recovery or checkpoint an incompatible store on disk. This is an
+admission check, not a migration or a new runtime adapter profile.
+
 The target server configuration is tagged. It does not encode cluster
 files, credentials, or namespace settings into a provider URI. A missing build
 feature causes a startup error and never falls back to Holt.
@@ -477,8 +491,10 @@ attach_root
 1. Validate the open mode, root placements, control record, and shared recovery
    frontier.
 2. Before any new acquisition, initialize or exclusively reopen the explicit
-   local namespace. Holt replays its WAL; `MetaShard` validates the catalog,
-   schema, logical-shard identity, system rows, and full recovery-outbox chain.
+   local namespace. An existing namespace first receives the read-only
+   inspection above; writable Holt recovery then replays its WAL. The Holt
+   adapter validates the catalog; `MetaShard` validates the schema,
+   logical-shard identity, system rows, and full recovery-outbox chain.
 3. Compare the local owner fence with the durable control state. A normal
    successor requires the exact previous epoch. An interrupted `Recovering`
    attempt accepts only that recovery epoch or its immediate predecessor.

@@ -5,9 +5,11 @@ SPDX-License-Identifier: Apache-2.0
 
 # Workbench Validation
 
-These assets validate the same 18-tool Workbench semantics exported by
-`crates/nokv-agent`. The native full CLI is the primary integration surface,
-and the direct Python SDK is second for embedded callers.
+These assets validate the 18-tool Workbench semantics exported by
+`crates/nokv-agent` and separate native workspace APIs, including stable append.
+The native full CLI is the primary integration surface, and the direct Python
+SDK is second for embedded callers. The append gates do not extend the frozen
+tool schema or the deprecated sidecar.
 
 Several runners here still reach the 18 tools through a `nokv mcp` child
 process. That sidecar is deprecated and is not a supported NoKV integration
@@ -116,6 +118,89 @@ The deployment must provide one persisted `RootId` placement, its
 `LogicalShardId`, current placement generation and owner epoch, a reachable
 metadata owner, and S3-compatible artifact credentials. Unknown or mixed
 metadata schemas are rejected; the sole marker is `nokv_workspace`.
+
+## Stable Append Gates
+
+These runners exercise native CLI append and the installed Python SDK. Setup
+uses native Workbench commands; no append scenario is driven through MCP.
+Their contract is the [append specification](../../docs/development/append-product-spec.md),
+with a [dated qualification record](../../docs/development/append-qualification.md).
+
+| Runner | Purpose | Qualification boundary |
+| --- | --- | --- |
+| [append_identity_recovery_gate.py](./append_identity_recovery_gate.py) | Reproduce duplicate append after lost success, owner death, and a new invocation; also supplies shared stack helpers. | Its `qualified` mode records the earlier single-attempt design. It is historical safety evidence, not the current completion or operator gate. |
+| [append_product_acceptance_gate.py](./append_product_acceptance_gate.py) | 21 scenarios covering identity, completion, real provider faults, limits, CLI/Python parity, and old-format rejection. | Bounded append on one local Holt authority and real RustFS; full execution requires the matching Python SDK and a frozen previous-format binary. |
+| [append_operations_acceptance_gate.py](./append_operations_acceptance_gate.py) | Four public inspection/recovery scenarios, including pagination, cleaned prefixes, concurrent recovery, ACK loss, ABA, stale former-child cursors, and owner death during seal. | Metadata-only public CLI/Python recovery with owner-executed sealing; one quarantine scenario overlaps the core gate. |
+
+Install `etcd`, `etcdctl`, AWS CLI, and Docker on `PATH`, with Docker running.
+The runners create isolated etcd, a digest-pinned RustFS container and volume,
+fresh buckets, and a Holt owner. Use a fresh evidence directory for every run;
+keep original failures and frozen binaries. Run Python without `-O`, `-OO`, or
+`PYTHONOPTIMIZE`; the historical identity runner uses assertions.
+
+Build and freeze the CLI and Python wheel from the same clean source revision,
+then install that wheel into an isolated Python environment. The runners do
+not build or install them. Set these paths for your checkout and artifacts:
+
+```bash
+NOKV_APPEND_SOURCE="$PWD"
+NOKV_APPEND_BIN=/absolute/path/to/frozen-nokv
+NOKV_APPEND_PYTHON=/absolute/path/to/isolated-env/bin/python
+NOKV_PREVIOUS_FORMAT_BIN=/absolute/path/to/frozen-e5f81daf68-nokv
+NOKV_APPEND_EVIDENCE="$PWD/target/append-acceptance/new-run"
+
+python3 scripts/workbench/append_product_acceptance_gate.py \
+  --source-dir "$NOKV_APPEND_SOURCE" \
+  --nokv-bin "$NOKV_APPEND_BIN" \
+  --python-executable "$NOKV_APPEND_PYTHON" \
+  --legacy-nokv-bin "$NOKV_PREVIOUS_FORMAT_BIN" \
+  --evidence-dir "$NOKV_APPEND_EVIDENCE/product" \
+  --scenario all --replay-count 100 \
+  --append-activity-lease-ms 1000 \
+  --completion-timeout-seconds 90 --timeout-seconds 120
+
+python3 scripts/workbench/append_operations_acceptance_gate.py \
+  --source-dir "$NOKV_APPEND_SOURCE" \
+  --nokv-bin "$NOKV_APPEND_BIN" \
+  --python-executable "$NOKV_APPEND_PYTHON" \
+  --evidence-dir "$NOKV_APPEND_EVIDENCE/operations" \
+  --scenario all --append-activity-lease-ms 1000 \
+  --completion-timeout-seconds 90 --timeout-seconds 120
+```
+
+The previous-format fixture is RPC v11/system format 12 (`e5f81daf68` in the
+recorded run); it is distinct from the original duplicate-append baseline.
+To reproduce that earlier defect with a preserved pre-feature binary:
+
+```bash
+python3 scripts/workbench/append_identity_recovery_gate.py \
+  --source-dir "$NOKV_APPEND_SOURCE" \
+  --nokv-bin /absolute/path/to/frozen-pre-feature-nokv \
+  --mode baseline \
+  --evidence-dir "$NOKV_APPEND_EVIDENCE/historical-red"
+```
+
+The baseline records the binary's embedded build head separately from the
+current helper source head; do not relabel them as equal. The product gate
+creates the old-format fixture with its old binary, checks rejection without
+file changes, and reads it back with that old binary. It does not migrate it.
+
+Inspect `product-results.json` or `operations-results.json`: both safety and
+completion must pass, `all_listed_scenarios_executed` must be true, and
+`qualified_scopes` must contain the requested matrix. A selected subset, missing
+Python, or missing required baseline is not full qualification. The per-gate
+result identifies the executed harness; `environment.json` identifies the
+shared identity-gate stack helper separately. Retain both hashes, binary and
+extension identities, source manifests, fault transcripts, exact readbacks,
+and `cleanup.json`.
+
+The 1,000 ms activity lease is a supported test configuration, followed by the
+normal 30-second grace; observed duration is not the default recovery latency
+or an SLA. Same-directory Holt reopen is not cross-host HA. The new full 21 + 4
+matrix was run locally; the dated remote NoKV workflows run their existing
+suite, while a separate demo workflow tests actual Linux queue redelivery.
+These results do not alter the frozen pre-#423 qualification ledger or resolve
+the complete Workbench Gate 0.
 
 ## Live Workbench evidence
 

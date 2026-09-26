@@ -43,6 +43,43 @@ git diff --check
 The contract check proves only the exact 18 names and normalized input schemas.
 It does not qualify persistence, object I/O, failover, restore, or latency.
 
+## Stable Append Deployment
+
+For cross-process append retries, use native `workspace-path append` and
+`operation status|inspect|recover`, or their direct Python SDK equivalents.
+The frozen `workbench_append` tool has no caller-supplied stable id and is not
+a durable queue's redelivery boundary. See the [append guide](./append.md).
+
+Stable append requires the current RPC v12, system format 13, and publication
+value format 7. Its public cleanup APIs require `artifact_append_recovery_v1`.
+Use matching owner, CLI, and Python builds; old formats are rejected before
+modification, not automatically migrated. Record the linked backend from
+`nokv version --json`: the qualified build uses registry Holt 0.8.6, which is
+independent of a developer's local Holt checkout.
+
+In addition to ordinary write admission, the concrete object-provider handle
+must pass append seal admission: conditional creation and replacement of a
+zero-byte guard must prevent a delayed create-if-absent PUT from resurrecting
+an aborted revision. Preserve those guards and failed revision reservations.
+External deletion, overwrite, or bucket expiration of guards breaks this
+contract. A provider's brand alone does not establish conformance.
+
+Persist the logical id, root, complete intent, and delta before dispatch. For
+quarantined cleanup, inspect publicly, save `operation_token.state_digest`,
+then call `operation recover` with that digest on every retry of the same
+recovery request. Status, inspection, and recovery need metadata routing but
+no caller-side S3 credentials or delta. The owner still needs a healthy,
+admitted provider to finish cleanup. `requested=true` acknowledges recovery
+admission; the queue may acknowledge its event only after append commitment.
+
+The server's `--append-activity-lease-ms` defaults to 1,800,000 ms and accepts
+1,000 through 86,400,000 ms, with an additional 30-second clock grace. The local
+fault qualification uses 1,000 ms explicitly; its recovery timings do not
+measure the default lease. Run the
+[stable append gates](../scripts/workbench/README.md#stable-append-gates) in fresh
+isolated evidence directories. Their [qualification record](./development/append-qualification.md)
+states the tested profile and limits separately from the full deployment gates.
+
 ## Default Deployment Shape
 
 A serving shard is one `nokv serve` process over one exclusive Holt store. That
@@ -96,13 +133,13 @@ tool advertisement. This is a fail-closed deployment identity check, not
 authentication. A legacy root without a binding requires a one-time,
 operator-verified provision with `--adopt-legacy-agent-binding`; NoKV never
 infers identity from the presentation path.
-Before serving any Agent-facing command, the CLI performs the typed workspace
+Before serving the Workbench facade, the CLI performs the typed workspace
 RPC preflight for every capability required by the 18-tool profile; a missing
 capability or route mismatch stops startup.
 
 Bring-up must stop if:
 
-- the tool set is not exactly 18 tools;
+- the Workbench facade tool set is not exactly 18 tools;
 - any normalized input schema differs;
 - the root route is stale or belongs to another logical shard;
 - the root has no durable Agent binding or is bound to another AgentId;
@@ -125,6 +162,10 @@ evidence for:
 - revision retention and GC fencing;
 - golden Workbench results and errors, not only input schemas.
 
+Stable append has separate native CLI/Python fault evidence and a real demo
+consumer redelivery test. Those results do not replace the complete 18-tool
+workflow or qualify unrelated commit, restore, and GC lifecycles.
+
 Keep raw commands, environment profile, logs, and result artifacts with the
 qualification report.
 
@@ -136,7 +177,9 @@ prove or implement all of the following:
   forgeable client assertion alone;
 - production adoption or bounded abort/cleanup for interrupted commit and
   restore operations, including release of their history/revision holds;
-- a tracked resolution for late direct PUT completion after publication abort;
+- late direct PUT completion after generic publication abort; stable append's
+  conditional-seal closure is separately tested, not evidence for every
+  publication lifecycle;
 - reconciliation that drives ambiguous object deletion out of quarantine;
 - destructive provider operations fenced against control-plane lease transfer,
   not only a preceding shard-local owner check.

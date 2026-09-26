@@ -21,10 +21,12 @@ native full CLI / Python SDK / lower-level Rust SDK
   -> RustFS
 ```
 
-NoKV sends immutable block puts, ranged gets, integrity checks, and fenced
-deletes through the common object package. The NoKV metadata schema remains the
-authority for paths, manifests, references, operations, and deletion
-eligibility. Holt is the current serving local metadata adapter.
+NoKV sends immutable block puts, ranged gets, integrity checks, fenced deletes,
+and failed-append key sealing through the common object package. The NoKV
+metadata schema remains the authority for paths, manifests, references,
+operations, and deletion
+eligibility. The locked Holt 0.8.6 dependency is the serving local metadata
+adapter. See the [durable append guide](append.md) for caller and operator use.
 
 ## Deployment Identity
 
@@ -91,10 +93,19 @@ above that profile is rejected. Multipart upload, completion, and abort are not
 qualified by admission v1 and must remain fail-closed until a separate endpoint
 probe covers them.
 
+Stable append needs a stronger admission receipt that also exercises monotonic
+empty-object sealing: create-if-absent, ETag-conditional replacement, and
+rejection of a delayed nonempty immutable create. The native serving owner
+advertises append support and requires this qualified capability before owner
+acquisition. Generic-only admission does not satisfy that requirement. A
+provider outage during admission is not cached as a permanent failure; the
+same client handle can retry admission after the dependency recovers.
+
 The deployment must additionally ensure:
 
 - timeout and retry settings preserve ambiguous outcomes for reconciliation;
-- lifecycle policies cannot delete reachable NoKV objects independently;
+- lifecycle policies cannot independently delete reachable NoKV objects or
+  permanent seals from failed appends;
 - bucket listing is not required for metadata recovery or reachability.
 
 NoKV should use a dedicated bucket or an exclusive prefix with a policy that
@@ -139,19 +150,50 @@ Publication follows object-first, metadata-last ordering:
 3. publish metadata;
 4. acknowledge the deterministic result.
 
-If metadata publication fails, staged-object records drive cleanup. If delete
-completion is uncertain, the operation enters quarantine and reconciliation.
-The system does not infer success from a later bucket listing.
+If metadata publication fails, staged-object records drive cleanup. Ordinary
+publication and published-revision GC retain their deletion/reconciliation
+contract. Stable append instead turns the failed child's registered keys into
+permanent zero-byte objects. It uses `If-None-Match: *` for an absent key and
+`If-Match` against an observed ETag for an existing payload. It never DELETEs
+those keys. The retained revision claim prevents their reuse by another
+publication, and a late immutable PUT cannot replace the seal.
+
+An unproved seal result quarantines the child. Use metadata-only
+`operation inspect` and `operation recover` with a saved logical state digest
+after correcting the provider failure. The fenced owner performs the seals and
+records progress; the operator client does not need provider credentials or a
+pre-failure transport transcript. The generic publication reconciliation RPC's
+caller-supplied verdicts do not authorize stable append cleanup. The system
+does not infer ownership or safe cleanup from bucket listing.
+
+Zero-byte seals and failed revision reservations currently have no expiration.
+Budget for their key/metadata cost. Bucket versioning may retain old payload
+versions after the current object is sealed; the append contract does not
+qualify removal of those historical versions. Do not use bucket lifecycle
+expiration to remove live seals. These constraints are detailed in
+[Object Layout](object-layout.md#failed-append-keys).
 
 Temporary provider failures remain retryable across the object, client, and
 Workbench error boundaries. After bounded attempts, callers receive
 `ObjectUnavailable` with `retryable: true` and an attempt count. Public
-provider-admission errors and ambiguous create/delete errors do not include
+provider-admission errors and ambiguous create/delete/seal errors do not include
 endpoint, bucket, prefix, or physical object keys. Immutable create and delete
 operations with ambiguous completion remain reconciliation cases rather than
 blind retries.
 
+Stable append additionally preserves the logical action ID in
+`AppendUnresolved`; operator recovery preserves the expected state digest and
+any known admission receipt in `AppendCleanupUnresolved`. Follow their
+structured next action. A transient failure is not permission to create a new
+logical action or silently select a fresh cleanup token.
+
 ## Existing Roots
+
+The namespace-binding procedure below is not a system-format upgrade. The
+current owner accepts RPC v12, system format 13, and publication value format
+7. An older incompatible Holt store is rejected without mutation before
+writable recovery. The adoption flag cannot migrate it or justify editing its
+schema marker. This feature provides no in-place migration procedure.
 
 Roots created before object-namespace binding have no durable evidence from
 which NoKV could infer the historical bucket/prefix. Automatic adoption would
@@ -199,7 +241,8 @@ Full RustFS qualification still requires:
 
 Retain raw evidence using [Benchmarks](./benchmarks.md) and
 [Workspace Acceptance](./development/workspace-acceptance.md).
-An endpoint admission receipt qualifies only the exercised single-PUT and
-range-read contract. It does not by itself qualify multipart behavior, exact
-crash recovery, process restart, owner replacement, or ambiguous-completion
+An endpoint admission receipt qualifies only its exercised single-PUT,
+range-read, and, when explicitly requested, append-sealing profile. It does
+not by itself qualify multipart behavior, exact crash recovery, process
+restart, owner replacement, or ambiguous-completion
 reconciliation.

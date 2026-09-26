@@ -16,10 +16,10 @@ SPDX-License-Identifier: Apache-2.0
   </p>
 
   <p>
-    <strong>18-operation native CLI</strong> ·
+    <strong>native CLI and 18-tool Workbench contract</strong> ·
     <strong>direct Python and Rust SDKs</strong> ·
     <strong>commit, snapshot, and restore</strong> ·
-    <strong>conditional publication and exact replay</strong>
+    <strong>durable append identity and recovery</strong>
   </p>
 
   <p>
@@ -49,7 +49,7 @@ SPDX-License-Identifier: Apache-2.0
 </div>
 
 > [!IMPORTANT]
-> This README describes the current `main` contract. An installed release may
+> This README describes the checked-in source contract. An installed release may
 > pin different component revisions; run `nokv version --json` to identify the
 > exact NoKV commit, Workbench schema, and
 > [Holt](https://github.com/NoKV-Lab/holt) build. Implemented and
@@ -90,7 +90,10 @@ same conformance and fault evidence:
   only when their revision, path head, indexes, references, and receipt commit.
 - **No silent overwrite:** create, replace, edit, append, rename, and remove
   are explicit and generation-fenced. A stale writer gets a conflict.
-- **Exact retry:** request identity and operation records distinguish
+- **Durable append identity:** save one logical operation ID and its inputs before
+  dispatch. A replacement worker can recover the original receipt after a lost
+  reply, or finish a safely cleaned attempt under that same ID.
+- **Explicit outcomes:** request identity and operation records distinguish
   definitely-not-applied, applied-with-lost-response, and unknown outcomes.
 - **Durable decision points:** commits retain an immutable revision closure;
   restore builds a hidden same-root incarnation and publishes it atomically.
@@ -106,7 +109,8 @@ same conformance and fault evidence:
 | --- | --- | --- |
 | Persist one run | `workbench_create`, `workbench_put_file`, `workspace-path append`, `workbench_edit`, `workbench_commit` | Five-section workspace, explicit write modes, immutable revisions, and a sealed run manifest |
 | Reopen work from another process | `workbench_list`, `workbench_stat`, `workbench_read`, `workbench_find` | Path-shaped discovery and verified reads without retaining the original sandbox |
-| Prevent stale or duplicate writes | generations, explicit request identity, exact replay | Typed conflict for stale state; the same outcome for an exact retry after response loss |
+| Prevent stale writes | generations and explicit write modes | Typed conflict when another writer has advanced the path |
+| Redeliver one event after a worker dies | `workspace-path append --operation-id`, `operation status/inspect/recover` | One saved action, one committed append receipt; inspect and resume recovery across processes |
 | Search many artifacts or runs | `workbench_grep`, `workbench_search`, `workbench_aggregate`, `workbench_catalog`, `workbench_find` | Literal body search plus typed indexed metadata query and aggregation |
 | Freeze a short-lived view | `workbench_snapshot`, `workbench_snapshot_renew`, `workbench_snapshot_list` | Leased point-in-time reads with explicit lifecycle state |
 | Create a durable replay point | `workbench_commit` then `workbench_restore` | Retained revision closure and atomic restore into a new destination |
@@ -152,8 +156,9 @@ harness can use its lifecycle primitives through the native CLI or SDK:
   snapshots provide shorter-lived point-in-time recovery and inspection.
 - **One recoverable workspace:** verified materialize/collect, indexed search,
   immutable lineage, and retention-aware GC share one workspace contract. The
-  Rust SDK additionally exposes change polling; quarantine and reconciliation
-  remain internal lifecycle mechanisms rather than CLI commands.
+  Rust SDK additionally exposes change polling. Stable append exposes native
+  `operation status`, `inspect`, and `recover` commands; other lifecycle
+  quarantine and reconciliation mechanisms remain internal.
 
 The harness still decides which state is authoritative and when execution may
 resume. Restoring state does not grant a replacement worker permission to act;
@@ -207,7 +212,7 @@ The names and normalized input schemas below are fixed by the
 | --- | --- |
 | `workbench_create` | Create one jailed Workbench with `input`, `scripts`, `outputs`, `logs`, and `metadata` sections. |
 | `workbench_put_file` | Publish create-only or replace-only bytes; it is never upsert. |
-| `workbench_append` | Append through immutable publication plus generation CAS and bounded conflict retry. |
+| `workbench_append` | Append through immutable publication, generation CAS and bounded conflict retry within one invocation. Use `workspace-path append --operation-id` for durable redelivery across invocations. |
 | `workbench_edit` | Replace exact UTF-8 text, revalidate after conflicts, and avoid a new revision for a byte-identical result. |
 | `workbench_list` | List direct children with scope-bound cursors at live state or a leased snapshot. |
 | `workbench_stat` | Read a compact artifact or implicit-prefix card without loading the body. |
@@ -246,101 +251,72 @@ real-service acceptance gate is still **not qualified**.
 | `nokv serve` | Start one explicit metadata owner from create, same-namespace reopen, or recovery-log state. | Shared recovery publication is opt-in and not currently qualified. |
 | `nokv mcp` | Deprecated stdio transport retained only because qualification runners still use it. | **Unsupported for integration.** |
 
-For an append that must survive a lost reply or a harness restart, save one
-operation id before sending the request, then reuse it with the same inputs:
+### Redeliver an append after a worker restart
 
-```shell
-nokv [route/agent/object options] workspace-path append run-42 logs events.jsonl \
-  --operation-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  --expected-workspace-incarnation-id bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
-  --text 'step-7-done' --content-type text/plain
+A queue consumer may append an event successfully, then die before saving its
+acknowledgement. Give that business action a durable identity: save its root,
+operation ID, destination, exact bytes and append options **before dispatch**.
+The replacement worker uses the saved ID and the same inputs. NoKV returns the
+original committed receipt without appending the event again. A different
+business action uses a new ID, even if its bytes are identical.
+
+For a provisioned deployment and an existing `run-001`, this command sends a
+previously saved delivery. The environment variables identify that saved job;
+generate neither a new ID nor new bytes when retrying it. Object settings must
+match the provisioned namespace, including its root and region.
+
+```bash
+nokv \
+  --root-id "$NOKV_ROOT_ID" \
+  --agent-id "$NOKV_AGENT_ID" \
+  --workbench-root /agents/research/wb \
+  --etcd-endpoint "$NOKV_ETCD_ENDPOINT" \
+  --object-bucket "$NOKV_BUCKET" \
+  --object-endpoint "$NOKV_OBJECT_ENDPOINT" \
+  --object-root "$NOKV_OBJECT_ROOT" \
+  --object-region "$NOKV_OBJECT_REGION" \
+  workspace-path append run-001 logs events.jsonl \
+  --operation-id "$APPEND_OPERATION_ID" \
+  --file "$APPEND_DELTA_FILE" --content-type application/x-ndjson
 ```
 
-Replace the example ids with the caller's stable logical operation id and the
-intended workspace's incarnation. On the first call, omitting the incarnation
-observes and fences the existing workspace. On recovery, omission resolves the
-original durable operation first, even if the workspace was deleted or recreated.
-Append never creates a missing workspace.
+The CLI binds the workspace incarnation on first admission and resolves that
+saved incarnation on retry; it never creates a missing workspace. Specify
+`--expected-workspace-incarnation-id` when the application already owns that
+identity. Retain the exact content-type choice, block size and logical-size
+limit with the job. In particular, changing an omitted content-type override
+to an explicit one can change the intent even if the displayed type is equal.
 
-Use exactly one of `--text`, `--base64`, or `--file`. Text defaults to
-`text/plain; charset=utf-8` on creation; binary and file input default to
-`application/octet-stream`. Existing content type is inherited unless
-`--content-type` overrides it. Explicitly use the same type when replaying across
-text, file, and Python inputs. The delta limit is 16 MiB; `--max-artifact-bytes`
-may lower it. The resulting body also defaults to a 16 MiB limit;
-`--max-logical-size` raises that bound and is part of the stable intent.
-`--block-size` defaults to 4 MiB and matches Python's `block_size` argument;
-retain the same value across retries and surface changes.
+After an uncertain outcome, query by the **same root and logical ID**:
 
-The receipt identifies both the logical `operation_id` and its successful
-`publication_operation_id`. Its revision, generation, workspace revision, size,
-digest, and incarnation describe the original publication, even if another
-writer has advanced or removed the path. `replayed` and nullable `commit_version`
-describe this SDK call and are not stable receipt fields.
-
-Query a result without resending the delta or contacting the object store:
-
-```shell
-nokv [route/agent options] operation status aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+```bash
+nokv \
+  --root-id "$NOKV_ROOT_ID" \
+  --agent-id "$NOKV_AGENT_ID" \
+  --etcd-endpoint "$NOKV_ETCD_ENDPOINT" \
+  operation status "$APPEND_OPERATION_ID"
 ```
 
-The response supplies a machine-readable recovery action:
+| Observation | Next action |
+| --- | --- |
+| `committed` | Save the original `receipt` durably, then acknowledge the delivery. |
+| `pending` | Poll the same ID. |
+| `ready_to_retry` | Resubmit the saved inputs with the same ID. |
+| `quarantined` | Inspect, save the logical state token, restore provider availability, and request owner cleanup with that token. |
+| Uncertain error or `NotFound` | Retain the job and ID; this observation alone cannot rule out an in-flight commit. |
 
-| `state` | `next_action` | Caller action |
-| --- | --- | --- |
-| `committed` | `none` | Consume the original `receipt`. |
-| `pending` | `poll` | Query the same logical identity again after waiting. |
-| `ready_to_retry` | `resubmit_same` | Resubmit the original append inputs under the same logical identity. |
-| `quarantined` | `retry_cleanup` | Inspect the failure, restore provider availability, then ask the owner to retry cleanup. |
+Status and inspection use metadata only. Recovery also takes no caller payload
+or object credentials, but the owner needs access to the object provider to
+finish cleanup. A recovery admission receipt is not an append commit receipt.
+Historical append receipts do not pin historical artifact bytes.
 
-Status also retains the current physical attempt's `cause_code`,
-`failure_message`, and structured `attempt_failure`, including when the logical
-operation is `ready_to_retry`.
-
-Inspect and recover without object credentials:
-
-```shell
-nokv [route/agent options] operation inspect aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --limit 32
-nokv [route/agent options] operation recover aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  --expected-state-digest <saved-operation_token.state_digest>
-```
-
-Inspection returns `operation_token` and `publication_token`, each with
-`operation_id` and `state_digest`, plus the object namespace, `registered_count`,
-`cleanup_cursor`, `remaining_count`, and `entries`. Entries describe retained
-staged objects, not a historical inventory of retired keys. Each entry includes
-its sequence, identity, expected length, digest, and optional multipart token.
-The page limit defaults to 32 and may range from 1 to 192. Continue with the
-opaque base64 `next_cursor` using `--cursor`; a stale cursor returns
-`Conflict/OperationState`, requiring a fresh inspection instead of mixing pages.
-
-Save the logical token before requesting recovery. Reuse its state digest after
-a lost reply or process restart. The owner performs sealing; this command never
-resends the append delta. `requested=true` means a cleanup request was durably
-accepted, including a replay. Its historical `recovery_receipt` contains the
-logical id, publication id, cleanup retry count, and expected state digest.
-The top-level status is a fresh observation and may be newer than that receipt;
-acceptance is not cleanup completion. Omitting the digest targets the current
-state once and is a no-op for pending, cleaned, or committed operations. A later
-quarantine needs an intentional new request with a newly inspected token.
-`AppendCleanupUnresolved` preserves the saved digest, any known recovery receipt,
-and `next_action=retry_same_cleanup`; generic retry handlers must not choose a
-new token. After `ready_to_retry`, resubmit the original append inputs.
-
-An interrupted publication must be fenced and cleaned before a successor
-attempt can start. Status queries only observe this lifecycle. Persist the delta
-or a way to reproduce the exact bytes until the operation commits. An unknown
-result or `NotFound` observation is not proof that a concurrent request cannot
-commit; errors preserve the logical id and use `next_action=query_same`.
-`cause_code=RequestReplayMismatch` means the identity belongs to different
-inputs or a different lifecycle: recover the original intent before retrying.
-Never generate a replacement id merely to bypass an uncertain outcome.
-
-The older `workbench_append` tool retains per-invocation identities and cannot
-recover one action across separate processes. Use `workspace-path append` for
-new retrying harness integrations. The fixed 18-tool contract remains unchanged.
-The [append product specification](docs/development/append-product-spec.md)
-defines the supported recovery, size, retention, and release boundaries.
+The [durable append guide](docs/append.md) covers a complete CLI/Python delivery
+record, error handling, `inspect` pagination, exact-token `recover`, size limits
+and deployment prerequisites. The [product specification](docs/development/append-product-spec.md)
+defines the storage and retention guarantees; the [qualification record](docs/development/append-qualification.md)
+identifies the executed crash and redelivery tests. The fixed 18-tool
+`workbench_append` facade has no caller-supplied logical identity and is not the
+entrypoint for this cross-process guarantee.
 
 ### Programmatic and non-CLI capabilities
 
@@ -353,7 +329,7 @@ do not expose identical method shapes.
 | Python adapters | Workbench-scoped fsspec, checkpoint helpers, and optional torch Distributed Checkpoint reader/writer | Bounded to an explicit Workbench; not arbitrary-root POSIX or FUSE |
 | Rust `WorkspaceClient` | Lower-level typed workspace, publication, query, lifecycle, routing, and batch-range workflows | Recommended when the caller must own typed retry and recovery integration |
 | Rust-only extensions | Polling change feed, generic custom-index registration, raw non-append operation status, and phased publish/restore primitives | No native CLI or Python method today; change feed is polling, not push |
-| Metadata and server lifecycle | snapshot reap, commit/tag holds, reference-fenced GC, quarantine reconciliation, Holt reopen, and optional shared recovery records | Internal/operator mechanisms, not independent end-user commands |
+| Metadata and server lifecycle | snapshot reap, commit/tag holds, reference-fenced GC, generic quarantine reconciliation, Holt reopen, and optional shared recovery records | Internal/operator mechanisms; stable append cleanup separately has public status/inspect/recover entrypoints |
 
 Python `append_bytes`, `operation_status`, `operation_inspect`, and
 `operation_recover` share the native stable append contract. Python inspection
@@ -473,7 +449,17 @@ The labels below mean exactly:
 - **Live-qualified:** the supported entrypoint ran against the required real
   dependencies at the pinned revision and produced accepted evidence.
 
-Evidence snapshot:
+The [stable append qualification record](docs/development/append-qualification.md)
+adds feature-specific evidence at NoKV `13590c1`: 1,158 Rust tests passed
+(11 ignored), 34 Python SDK tests passed, local real-service append/recovery
+matrices completed, and a Linux demo consumer passed the SIGKILL red/green
+redelivery gate. The remote [Rust](https://github.com/NoKV-Lab/NoKV/actions/runs/35992447765),
+[Python wheel](https://github.com/NoKV-Lab/NoKV/actions/runs/35992447625), and
+[amd64/arm64 image](https://github.com/NoKV-Lab/NoKV/actions/runs/35992447760)
+checks also passed. This qualifies the documented append scenarios, not the
+complete 18-tool or installed-Python Gate 0 surface or a new release.
+
+Earlier general-surface evidence snapshot (the counts below are historical):
 
 - NoKV commit [`0f1995ebee96`](https://github.com/NoKV-Lab/NoKV/commit/0f1995ebee96048e5d4f9d4745d84c3518c64351);
 - pinned Holt `0.8.6` dependency.
@@ -488,7 +474,7 @@ Evidence snapshot:
 | Holt 0.8.6 | 705 listed entries; 10 marked ignored; all executed entries passed; the NoKV adapter adds 32 unit and one reopen/conformance integration test | Layer-tested for the embedded local boundary |
 | Holt third-party A/B | the current v0.8.6 Holt/RocksDB/SQLite/sled comparator target was attempted; local `librocksdb-sys`/`libclang` build failed before measurement | No result; no performance claim |
 
-The 10 ignored NoKV workspace tests are six real-etcd tests, two direct object
+The 10 ignored tests in that earlier snapshot are six real-etcd tests, two direct object
 provider tests, and two Python S3-admission tests. They are gaps, not passes.
 See [Workspace acceptance](docs/development/workspace-acceptance.md) for the
 normative gate and [Benchmarks and evidence](docs/benchmarks.md) for evidence
@@ -591,7 +577,7 @@ Credentials use the provider's normal chain or
 agent skill / harness       embedded Python         native control plane
         |                        |                         |
         v                        v                         v
-  18-tool CLI facade      direct Python API       lower-level Rust SDK
+  native CLI             direct Python API       lower-level Rust SDK
         +------------------------+-------------------------+
                                  |
                          typed NoKV protocol
@@ -616,6 +602,9 @@ immutable revisions are visible and retained by a workspace.
 ## Documentation
 
 - [Documentation index](docs/index.md)
+- [Durable append guide](docs/append.md)
+- [Append product specification](docs/development/append-product-spec.md)
+- [Append qualification record](docs/development/append-qualification.md)
 - [Product design](docs/product-design.md)
 - [Architecture](docs/architecture.md)
 - [Workbench contract](docs/workbench-contract.md)
