@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::future::Future;
 
 use etcd_client::{
-    Client, Compare, CompareOp, GetOptions, GetResponse, PutOptions, Txn, TxnOp, TxnOpResponse,
+    Client, Compare, CompareOp, GetOptions, GetResponse, KeyValue, PutOptions, Txn, TxnOp,
+    TxnOpResponse,
 };
 use tokio::runtime::{Builder, Runtime};
 
@@ -593,6 +594,52 @@ impl ControlStore for EtcdControlStore {
         })
     }
 
+    fn prove_owner(&self, lease: &LogicalShardLease) -> Result<LogicalShardRecord, ControlError> {
+        let mut client = self.client.clone();
+        let options = self.options.clone();
+        let lease = lease.clone();
+        self.block_on(async move {
+            let shard = &lease.logical_shard_id;
+            // One linearizable transaction reads the record and the
+            // lease-attached owner session at the same revision.
+            let response = client
+                .txn(Txn::new().and_then(vec![
+                    TxnOp::get(options.logical_shard_record_key(shard), None),
+                    TxnOp::get(options.logical_shard_recovery_key(shard), None),
+                    TxnOp::get(options.logical_shard_session_key(shard), None),
+                ]))
+                .await
+                .map_err(etcd_backend)?;
+            let mut responses = response.op_responses().into_iter();
+            let (
+                Some(TxnOpResponse::Get(record)),
+                Some(TxnOpResponse::Get(recovery)),
+                Some(TxnOpResponse::Get(session)),
+                None,
+            ) = (
+                responses.next(),
+                responses.next(),
+                responses.next(),
+                responses.next(),
+            )
+            else {
+                return Err(ControlError::Backend(
+                    "etcd ownership proof returned an unexpected response shape".to_owned(),
+                ));
+            };
+            let current = parse_logical_shard(&options, shard, &record, &recovery)?
+                .ok_or(ControlError::LogicalShardNotFound(*shard))?;
+            validate_record_lease(&current.record, &lease)?;
+            let session = parse_owner_session(&options, shard, session.kvs())?
+                .ok_or_else(|| ControlError::StaleLease(lease.clone()))?;
+            if session.lease != lease || session.attached_lease_id != lease_id_i64(lease.lease_id)?
+            {
+                return Err(ControlError::StaleLease(lease));
+            }
+            Ok(current.record)
+        })
+    }
+
     fn mark_serving(
         &self,
         lease: &LogicalShardLease,
@@ -957,6 +1004,23 @@ async fn fetch_logical_shard(
         .await
         .map_err(etcd_backend)?;
     let (record_response, recovery_response) = split_two_get_responses(response.op_responses())?;
+    parse_logical_shard(
+        options,
+        logical_shard_id,
+        &record_response,
+        &recovery_response,
+    )
+}
+
+/// Decode one logical shard from its routing and recovery reads taken at one
+/// etcd revision.
+fn parse_logical_shard(
+    options: &EtcdControlStoreOptions,
+    logical_shard_id: &LogicalShardId,
+    record_response: &GetResponse,
+    recovery_response: &GetResponse,
+) -> Result<Option<StoredLogicalShard>, ControlError> {
+    let record_key = options.logical_shard_record_key(logical_shard_id);
     let Some(kv) = record_response.kvs().first() else {
         return Ok(None);
     };
@@ -1136,8 +1200,17 @@ async fn fetch_owner_session(
     logical_shard_id: &LogicalShardId,
 ) -> Result<Option<StoredOwnerSession>, ControlError> {
     let key = options.logical_shard_session_key(logical_shard_id);
-    let response = client.get(key.clone(), None).await.map_err(etcd_backend)?;
-    let Some(kv) = response.kvs().first() else {
+    let response = client.get(key, None).await.map_err(etcd_backend)?;
+    parse_owner_session(options, logical_shard_id, response.kvs())
+}
+
+fn parse_owner_session(
+    options: &EtcdControlStoreOptions,
+    logical_shard_id: &LogicalShardId,
+    kvs: &[KeyValue],
+) -> Result<Option<StoredOwnerSession>, ControlError> {
+    let key = options.logical_shard_session_key(logical_shard_id);
+    let Some(kv) = kvs.first() else {
         return Ok(None);
     };
     let lease = decode_owner_session(kv.value())?;
@@ -1939,6 +2012,88 @@ mod tests {
                     .await
                     .map_err(etcd_backend)?;
                 Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires NOKV_TEST_ETCD_ENDPOINT"]
+    fn etcd_ownership_proof_reads_one_revision_and_fails_after_revocation() {
+        let endpoint = std::env::var("NOKV_TEST_ETCD_ENDPOINT")
+            .expect("NOKV_TEST_ETCD_ENDPOINT must name an isolated test etcd endpoint");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let prefix = format!("/nokv/test/ownership-proof-{}-{nonce}", std::process::id());
+        let options = EtcdControlStoreOptions::new([endpoint]).with_key_prefix(prefix.clone());
+        let store = EtcdControlStore::connect(options.clone()).unwrap();
+        let logical_shard_id = shard(11);
+        store.create_logical_shard(logical_shard_id).unwrap();
+        store
+            .create_root_placement(RootPlacement {
+                root_id: root(11),
+                logical_shard_id,
+                placement_generation: PlacementGeneration::new(1).unwrap(),
+                lifecycle: RootPlacementLifecycle::Provisioning,
+            })
+            .unwrap();
+        let lease = store
+            .acquire_owner(
+                &logical_shard_id,
+                NodeId::new("node-a").unwrap(),
+                "node-a:7000".to_owned(),
+            )
+            .unwrap();
+
+        let proved = store.prove_owner(&lease).unwrap();
+        assert_eq!(proved, store.renew_owner(&lease).unwrap());
+
+        // A proof only reads: it must not change any control key.
+        let mut client = store.client.clone();
+        let revision = |client: &mut Client| {
+            store
+                .block_on(async {
+                    let response = client
+                        .get(prefix.clone(), Some(GetOptions::new().with_prefix()))
+                        .await
+                        .map_err(etcd_backend)?;
+                    Ok::<i64, ControlError>(
+                        response
+                            .kvs()
+                            .iter()
+                            .map(|kv| kv.mod_revision())
+                            .max()
+                            .unwrap_or(0),
+                    )
+                })
+                .unwrap()
+        };
+        let before = revision(&mut client);
+        store.prove_owner(&lease).unwrap();
+        assert_eq!(revision(&mut client), before);
+
+        store
+            .block_on(async {
+                client
+                    .lease_revoke(lease_id_i64(lease.lease_id)?)
+                    .await
+                    .map_err(etcd_backend)?;
+                Ok::<(), ControlError>(())
+            })
+            .unwrap();
+        assert!(matches!(
+            store.prove_owner(&lease),
+            Err(ControlError::StaleLease(_))
+        ));
+
+        store
+            .block_on(async {
+                client
+                    .delete(prefix, Some(DeleteOptions::new().with_prefix()))
+                    .await
+                    .map_err(etcd_backend)?;
+                Ok::<(), ControlError>(())
             })
             .unwrap();
     }

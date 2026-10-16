@@ -221,7 +221,7 @@ impl RecoveryPublisher {
         &self,
         required: RecoveryState,
     ) -> Result<LogicalShardRecord, RecoveryPublisherError> {
-        let record = self.control.renew_owner(&self.lease)?;
+        let record = self.control.prove_owner(&self.lease)?;
         self.validate_control_frontier(&record, required)?;
         if record.pending_recovery_upload.is_some() {
             return Err(RecoveryPublisherError::InvalidState(
@@ -240,7 +240,7 @@ impl RecoveryPublisher {
             // local and durable frontiers already match, prove that this exact
             // owner session is still live before allowing a response to leave
             // the shard.
-            let mut record = self.control.renew_owner(&self.lease)?;
+            let mut record = self.control.prove_owner(&self.lease)?;
             self.validate_control_frontier(&record, required)?;
             if record.pending_recovery_upload.is_none()
                 && record.durable_lsn == required.applied_recovery_lsn
