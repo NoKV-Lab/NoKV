@@ -8905,14 +8905,23 @@ mod tests {
 
     impl OneBytePlan {
         fn new(artifact_revision_id: protocol::ArtifactRevisionIdentity, byte: u8) -> Self {
+            Self::single_object(artifact_revision_id, &[byte])
+        }
+
+        /// The sealed plan of a body uploaded as one object.
+        fn single_object(
+            artifact_revision_id: protocol::ArtifactRevisionIdentity,
+            body: &[u8],
+        ) -> Self {
             let revision_id: types::ArtifactRevisionId = artifact_revision_id.into();
             let object_key = meta::object_block_key(shard(), root(), revision_id, 0);
+            let length = body.len() as u64;
             let body_digest =
-                protocol::sha256_digest_uri(protocol::Digest(Sha256::digest([byte]).into()));
+                protocol::sha256_digest_uri(protocol::Digest(Sha256::digest(body).into()));
             let staged_objects = vec![protocol::StagedObject {
                 sequence: 0,
                 object_identity: protocol::ObjectIdentity::new(object_key.clone()).unwrap(),
-                expected_length: 1,
+                expected_length: length,
                 expected_digest: body_digest.clone(),
                 multipart_token: None,
             }];
@@ -8923,7 +8932,7 @@ mod tests {
                 physical_owner_revision_id: artifact_revision_id,
                 object_identity: protocol::ObjectIdentity::new(object_key).unwrap(),
                 object_offset: 0,
-                length: 1,
+                length,
                 digest: body_digest.clone(),
                 append_segment: None,
             }];
@@ -8934,7 +8943,7 @@ mod tests {
             )
             .unwrap();
             let artifact = protocol::ArtifactDescriptor {
-                logical_size: 1,
+                logical_size: length,
                 body_digest: body_digest.clone(),
                 manifest_digest: protocol::sha256_digest_uri(seals.manifest_seal),
                 content_type: protocol::ContentType::new("application/json").unwrap(),
@@ -8946,7 +8955,7 @@ mod tests {
                 staged_objects,
                 upload_proofs: vec![protocol::ObjectUploadProof {
                     sequence: 0,
-                    observed_length: 1,
+                    observed_length: length,
                     observed_digest: body_digest,
                 }],
                 manifest_rows,
@@ -9213,6 +9222,97 @@ mod tests {
         assert_eq!(read.next_cursor, None);
         assert_eq!(read.inline_body.as_deref(), Some(&body[..]));
         assert_eq!(read.metadata.unwrap().descriptor, request.artifact);
+    }
+
+    /// Recovery-log records and logical bytes the shard appended after `lsn`.
+    fn recovery_log_since(store: &meta::MetaShard, lsn: u64) -> (usize, usize) {
+        let records = store.recovery_outbox_after(lsn, 1_000).unwrap();
+        let bytes = records
+            .iter()
+            .map(|record| record.encode().unwrap().len())
+            .sum();
+        (records.len(), bytes)
+    }
+
+    #[test]
+    fn a_small_inline_publication_logs_half_the_commands_and_fewer_bytes() {
+        let (store, executor) = ready_executor();
+        let workbench = protocol::WorkbenchName::new("inline-log").unwrap();
+        executor
+            .execute(&restore_rpc(
+                0x80,
+                protocol::WorkspaceRequest::CreateWorkspace(protocol::CreateWorkspaceRequest {
+                    workbench: workbench.clone(),
+                    workspace_incarnation_id: protocol::WorkspaceIdentity(
+                        [0x80; types::FIXED_ID_BYTES],
+                    ),
+                }),
+            ))
+            .unwrap();
+        // The mean size of a Pi harness session record.
+        let body = vec![b'j'; 1_100];
+        let target = |path: &str| protocol::WorkspacePath {
+            workbench: workbench.clone(),
+            path: protocol::RelativePath::new(path).unwrap(),
+        };
+
+        let object_revision = protocol::ArtifactRevisionIdentity([0x81; types::FIXED_ID_BYTES]);
+        let plan = OneBytePlan::single_object(object_revision, &body);
+        let begin = plan.begin(
+            protocol::OperationIdentity([0x82; types::FIXED_ID_BYTES]),
+            object_revision,
+            target("logs/object.json"),
+            protocol::PublicationAuthority::Visible,
+        );
+        let before = store.recovery_state().unwrap().applied_recovery_lsn;
+        let prepared = executor
+            .execute(&restore_rpc(
+                0x83,
+                protocol::WorkspaceRequest::PrepareArtifactPublish(
+                    protocol::PrepareArtifactPublishRequest {
+                        begin: begin.clone(),
+                        objects: plan.staged_objects.clone(),
+                    },
+                ),
+            ))
+            .unwrap();
+        executor
+            .execute(&restore_rpc(
+                0x84,
+                finish_request(&plan, executed_operation(&prepared).token),
+            ))
+            .unwrap();
+        let (object_records, object_bytes) = recovery_log_since(&store, before);
+
+        let mut inline_begin = begin;
+        inline_begin.target = target("logs/inline.json");
+        inline_begin.artifact_revision_id =
+            protocol::ArtifactRevisionIdentity([0x85; types::FIXED_ID_BYTES]);
+        let inline = inline_publication(
+            0x86,
+            &inline_begin,
+            protocol::PublishCondition::CreateOnly,
+            &body,
+        );
+        let before = store.recovery_state().unwrap().applied_recovery_lsn;
+        executor
+            .execute(&restore_rpc(
+                0x87,
+                protocol::WorkspaceRequest::PublishInlineArtifact(inline),
+            ))
+            .unwrap();
+        let (inline_records, inline_bytes) = recovery_log_since(&store, before);
+
+        // Prepare logs its claim, Begin, and the staged plan; Finish logs its
+        // claim, the upload proof, the manifest, the Finalizing transition,
+        // and the publication. The inline request logs its claim, Begin, the
+        // transition, and the publication with the body.
+        assert_eq!(object_records, 8);
+        assert_eq!(inline_records, 4);
+        assert!(
+            inline_bytes < object_bytes,
+            "inline {inline_bytes} bytes, object {object_bytes} bytes"
+        );
     }
 
     #[test]
