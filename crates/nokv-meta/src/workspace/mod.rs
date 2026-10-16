@@ -41,10 +41,10 @@ pub use build_commit_records::{
     COMMIT_RETIRE_OPERATION_VALUE_FORMAT_VERSION, MAX_COMMIT_OPERATION_ERROR_BYTES,
 };
 pub use codec::{
-    artifact_manifest_key, artifact_manifest_prefix, artifact_revision_claim_key,
-    artifact_revision_key, build_commit_history_hold_key, child_commit_consumer_key,
-    commit_generic_index_member_key, commit_generic_index_member_prefix, commit_key,
-    commit_member_key, commit_member_prefix, commit_prefix, commit_revision_ref_key,
+    artifact_inline_body_key, artifact_manifest_key, artifact_manifest_prefix,
+    artifact_revision_claim_key, artifact_revision_key, build_commit_history_hold_key,
+    child_commit_consumer_key, commit_generic_index_member_key, commit_generic_index_member_prefix,
+    commit_key, commit_member_key, commit_member_prefix, commit_prefix, commit_revision_ref_key,
     commit_revision_ref_prefix, decode_artifact_manifest_key,
     decode_commit_generic_index_member_key, decode_commit_key, decode_commit_member_key,
     decode_gc_candidate_key, decode_generic_index_append_receipt_key,
@@ -154,9 +154,10 @@ pub use publication::{
     TakeOverOrphanedPublishRequest, TransitionPublishRequest, MAX_PUBLICATION_BATCH_ROWS,
 };
 pub use publication_records::{
-    ArtifactRevisionClaimRecord, ArtifactRevisionRecord, GcCandidateRecord, PathEntry,
-    PublicationRecordCodecError, RevisionRefRecord, WorkspaceIncarnationClaimRecord,
-    WorkspaceRecord, MAX_CONTENT_TYPE_BYTES, MAX_DEPENDENCY_COUNT as MAX_REVISION_DEPENDENCIES,
+    ArtifactInlineBodyRecord, ArtifactRevisionClaimRecord, ArtifactRevisionRecord,
+    GcCandidateRecord, PathEntry, PublicationRecordCodecError, RevisionRefRecord,
+    WorkspaceIncarnationClaimRecord, WorkspaceRecord, MAX_CONTENT_TYPE_BYTES,
+    MAX_DEPENDENCY_COUNT as MAX_REVISION_DEPENDENCIES,
     MAX_DEPENDENCY_DEPTH as MAX_REVISION_DEPENDENCY_DEPTH, MAX_DIGEST_URI_BYTES,
     MAX_INDEX_PROJECTION_BYTES, MAX_MANIFEST_ID_BYTES, MAX_PRODUCER_BYTES,
     MAX_QUARANTINE_EVIDENCE_BYTES, PUBLICATION_VALUE_FORMAT_VERSION,
@@ -167,7 +168,7 @@ pub use publish_operation_records::{
     PublishRecordError, PublishResult, PublishTerminalError, PublishTerminalErrorKind,
     PublishTransition, StagedObjectRecord, MAX_APPEND_SEGMENTS, MAX_MANIFEST_ROWS,
     MAX_MULTIPART_ID_BYTES, MAX_STAGED_OBJECTS, MAX_TERMINAL_ERROR_BYTES,
-    PUBLISH_VALUE_FORMAT_VERSION,
+    PUBLISH_OPERATION_VALUE_FORMAT_VERSION, PUBLISH_VALUE_FORMAT_VERSION,
 };
 pub use query::{
     aggregate_paths_at, catalog_fields_at, find_workspaces_at, get_current_workspace,

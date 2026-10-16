@@ -3348,6 +3348,7 @@ mod tests {
             range: None,
             blocks: Vec::new(),
             next_cursor: None,
+            inline_body: None,
         }
     }
 
@@ -3437,6 +3438,7 @@ mod tests {
             range: None,
             blocks: Vec::new(),
             next_cursor: None,
+            inline_body: None,
         };
         let range = wire::PathReadResult {
             not_modified: false,
@@ -3447,6 +3449,7 @@ mod tests {
             }),
             blocks: rows,
             next_cursor: None,
+            inline_body: None,
         };
         let objects: Arc<dyn ArtifactObjectStore> = Arc::new(
             BoundArtifactStore::open(raw_store, namespace_id).expect("bind in-memory namespace"),
@@ -6273,20 +6276,31 @@ mod tests {
 
     #[test]
     fn publish_implicitly_admits_a_missing_workbench_before_provider_use() {
-        let (backend, requests, server) = scripted_backend(vec![
-            not_found_failure(),
-            already_exists_failure(),
-            success(wire::WorkspaceResult::Workspace(workspace_summary(
-                "implicit-publish",
-                [5; 16],
-            ))),
-        ]);
+        // A body above the inline bound is the one that needs the provider.
+        let body = vec![b' '; nokv_protocol::MAX_INLINE_ARTIFACT_BODY_BYTES + 1];
+        let objects: Arc<dyn ArtifactObjectStore> = Arc::new(
+            CliObjectStore::build(&crate::cli::ObjectConfig {
+                bucket: Some("unused-test-bucket".to_owned()),
+                ..crate::cli::ObjectConfig::default()
+            })
+            .unwrap(),
+        );
+        let (backend, requests, server) = scripted_backend_with_objects(
+            vec![
+                not_found_failure(),
+                already_exists_failure(),
+                success(wire::WorkspaceResult::Workspace(workspace_summary(
+                    "implicit-publish",
+                    [5; 16],
+                ))),
+            ],
+            objects,
+            body.len(),
+        );
 
-        let error = agent::WorkbenchBackend::publish(
-            &backend,
-            publish_request(agent::PublishCondition::CreateOnly),
-        )
-        .unwrap_err();
+        let mut request = publish_request(agent::PublishCondition::CreateOnly);
+        request.body = body;
+        let error = agent::WorkbenchBackend::publish(&backend, request).unwrap_err();
         server.join().unwrap();
 
         assert_eq!(

@@ -267,6 +267,9 @@ impl WorkspaceSummary {
 }
 
 /// Exact stat plus an optional provider-neutral immutable block plan.
+///
+/// A ranged read of an inline revision carries its complete body instead of
+/// a block plan, so the caller verifies the whole-body digest before slicing.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PathReadResult {
@@ -275,6 +278,12 @@ pub struct PathReadResult {
     pub range: Option<ByteRange>,
     pub blocks: Vec<ArtifactManifestRow>,
     pub next_cursor: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::artifact_publish::wire_bytes::option"
+    )]
+    pub inline_body: Option<Vec<u8>>,
 }
 
 impl PathReadResult {
@@ -284,6 +293,7 @@ impl PathReadResult {
                 || self.range.is_some()
                 || !self.blocks.is_empty()
                 || self.next_cursor.is_some()
+                || self.inline_body.is_some()
             {
                 return Err(ProtocolError::invalid(
                     "path",
@@ -299,7 +309,10 @@ impl PathReadResult {
         metadata.validate()?;
         match self.range {
             None => {
-                if !self.blocks.is_empty() || self.next_cursor.is_some() {
+                if !self.blocks.is_empty()
+                    || self.next_cursor.is_some()
+                    || self.inline_body.is_some()
+                {
                     return Err(ProtocolError::invalid(
                         "path",
                         "metadata-only result must not include a read plan",
@@ -308,6 +321,24 @@ impl PathReadResult {
             }
             Some(range) => {
                 range.validate()?;
+                if let Some(body) = &self.inline_body {
+                    let range_end = range.offset.checked_add(range.length).ok_or_else(|| {
+                        ProtocolError::invalid("path.range", "offset plus length overflows")
+                    })?;
+                    if !self.blocks.is_empty()
+                        || self.next_cursor.is_some()
+                        || body.is_empty()
+                        || body.len() > crate::MAX_INLINE_ARTIFACT_BODY_BYTES
+                        || metadata.descriptor.logical_size != body.len() as u64
+                        || range_end > body.len() as u64
+                    {
+                        return Err(ProtocolError::invalid(
+                            "path.inline_body",
+                            "must be the complete inline body covering the range, without a block plan",
+                        ));
+                    }
+                    return Ok(());
+                }
                 if self.blocks.is_empty() {
                     return Err(ProtocolError::invalid(
                         "path.blocks",
@@ -2812,6 +2843,7 @@ mod tests {
             range: None,
             blocks: Vec::new(),
             next_cursor: None,
+            inline_body: None,
         });
         assert!(matches!(
             result.validate(),

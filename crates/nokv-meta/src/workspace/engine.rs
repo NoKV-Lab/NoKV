@@ -2834,9 +2834,13 @@ impl MetaShard {
         if requested.len() != command.history_projection.len() {
             return Err(invalid("duplicate history projection"));
         }
+        // A write-once inline body is deleted only after its revision's
+        // garbage-collection floor proves no retained read version can reach
+        // it, so its deletion keeps no History copy of the body.
         let expected = command
             .mutations
             .iter()
+            .filter(|mutation| mutation.family() != MetadataFamily::ArtifactInlineBody)
             .filter_map(|mutation| {
                 let planned = plan
                     .exact
@@ -3577,6 +3581,12 @@ fn validate_predicate_plan(
             return Err(invalid(
                 "workspace incarnation claims are append-only and permanent",
             ));
+        }
+        if mutation.family() == MetadataFamily::ArtifactInlineBody
+            && matches!(mutation, CommandMutation::Put { .. })
+            && predicate.current.is_some()
+        {
+            return Err(invalid("artifact inline bodies are write-once"));
         }
         if matches!(mutation, CommandMutation::Delete { .. }) && predicate.current.is_none() {
             return Err(invalid("delete mutation requires an existing value"));
@@ -4767,7 +4777,7 @@ mod tests {
     #[test]
     fn fresh_store_freezes_schema_shard_and_bootstrap_version() {
         let store = crate::workspace::test_support::memory(shard(1)).unwrap();
-        assert_eq!(keyspaces().len(), 29);
+        assert_eq!(keyspaces().len(), 30);
         assert_eq!(store.current_read_version().unwrap().get(), 1);
         assert_eq!(
             store.advance_owner_epoch(Some(epoch(1)), epoch(2)),

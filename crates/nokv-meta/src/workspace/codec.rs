@@ -24,7 +24,7 @@ const GENERIC_INDEX_APPEND_RECEIPT_DISCRIMINATOR: u8 = 3;
 
 const FIXED_ID_BYTES: usize = 16;
 pub(crate) const SYSTEM_SCHEMA_KEY: &[u8] = b"schema";
-const SYSTEM_FORMAT_VERSION: u32 = 13;
+const SYSTEM_FORMAT_VERSION: u32 = 14;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SchemaMarkerVersion {
@@ -183,6 +183,12 @@ pub fn artifact_revision_claim_key(root: RootId, revision: ArtifactRevisionId) -
     key.push(ARTIFACT_REVISION_CLAIM_DISCRIMINATOR);
     key.extend_from_slice(revision.as_bytes());
     key
+}
+
+/// Write-once inline body of one artifact revision, keyed exactly like the
+/// revision row it belongs to.
+pub fn artifact_inline_body_key(root: RootId, revision: ArtifactRevisionId) -> Vec<u8> {
+    artifact_revision_key(root, revision)
 }
 
 pub fn history_hold_prefix(root: RootId) -> Vec<u8> {
@@ -1308,7 +1314,7 @@ mod tests {
 
     #[test]
     fn schema_marker_is_exact_and_versioned() {
-        assert_eq!(SYSTEM_FORMAT_VERSION, 13);
+        assert_eq!(SYSTEM_FORMAT_VERSION, 14);
         let marker = encode_schema_marker();
         assert_eq!(marker[0], VALUE_FORMAT_VERSION);
         assert_eq!(
@@ -1321,7 +1327,7 @@ mod tests {
             SchemaMarkerVersion::Current
         );
 
-        let previous_layout = encode_schema_marker_version(12);
+        let previous_layout = encode_schema_marker_version(13);
         assert_eq!(
             validate_schema_marker(&previous_layout),
             Err(SchemaMarkerError)

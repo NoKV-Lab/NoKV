@@ -12,19 +12,20 @@ use nokv_object::{
     ArtifactUploadStats, ObjectError, ObjectKey, DEFAULT_ARTIFACT_BLOCK_SIZE,
 };
 use nokv_protocol::{
-    parse_sha256_digest_uri, seal_artifact_publish_plan, sha256_digest_uri,
-    AbortArtifactPublishRequest, AppendAttemptBinding, AppendSegment, ArtifactDescriptor,
-    ArtifactManifestRow, ArtifactRevisionIdentity, BeginArtifactPublishRequest, ByteRange,
-    CompleteArtifactPublishRequest, ContentType, Digest, ErrorCode, FieldValue,
+    inline_artifact_body_digest, parse_sha256_digest_uri, seal_artifact_publish_plan,
+    sha256_digest_uri, AbortArtifactPublishRequest, AppendAttemptBinding, AppendSegment,
+    ArtifactDescriptor, ArtifactManifestRow, ArtifactRevisionIdentity, BeginArtifactPublishRequest,
+    ByteRange, CompleteArtifactPublishRequest, ContentType, Digest, ErrorCode, FieldValue,
     FinishArtifactPublishRequest, GetOperationRequest, GetPathRequest, LogicalShardIdentity,
     MarkArtifactObjectsUploadedRequest, ObjectIdentity, ObjectUploadProof, OperationIdentity,
     OperationKind, OperationResult, OperationState, OperationStatus, OperationToken, PageRequest,
     PathMetadata, PathReadResult, PrepareArtifactPublishRequest, PublicationAuthority,
-    PublishCondition, PublishResult, ReadRestoreSourceRunManifestRequest, RootRoute,
-    StageArtifactManifestRequest, StageArtifactObjectsRequest, StagedObject, WorkspaceIdentity,
-    WorkspacePath, WorkspaceReadView, WorkspaceRequest, WorkspaceResult,
-    MAX_ARTIFACT_DEPENDENCY_DEPTH, MAX_ARTIFACT_DEPENDENCY_OWNERS, MAX_ARTIFACT_PUBLISH_BATCH_ROWS,
-    MAX_ARTIFACT_READ_PLAN_ROWS,
+    PublishCondition, PublishInlineArtifactRequest, PublishResult,
+    ReadRestoreSourceRunManifestRequest, RootRoute, StageArtifactManifestRequest,
+    StageArtifactObjectsRequest, StagedObject, WorkspaceIdentity, WorkspacePath, WorkspaceReadView,
+    WorkspaceRequest, WorkspaceResult, MAX_ARTIFACT_DEPENDENCY_DEPTH,
+    MAX_ARTIFACT_DEPENDENCY_OWNERS, MAX_ARTIFACT_PUBLISH_BATCH_ROWS, MAX_ARTIFACT_READ_PLAN_ROWS,
+    MAX_INLINE_ARTIFACT_BODY_BYTES,
 };
 use nokv_types::{ArtifactRevisionId, LogicalShardId, RootId};
 use sha2::{Digest as _, Sha256};
@@ -289,6 +290,31 @@ where
             ));
         }
 
+        if publishes_inline(&options.authority, bytes, options.block_size) {
+            // No provider write happens, so provider admission is not needed.
+            let route = self.resolve_artifact_route()?;
+            require_object_namespace(store, route)?;
+            let descriptor = inline_descriptor(
+                bytes,
+                options.content_type.clone(),
+                options.producer.clone(),
+                options.manifest_identity.clone(),
+                options.index_fields.clone(),
+            );
+            return self.publish_inline_artifact(
+                route.logical_shard_id,
+                options.operation_id,
+                options.artifact_revision_id,
+                &options.target,
+                options.authority,
+                options.condition,
+                options.expected_workspace_incarnation_id,
+                None,
+                None,
+                &descriptor,
+                bytes,
+            );
+        }
         require_provider_admission(store, options.block_size)?;
 
         let route = self.resolve_artifact_route()?;
@@ -338,6 +364,152 @@ where
             descriptor,
             bytes,
         )
+    }
+
+    /// Publish a body stored inline in shard metadata with one request.
+    ///
+    /// The request admits and completes the publication under one durable
+    /// acknowledgement. A retry with the same operation identity converges
+    /// on the first durable outcome.
+    #[allow(clippy::too_many_arguments)]
+    fn publish_inline_artifact(
+        &self,
+        logical_shard: LogicalShardIdentity,
+        operation_id: OperationIdentity,
+        artifact_revision_id: ArtifactRevisionIdentity,
+        target: &WorkspacePath,
+        authority: PublicationAuthority,
+        condition: PublishCondition,
+        expected_workspace_incarnation_id: Option<WorkspaceIdentity>,
+        append_intent_digest: Option<Digest>,
+        append_attempt: Option<AppendAttemptBinding>,
+        descriptor: &ArtifactDescriptor,
+        body: &[u8],
+    ) -> Result<ArtifactPublishOutcome, ClientError> {
+        descriptor.validate()?;
+        let request = PublishInlineArtifactRequest {
+            begin: BeginArtifactPublishRequest {
+                operation_id,
+                artifact_revision_id,
+                target: target.clone(),
+                authority,
+                condition,
+                expected_workspace_incarnation_id,
+                append_intent_digest,
+                append_attempt,
+                staged_object_count: 0,
+                staged_object_seal: Digest([0; 32]),
+                manifest_row_count: 0,
+                manifest_seal: Digest([0; 32]),
+                dependency_owner_revision_ids: Vec::new(),
+                inline_body_digest: Some(inline_artifact_body_digest(body)),
+            },
+            body: body.to_vec(),
+            artifact: descriptor.clone(),
+        };
+        let stage = ArtifactPublishStage::PublishInline;
+        for attempt in 1..=self.max_attempts() {
+            let error = match self.execute_on_logical_shard(
+                self.new_request_id(),
+                WorkspaceRequest::PublishInlineArtifact(request.clone()),
+                logical_shard,
+            ) {
+                Ok(call) => {
+                    return self.inline_publication_outcome(
+                        logical_shard,
+                        operation_id,
+                        authority,
+                        append_intent_digest.is_some(),
+                        call,
+                    )
+                }
+                Err(error) => error,
+            };
+            // The request may have committed before its response was lost.
+            if let Ok(Some(recovered)) = self.recover_completed_publish(logical_shard, operation_id)
+            {
+                return Ok(ArtifactPublishOutcome {
+                    publication: recovered,
+                    upload_stats: ArtifactUploadStats::default(),
+                });
+            }
+            if !should_resume_artifact_publication(&error) {
+                return Err(if append_intent_digest.is_some() {
+                    publication_failure_without_abort(stage, error)
+                } else {
+                    self.failed_publication(logical_shard, operation_id, None, stage, error)
+                });
+            }
+            if attempt == self.max_attempts() {
+                return Err(ClientError::RetryExhausted {
+                    attempts: attempt,
+                    last_error: Box::new(publication_failure_without_abort(stage, error)),
+                });
+            }
+        }
+        unreachable!("validated max_attempts is non-zero")
+    }
+
+    fn inline_publication_outcome(
+        &self,
+        logical_shard: LogicalShardIdentity,
+        operation_id: OperationIdentity,
+        authority: PublicationAuthority,
+        stable_append: bool,
+        call: ClientCall<WorkspaceResult>,
+    ) -> Result<ArtifactPublishOutcome, ClientError> {
+        let stage = ArtifactPublishStage::PublishInline;
+        let (replayed, commit_version) = (call.replayed, call.commit_version);
+        let status = match call.value {
+            WorkspaceResult::Published(value) => {
+                return Ok(ArtifactPublishOutcome {
+                    publication: ClientCall {
+                        value,
+                        commit_version,
+                        replayed,
+                    },
+                    upload_stats: ArtifactUploadStats::default(),
+                });
+            }
+            WorkspaceResult::Operation(status) => validated_publish_status(status, operation_id)
+                .map_err(|source| publication_failure_without_abort(stage, source))?,
+            _ => {
+                return Err(publication_failure_without_abort(
+                    stage,
+                    ClientError::ResponseMismatch(
+                        "inline publication returned neither a publication nor its operation"
+                            .to_owned(),
+                    ),
+                ))
+            }
+        };
+        match status.state {
+            OperationState::Succeeded => {
+                let value = published_result_from_status(&status)
+                    .map_err(|source| publication_failure_without_abort(stage, source))?;
+                // As for a replayed Begin, a visible create whose path was
+                // removed and reclaimed must not be reported as current.
+                if !stable_append && matches!(authority, PublicationAuthority::Visible) {
+                    self.confirm_replayed_publication_is_live(logical_shard, &value)
+                        .map_err(|source| publication_failure_without_abort(stage, source))?;
+                }
+                Ok(ArtifactPublishOutcome {
+                    publication: ClientCall {
+                        value,
+                        commit_version,
+                        replayed: true,
+                    },
+                    upload_stats: ArtifactUploadStats::default(),
+                })
+            }
+            state => Err(publication_failure_without_abort(
+                stage,
+                ClientError::ResponseMismatch(format!(
+                    "artifact publication operation is durably {state:?} and cannot be \
+                     resumed; retry with a new operation identity"
+                )),
+            )),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -458,6 +630,7 @@ where
             manifest_row_count: seals.manifest_row_count,
             manifest_seal: seals.manifest_seal,
             dependency_owner_revision_ids: dependencies.to_vec(),
+            inline_body_digest: None,
         };
         // A plan whose objects fit one batch is admitted and staged under one
         // durable acknowledgement; a larger plan stages in batches after Begin.
@@ -829,6 +1002,38 @@ where
         ) = match metadata {
             None => {
                 enforce_append_size(delta_len, options.max_logical_size)?;
+                if publishes_inline(&PublicationAuthority::Visible, delta, options.block_size) {
+                    let descriptor = inline_descriptor(
+                        delta,
+                        options
+                            .content_type
+                            .clone()
+                            .unwrap_or_else(|| options.create_content_type.clone()),
+                        None,
+                        None,
+                        Vec::new(),
+                    );
+                    let outcome = self.publish_inline_artifact(
+                        logical_shard,
+                        operation_id,
+                        artifact_revision_id,
+                        &options.target,
+                        PublicationAuthority::Visible,
+                        PublishCondition::CreateOnly,
+                        expected_workspace_incarnation_id,
+                        append_intent_digest,
+                        append_attempt,
+                        &descriptor,
+                        delta,
+                    )?;
+                    return Ok(ArtifactAppendOutcome {
+                        publication: outcome.publication,
+                        descriptor,
+                        upload_stats: outcome.upload_stats,
+                        base_read_stats: ArtifactReadStats::default(),
+                        created: true,
+                    });
+                }
                 let object_plan = plan_artifact_upload(
                     ArtifactUploadOptions::new(
                         LogicalShardId::from(logical_shard),
@@ -887,7 +1092,7 @@ where
                 let base_rows = if metadata.descriptor.logical_size == 0 {
                     Vec::new()
                 } else {
-                    self.load_artifact_range_rows(
+                    let loaded = self.load_artifact_range_rows(
                         logical_shard,
                         &options.target,
                         WorkspaceReadView::Live,
@@ -896,8 +1101,23 @@ where
                             length: metadata.descriptor.logical_size,
                         },
                         Some(&metadata),
-                    )?
-                    .rows
+                    )?;
+                    if let Some(base) = loaded.inline_body {
+                        return self.append_to_inline_base(
+                            store,
+                            options,
+                            logical_shard,
+                            operation_id,
+                            artifact_revision_id,
+                            &metadata,
+                            base,
+                            delta,
+                            expected_workspace_incarnation_id,
+                            append_intent_digest,
+                            append_attempt,
+                        );
+                    }
+                    loaded.rows
                 };
                 let base_manifest =
                     manifest_from_rows(self.root_id(), logical_shard, &metadata, &base_rows)?;
@@ -1033,6 +1253,116 @@ where
             upload_stats: outcome.upload_stats,
             base_read_stats,
             created,
+        })
+    }
+
+    /// Append to an inline base. The base owns no objects to borrow, so the
+    /// result is a complete body owned by the new revision: inline while it
+    /// fits the bound, otherwise rematerialized into dependency-free objects.
+    #[allow(clippy::too_many_arguments)]
+    fn append_to_inline_base(
+        &self,
+        store: &dyn ArtifactObjectStore,
+        options: &ArtifactAppendOptions,
+        logical_shard: LogicalShardIdentity,
+        operation_id: OperationIdentity,
+        artifact_revision_id: ArtifactRevisionIdentity,
+        metadata: &PathMetadata,
+        mut body: Vec<u8>,
+        delta: &[u8],
+        expected_workspace_incarnation_id: Option<WorkspaceIdentity>,
+        append_intent_digest: Option<Digest>,
+        append_attempt: Option<AppendAttemptBinding>,
+    ) -> Result<ArtifactAppendOutcome, ClientError> {
+        body.try_reserve(delta.len()).map_err(|_| {
+            ClientError::InvalidOptions(
+                "append result cannot be materialized in client memory".to_owned(),
+            )
+        })?;
+        body.extend_from_slice(delta);
+        let condition = PublishCondition::Append {
+            expected_generation: Some(metadata.generation),
+        };
+        let content_type = options
+            .content_type
+            .clone()
+            .unwrap_or_else(|| metadata.descriptor.content_type.clone());
+        if publishes_inline(&PublicationAuthority::Visible, &body, options.block_size) {
+            let descriptor = inline_descriptor(
+                &body,
+                content_type,
+                metadata.descriptor.producer.clone(),
+                metadata.descriptor.manifest_identity.clone(),
+                metadata.descriptor.index_fields.clone(),
+            );
+            let outcome = self.publish_inline_artifact(
+                logical_shard,
+                operation_id,
+                artifact_revision_id,
+                &options.target,
+                PublicationAuthority::Visible,
+                condition,
+                expected_workspace_incarnation_id,
+                append_intent_digest,
+                append_attempt,
+                &descriptor,
+                &body,
+            )?;
+            return Ok(ArtifactAppendOutcome {
+                publication: outcome.publication,
+                descriptor,
+                upload_stats: outcome.upload_stats,
+                base_read_stats: ArtifactReadStats::default(),
+                created: false,
+            });
+        }
+        let object_plan = plan_artifact_upload(
+            ArtifactUploadOptions::new(
+                LogicalShardId::from(logical_shard),
+                RootId::from(self.root_id()),
+                ArtifactRevisionId::from(artifact_revision_id),
+            )
+            .with_block_size(options.block_size),
+            &body,
+        )?;
+        let (staged_objects, manifest_rows) =
+            publication_rows(artifact_revision_id, &object_plan.manifest)?;
+        let seals =
+            seal_artifact_publish_plan(artifact_revision_id, &staged_objects, &manifest_rows)?;
+        let mut descriptor = metadata.descriptor.clone();
+        descriptor.logical_size = object_plan.manifest.logical_len;
+        descriptor.body_digest = sha256_digest_uri(Digest(object_plan.manifest.sha256));
+        descriptor.manifest_digest = sha256_digest_uri(seals.manifest_seal);
+        descriptor.content_type = content_type;
+        let mut body_digest = BodyDigestState::new();
+        body_digest.update(&body);
+        let published_rows = manifest_rows.clone();
+        let outcome = self.publish_artifact_plan(
+            store,
+            logical_shard,
+            operation_id,
+            artifact_revision_id,
+            options.target.clone(),
+            PublicationAuthority::Visible,
+            condition,
+            expected_workspace_incarnation_id,
+            append_intent_digest,
+            append_attempt,
+            object_plan,
+            staged_objects,
+            manifest_rows,
+            Vec::new(),
+            descriptor.clone(),
+            &body,
+        )?;
+        self.body_digests()
+            .insert(artifact_revision_id, body_digest, &published_rows);
+        Ok(ArtifactAppendOutcome {
+            publication: outcome.publication,
+            descriptor,
+            upload_stats: outcome.upload_stats,
+            base_read_stats: ArtifactReadStats::default(),
+            created: false,
         })
     }
 
@@ -1493,6 +1823,15 @@ where
                 },
                 Some(&metadata),
             )?;
+            if let Some(body) = loaded.inline_body {
+                // The first window of an inline revision is its whole body,
+                // already verified against the sealed descriptor.
+                return Ok(ArtifactReadOutcome {
+                    metadata,
+                    bytes: body,
+                    stats,
+                });
+            }
             let window = window_from_rows(
                 self.root_id(),
                 route.logical_shard_id,
@@ -1637,19 +1976,19 @@ where
             ByteRange { offset, length },
             None,
         )?;
-        let window = window_from_rows(
+        let (bytes, stats) = read_loaded_range(
+            store,
+            cache,
             self.root_id(),
             route.logical_shard_id,
-            &loaded.metadata,
-            &loaded.rows,
+            &loaded,
             offset,
             len,
         )?;
-        let read = read_artifact_window(store, cache, &window, offset, len)?;
         Ok(ArtifactReadOutcome {
             metadata: loaded.metadata,
-            bytes: read.bytes,
-            stats: read.stats,
+            bytes,
+            stats,
         })
     }
 
@@ -1729,22 +2068,22 @@ where
                     },
                     Some(&item.metadata),
                 )?;
-                let window = window_from_rows(
+                let (read_bytes, read_stats) = read_loaded_range(
+                    store,
+                    cache,
                     self.root_id(),
                     route.logical_shard_id,
-                    &loaded.metadata,
-                    &loaded.rows,
+                    &loaded,
                     merged.offset,
                     len,
                 )?;
-                let read = read_artifact_window(store, cache, &window, merged.offset, len)?;
-                if read.bytes.len() != len {
+                if read_bytes.len() != len {
                     return Err(ClientError::ArtifactIntegrity(format!(
                         "coalesced range returned {} bytes, expected {len}",
-                        read.bytes.len()
+                        read_bytes.len()
                     )));
                 }
-                merge_read_stats(&mut total_stats, read.stats);
+                merge_read_stats(&mut total_stats, read_stats);
                 for member in merged.members {
                     let range = item.request.ranges[member];
                     let start = usize::try_from(range.offset - merged.offset).map_err(|_| {
@@ -1762,7 +2101,7 @@ where
                             "range scatter end overflows usize".to_owned(),
                         )
                     })?;
-                    let bytes = read.bytes.get(start..end).ok_or_else(|| {
+                    let bytes = read_bytes.get(start..end).ok_or_else(|| {
                         ClientError::ArtifactIntegrity(
                             "coalesced range omitted requested scatter bytes".to_owned(),
                         )
@@ -1902,6 +2241,7 @@ where
         Ok(LoadedRangeRows {
             metadata: expected_metadata.clone(),
             rows,
+            inline_body: None,
         })
     }
 
@@ -1948,6 +2288,20 @@ where
                 return Err(ClientError::ArtifactReadFenceChanged);
             }
             metadata.get_or_insert_with(|| page_metadata.clone());
+            if let Some(body) = result.inline_body {
+                if cursor.is_some() || !rows.is_empty() {
+                    return Err(ClientError::ArtifactIntegrity(
+                        "an inline body followed a block-plan page".to_owned(),
+                    ));
+                }
+                let metadata = metadata.expect("every valid range page includes metadata");
+                verify_inline_body(&metadata, &body)?;
+                return Ok(LoadedRangeRows {
+                    metadata,
+                    rows,
+                    inline_body: Some(body),
+                });
+            }
             append_range_page(&mut rows, result.blocks)?;
 
             let Some(next_cursor) = result.next_cursor else {
@@ -1965,6 +2319,7 @@ where
         Ok(LoadedRangeRows {
             metadata: metadata.expect("every valid range page includes metadata"),
             rows,
+            inline_body: None,
         })
     }
 }
@@ -2109,6 +2464,83 @@ fn coalesce_artifact_ranges(
 struct LoadedRangeRows {
     metadata: PathMetadata,
     rows: Vec<ArtifactManifestRow>,
+    /// The complete, verified body of an inline revision, which has no rows.
+    inline_body: Option<Vec<u8>>,
+}
+
+/// Read `len` bytes at `offset` of a loaded range: an inline body is sliced
+/// from its verified bytes, and manifest rows are read from the object store.
+fn read_loaded_range(
+    store: &dyn ArtifactObjectStore,
+    cache: Option<&dyn ArtifactBlockCache>,
+    root_id: nokv_protocol::RootIdentity,
+    logical_shard_id: LogicalShardIdentity,
+    loaded: &LoadedRangeRows,
+    offset: u64,
+    len: usize,
+) -> Result<(Vec<u8>, ArtifactReadStats), ClientError> {
+    if let Some(body) = &loaded.inline_body {
+        let bytes = usize::try_from(offset)
+            .ok()
+            .and_then(|start| body.get(start..start.checked_add(len)?))
+            .ok_or_else(|| {
+                ClientError::ArtifactIntegrity(
+                    "inline body does not cover the requested range".to_owned(),
+                )
+            })?;
+        return Ok((bytes.to_vec(), ArtifactReadStats::default()));
+    }
+    let window = window_from_rows(
+        root_id,
+        logical_shard_id,
+        &loaded.metadata,
+        &loaded.rows,
+        offset,
+        len,
+    )?;
+    let read = read_artifact_window(store, cache, &window, offset, len)?;
+    Ok((read.bytes, read.stats))
+}
+
+/// Whether a publication stores its body inline in shard metadata: a
+/// visible, non-empty body that would be one object no larger than the
+/// inline bound.
+fn publishes_inline(authority: &PublicationAuthority, bytes: &[u8], block_size: usize) -> bool {
+    matches!(authority, PublicationAuthority::Visible)
+        && !bytes.is_empty()
+        && bytes.len() <= MAX_INLINE_ARTIFACT_BODY_BYTES.min(block_size)
+}
+
+/// An inline revision has no manifest rows, so its manifest digest is the
+/// empty closure; its body digest covers the inline bytes.
+fn inline_descriptor(
+    bytes: &[u8],
+    content_type: ContentType,
+    producer: Option<String>,
+    manifest_identity: Option<String>,
+    index_fields: Vec<FieldValue>,
+) -> ArtifactDescriptor {
+    ArtifactDescriptor {
+        logical_size: bytes.len() as u64,
+        body_digest: sha256_digest_uri(inline_artifact_body_digest(bytes)),
+        manifest_digest: sha256_digest_uri(Digest([0; 32])),
+        content_type,
+        producer,
+        manifest_identity,
+        index_fields,
+    }
+}
+
+fn verify_inline_body(metadata: &PathMetadata, body: &[u8]) -> Result<(), ClientError> {
+    if body.len() as u64 != metadata.descriptor.logical_size
+        || metadata.descriptor.body_digest != sha256_digest_uri(inline_artifact_body_digest(body))
+        || metadata.descriptor.manifest_digest != sha256_digest_uri(Digest([0; 32]))
+    {
+        return Err(ClientError::ArtifactIntegrity(
+            "inline body does not match its sealed descriptor".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_path_result(
@@ -2135,14 +2567,17 @@ fn validate_path_result(
         ));
     }
     match expected_range {
-        None if !result.blocks.is_empty() || result.next_cursor.is_some() => {
+        None if !result.blocks.is_empty()
+            || result.next_cursor.is_some()
+            || result.inline_body.is_some() =>
+        {
             Err(ClientError::ResponseMismatch(
                 "metadata-only artifact response included a read plan".to_owned(),
             ))
         }
-        Some(_) if result.blocks.is_empty() => Err(ClientError::ArtifactIntegrity(
-            "range-plan page contains no manifest rows".to_owned(),
-        )),
+        Some(_) if result.blocks.is_empty() && result.inline_body.is_none() => Err(
+            ClientError::ArtifactIntegrity("range-plan page contains no manifest rows".to_owned()),
+        ),
         _ => Ok(()),
     }
 }
@@ -3566,8 +4001,38 @@ mod tests {
                     range: None,
                     blocks: state.manifest_rows.clone(),
                     next_cursor: None,
+                    inline_body: None,
                 });
                 Ok(WorkspaceResult::Published(published))
+            }
+            WorkspaceRequest::PublishInlineArtifact(publish) => {
+                let begun = apply_request(
+                    state,
+                    &publication_step(
+                        request,
+                        WorkspaceRequest::BeginArtifactPublish(publish.begin.clone()),
+                    ),
+                )?;
+                let WorkspaceResult::Operation(status) = &begun else {
+                    return Ok(begun);
+                };
+                if status.state != OperationState::Running {
+                    return Ok(begun);
+                }
+                let published = apply_request(
+                    state,
+                    &publication_step(
+                        request,
+                        WorkspaceRequest::CompleteArtifactPublish(CompleteArtifactPublishRequest {
+                            token: status.token,
+                            artifact: publish.artifact.clone(),
+                        }),
+                    ),
+                )?;
+                if let Some(path) = state.path.as_mut() {
+                    path.inline_body = Some(publish.body.clone());
+                }
+                Ok(published)
             }
             WorkspaceRequest::AbortArtifactPublish(abort) => {
                 require_token(state, abort.token)?;
@@ -3612,8 +4077,19 @@ mod tests {
                         range: None,
                         blocks: Vec::new(),
                         next_cursor: None,
+                        inline_body: None,
                     }));
                 };
+                if let Some(body) = stored.inline_body.take() {
+                    return Ok(WorkspaceResult::Path(PathReadResult {
+                        not_modified: false,
+                        metadata: stored.metadata,
+                        range: Some(range),
+                        blocks: Vec::new(),
+                        next_cursor: None,
+                        inline_body: Some(body),
+                    }));
+                }
                 let page = get
                     .plan_page
                     .as_ref()
@@ -3672,6 +4148,7 @@ mod tests {
                     range: Some(range),
                     blocks: matching[start..end].to_vec(),
                     next_cursor,
+                    inline_body: None,
                 }))
             }
             _ => Err(TransportError::new(
@@ -3694,7 +4171,7 @@ mod tests {
         state
             .attempts
             .iter()
-            .filter(|(label, _)| matches!(*label, "begin" | "prepare"))
+            .filter(|(label, _)| matches!(*label, "begin" | "prepare" | "publish_inline"))
             .count()
     }
 
@@ -3745,6 +4222,7 @@ mod tests {
             WorkspaceRequest::CompleteArtifactPublish(_) => "complete",
             WorkspaceRequest::PrepareArtifactPublish(_) => "prepare",
             WorkspaceRequest::FinishArtifactPublish(_) => "finish",
+            WorkspaceRequest::PublishInlineArtifact(_) => "publish_inline",
             WorkspaceRequest::AbortArtifactPublish(_) => "abort",
             WorkspaceRequest::GetOperation(_) => "get_operation",
             WorkspaceRequest::GetPath(_) => "get_path",
@@ -4392,6 +4870,162 @@ mod tests {
             .into_iter()
             .all(|index| index < first_create));
         assert_eq!(events[0], "begin");
+    }
+
+    fn append_options_numbered(index: u8, block_size: usize) -> ArtifactAppendOptions {
+        ArtifactAppendOptions::new(
+            OperationIdentity([0x60 + index; 16]),
+            ArtifactRevisionIdentity([0x70 + index; 16]),
+            target(),
+            ContentType::new("text/plain").unwrap(),
+        )
+        .with_block_size(block_size)
+    }
+
+    #[test]
+    fn a_one_block_body_publishes_inline_in_one_request_without_provider_writes() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let client = client(transport);
+        // Nothing reaches the provider, so its admission is not required.
+        let store = AdmissionOverrideStore::unadmitted(Arc::clone(&events));
+        let body = br#"{"turn":3,"role":"tool","text":"ok"}"#;
+
+        let outcome = client
+            .publish_artifact(&store, publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE), body)
+            .unwrap();
+        assert_eq!(outcome.upload_stats, ArtifactUploadStats::default());
+        assert_eq!(events.lock().unwrap().as_slice(), ["publish_inline"]);
+
+        let read = client
+            .read_artifact(&store, None, target(), WorkspaceReadView::Live)
+            .unwrap();
+        assert_eq!(read.bytes, body);
+        assert_eq!(read.stats, ArtifactReadStats::default());
+        let range = client
+            .read_artifact_range(&store, None, target(), WorkspaceReadView::Live, 2, 5)
+            .unwrap();
+        assert_eq!(range.bytes, &body[2..7]);
+        let batch = client
+            .read_artifact_ranges_batch(
+                &store,
+                None,
+                vec![ArtifactRangeBatchRequest {
+                    target: target(),
+                    ranges: vec![
+                        ByteRange {
+                            offset: 0,
+                            length: 1,
+                        },
+                        ByteRange {
+                            offset: 3,
+                            length: 4,
+                        },
+                    ],
+                    expected_generation: None,
+                    max_gap_bytes: 0,
+                }],
+                WorkspaceReadView::Live,
+            )
+            .unwrap();
+        assert_eq!(
+            batch.items[0].ranges,
+            vec![body[0..1].to_vec(), body[3..7].to_vec()]
+        );
+        assert!(!events.lock().unwrap().contains(&"object_create"));
+        assert_eq!(store.inner.reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn an_inline_body_that_misses_its_sealed_digest_fails_integrity() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(
+                &store,
+                publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE),
+                b"exact",
+            )
+            .unwrap();
+        inspector
+            .state()
+            .path
+            .as_mut()
+            .and_then(|path| path.inline_body.as_mut())
+            .unwrap()[0] ^= 0xff;
+        let error = client
+            .read_artifact(&store, None, target(), WorkspaceReadView::Live)
+            .unwrap_err();
+        assert!(
+            matches!(error, ClientError::ArtifactIntegrity(_)),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn appends_to_an_inline_base_stay_inline_until_the_bound_then_rematerialize() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(
+                &store,
+                publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE),
+                b"base",
+            )
+            .unwrap();
+
+        let appended = client
+            .append_artifact(
+                &store,
+                append_options_numbered(1, DEFAULT_ARTIFACT_BLOCK_SIZE),
+                b"+delta",
+            )
+            .unwrap();
+        assert_eq!(appended.upload_stats, ArtifactUploadStats::default());
+        assert_eq!(appended.descriptor.logical_size, 10);
+        assert_eq!(store.creates.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            inspector
+                .state()
+                .path
+                .as_ref()
+                .and_then(|path| path.inline_body.as_deref()),
+            Some(&b"base+delta"[..])
+        );
+
+        // The next body outgrows the bound: the new revision owns all of it.
+        let large = vec![b'x'; MAX_INLINE_ARTIFACT_BODY_BYTES];
+        let appended = client
+            .append_artifact(
+                &store,
+                append_options_numbered(2, DEFAULT_ARTIFACT_BLOCK_SIZE),
+                &large,
+            )
+            .unwrap();
+        assert_eq!(appended.upload_stats.blocks, 1);
+        assert_eq!(store.creates.load(Ordering::SeqCst), 1);
+        let state = inspector.state();
+        assert!(state
+            .begin
+            .as_ref()
+            .unwrap()
+            .dependency_owner_revision_ids
+            .is_empty());
+        assert_eq!(state.path.as_ref().unwrap().inline_body, None);
+        drop(state);
+        let mut expected = b"base+delta".to_vec();
+        expected.extend_from_slice(&large);
+        let read = client
+            .read_artifact(&store, None, target(), WorkspaceReadView::Live)
+            .unwrap();
+        assert_eq!(read.bytes, expected);
+        assert_eq!(read.metadata.descriptor.logical_size, expected.len() as u64);
     }
 
     #[test]

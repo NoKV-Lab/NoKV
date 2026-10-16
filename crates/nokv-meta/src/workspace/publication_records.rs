@@ -14,7 +14,7 @@ use std::fmt;
 use nokv_types::{
     ArtifactRevisionId, CommitVersion, GcClaimState, Generation, OperationId, ReferenceEpoch,
     RevisionState, WorkbenchId, WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState,
-    FIXED_ID_BYTES, SHA256_BYTES,
+    FIXED_ID_BYTES, MAX_INLINE_ARTIFACT_BODY_BYTES, SHA256_BYTES,
 };
 
 /// Only supported value format for publication payload records.
@@ -108,6 +108,17 @@ pub struct ArtifactRevisionRecord {
     pub reference_epoch: ReferenceEpoch,
     pub strong_reference_count: u64,
     pub last_zero_ref_version: Option<CommitVersion>,
+}
+
+/// Complete body of an inline artifact revision.
+///
+/// It is inserted by the command that creates its `Available` revision, is
+/// never replaced, and is deleted only by the command that completes the
+/// revision's garbage collection. Its revision has no manifest rows, and its
+/// manifest digest is the SHA-256 of these bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactInlineBodyRecord {
+    pub body: Vec<u8>,
 }
 
 /// Strong reference row payload.
@@ -503,6 +514,40 @@ impl ArtifactRevisionRecord {
             last_zero_ref_version,
         })
     }
+}
+
+impl ArtifactInlineBodyRecord {
+    pub fn encode(&self) -> Result<Vec<u8>, PublicationRecordCodecError> {
+        validate_inline_body(&self.body)?;
+        let mut encoded = Vec::with_capacity(1 + 4 + self.body.len());
+        encoded.push(PUBLICATION_VALUE_FORMAT_VERSION);
+        put_bounded_bytes(
+            &mut encoded,
+            "inline_body",
+            &self.body,
+            MAX_INLINE_ARTIFACT_BODY_BYTES,
+        )?;
+        Ok(encoded)
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, PublicationRecordCodecError> {
+        let mut decoder = Decoder::new(encoded);
+        decoder.require_value_version()?;
+        let body = decoder.bounded_bytes("inline_body", MAX_INLINE_ARTIFACT_BODY_BYTES)?;
+        decoder.finish()?;
+        validate_inline_body(&body)?;
+        Ok(Self { body })
+    }
+}
+
+fn validate_inline_body(body: &[u8]) -> Result<(), PublicationRecordCodecError> {
+    validate_length("inline_body", body.len(), MAX_INLINE_ARTIFACT_BODY_BYTES)?;
+    if body.is_empty() {
+        return Err(PublicationRecordCodecError::EmptyString {
+            field: "inline_body",
+        });
+    }
+    Ok(())
 }
 
 impl RevisionRefRecord {
@@ -1029,6 +1074,52 @@ mod tests {
         );
         assert_every_proper_prefix_is_truncated(&expected, ArtifactRevisionClaimRecord::decode);
         assert_trailing_byte_is_rejected(expected, ArtifactRevisionClaimRecord::decode);
+    }
+
+    #[test]
+    fn artifact_inline_body_has_frozen_golden_bytes_and_bounds() {
+        let record = ArtifactInlineBodyRecord {
+            body: b"{\"k\":1}".to_vec(),
+        };
+        let expected = [
+            &[PUBLICATION_VALUE_FORMAT_VERSION][..],
+            &7_u32.to_be_bytes(),
+            b"{\"k\":1}",
+        ]
+        .concat();
+
+        assert_eq!(record.encode().unwrap(), expected);
+        assert_eq!(ArtifactInlineBodyRecord::decode(&expected).unwrap(), record);
+        assert_every_proper_prefix_is_truncated(&expected, ArtifactInlineBodyRecord::decode);
+        assert_trailing_byte_is_rejected(expected, ArtifactInlineBodyRecord::decode);
+
+        let largest = ArtifactInlineBodyRecord {
+            body: vec![0xa5; MAX_INLINE_ARTIFACT_BODY_BYTES],
+        };
+        assert_eq!(
+            ArtifactInlineBodyRecord::decode(&largest.encode().unwrap()).unwrap(),
+            largest
+        );
+        assert!(matches!(
+            ArtifactInlineBodyRecord {
+                body: vec![0; MAX_INLINE_ARTIFACT_BODY_BYTES + 1],
+            }
+            .encode(),
+            Err(PublicationRecordCodecError::LengthLimit { .. })
+        ));
+        assert!(matches!(
+            ArtifactInlineBodyRecord { body: Vec::new() }.encode(),
+            Err(PublicationRecordCodecError::EmptyString { .. })
+        ));
+        let empty = [
+            &[PUBLICATION_VALUE_FORMAT_VERSION][..],
+            &0_u32.to_be_bytes(),
+        ]
+        .concat();
+        assert!(matches!(
+            ArtifactInlineBodyRecord::decode(&empty),
+            Err(PublicationRecordCodecError::EmptyString { .. })
+        ));
     }
 
     #[test]

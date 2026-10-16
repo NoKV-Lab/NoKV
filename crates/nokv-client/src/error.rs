@@ -54,6 +54,8 @@ pub enum ArtifactPublishStage {
     Complete,
     /// Marking uploads, staging the manifest, and `Complete` in one request.
     Finish,
+    /// `Begin` and `Complete` of a body stored inline, in one request.
+    PublishInline,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -235,6 +237,7 @@ impl fmt::Display for ArtifactPublishStage {
             Self::StageManifest => "stage manifest",
             Self::Complete => "complete",
             Self::Finish => "finish",
+            Self::PublishInline => "publish inline",
         })
     }
 }

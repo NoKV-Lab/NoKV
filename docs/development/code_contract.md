@@ -113,7 +113,10 @@ that owns them. Do not move domain-specific or single-use logic into a generic
 - `WorkspaceCurrent` is the visibility marker; staging must be absent from
   every query surface until marker publication.
 - Keep object bytes out of the metadata store except compact immutable
-  descriptors.
+  descriptors and the write-once inline body of a visible revision of at most
+  `MAX_INLINE_ARTIFACT_BODY_BYTES` (16 KiB). An inline revision has no staged
+  objects or manifest rows; its body row is created with the revision and
+  deleted only by the revision's garbage collection, without a History copy.
 - Publish objects first and metadata last. Metadata failure leaves no
   user-visible path.
 - Every published body has a never-reused immutable
