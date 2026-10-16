@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use nokv_types::{
     CommitId, CommitVersion, Generation, GenericIndexGenerationState, NormalizedRelativePath,
-    ReadVersion, RootId, WorkbenchId, WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState,
-    FIXED_ID_BYTES, SHA256_BYTES,
+    OwnerEpoch, PlacementGeneration, ReadVersion, RootId, WorkbenchId, WorkspaceIncarnationId,
+    WorkspaceRevision, WorkspaceState, FIXED_ID_BYTES, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
 
@@ -26,7 +26,7 @@ use super::codec::{
     change_event_key, decode_change_event_key as decode_change_event_key_bytes,
     decode_generic_index_row_key, decode_path_current_key, decode_workspace_current_key,
     generic_index_current_key, generic_index_generation_key, generic_index_row_prefix,
-    path_child_prefix, workbench_commit_head_key,
+    path_child_prefix, workbench_commit_head_key, workspace_current_key,
 };
 use super::commit_records::{CommitRecordError, WorkbenchCommitHeadRecord};
 use super::engine::{MetaError, MetaShard, MetadataScanItem};
@@ -1413,36 +1413,58 @@ pub fn find_workspaces_at(
     })
 }
 
-/// Resolve one visible workbench and its optional commit head without a scan.
-pub fn get_workspace_at(
+/// Resolve one visible workspace and its commit head at the current version
+/// inside one fenced point-read window. Sampling the version separately would
+/// let a concurrent publication advance the workspace in between and send the
+/// live read through a historical lookup.
+pub fn get_current_workspace(
     store: &MetaShard,
-    context: RootReadContext,
+    root_id: RootId,
+    placement_generation: PlacementGeneration,
+    owner_epoch: OwnerEpoch,
     workbench_id: &WorkbenchId,
 ) -> Result<Option<WorkspaceDiscovery>, QueryError> {
-    let Some(workspace) = get_visible_workspace_at(store, context, workbench_id)? else {
-        return Ok(None);
-    };
-    let head = store
-        .read_at(
-            context.root_id,
-            context.placement_generation,
-            context.owner_epoch,
-            MetadataFamily::WorkbenchCommitHead,
-            &workbench_commit_head_key(context.root_id, workspace.incarnation_id),
-            context.read_version,
-        )?
-        .map(|payload| {
-            WorkbenchCommitHeadRecord::decode(&payload)
-                .map_err(|source| QueryError::CommitHeadCodec { source })
-        })
-        .transpose()?;
-    Ok(Some(WorkspaceDiscovery {
-        workbench_id: workbench_id.clone(),
-        workspace_incarnation_id: workspace.incarnation_id,
-        workspace_revision: workspace.workspace_revision,
-        commit_id: head.map(|head| head.commit_id),
-        commit_head_generation: head.map(|head| head.head_generation),
-    }))
+    store.with_fenced_point_reads(
+        root_id,
+        placement_generation,
+        owner_epoch,
+        None,
+        |_, reader| {
+            let Some(payload) = reader.get(
+                MetadataFamily::WorkspaceCurrent,
+                &workspace_current_key(root_id, workbench_id),
+            )?
+            else {
+                return Ok(None);
+            };
+            let workspace = WorkspaceRecord::decode(&payload).map_err(|source| {
+                QueryError::Namespace(NamespaceError::Codec {
+                    record: "WorkspaceCurrent",
+                    source,
+                })
+            })?;
+            if workspace.state != WorkspaceState::Visible {
+                return Ok(None);
+            }
+            let head = reader
+                .get(
+                    MetadataFamily::WorkbenchCommitHead,
+                    &workbench_commit_head_key(root_id, workspace.incarnation_id),
+                )?
+                .map(|payload| {
+                    WorkbenchCommitHeadRecord::decode(&payload)
+                        .map_err(|source| QueryError::CommitHeadCodec { source })
+                })
+                .transpose()?;
+            Ok(Some(WorkspaceDiscovery {
+                workbench_id: workbench_id.clone(),
+                workspace_incarnation_id: workspace.incarnation_id,
+                workspace_revision: workspace.workspace_revision,
+                commit_id: head.map(|head| head.commit_id),
+                commit_head_generation: head.map(|head| head.head_generation),
+            }))
+        },
+    )
 }
 
 /// Page strict typed events from an append-only durable position, rechecking
@@ -4063,6 +4085,78 @@ mod tests {
             path_current_key(root(), incarnation_id, &path(name)),
             entry.encode().unwrap(),
         )
+    }
+
+    #[test]
+    fn current_workspace_resolves_inside_one_read_window() {
+        let store = ready_store();
+        let name = workbench("shared-bench");
+        put_records(
+            &store,
+            0x71,
+            vec![workspace_row(
+                &name,
+                incarnation(1),
+                WorkspaceState::Visible,
+            )],
+        );
+        // A version sampled before a concurrent publication advanced the
+        // workspace can only be served through the key's history.
+        let sampled = context(&store);
+        let key = workspace_current_key(root(), &name);
+        let advanced = WorkspaceRecord {
+            workspace_revision: WorkspaceRevision::new(2),
+            ..workspace_record(incarnation(1), WorkspaceState::Visible)
+        };
+        execute(
+            &store,
+            0x72,
+            vec![CommandPredicate::Value {
+                family: MetadataFamily::WorkspaceCurrent,
+                key: key.clone(),
+                expected: Some(
+                    workspace_record(incarnation(1), WorkspaceState::Visible)
+                        .encode()
+                        .unwrap(),
+                ),
+            }],
+            vec![CommandMutation::Put {
+                family: MetadataFamily::WorkspaceCurrent,
+                key: key.clone(),
+                value: advanced.encode().unwrap(),
+            }],
+            vec![HistoryProjection {
+                family: MetadataFamily::WorkspaceCurrent,
+                key,
+            }],
+            Vec::new(),
+        );
+
+        #[cfg(feature = "metadata-read-stats")]
+        let sampled_stats = store.begin_read_stats_session().unwrap();
+        let stale = get_visible_workspace_at(&store, sampled, &name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale.workspace_revision, WorkspaceRevision::new(1));
+        #[cfg(feature = "metadata-read-stats")]
+        assert_eq!(sampled_stats.finish().unwrap().scan_calls, 1);
+
+        #[cfg(feature = "metadata-read-stats")]
+        let current_stats = store.begin_read_stats_session().unwrap();
+        let current = get_current_workspace(&store, root(), placement(), owner(), &name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.workspace_revision, WorkspaceRevision::new(2));
+        assert_eq!(current.workspace_incarnation_id, incarnation(1));
+        assert_eq!(current.commit_id, None);
+        #[cfg(feature = "metadata-read-stats")]
+        assert_eq!(current_stats.finish().unwrap().scan_calls, 0);
+
+        assert_eq!(
+            get_current_workspace(&store, root(), placement(), owner(), &workbench("absent"))
+                .unwrap(),
+            None
+        );
     }
 
     fn search_request(scope: QueryScope) -> SearchRequest {

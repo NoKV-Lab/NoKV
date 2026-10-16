@@ -402,9 +402,12 @@ impl MetadataWorkspaceRequestExecutor {
         rpc: &protocol::WorkspaceRpcRequest,
         request: &protocol::GetWorkspaceRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
-        let workspace = meta::get_workspace_at(
+        let route = route_parts(rpc.route)?;
+        let workspace = meta::get_current_workspace(
             &self.meta,
-            self.read_context(rpc.route)?,
+            route.root_id,
+            route.placement_generation,
+            route.owner_epoch,
             &workbench_id(&request.workbench)?,
         )
         .map_err(query_failure)?

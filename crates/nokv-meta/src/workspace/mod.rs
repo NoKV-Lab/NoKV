@@ -170,16 +170,16 @@ pub use publish_operation_records::{
     PUBLISH_VALUE_FORMAT_VERSION,
 };
 pub use query::{
-    aggregate_paths_at, catalog_fields_at, find_workspaces_at, get_workspace_at, read_changes_at,
-    search_paths_at, AggregateFunction, AggregateGroup, AggregatePage, AggregateRequest,
-    AggregateSpec, CatalogField, CatalogPage, CatalogPathMatch, CatalogRequest, ChangeEvent,
-    ChangePage, ChangePageRequest, CommittedFilter, FacetBucket, FacetResult, FindWorkspacesPage,
-    FindWorkspacesRequest, GenericArtifactMetadata, GenericNamespaceHit, GenericNamespaceKind,
-    PresentationPathRoot, QueryError, QueryOperand, QueryOperator, QueryPredicate, QueryProfile,
-    QueryScope, QuerySort, QuerySortDirection, SearchHit, SearchPage, SearchRequest,
-    WorkspaceDiscovery, MAX_FACET_BUCKETS_PER_FIELD, MAX_QUERY_AGGREGATES, MAX_QUERY_CURSOR_BYTES,
-    MAX_QUERY_FACET_FIELDS, MAX_QUERY_GROUP_FIELDS, MAX_QUERY_IN_VALUES, MAX_QUERY_PAGE_SIZE,
-    MAX_QUERY_PREDICATES, MAX_QUERY_PROJECTION_FIELDS, MAX_QUERY_SORT_FIELDS,
+    aggregate_paths_at, catalog_fields_at, find_workspaces_at, get_current_workspace,
+    read_changes_at, search_paths_at, AggregateFunction, AggregateGroup, AggregatePage,
+    AggregateRequest, AggregateSpec, CatalogField, CatalogPage, CatalogPathMatch, CatalogRequest,
+    ChangeEvent, ChangePage, ChangePageRequest, CommittedFilter, FacetBucket, FacetResult,
+    FindWorkspacesPage, FindWorkspacesRequest, GenericArtifactMetadata, GenericNamespaceHit,
+    GenericNamespaceKind, PresentationPathRoot, QueryError, QueryOperand, QueryOperator,
+    QueryPredicate, QueryProfile, QueryScope, QuerySort, QuerySortDirection, SearchHit, SearchPage,
+    SearchRequest, WorkspaceDiscovery, MAX_FACET_BUCKETS_PER_FIELD, MAX_QUERY_AGGREGATES,
+    MAX_QUERY_CURSOR_BYTES, MAX_QUERY_FACET_FIELDS, MAX_QUERY_GROUP_FIELDS, MAX_QUERY_IN_VALUES,
+    MAX_QUERY_PAGE_SIZE, MAX_QUERY_PREDICATES, MAX_QUERY_PROJECTION_FIELDS, MAX_QUERY_SORT_FIELDS,
 };
 pub use query_records::{
     encode_ordered_index_scalar, secondary_index_field_prefix, secondary_index_key,
