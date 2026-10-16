@@ -3693,15 +3693,18 @@ impl MetadataWorkspaceRequestExecutor {
             token.operation_id,
         )?;
         require_publish_token(&operation, token)?;
-        let activity_deadline_ms = publish_activity_deadline_ms(
-            &self.meta,
-            if operation.append_attempt.is_some() {
-                self.append_activity_lease_ms
-            } else {
-                PUBLISH_ACTIVITY_LEASE_MS
-            },
-        )?;
-        if activity_deadline_ms <= operation.activity_deadline_ms {
+        let lease_ms = if operation.append_attempt.is_some() {
+            self.append_activity_lease_ms
+        } else {
+            PUBLISH_ACTIVITY_LEASE_MS
+        };
+        let activity_deadline_ms = publish_activity_deadline_ms(&self.meta, lease_ms)?;
+        if !activity_extension_needed(
+            &operation,
+            heartbeat_context.owner_epoch,
+            activity_deadline_ms,
+            lease_ms,
+        ) {
             return Ok(operation);
         }
         meta::PublicationService::new(&self.meta)
@@ -4368,6 +4371,33 @@ fn decode_manifest_plan_cursor(
             .try_into()
             .expect("cursor object index has fixed width"),
     ))
+}
+
+/// Upper bound of the window within which repeated activity of the
+/// initiating owner does not rewrite a publication's deadline.
+const MAX_ACTIVITY_COALESCING_MS: u64 = 1_000;
+
+/// Whether a step must durably extend the publication's activity deadline.
+///
+/// The steps of one publication arrive milliseconds apart, so the initiating
+/// owner extends the deadline only once it would move by more than
+/// `min(lease / 10, MAX_ACTIVITY_COALESCING_MS)`; recovery after the last
+/// activity therefore waits at least the lease minus that window. Any other
+/// owner always reaches the heartbeat, which refuses a non-initiating owner.
+fn activity_extension_needed(
+    operation: &meta::PublishOperationRecord,
+    owner_epoch: types::OwnerEpoch,
+    requested_deadline_ms: u64,
+    lease_ms: u64,
+) -> bool {
+    if requested_deadline_ms <= operation.activity_deadline_ms {
+        return false;
+    }
+    if owner_epoch != operation.initiating_owner_epoch {
+        return true;
+    }
+    let window_ms = (lease_ms / 10).min(MAX_ACTIVITY_COALESCING_MS);
+    requested_deadline_ms > operation.activity_deadline_ms.saturating_add(window_ms)
 }
 
 fn publish_activity_deadline_ms(
@@ -9048,6 +9078,68 @@ mod tests {
         let resumed = executor.execute(&finish).unwrap();
         assert!(resumed.replayed);
         assert_eq!(executed_publication(&resumed).generation, 1);
+    }
+
+    #[test]
+    fn initiating_owner_activity_coalesces_within_a_bounded_window() {
+        let (executor, plan, begin) = fused_publication_fixture("fused-activity", 0x78);
+        executor
+            .execute(&restore_rpc(
+                0x7b,
+                protocol::WorkspaceRequest::PrepareArtifactPublish(
+                    protocol::PrepareArtifactPublishRequest {
+                        begin: begin.clone(),
+                        objects: plan.staged_objects.clone(),
+                    },
+                ),
+            ))
+            .unwrap();
+        let operation = executor
+            .find_publish_operation(
+                route(1),
+                executor.meta.current_read_version().unwrap(),
+                begin.operation_id,
+            )
+            .unwrap()
+            .unwrap();
+        let stored = operation.activity_deadline_ms;
+        let owner = operation.initiating_owner_epoch;
+        let lease = PUBLISH_ACTIVITY_LEASE_MS;
+
+        assert!(!activity_extension_needed(&operation, owner, stored, lease));
+        assert!(!activity_extension_needed(
+            &operation,
+            owner,
+            stored + MAX_ACTIVITY_COALESCING_MS,
+            lease
+        ));
+        assert!(activity_extension_needed(
+            &operation,
+            owner,
+            stored + MAX_ACTIVITY_COALESCING_MS + 1,
+            lease
+        ));
+        // A short lease bounds the window by a tenth of the lease.
+        assert!(!activity_extension_needed(
+            &operation,
+            owner,
+            stored + 100,
+            1_000
+        ));
+        assert!(activity_extension_needed(
+            &operation,
+            owner,
+            stored + 101,
+            1_000
+        ));
+        // Any other owner always reaches the heartbeat that refuses it.
+        let successor = types::OwnerEpoch::new(owner.get() + 1).unwrap();
+        assert!(activity_extension_needed(
+            &operation,
+            successor,
+            stored + 1,
+            lease
+        ));
     }
 
     #[test]
