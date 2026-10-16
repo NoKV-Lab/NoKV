@@ -24,7 +24,7 @@ mod test_support;
 
 pub use bootstrap::{bootstrap_shard, LeaseMode, OpenMode, RootAttach, ShardBoot, ShardOwner};
 pub use error::ServerError;
-pub use executor::MetadataWorkspaceRequestExecutor;
+pub use executor::{MetadataWorkspaceRequestExecutor, MAX_APPEND_ACTIVITY_LEASE_MS};
 #[cfg(feature = "restore-crash-test-support")]
 pub use executor::{
     RestoreInitializationBarrier, RestoreInitializationBarrierEvidence,
@@ -32,10 +32,10 @@ pub use executor::{
     RestoreManifestPublicationEvidence,
 };
 pub use lifecycle::{
-    ArtifactLifecycleDeleter, LifecycleAbsenceProof, LifecycleCycleReport,
-    LifecycleDeleteDisposition, LifecycleDeleteError, LifecycleDeletePurpose,
-    LifecycleDeleteRequest, LifecycleDurabilityBarrier, LifecycleError, LifecycleObjectDeleter,
-    LifecycleRunner, LifecycleRunnerOptions,
+    ArtifactLifecycleCleaner, LifecycleCleanupDisposition, LifecycleCleanupError,
+    LifecycleCleanupProof, LifecycleCleanupPurpose, LifecycleCleanupRequest, LifecycleCycleReport,
+    LifecycleDurabilityBarrier, LifecycleError, LifecycleObjectCleaner, LifecycleRunner,
+    LifecycleRunnerOptions,
 };
 pub use recovery_installer::{
     install_recovery_log, validate_local_recovery_prefix, LocalRecoveryPrefixReport,

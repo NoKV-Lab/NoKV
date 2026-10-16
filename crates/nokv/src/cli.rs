@@ -10,12 +10,16 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
+
 pub const DEFAULT_METADATA_ADDRESS: &str = "127.0.0.1:7750";
 pub const DEFAULT_SERVER_BIND: &str = "127.0.0.1:7750";
 pub const DEFAULT_MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_ETCD_KEY_PREFIX: &str = "/nokv/control";
 pub const DEFAULT_ETCD_LEASE_TTL_SECONDS: i64 = 10;
 pub const DEFAULT_LIFECYCLE_INTERVAL_MILLIS: u64 = 1_000;
+pub const DEFAULT_APPEND_ACTIVITY_LEASE_MS: u64 = 1_800_000;
 pub const DEFAULT_HANDSHAKE_TIMEOUT_MILLIS: u64 = 5_000;
 pub const DEFAULT_MAX_INFLIGHT_CONNECTIONS: usize = 256;
 
@@ -74,6 +78,7 @@ pub struct ServerConfig {
     pub node_id: Option<String>,
     pub metadata_store: Option<MetadataStoreConfig>,
     pub lifecycle_interval_millis: u64,
+    pub append_activity_lease_ms: u64,
     pub recovery_publication: RecoveryPublicationConfig,
 }
 
@@ -133,6 +138,18 @@ pub enum Command {
         content_type: Option<String>,
     },
     WorkspacePath(WorkspacePathCommand),
+    OperationStatus {
+        operation_id: [u8; 16],
+    },
+    OperationInspect {
+        operation_id: [u8; 16],
+        limit: u32,
+        cursor: Option<Vec<u8>>,
+    },
+    OperationRecover {
+        operation_id: [u8; 16],
+        expected_state_digest: Option<[u8; 32]>,
+    },
     Provision {
         logical_shard_id: String,
         adopt_legacy_object_namespace: bool,
@@ -155,6 +172,17 @@ pub enum McpProfile {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspacePathCommand {
+    Append {
+        workbench: String,
+        section: String,
+        path: String,
+        operation_id: [u8; 16],
+        expected_workspace_incarnation_id: Option<[u8; 16]>,
+        payload: AppendPayload,
+        content_type: Option<String>,
+        max_logical_size: Option<u64>,
+        block_size: usize,
+    },
     Rename {
         workbench: String,
         section: String,
@@ -173,6 +201,13 @@ pub enum WorkspacePathCommand {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppendPayload {
+    Text(String),
+    Base64(String),
+    File(PathBuf),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliError {
     MissingValue(String),
     MissingArgument(&'static str),
@@ -180,10 +215,23 @@ pub enum CliError {
     UnknownOption(String),
     UnknownCommand(String),
     UnexpectedArgument(String),
-    InvalidNumber { option: &'static str, value: String },
-    InvalidAddress { option: &'static str, value: String },
-    InvalidOption { option: &'static str, value: String },
+    InvalidNumber {
+        option: &'static str,
+        value: String,
+    },
+    InvalidAddress {
+        option: &'static str,
+        value: String,
+    },
+    InvalidOption {
+        option: &'static str,
+        value: String,
+    },
     InvalidRequestId(String),
+    OperationInput {
+        operation_id: [u8; 16],
+        message: String,
+    },
     MixedRoutingOptions,
     MixedMetadataStoreOptions,
     LocalOnlyRecoverLog,
@@ -214,6 +262,7 @@ impl fmt::Display for CliError {
                 formatter,
                 "--request-id must be exactly 32 lowercase hexadecimal characters, got {value:?}"
             ),
+            Self::OperationInput { message, .. } => formatter.write_str(message),
             Self::MixedRoutingOptions => formatter.write_str(
                 "static metadata routing options and etcd routing options cannot be combined",
             ),
@@ -297,6 +346,7 @@ impl Default for ServerConfig {
             node_id: None,
             metadata_store: None,
             lifecycle_interval_millis: DEFAULT_LIFECYCLE_INTERVAL_MILLIS,
+            append_activity_lease_ms: DEFAULT_APPEND_ACTIVITY_LEASE_MS,
             recovery_publication: RecoveryPublicationConfig::LocalOnly,
         }
     }
@@ -307,6 +357,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     let mut client = ClientConfig::default();
     let mut server = ServerConfig::default();
     let mut recovery_publication_explicit = false;
+    let mut append_activity_lease_explicit = false;
     let mut static_routing = StaticRoutingConfig::default();
     let mut etcd_routing = EtcdRoutingConfig::default();
     let mut routing_kind = None;
@@ -409,6 +460,20 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             "--bind" => {
                 server.bind = parse_address("--bind", next_value(&mut arguments, &argument)?)?;
             }
+            "--append-activity-lease-ms" => {
+                let value = next_value(&mut arguments, &argument)?;
+                server.append_activity_lease_ms =
+                    parse_number("--append-activity-lease-ms", value.clone())?;
+                if !(1_000..=nokv_server::MAX_APPEND_ACTIVITY_LEASE_MS)
+                    .contains(&server.append_activity_lease_ms)
+                {
+                    return Err(CliError::InvalidOption {
+                        option: "--append-activity-lease-ms",
+                        value,
+                    });
+                }
+                append_activity_lease_explicit = true;
+            }
             "--handshake-timeout-millis" => {
                 server.handshake_timeout_millis = parse_number(
                     "--handshake-timeout-millis",
@@ -468,7 +533,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
                         return Err(CliError::InvalidOption {
                             option: "--recovery-publication",
                             value,
-                        })
+                        });
                     }
                 };
             }
@@ -499,6 +564,11 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     if let Some(argument) = arguments.next() {
         return Err(CliError::UnexpectedArgument(argument));
     }
+    if append_activity_lease_explicit && !matches!(command, Command::Serve) {
+        return Err(CliError::UnexpectedArgument(
+            "--append-activity-lease-ms is only valid with serve".to_owned(),
+        ));
+    }
     if matches!(
         &command,
         Command::Workbench { .. } | Command::Mcp { .. } | Command::Collect { .. }
@@ -513,6 +583,9 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             | Command::Materialize { .. }
             | Command::Collect { .. }
             | Command::WorkspacePath(_)
+            | Command::OperationStatus { .. }
+            | Command::OperationInspect { .. }
+            | Command::OperationRecover { .. }
             | Command::Provision { .. }
     ) && agent_id.is_none()
     {
@@ -588,12 +661,106 @@ fn parse_command(
         }),
         "collect" => parse_collect(arguments),
         "workspace-path" => parse_workspace_path(arguments),
+        "operation" => parse_operation(arguments),
         "provision" => parse_provision(arguments),
         "serve" => Ok(Command::Serve),
         "schema" => Ok(Command::Schema),
         "version" => parse_version(arguments),
         "help" => Ok(Command::Help),
         _ => Err(CliError::UnknownCommand(command)),
+    }
+}
+
+fn parse_operation(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
+    let operation = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("operation command"))?;
+    if !matches!(operation.as_str(), "status" | "inspect" | "recover") {
+        return Err(CliError::UnknownCommand(format!("operation {operation}")));
+    }
+    let identity = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("operation identity"))?;
+    let operation_id = parse_append_identity("operation identity", identity)?;
+    if operation == "status" {
+        return Ok(Command::OperationStatus { operation_id });
+    }
+    parse_operation_options(&operation, operation_id, arguments).map_err(|error| {
+        CliError::OperationInput {
+            operation_id,
+            message: error.to_string(),
+        }
+    })
+}
+
+fn parse_operation_options(
+    operation: &str,
+    operation_id: [u8; 16],
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<Command, CliError> {
+    let mut limit = None;
+    let mut cursor = None;
+    let mut expected_state_digest = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--limit" if operation == "inspect" && limit.is_none() => {
+                let value = next_value(arguments, &argument)?;
+                let parsed = parse_number::<u32>("--limit", value.clone())?;
+                if !(1..=nokv_client::MAX_APPEND_INSPECTION_LIMIT).contains(&parsed) {
+                    return Err(CliError::InvalidOption {
+                        option: "--limit",
+                        value,
+                    });
+                }
+                limit = Some(parsed);
+            }
+            "--cursor" if operation == "inspect" && cursor.is_none() => {
+                let value = next_value(arguments, &argument)?;
+                let maximum = nokv_protocol::PageRequest::MAX_CURSOR_BYTES;
+                if value.len() > maximum.div_ceil(3) * 4 {
+                    return Err(CliError::InvalidOption {
+                        option: "--cursor",
+                        value,
+                    });
+                }
+                let decoded = STANDARD
+                    .decode(&value)
+                    .map_err(|_| CliError::InvalidOption {
+                        option: "--cursor",
+                        value: value.clone(),
+                    })?;
+                if decoded.len() > maximum {
+                    return Err(CliError::InvalidOption {
+                        option: "--cursor",
+                        value,
+                    });
+                }
+                cursor = Some(decoded);
+            }
+            "--expected-state-digest"
+                if operation == "recover" && expected_state_digest.is_none() =>
+            {
+                let value = next_value(arguments, &argument)?;
+                expected_state_digest =
+                    Some(decode_fixed_hex(&value).ok_or(CliError::InvalidOption {
+                        option: "--expected-state-digest",
+                        value,
+                    })?);
+            }
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    if operation == "inspect" {
+        Ok(Command::OperationInspect {
+            operation_id,
+            limit: limit.unwrap_or(nokv_client::DEFAULT_APPEND_INSPECTION_LIMIT),
+            cursor,
+        })
+    } else {
+        Ok(Command::OperationRecover {
+            operation_id,
+            expected_state_digest,
+        })
     }
 }
 
@@ -636,6 +803,9 @@ fn parse_workspace_path(arguments: &mut impl Iterator<Item = String>) -> Result<
     let first_path = arguments
         .next()
         .ok_or(CliError::MissingArgument("workspace path"))?;
+    if operation == "append" {
+        return parse_workspace_append(arguments, workbench, section, first_path);
+    }
     let destination = match operation.as_str() {
         "rename" => Some(
             arguments
@@ -646,7 +816,7 @@ fn parse_workspace_path(arguments: &mut impl Iterator<Item = String>) -> Result<
         _ => {
             return Err(CliError::UnknownCommand(format!(
                 "workspace-path {operation}"
-            )))
+            )));
         }
     };
 
@@ -691,6 +861,91 @@ fn parse_workspace_path(arguments: &mut impl Iterator<Item = String>) -> Result<
             request_id,
         },
     }))
+}
+
+fn parse_workspace_append(
+    arguments: &mut impl Iterator<Item = String>,
+    workbench: String,
+    section: String,
+    path: String,
+) -> Result<Command, CliError> {
+    let mut operation_id = None;
+    let mut expected_workspace_incarnation_id = None;
+    let mut payload = None;
+    let mut content_type = None;
+    let mut max_logical_size = None;
+    let mut block_size = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--operation-id" if operation_id.is_none() => {
+                operation_id = Some(parse_append_identity(
+                    "--operation-id",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--expected-workspace-incarnation-id"
+                if expected_workspace_incarnation_id.is_none() =>
+            {
+                expected_workspace_incarnation_id = Some(parse_append_identity(
+                    "--expected-workspace-incarnation-id",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--text" if payload.is_none() => {
+                payload = Some(AppendPayload::Text(next_value(arguments, &argument)?));
+            }
+            "--base64" if payload.is_none() => {
+                payload = Some(AppendPayload::Base64(next_value(arguments, &argument)?));
+            }
+            "--file" if payload.is_none() => {
+                payload = Some(AppendPayload::File(PathBuf::from(next_value(
+                    arguments, &argument,
+                )?)));
+            }
+            "--content-type" if content_type.is_none() => {
+                content_type = Some(next_value(arguments, &argument)?);
+            }
+            "--max-logical-size" if max_logical_size.is_none() => {
+                max_logical_size = Some(parse_number(
+                    "--max-logical-size",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--block-size" if block_size.is_none() => {
+                block_size = Some(parse_number(
+                    "--block-size",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--operation-id"
+            | "--expected-workspace-incarnation-id"
+            | "--text"
+            | "--base64"
+            | "--file"
+            | "--content-type"
+            | "--max-logical-size"
+            | "--block-size" => return Err(CliError::UnexpectedArgument(argument)),
+            _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    Ok(Command::WorkspacePath(WorkspacePathCommand::Append {
+        workbench,
+        section,
+        path,
+        operation_id: operation_id.ok_or(CliError::MissingOption("--operation-id"))?,
+        expected_workspace_incarnation_id,
+        payload: payload.ok_or(CliError::MissingArgument(
+            "one of --text, --base64, or --file",
+        ))?,
+        content_type,
+        max_logical_size,
+        block_size: block_size.unwrap_or(nokv_object::DEFAULT_ARTIFACT_BLOCK_SIZE),
+    }))
+}
+
+fn parse_append_identity(option: &'static str, value: String) -> Result<[u8; 16], CliError> {
+    parse_request_id(value.clone()).map_err(|_| CliError::InvalidOption { option, value })
 }
 
 fn parse_provision(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
@@ -796,20 +1051,24 @@ fn parse_address(option: &'static str, value: String) -> Result<SocketAddr, CliE
 }
 
 fn parse_request_id(value: String) -> Result<[u8; 16], CliError> {
-    if value.len() != 32
+    decode_fixed_hex(&value).ok_or(CliError::InvalidRequestId(value))
+}
+
+fn decode_fixed_hex<const WIDTH: usize>(value: &str) -> Option<[u8; WIDTH]> {
+    if value.len() != WIDTH * 2
         || !value
             .as_bytes()
             .iter()
             .copied()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
-        return Err(CliError::InvalidRequestId(value));
+        return None;
     }
-    let mut decoded = [0_u8; 16];
+    let mut decoded = [0_u8; WIDTH];
     for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         decoded[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
     }
-    Ok(decoded)
+    Some(decoded)
 }
 
 fn hex_nibble(byte: u8) -> u8 {
@@ -949,6 +1208,199 @@ mod tests {
             unpinned.is_err(),
             "expected-generation without --replace must fail"
         );
+    }
+
+    #[test]
+    fn append_activity_lease_is_an_explicit_bounded_server_option() {
+        assert_eq!(
+            parse(args(&["serve"]))
+                .unwrap()
+                .server
+                .append_activity_lease_ms,
+            1_800_000
+        );
+        assert_eq!(
+            parse(args(&["--append-activity-lease-ms", "1000", "serve"]))
+                .unwrap()
+                .server
+                .append_activity_lease_ms,
+            1000
+        );
+        assert!(parse(args(&["--append-activity-lease-ms", "999", "serve"])).is_err());
+        assert!(parse(args(&["--append-activity-lease-ms", "86400001", "serve"])).is_err());
+        assert!(parse(args(&["--append-activity-lease-ms", "86400000", "serve"])).is_ok());
+        assert!(parse(args(&["--append-activity-lease-ms", "1000", "schema"])).is_err());
+    }
+
+    #[test]
+    fn operation_status_needs_only_identity_and_agent_routing() {
+        let parsed = parse(args(&[
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "operation",
+            "status",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::OperationStatus {
+                operation_id: [0xaa; 16],
+            }
+        );
+        assert!(parsed.workbench_root.is_none());
+        assert!(parsed.client.object.bucket.is_none());
+        assert!(parse(args(&["operation", "status", "aa"])).is_err());
+        assert!(parse(args(&["operation", "status"])).is_err());
+        assert!(parse(args(&["operation", "resume", "aa"])).is_err());
+        assert!(parse(args(&[
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "operation",
+            "status",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "unexpected",
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn operation_inspection_and_recovery_preserve_cursor_and_exact_token() {
+        let parse_command = |tail: &[&str]| {
+            let mut input = vec![
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "operation",
+            ];
+            input.extend_from_slice(tail);
+            parse(args(&input))
+        };
+        let identity = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let inspected = parse_command(&["inspect", identity]).unwrap();
+        assert_eq!(
+            inspected.command,
+            Command::OperationInspect {
+                operation_id: [0xaa; 16],
+                limit: 32,
+                cursor: None,
+            }
+        );
+        assert!(inspected.client.object.bucket.is_none());
+        assert!(inspected.workbench_root.is_none());
+        assert_eq!(
+            parse_command(&["inspect", identity, "--limit", "192", "--cursor", "AQID"])
+                .unwrap()
+                .command,
+            Command::OperationInspect {
+                operation_id: [0xaa; 16],
+                limit: 192,
+                cursor: Some(vec![1, 2, 3])
+            }
+        );
+        assert_eq!(
+            parse_command(&["recover", identity]).unwrap().command,
+            Command::OperationRecover {
+                operation_id: [0xaa; 16],
+                expected_state_digest: None
+            }
+        );
+        assert_eq!(
+            parse_command(&[
+                "recover",
+                identity,
+                "--expected-state-digest",
+                &"bb".repeat(32)
+            ])
+            .unwrap()
+            .command,
+            Command::OperationRecover {
+                operation_id: [0xaa; 16],
+                expected_state_digest: Some([0xbb; 32])
+            }
+        );
+        for tail in [
+            vec!["inspect", identity, "--limit", "0"],
+            vec!["inspect", identity, "--limit", "193"],
+            vec!["inspect", identity, "--cursor", "%%%"],
+            vec!["inspect", identity, "--limit", "1", "--limit", "2"],
+            vec!["recover", identity, "--expected-state-digest", "aa"],
+            vec!["recover", identity, "--limit", "1"],
+        ] {
+            assert!(
+                matches!(parse_command(&tail), Err(CliError::OperationInput { operation_id, .. }) if operation_id == [0xaa; 16]),
+                "{tail:?}"
+            );
+        }
+        assert!(parse_command(&["inspect", identity, "--cursor", &"A".repeat(6000)]).is_err());
+        assert!(parse_command(&[
+            "recover",
+            identity,
+            "--expected-state-digest",
+            &"BB".repeat(32)
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn workspace_append_requires_one_payload_and_stable_identity() {
+        let prefix = ["append", "run-42", "logs", "events.jsonl"];
+        let parse_append = |tail: &[&str]| {
+            let mut input = prefix.to_vec();
+            input.extend_from_slice(tail);
+            parse_workspace_path(&mut args(&input).into_iter())
+        };
+        assert_eq!(
+            parse_append(&["--text", "event"]),
+            Err(CliError::MissingOption("--operation-id"))
+        );
+        assert!(parse_append(&["--operation-id", "ABC", "--text", "event"]).is_err());
+        assert!(parse_append(&[
+            "--operation-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--text",
+            "event",
+            "--base64",
+            "ZXZlbnQ="
+        ])
+        .is_err());
+        let command = parse_append(&[
+            "--operation-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--expected-workspace-incarnation-id",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--text",
+            "event",
+            "--content-type",
+            "text/plain",
+            "--max-logical-size",
+            "1024",
+            "--block-size",
+            "1024",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::WorkspacePath(WorkspacePathCommand::Append {
+                workbench: "run-42".to_owned(),
+                section: "logs".to_owned(),
+                path: "events.jsonl".to_owned(),
+                operation_id: [0xaa; 16],
+                expected_workspace_incarnation_id: Some([0xbb; 16]),
+                payload: AppendPayload::Text("event".to_owned()),
+                content_type: Some("text/plain".to_owned()),
+                max_logical_size: Some(1024),
+                block_size: 1024,
+            })
+        );
+        for payload in [["--base64", "ZXZlbnQ="], ["--file", "/tmp/delta.bin"]] {
+            assert!(parse_append(&[
+                "--operation-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                payload[0],
+                payload[1]
+            ])
+            .is_ok());
+        }
     }
 
     #[test]

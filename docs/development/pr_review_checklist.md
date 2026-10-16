@@ -27,7 +27,8 @@ boundaries, or Workbench behavior.
   changes split out?
 - Is every observable behavior change described?
 - Does every non-merge commit include a `Signed-off-by` trailer?
-- Is LingTai the active integration partner?
+- Do integration targets follow the user's current scope and verified
+  requirements rather than historical partner material?
 - Does the change avoid FUSE, POSIX, CSI, fsspec, inode, and dentry behavior?
 - Does the change preserve one authoritative schema, route, and implementation
   for each lifecycle state machine?

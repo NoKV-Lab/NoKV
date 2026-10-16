@@ -4,12 +4,12 @@
  */
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use nokv_object::{
     admit_artifact_provider, ArtifactObjectStore, ArtifactStoreCapabilities,
     ImmutableCreateOutcome, MemoryArtifactStore, ObjectDeleteOutcome, ObjectError, ObjectInfo,
-    ObjectKey, ObjectRange, ProviderAdmissionError, ProviderAdmissionProfile,
+    ObjectKey, ObjectRange, ObjectSealOutcome, ProviderAdmissionError, ProviderAdmissionProfile,
     ProviderAdmissionReceipt, ProviderHandleIdentity, S3ArtifactStore, S3ArtifactStoreOptions,
     DEFAULT_ARTIFACT_BLOCK_SIZE,
 };
@@ -22,6 +22,8 @@ pub(crate) enum ConfiguredObjectStore {
     S3 {
         store: S3ArtifactStore,
         admission: Arc<ProviderAdmissionReceipt>,
+        append_admission: Arc<OnceLock<ProviderAdmissionReceipt>>,
+        admission_probe: Arc<Mutex<()>>,
     },
 }
 
@@ -114,9 +116,47 @@ impl PythonObjectStoreConfig {
 }
 
 impl ConfiguredObjectStore {
+    pub(crate) fn validate_append_capabilities(&self) -> Result<(), ProviderAdmissionError> {
+        match self {
+            Self::Memory(_) => Ok(()),
+            Self::S3 {
+                store,
+                append_admission,
+                admission_probe,
+                ..
+            } => cache_successful_admission(append_admission, admission_probe, || {
+                admit_artifact_provider(
+                    store,
+                    ProviderAdmissionProfile::single_put(DEFAULT_ARTIFACT_BLOCK_SIZE)?
+                        .with_append_sealing(),
+                )
+            }),
+        }
+    }
+
     pub(crate) fn is_memory(&self) -> bool {
         matches!(self, Self::Memory(_))
     }
+}
+
+fn cache_successful_admission(
+    admission: &OnceLock<ProviderAdmissionReceipt>,
+    probe_lock: &Mutex<()>,
+    probe: impl FnOnce() -> Result<ProviderAdmissionReceipt, ProviderAdmissionError>,
+) -> Result<(), ProviderAdmissionError> {
+    if admission.get().is_some() {
+        return Ok(());
+    }
+    let _guard = probe_lock
+        .lock()
+        .map_err(|_| ProviderAdmissionError::Inconclusive)?;
+    if admission.get().is_none() {
+        // Long-lived embedded clients must recover after a provider outage.
+        // Only successful evidence is immutable; errors may be retried.
+        let receipt = probe()?;
+        admission.get_or_init(|| receipt);
+    }
+    Ok(())
 }
 
 impl PythonObjectStoreConfig {
@@ -132,6 +172,8 @@ impl PythonObjectStoreConfig {
                 Ok(ConfiguredObjectStore::S3 {
                     store,
                     admission: Arc::new(admission),
+                    append_admission: Arc::new(OnceLock::new()),
+                    admission_probe: Arc::new(Mutex::new(())),
                 })
             }
         }
@@ -179,7 +221,11 @@ impl ArtifactObjectStore for ConfiguredObjectStore {
     fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
         match self {
             Self::Memory(store) => store.provider_admission_receipt(),
-            Self::S3 { admission, .. } => Some(admission.as_ref()),
+            Self::S3 {
+                admission,
+                append_admission,
+                ..
+            } => append_admission.get().or(Some(admission.as_ref())),
         }
     }
 
@@ -191,6 +237,13 @@ impl ArtifactObjectStore for ConfiguredObjectStore {
         match self {
             Self::Memory(store) => store.create_immutable(key, bytes),
             Self::S3 { store, .. } => store.create_immutable(key, bytes),
+        }
+    }
+
+    fn seal_immutable(&self, key: &ObjectKey) -> Result<ObjectSealOutcome, ObjectError> {
+        match self {
+            Self::Memory(store) => store.seal_immutable(key),
+            Self::S3 { store, .. } => store.seal_immutable(key),
         }
     }
 
@@ -218,7 +271,76 @@ impl ArtifactObjectStore for ConfiguredObjectStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    #[test]
+    fn failed_append_admission_can_recover_on_the_same_cache() {
+        let admission = OnceLock::new();
+        let probe_lock = Mutex::new(());
+        let store = MemoryArtifactStore::new();
+        let calls = AtomicUsize::new(0);
+        for error in [
+            ProviderAdmissionError::Unavailable,
+            ProviderAdmissionError::Inconclusive,
+        ] {
+            assert_eq!(
+                cache_successful_admission(&admission, &probe_lock, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(error)
+                }),
+                Err(error)
+            );
+            assert!(admission.get().is_none());
+        }
+        cache_successful_admission(&admission, &probe_lock, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            admit_artifact_provider(
+                &store,
+                ProviderAdmissionProfile::single_put(64)
+                    .unwrap()
+                    .with_append_sealing(),
+            )
+        })
+        .unwrap();
+        cache_successful_admission(&admission, &probe_lock, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(ProviderAdmissionError::Unavailable)
+        })
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(admission.get().unwrap().admits_append_store(&store, 64));
+    }
+
+    #[test]
+    fn concurrent_append_admission_publishes_one_successful_receipt() {
+        let admission = OnceLock::new();
+        let probe_lock = Mutex::new(());
+        let store = MemoryArtifactStore::new();
+        let calls = AtomicUsize::new(0);
+        let barrier = std::sync::Barrier::new(5);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    cache_successful_admission(&admission, &probe_lock, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        admit_artifact_provider(
+                            &store,
+                            ProviderAdmissionProfile::single_put(64)
+                                .unwrap()
+                                .with_append_sealing(),
+                        )
+                    })
+                    .unwrap();
+                });
+            }
+            barrier.wait();
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(admission.get().unwrap().admits_append_store(&store, 64));
+    }
 
     #[test]
     fn memory_configuration_builds_the_explicit_test_store() {
@@ -259,6 +381,8 @@ mod tests {
         let store = ConfiguredObjectStore::S3 {
             store: S3ArtifactStore::new(S3ArtifactStoreOptions::new("unused-test-bucket")).unwrap(),
             admission: Arc::new(foreign),
+            append_admission: Arc::new(OnceLock::new()),
+            admission_probe: Arc::new(Mutex::new(())),
         };
 
         assert!(!store

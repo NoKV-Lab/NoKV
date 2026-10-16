@@ -12,6 +12,12 @@ on:
 permissions:
   contents: read
 
+# Pin the toolchain so a new stable release cannot turn main red through lints
+# it adds; Rust 1.97, 1.98, and 1.99 clippy each did. Bump it in a dedicated
+# pull request that also clears whatever the new toolchain reports.
+env:
+  RUST_TOOLCHAIN: "1.99.1"
+
 jobs:
   workbench-contract:
     runs-on: ubuntu-latest
@@ -20,7 +26,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Set up Rust for typed qualification
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Install protobuf compiler for typed qualification
         run: |
@@ -54,7 +62,8 @@ jobs:
             scripts/workbench/local_wal_recovery_gate.py \
             scripts/workbench/object_namespace_recovery_gate.py \
             scripts/workbench/restore_composition_gate.py \
-            scripts/workbench/fork_restore_recovery_gate.py
+            scripts/workbench/fork_restore_recovery_gate.py \
+            scripts/workbench/loopx_stage2a_stack.py
           python3 scripts/workbench/pre423_contract_ledger.py
           python3 scripts/workbench/pre423_contract_ledger_test.py
           python3 scripts/workbench/workbench_contract_test.py
@@ -63,6 +72,7 @@ jobs:
           python3 scripts/workbench/object_namespace_recovery_gate_test.py
           python3 scripts/workbench/restore_composition_gate_test.py
           python3 scripts/workbench/fork_restore_recovery_gate_test.py
+          python3 scripts/workbench/loopx_stage2a_stack_test.py
           bash -n scripts/workbench/start_rustfs.sh
 
       - name: Check Phase 1 qualification framework
@@ -343,7 +353,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
 
       - name: Install protobuf compiler
         run: |
@@ -581,7 +594,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Install protobuf compiler
         run: |
@@ -662,7 +677,9 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Install protobuf compiler
         run: |

@@ -49,7 +49,8 @@ const SYSTEM_RECOVERY_CHAIN_DIGEST_KEY: &[u8] = b"recovery_chain_digest";
 const SYSTEM_VALUE_FORMAT_VERSION: u8 = 1;
 const INITIAL_COMMIT_VERSION: u64 = 1;
 
-const MAX_COMMAND_ITEMS: usize = 256;
+/// Shared admission and recovery-codec item budget for one metadata command.
+pub(super) const MAX_COMMAND_ITEMS: usize = 260;
 const MAX_DELIMITED_SCAN_ITEMS: usize = MAX_COMMAND_ITEMS * 2;
 const MAX_HISTORICAL_SCAN_PAGE_ROWS: usize = MAX_COMMAND_ITEMS;
 const MAX_HISTORICAL_SCAN_ATTEMPTS: usize = 4;
@@ -4219,7 +4220,7 @@ mod tests {
                 let scan_index = self.history_scan_reads.fetch_add(1, Ordering::AcqRel);
                 if self
                     .remaining_advances
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok()
@@ -4274,14 +4275,14 @@ mod tests {
                 let scan_index = self.recovery_scan_reads.fetch_add(1, Ordering::AcqRel);
                 let skip = self
                     .skipped_recovery_scans
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok();
                 if !skip
                     && self
                         .remaining_advances
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                             remaining.checked_sub(1)
                         })
                         .is_ok()

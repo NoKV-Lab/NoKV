@@ -4,19 +4,17 @@
 
 # NoKV × LingTai: a design-partner collaboration
 
-> Status: this page records the start of the collaboration. The active
-> integration uses the complete
-> [Workbench contract](../workbench-contract.md) through the native full CLI
-> first, the direct Python SDK second, and an optional MCP sidecar when a host
-> requires it, backed by NoKV's path-native workspace format. It does not use
-> NoKV as a FUSE/POSIX mount.
-> See [Product Design](../product-design.md).
+> Status update (2026-09-22): LingTai is no longer an active NoKV partner or
+> a default integration target. This page records the historical collaboration;
+> it does not establish current adoption, integration qualification, or direction.
+> Current product guidance is in [Product Design](../product-design.md) and the
+> [Workbench contract](../workbench-contract.md).
 >
 > Update (2026-08): the optional Workbench MCP sidecar described on this page
 > is deprecated and is not a supported NoKV integration surface. The stable
 > boundary was and remains the 18-tool Workbench semantic contract, reached
-> through the native full CLI and the direct Python SDK. The text below is
-> preserved as published.
+> through the native full CLI and the direct Python SDK. The historical scope
+> below is retained for reference.
 
 This announcement marks the start of the design-partner collaboration between
 **NoKV** and **LingTai**
@@ -36,7 +34,7 @@ The integration point is the Workbench contract, not a shared host-filesystem
 namespace. LingTai owns its local runtime layout; NoKV owns distributed
 artifact identity, publication, discovery, and recovery semantics.
 
-## What we're building together
+## What the collaboration proposed
 
 The collaboration focuses on:
 
@@ -54,14 +52,14 @@ The upper path-shaped behavior remains stable while the storage boundary stays
 explicit. Executables that require local files use materialize/collect adapters;
 that sandbox is not NoKV namespace truth.
 
-## Current direction
+## Direction at the time of the announcement
 
 The stable boundary is the 18-tool Workbench semantic contract. Downstream
 skills use the native full CLI by default; embedded callers use the Python SDK;
 MCP remains an optional sidecar transport. NoKV keeps path-shaped Agent
 semantics while storing canonical full-path metadata in Holt and immutable
-artifact revisions in S3-compatible storage. LingTai remains the active design
-partner and first-client integration.
+artifact revisions in S3-compatible storage. At the time of the announcement,
+LingTai was the design partner and intended first-client integration.
 
 If a stateful, snapshot-able, auditable Agent workspace is something you've
 wanted: star NoKV, follow [LingTai](https://github.com/Lingtai-AI/lingtai), and
