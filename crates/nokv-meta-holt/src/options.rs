@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use holt::{Durability, Storage, TreeConfig};
 use nokv_meta_store::{Keyspace, StoreError, StoreLimits};
@@ -15,6 +16,15 @@ const HOLT_MAX_VALUE_BYTES: usize = u16::MAX as usize;
 const HOLT_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const HOLT_DB_RECORD_FIXED_BYTES: usize = 33;
 const HOLT_DB_MUTATION_OVERHEAD_BYTES: usize = 17;
+/// Cache budget in 512 KiB Holt frames: 512 MiB. Metadata keys are mostly
+/// random identities spread over every frame of their tree, so a budget
+/// smaller than the written set turns a miss into a frame read plus an
+/// eviction that waits for the checkpointer to clean a dirty frame.
+const HOLT_BUFFER_POOL_FRAMES: usize = 1024;
+/// Interval between background checkpoint rounds. A round rewrites every
+/// dirty 512 KiB frame, so a longer interval folds more metadata commands
+/// into each frame write; recovery replays at most that much journal.
+const HOLT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Physical Holt configuration for one local metadata authority.
 #[derive(Clone, Debug)]
@@ -55,6 +65,8 @@ impl HoltOptions {
     ) -> Self {
         let mut config = TreeConfig::new(path);
         config.durability = Durability::Wal { sync: true };
+        config.buffer_pool_size = HOLT_BUFFER_POOL_FRAMES;
+        config.checkpoint.idle_interval = HOLT_CHECKPOINT_INTERVAL;
         config.checkpoint.auto_vacuum = false;
         Self {
             config,
