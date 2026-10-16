@@ -215,6 +215,24 @@ impl From<&PathMetadata> for ArtifactReadAuthority {
     }
 }
 
+/// Whether two metadata reads name the same immutable artifact revision.
+///
+/// A live paged read stays consistent while the path keeps its generation and
+/// revision: the bytes are immutable. `workspace_revision` is deliberately not
+/// compared, because every publication to any other path of the workspace
+/// advances it; comparing it would make concurrent writers elsewhere fail an
+/// otherwise unaffected read. Callers that need the exact workspace revision
+/// use `read_artifact_at_authority`.
+fn same_artifact_revision(left: &PathMetadata, right: &PathMetadata) -> bool {
+    left.path == right.path
+        && left.workspace_incarnation_id == right.workspace_incarnation_id
+        && left.generation == right.generation
+        && left.artifact_revision_id == right.artifact_revision_id
+        && left.dependency_count == right.dependency_count
+        && left.dependency_depth == right.dependency_depth
+        && left.descriptor == right.descriptor
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExpectedArtifactReadFence {
     Generation(u64),
@@ -1816,7 +1834,7 @@ where
                     "restore source range plan omitted path metadata".to_owned(),
                 )
             })?;
-            if &page_metadata != expected_metadata {
+            if !same_artifact_revision(&page_metadata, expected_metadata) {
                 return Err(ClientError::ArtifactReadFenceChanged);
             }
             append_range_page(&mut rows, result.blocks)?;
@@ -1875,7 +1893,7 @@ where
             })?;
             if metadata
                 .as_ref()
-                .is_some_and(|expected| expected != &page_metadata)
+                .is_some_and(|expected| !same_artifact_revision(expected, &page_metadata))
             {
                 return Err(ClientError::ArtifactReadFenceChanged);
             }
@@ -2852,6 +2870,7 @@ mod tests {
         abort_applies: usize,
         change_fence_on_second_page_once: bool,
         change_fence_on_every_range: bool,
+        advance_workspace_on_every_range: bool,
         fence_changed: bool,
         append_begin_conflicts: usize,
         advance_stage_before_response_once: bool,
@@ -2878,6 +2897,7 @@ mod tests {
                     abort_applies: 0,
                     change_fence_on_second_page_once: false,
                     change_fence_on_every_range: false,
+                    advance_workspace_on_every_range: false,
                     fence_changed: false,
                     append_begin_conflicts: 0,
                     advance_stage_before_response_once: false,
@@ -2892,6 +2912,10 @@ mod tests {
 
         fn change_fence_on_second_page_once(&self) {
             self.state.lock().unwrap().change_fence_on_second_page_once = true;
+        }
+
+        fn advance_workspace_on_every_range(&self) {
+            self.state.lock().unwrap().advance_workspace_on_every_range = true;
         }
 
         fn change_fence_on_every_range(&self) {
@@ -3337,6 +3361,17 @@ mod tests {
                 if state.change_fence_on_every_range {
                     if let Some(metadata) = stored.metadata.as_mut() {
                         metadata.generation = metadata.generation.saturating_add(1);
+                    }
+                }
+                if state.advance_workspace_on_every_range {
+                    // Another path of the same workspace was published.
+                    if let Some(metadata) =
+                        state.path.as_mut().and_then(|path| path.metadata.as_mut())
+                    {
+                        metadata.workspace_revision = metadata.workspace_revision.saturating_add(1);
+                    }
+                    if let Some(metadata) = stored.metadata.as_mut() {
+                        metadata.workspace_revision = metadata.workspace_revision.saturating_add(1);
                     }
                 }
                 let range_end = range
@@ -4530,6 +4565,35 @@ mod tests {
             Err(ClientError::ArtifactIntegrity(message))
                 if message.contains("declares physical index 7")
         ));
+    }
+
+    #[test]
+    fn full_read_survives_publications_to_other_paths_of_the_workspace() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        let bytes = vec![0x5a; MAX_ARTIFACT_READ_PLAN_ROWS + 1];
+        client
+            .publish_artifact(&store, publish_options(1), &bytes)
+            .unwrap();
+        inspector.advance_workspace_on_every_range();
+
+        let read = client
+            .read_artifact(&store, None, target(), WorkspaceReadView::Live)
+            .unwrap();
+        assert_eq!(read.bytes, bytes);
+        // One metadata read and one plan read per page, without a restart.
+        assert_eq!(
+            inspector
+                .state()
+                .attempts
+                .iter()
+                .filter(|(label, _)| *label == "get_path")
+                .count(),
+            3
+        );
     }
 
     #[test]
