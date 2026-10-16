@@ -67,23 +67,14 @@ impl FramedTcpTransport {
         }
         Ok(Self { options })
     }
-}
 
-impl RpcTransport for FramedTcpTransport {
-    fn round_trip(&self, endpoint: SocketAddr, request: &[u8]) -> Result<Vec<u8>, TransportError> {
-        if request.len() > MAX_FRAME_BYTES {
-            return Err(TransportError::new(
-                format!(
-                    "request frame is {} bytes, maximum is {MAX_FRAME_BYTES}",
-                    request.len()
-                ),
-                false,
-            ));
-        }
-        let length = u32::try_from(request.len())
-            .map_err(|_| TransportError::new("request length exceeds u32", false))?;
+    /// Opens one connection and completes the exact-schema handshake. Nagle's
+    /// algorithm is disabled before the first byte is written, so no frame
+    /// waits for the server's delayed ACK of an earlier segment.
+    fn connect(&self, endpoint: SocketAddr) -> Result<TcpStream, TransportError> {
         let mut stream = TcpStream::connect_timeout(&endpoint, self.options.connect_timeout)
             .map_err(io_error)?;
+        stream.set_nodelay(true).map_err(io_error)?;
         perform_handshake(&mut stream, self.options.handshake_timeout)?;
         stream
             .set_read_timeout(Some(self.options.read_timeout))
@@ -91,24 +82,63 @@ impl RpcTransport for FramedTcpTransport {
         stream
             .set_write_timeout(Some(self.options.write_timeout))
             .map_err(io_error)?;
-        stream.write_all(&length.to_be_bytes()).map_err(io_error)?;
-        stream.write_all(request).map_err(io_error)?;
-        stream.flush().map_err(io_error)?;
-
-        let mut response_length = [0_u8; 4];
-        stream.read_exact(&mut response_length).map_err(io_error)?;
-        let response_length = usize::try_from(u32::from_be_bytes(response_length))
-            .map_err(|_| TransportError::new("response length does not fit usize", false))?;
-        if response_length > MAX_FRAME_BYTES {
-            return Err(TransportError::new(
-                format!("response frame is {response_length} bytes, maximum is {MAX_FRAME_BYTES}"),
-                false,
-            ));
-        }
-        let mut response = vec![0_u8; response_length];
-        stream.read_exact(&mut response).map_err(io_error)?;
-        Ok(response)
+        Ok(stream)
     }
+}
+
+impl RpcTransport for FramedTcpTransport {
+    fn round_trip(&self, endpoint: SocketAddr, request: &[u8]) -> Result<Vec<u8>, TransportError> {
+        let frame = length_prefixed_frame(request)?;
+        let mut stream = self.connect(endpoint)?;
+        exchange_frame(&mut stream, &frame)
+    }
+}
+
+/// Builds one complete request frame, the four-byte big-endian length followed
+/// by the request, so it leaves in a single write. Writing the prefix on its own
+/// lets Nagle's algorithm hold the request until the server acknowledges the
+/// prefix, and delayed ACK postpones that acknowledgement by tens of
+/// milliseconds.
+fn length_prefixed_frame(request: &[u8]) -> Result<Vec<u8>, TransportError> {
+    if request.len() > MAX_FRAME_BYTES {
+        return Err(TransportError::new(
+            format!(
+                "request frame is {} bytes, maximum is {MAX_FRAME_BYTES}",
+                request.len()
+            ),
+            false,
+        ));
+    }
+    let length = u32::try_from(request.len())
+        .map_err(|_| TransportError::new("request length exceeds u32", false))?;
+    let mut frame = Vec::with_capacity(4 + request.len());
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(request);
+    Ok(frame)
+}
+
+/// Writes one complete request frame with a single `write_all` and reads one
+/// length-prefixed response.
+fn exchange_frame(
+    stream: &mut (impl Read + Write),
+    frame: &[u8],
+) -> Result<Vec<u8>, TransportError> {
+    stream.write_all(frame).map_err(io_error)?;
+    stream.flush().map_err(io_error)?;
+
+    let mut response_length = [0_u8; 4];
+    stream.read_exact(&mut response_length).map_err(io_error)?;
+    let response_length = usize::try_from(u32::from_be_bytes(response_length))
+        .map_err(|_| TransportError::new("response length does not fit usize", false))?;
+    if response_length > MAX_FRAME_BYTES {
+        return Err(TransportError::new(
+            format!("response frame is {response_length} bytes, maximum is {MAX_FRAME_BYTES}"),
+            false,
+        ));
+    }
+    let mut response = vec![0_u8; response_length];
+    stream.read_exact(&mut response).map_err(io_error)?;
+    Ok(response)
 }
 
 fn perform_handshake(stream: &mut TcpStream, timeout: Duration) -> Result<(), TransportError> {
@@ -220,6 +250,7 @@ fn io_error(error: std::io::Error) -> TransportError {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::net::TcpListener;
     use std::thread;
 
@@ -238,6 +269,85 @@ mod tests {
             write_timeout: Duration::from_secs(1),
         })
         .unwrap()
+    }
+
+    /// In-memory stream that keeps every `write` call as a separate entry.
+    struct RecordingStream {
+        response: Cursor<Vec<u8>>,
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl Read for RecordingStream {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.response.read(buffer)
+        }
+    }
+
+    impl Write for RecordingStream {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.writes.push(buffer.to_vec());
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn accept_one_handshake(listener: TcpListener) -> TcpStream {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut hello = [0_u8; HANDSHAKE_FRAME_BYTES];
+        stream.read_exact(&mut hello).unwrap();
+        let accepted =
+            WorkspaceHandshake::new(HandshakeKind::Accepted, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
+        stream
+            .write_all(&encode_handshake_frame(&accepted).unwrap())
+            .unwrap();
+        stream
+    }
+
+    #[test]
+    fn request_frame_leaves_in_one_write() {
+        let request = [7_u8; 48];
+        let mut response = 3_u32.to_be_bytes().to_vec();
+        response.extend_from_slice(b"ok!");
+        let mut stream = RecordingStream {
+            response: Cursor::new(response),
+            writes: Vec::new(),
+        };
+
+        let frame = length_prefixed_frame(&request).unwrap();
+        assert_eq!(exchange_frame(&mut stream, &frame).unwrap(), b"ok!");
+
+        let mut expected = 48_u32.to_be_bytes().to_vec();
+        expected.extend_from_slice(&request);
+        assert_eq!(stream.writes, vec![expected]);
+    }
+
+    #[test]
+    fn oversized_request_is_rejected_before_connecting() {
+        // Nothing listens on the endpoint, so a connection attempt would fail
+        // with a retryable refusal instead of the size error.
+        let endpoint = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let error = transport()
+            .round_trip(endpoint, &vec![0_u8; MAX_FRAME_BYTES + 1])
+            .unwrap_err();
+        assert!(!error.retryable());
+        assert!(error.message().contains("maximum"));
+    }
+
+    #[test]
+    fn connection_disables_nagle() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || accept_one_handshake(listener));
+
+        let stream = transport().connect(endpoint).unwrap();
+        assert!(stream.nodelay().unwrap());
+        server.join().unwrap();
     }
 
     #[test]
