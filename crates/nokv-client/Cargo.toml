@@ -20,3 +20,6 @@ nokv-object.workspace = true
 nokv-protocol.workspace = true
 nokv-types.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

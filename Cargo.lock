@@ -1328,6 +1328,7 @@ dependencies = [
  "nokv-protocol",
  "nokv-types",
  "sha2 0.11.0",
+ "tempfile",
 ]
 
 [[package]]
