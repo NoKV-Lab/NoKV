@@ -11,6 +11,8 @@ mod conformance;
 mod errors;
 #[cfg(feature = "etcd")]
 mod etcd;
+#[cfg(unix)]
+mod local;
 mod options;
 mod store;
 mod types;
@@ -27,6 +29,8 @@ pub use codec::{
 pub use errors::ControlError;
 #[cfg(feature = "etcd")]
 pub use etcd::EtcdControlStore;
+#[cfg(unix)]
+pub use local::LocalControlStore;
 pub use options::EtcdControlStoreOptions;
 pub use store::{
     ControlStore, InMemoryControlStore, MAX_LOGICAL_SHARD_RECORD_BYTES,

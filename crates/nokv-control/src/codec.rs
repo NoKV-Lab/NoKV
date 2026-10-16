@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use serde_json::value::RawValue;
 
+#[cfg(unix)]
+use crate::store::InMemoryState;
 use crate::store::{validate_logical_shard_record, MAX_LOGICAL_SHARD_RECORD_BYTES};
 #[cfg(any(feature = "etcd", test))]
 use crate::LogicalShardLease;
@@ -31,6 +35,8 @@ pub const LOGICAL_SHARD_RECOVERY_CODEC_VERSION: u8 = 1;
 const LEGACY_COMBINED_LOGICAL_SHARD_RECORD_MAX_VERSION: u8 = 3;
 #[cfg(any(feature = "etcd", test))]
 const OWNER_SESSION_CODEC_VERSION: u8 = 1;
+#[cfg(unix)]
+const LOCAL_CONTROL_STATE_CODEC_VERSION: u8 = 1;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -647,6 +653,150 @@ pub(crate) fn decode_owner_session(bytes: &[u8]) -> Result<LogicalShardLease, Co
         ));
     }
     Ok(lease)
+}
+
+/// Every durable record of a local control directory, one file replaced as a
+/// whole. Each record keeps the exact canonical encoding the etcd store
+/// writes under its own key; owner sessions are OS locks and never appear.
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalControlStateWire {
+    version: u8,
+    next_lease_id: u64,
+    root_agent_bindings: Vec<Box<RawValue>>,
+    root_object_namespace_bindings: Vec<Box<RawValue>>,
+    root_placements: Vec<Box<RawValue>>,
+    logical_shards: Vec<LocalLogicalShardWire>,
+}
+
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalLogicalShardWire {
+    routing: Box<RawValue>,
+    recovery: Option<Box<RawValue>>,
+}
+
+#[cfg(unix)]
+pub(crate) fn encode_local_control_state(state: &InMemoryState) -> Result<Vec<u8>, ControlError> {
+    fn raw(encoded: Vec<u8>) -> Result<Box<RawValue>, ControlError> {
+        let encoded =
+            String::from_utf8(encoded).map_err(|error| ControlError::Codec(error.to_string()))?;
+        RawValue::from_string(encoded).map_err(codec_error)
+    }
+    let wire = LocalControlStateWire {
+        version: LOCAL_CONTROL_STATE_CODEC_VERSION,
+        next_lease_id: state.next_lease_id,
+        root_agent_bindings: state
+            .root_agents
+            .values()
+            .map(|binding| raw(encode_root_agent_binding(binding)?))
+            .collect::<Result<_, _>>()?,
+        root_object_namespace_bindings: state
+            .root_object_namespaces
+            .values()
+            .map(|binding| raw(encode_root_object_namespace_binding(binding)?))
+            .collect::<Result<_, _>>()?,
+        root_placements: state
+            .root_placements
+            .values()
+            .map(|placement| raw(encode_root_placement(placement)?))
+            .collect::<Result<_, _>>()?,
+        logical_shards: state
+            .logical_shards
+            .values()
+            .map(|record| {
+                Ok(LocalLogicalShardWire {
+                    routing: raw(encode_logical_shard_routing_record(record)?)?,
+                    recovery: encode_logical_shard_recovery_state(record)?
+                        .map(raw)
+                        .transpose()?,
+                })
+            })
+            .collect::<Result<_, ControlError>>()?,
+    };
+    serde_json::to_vec(&wire).map_err(codec_error)
+}
+
+/// Decode a local control state file. The result carries no owner sessions.
+#[cfg(unix)]
+pub(crate) fn decode_local_control_state(bytes: &[u8]) -> Result<InMemoryState, ControlError> {
+    let wire: LocalControlStateWire = serde_json::from_slice(bytes).map_err(codec_error)?;
+    require_version(
+        "local control state",
+        wire.version,
+        LOCAL_CONTROL_STATE_CODEC_VERSION,
+    )?;
+    let mut state = InMemoryState {
+        next_lease_id: wire.next_lease_id,
+        ..InMemoryState::default()
+    };
+    for encoded in wire.root_agent_bindings {
+        let binding = decode_root_agent_binding(encoded.get().as_bytes())?;
+        if state.root_agents.insert(binding.root_id, binding).is_some() {
+            return Err(duplicate_local_record("root Agent binding"));
+        }
+    }
+    for encoded in wire.root_object_namespace_bindings {
+        let binding = decode_root_object_namespace_binding(encoded.get().as_bytes())?;
+        if state
+            .root_object_namespaces
+            .insert(binding.root_id, binding)
+            .is_some()
+        {
+            return Err(duplicate_local_record("root object namespace binding"));
+        }
+    }
+    for encoded in wire.root_placements {
+        let placement = decode_root_placement(encoded.get().as_bytes())?;
+        if state
+            .root_placements
+            .insert(placement.root_id, placement)
+            .is_some()
+        {
+            return Err(duplicate_local_record("root placement"));
+        }
+    }
+    for shard in wire.logical_shards {
+        let decoded = decode_logical_shard_record_value(shard.routing.get().as_bytes())?;
+        if decoded.wire != LogicalShardRecordWireKind::Routing {
+            return Err(ControlError::Codec(
+                "local control state stores only version-1 logical shard routing records"
+                    .to_owned(),
+            ));
+        }
+        let mut record = decoded.record;
+        if let Some(recovery) = shard.recovery {
+            record = record.with_recovery_state(decode_logical_shard_recovery_state(
+                recovery.get().as_bytes(),
+            )?)?;
+            validate_logical_shard_record(&record)?;
+        }
+        if record.lease_id > state.next_lease_id {
+            return Err(ControlError::Codec(
+                "logical shard lease id is beyond the local lease allocator".to_owned(),
+            ));
+        }
+        if state
+            .logical_shards
+            .insert(record.logical_shard_id, record)
+            .is_some()
+        {
+            return Err(duplicate_local_record("logical shard"));
+        }
+    }
+    if encode_local_control_state(&state)?.as_slice() != bytes {
+        return Err(ControlError::Codec(
+            "local control state input is not canonical".to_owned(),
+        ));
+    }
+    Ok(state)
+}
+
+#[cfg(unix)]
+fn duplicate_local_record(record: &str) -> ControlError {
+    ControlError::Codec(format!("local control state repeats a {record}"))
 }
 
 pub(crate) fn encode_fixed_id<const N: usize>(bytes: &[u8; N]) -> String {
