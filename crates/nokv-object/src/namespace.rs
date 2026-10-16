@@ -8,7 +8,7 @@ use nokv_types::{ObjectNamespaceId, FIXED_ID_BYTES};
 
 use crate::{
     ArtifactObjectStore, ArtifactStoreCapabilities, ImmutableCreateOutcome, ObjectDeleteOutcome,
-    ObjectError, ObjectInfo, ObjectKey, ObjectRange, ProviderAdmissionReceipt,
+    ObjectError, ObjectInfo, ObjectKey, ObjectRange, ObjectSealOutcome, ProviderAdmissionReceipt,
     ProviderHandleIdentity,
 };
 
@@ -83,6 +83,10 @@ where
 
     fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
         self.inner.head(key)
+    }
+
+    fn seal_immutable(&self, key: &ObjectKey) -> Result<ObjectSealOutcome, ObjectError> {
+        self.inner.seal_immutable(key)
     }
 
     fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {

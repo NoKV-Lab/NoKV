@@ -24,8 +24,8 @@ use nokv_control::{
 use nokv_object::{
     admit_artifact_provider, ArtifactObjectStore, ArtifactStoreCapabilities, BoundArtifactStore,
     ImmutableCreateOutcome, ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectKey, ObjectRange,
-    ProviderAdmissionProfile, ProviderAdmissionReceipt, ProviderHandleIdentity, S3ArtifactStore,
-    S3ArtifactStoreOptions, DEFAULT_RECOVERY_LOG_SEGMENT_CHUNK_SIZE,
+    ObjectSealOutcome, ProviderAdmissionProfile, ProviderAdmissionReceipt, ProviderHandleIdentity,
+    S3ArtifactStore, S3ArtifactStoreOptions, DEFAULT_RECOVERY_LOG_SEGMENT_CHUNK_SIZE,
 };
 use nokv_protocol::{
     GetOperationRequest, GetWorkspaceRequest, OperationIdentity, RootIdentity, WorkbenchName,
@@ -722,6 +722,10 @@ impl ArtifactObjectStore for AdmittedRecoveryObjectStore {
     fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
         self.inner.delete(key)
     }
+
+    fn seal_immutable(&self, key: &ObjectKey) -> Result<ObjectSealOutcome, ObjectError> {
+        self.inner.seal_immutable(key)
+    }
 }
 
 fn recovery_object_store(
@@ -741,7 +745,8 @@ fn recovery_object_store(
     })
     .map_err(|error| error.to_string())?;
     let profile = ProviderAdmissionProfile::single_put(DEFAULT_RECOVERY_LOG_SEGMENT_CHUNK_SIZE)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+        .with_append_sealing();
     let admission = admit_artifact_provider(&raw, profile).map_err(|error| error.to_string())?;
     let inner = BoundArtifactStore::open(raw, namespace).map_err(|error| error.to_string())?;
     Ok(Arc::new(AdmittedRecoveryObjectStore { inner, admission }))
@@ -797,6 +802,7 @@ fn run_server(config: ServeConfig) -> Result<(), String> {
         Arc::clone(&registry),
         recovery_objects,
         ShardBoot {
+            append_activity_lease_ms: 1_800_000,
             shard_id: placement.logical_shard_id,
             open: OpenMode::Existing(config.metadata_reopen),
             lease: LeaseMode::Acquire {

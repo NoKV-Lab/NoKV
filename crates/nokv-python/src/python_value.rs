@@ -5,10 +5,11 @@
 
 use nokv_client::{ArtifactPublishOutcome, ArtifactReadOutcome};
 use nokv_protocol::{
-    AggregateFunction, AggregateResult, AggregateSpec, CatalogResult, CommitResult, FacetResult,
-    FieldValue, FindWorkspacesResult, PathListEntry, PathMetadata, PathPage, PublishResult,
-    QueryOperand, QueryOperator, QueryPredicate, ScalarValue, SearchResult, SearchRow,
-    SnapshotResult, SnapshotStatus, SortDirection, SortField, WorkspaceSummary,
+    AggregateFunction, AggregateResult, AggregateSpec, AppendCleanupRetryResult, CatalogResult,
+    CommitResult, FacetResult, FieldValue, FindWorkspacesResult, OperationToken, PathListEntry,
+    PathMetadata, PathPage, PublishResult, QueryOperand, QueryOperator, QueryPredicate,
+    ScalarValue, SearchResult, SearchRow, SnapshotResult, SnapshotStatus, SortDirection, SortField,
+    WorkspaceSummary,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -18,6 +19,34 @@ pub(crate) type PythonFieldSpec = (String, String, String);
 pub(crate) type PythonPredicateSpec = (String, String, String, String);
 pub(crate) type PythonSortSpec = (String, String);
 pub(crate) type PythonAggregateSpec = (String, Option<String>, String);
+
+pub(crate) fn operation_token_to_py<'py>(
+    py: Python<'py>,
+    token: OperationToken,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("operation_id", hex(&token.operation_id.0))?;
+    dict.set_item("state_digest", hex(&token.state_digest.0))?;
+    Ok(dict)
+}
+
+pub(crate) fn cleanup_retry_receipt_to_py<'py>(
+    py: Python<'py>,
+    receipt: &AppendCleanupRetryResult,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("operation_id", hex(&receipt.operation_id.0))?;
+    dict.set_item(
+        "publication_operation_id",
+        hex(&receipt.publication_operation_id.0),
+    )?;
+    dict.set_item("cleanup_retry_count", receipt.cleanup_retry_count)?;
+    dict.set_item(
+        "expected_state_digest",
+        hex(&receipt.expected_state_digest.0),
+    )?;
+    Ok(dict)
+}
 
 pub(crate) fn parse_fixed_hex<const WIDTH: usize>(
     field: &str,
@@ -382,6 +411,30 @@ pub(crate) fn publish_result_to_py<'py>(
     dict.set_item("operation_id", hex(&result.operation_id.0))?;
     dict.set_item("workbench", result.target.workbench.as_str())?;
     dict.set_item("path", result.target.path.as_str())?;
+    dict.set_item("workspace_revision", result.workspace_revision)?;
+    dict.set_item("generation", result.generation)?;
+    dict.set_item("artifact_revision_id", hex(&result.artifact_revision_id.0))?;
+    dict.set_item("logical_size", result.logical_size)?;
+    dict.set_item("body_digest", result.body_digest.as_str())?;
+    Ok(dict)
+}
+
+pub(crate) fn append_result_to_py<'py>(
+    py: Python<'py>,
+    result: &nokv_protocol::AppendResult,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("operation_id", hex(&result.operation_id.0))?;
+    dict.set_item(
+        "publication_operation_id",
+        hex(&result.publication_operation_id.0),
+    )?;
+    dict.set_item("workbench_id", result.target.workbench.as_str())?;
+    dict.set_item("path", result.target.path.as_str())?;
+    dict.set_item(
+        "workspace_incarnation_id",
+        hex(&result.workspace_incarnation_id.0),
+    )?;
     dict.set_item("workspace_revision", result.workspace_revision)?;
     dict.set_item("generation", result.generation)?;
     dict.set_item("artifact_revision_id", hex(&result.artifact_revision_id.0))?;

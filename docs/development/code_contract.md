@@ -159,6 +159,11 @@ cargo test --workspace
 git diff --check
 ```
 
+CI runs these with the toolchain pinned as `RUST_TOOLCHAIN` in
+`.github/workflows/rust.yml`; use `cargo +<that version>` to reproduce its lint
+results. Moving the pin is its own pull request that also clears every lint the
+new toolchain reports.
+
 For Workbench-facing changes also run:
 
 ```bash

@@ -9,9 +9,11 @@
 //! result extraction. Metadata layout and shard-owner implementation remain
 //! outside this crate.
 
+mod append_operations;
 mod artifact;
 mod error;
 mod generic_index;
+mod idempotent_append;
 mod route;
 mod sdk;
 mod snapshot_workflow;
@@ -19,6 +21,10 @@ mod transport;
 mod workbench_lifecycle;
 mod workbench_workflow;
 
+pub use append_operations::{
+    AppendOperationInspection, AppendRecoveryRequestResult, DEFAULT_APPEND_INSPECTION_LIMIT,
+    MAX_APPEND_INSPECTION_LIMIT,
+};
 pub use artifact::{
     ArtifactAppendOptions, ArtifactAppendOutcome, ArtifactPublishOptions, ArtifactPublishOutcome,
     ArtifactRangeBatchItem, ArtifactRangeBatchOutcome, ArtifactRangeBatchRequest,
@@ -29,6 +35,10 @@ pub use artifact::{
 pub use error::{ArtifactPublishStage, ClientError, TransportError};
 pub use generic_index::{
     GenericIndexAbortOutcome, GenericIndexRegistrationOutcome, GenericIndexRegistrationPlan,
+};
+pub use idempotent_append::{
+    append_operation_recovery, AppendNextAction, AppendRecovery, AppendRecoveryState,
+    IdempotentAppendOptions, DEFAULT_APPEND_MAX_LOGICAL_SIZE, MAX_APPEND_DELTA_BYTES,
 };
 #[cfg(feature = "control")]
 pub use route::ControlRouteResolver;

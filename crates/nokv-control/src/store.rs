@@ -1053,7 +1053,7 @@ fn validate_recovery_upload_intent(
             record.state
         )));
     }
-    validate_recovery_upload_intent_shape(intent).map_err(&conflict)?;
+    validate_recovery_upload_intent_shape(intent).map_err(conflict)?;
     let retained_segments = record.log.as_ref().map_or(0, |log| log.segments.len());
     if retained_segments >= MAX_RECOVERY_LOG_SEGMENTS {
         return Err(conflict(format!(
@@ -1090,7 +1090,7 @@ fn validate_recovery_upload_intent(
             intent.first_lsn
         )));
     }
-    if let Some(expected) = durable_tail_digest(record).map_err(&conflict)? {
+    if let Some(expected) = durable_tail_digest(record).map_err(conflict)? {
         if intent.previous_chain_digest != expected {
             return Err(conflict(
                 "upload previous digest differs from the durable tail".to_owned(),
@@ -1347,7 +1347,7 @@ pub(crate) fn apply_recovery_publication(
     };
 
     if let Some(checkpoint) = checkpoint.as_ref() {
-        validate_checkpoint_ref(checkpoint).map_err(&conflict)?;
+        validate_checkpoint_ref(checkpoint).map_err(conflict)?;
     }
     let reference_lsn = match (checkpoint.as_ref(), log.as_ref()) {
         (Some(checkpoint), Some(log)) => checkpoint.lsn.max(log.durable_lsn),
@@ -1384,7 +1384,7 @@ pub(crate) fn apply_recovery_publication(
                 log.durable_lsn, record.durable_lsn
             )));
         }
-        validate_log_ref(record, checkpoint.as_ref(), log).map_err(&conflict)?;
+        validate_log_ref(record, checkpoint.as_ref(), log).map_err(conflict)?;
         if let Some(current) = record
             .log
             .as_ref()
@@ -1408,7 +1408,7 @@ pub(crate) fn apply_recovery_publication(
         }
     }
 
-    let current_tail_digest = durable_tail_digest(record).map_err(&conflict)?;
+    let current_tail_digest = durable_tail_digest(record).map_err(conflict)?;
     if let Some(expected) = current_tail_digest.as_deref() {
         if let Some(checkpoint) = checkpoint
             .as_ref()

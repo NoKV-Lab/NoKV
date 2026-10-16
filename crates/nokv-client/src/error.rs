@@ -6,7 +6,10 @@
 use std::fmt;
 
 use nokv_object::{ArtifactUploadFailure, ObjectError};
-use nokv_protocol::{ErrorCode, ProtocolError, RpcFailure, WorkspaceCapability};
+use nokv_protocol::{
+    AppendCleanupRetryResult, ErrorCode, OperationIdentity, OperationState, OperationToken,
+    ProtocolError, RpcFailure, WorkspaceCapability,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransportError {
@@ -67,6 +70,21 @@ pub enum ClientError {
         source: Box<ClientError>,
         abort_failure: Option<Box<ClientError>>,
     },
+    /// The stable append identity must be retained until its recorded outcome
+    /// is understood. A missing state is not proof that publication is absent.
+    AppendUnresolved {
+        operation_id: OperationIdentity,
+        state: Option<OperationState>,
+        source: Box<ClientError>,
+    },
+    /// Cleanup was requested against this exact observation. Retain its token
+    /// across process retries; a fresh observation may authorize another round.
+    AppendCleanupUnresolved {
+        operation_id: OperationIdentity,
+        expected_token: OperationToken,
+        receipt: Option<Box<AppendCleanupRetryResult>>,
+        source: Box<ClientError>,
+    },
     RetryExhausted {
         attempts: u32,
         last_error: Box<ClientError>,
@@ -86,6 +104,9 @@ impl ClientError {
                 ..
             } => abort_failure.is_none() && source.retryable(),
             Self::RetryExhausted { last_error, .. } => last_error.retryable(),
+            // Generic retry loops must not turn an unresolved append into a
+            // fresh operation. The caller can explicitly retry the same intent.
+            Self::AppendUnresolved { .. } | Self::AppendCleanupUnresolved { .. } => false,
             Self::ArtifactReadFenceChanged => true,
             Self::InvalidOptions(_)
             | Self::InvalidRoute(_)
@@ -100,6 +121,8 @@ impl ClientError {
         match self {
             Self::Rpc(failure) => Some(failure),
             Self::ArtifactPublishFailed { source, .. } => source.rpc_failure(),
+            Self::AppendUnresolved { source, .. } => source.rpc_failure(),
+            Self::AppendCleanupUnresolved { source, .. } => source.rpc_failure(),
             Self::RetryExhausted { last_error, .. } => last_error.rpc_failure(),
             _ => None,
         }
@@ -175,6 +198,24 @@ impl fmt::Display for ClientError {
                 formatter,
                 "workspace request exhausted {attempts} attempts: {last_error}"
             ),
+            Self::AppendUnresolved {
+                operation_id,
+                state,
+                source,
+            } => write!(
+                formatter,
+                "append operation {operation_id:?} has state {state:?}: {source}; retain the same operation identity"
+            ),
+            Self::AppendCleanupUnresolved {
+                operation_id,
+                expected_token,
+                source,
+                ..
+            } => write!(
+                formatter,
+                "append cleanup for {operation_id:?} is unresolved: {source}; retry with the same expected state digest {:?}",
+                expected_token.state_digest
+            ),
         }
     }
 }
@@ -200,6 +241,8 @@ impl std::error::Error for ClientError {
             Self::Object(error) => Some(error),
             Self::ArtifactUpload(error) => Some(error.as_ref()),
             Self::ArtifactPublishFailed { source, .. } => Some(source.as_ref()),
+            Self::AppendUnresolved { source, .. } => Some(source.as_ref()),
+            Self::AppendCleanupUnresolved { source, .. } => Some(source.as_ref()),
             Self::RetryExhausted { last_error, .. } => Some(last_error.as_ref()),
             Self::InvalidOptions(_)
             | Self::InvalidRoute(_)

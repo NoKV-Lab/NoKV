@@ -70,6 +70,8 @@ pub struct RootAttach {
 /// Complete input for opening and serving one logical metadata shard.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardBoot {
+    /// Activity lease for stable append attempts; 1000..=86400000 milliseconds.
+    pub append_activity_lease_ms: u64,
     /// Logical shard that owns the store and lease.
     pub shard_id: nokv_types::LogicalShardId,
     /// Exact physical-store open mode.
@@ -461,6 +463,17 @@ pub fn bootstrap_shard(
     boot: ShardBoot,
 ) -> Result<ShardOwner, ServerError> {
     validate_boot(&boot)?;
+    if !recovery_objects
+        .provider_admission_receipt()
+        .is_some_and(|receipt| {
+            receipt.is_bound_to_store(recovery_objects.as_ref())
+                && receipt.append_sealing_verified()
+        })
+    {
+        return Err(ServerError::InvalidBootstrap(
+            "shard owner requires a handle-bound provider receipt verifying permanent append sealing".to_owned(),
+        ));
+    }
     let expected_namespace = boot
         .roots
         .first()
@@ -658,8 +671,10 @@ pub fn bootstrap_shard(
         ));
     }
 
-    let metadata_executor: Arc<dyn WorkspaceRequestExecutor> =
-        Arc::new(MetadataWorkspaceRequestExecutor::new(Arc::clone(&meta)));
+    let metadata_executor: Arc<dyn WorkspaceRequestExecutor> = Arc::new(
+        MetadataWorkspaceRequestExecutor::new(Arc::clone(&meta))
+            .with_append_activity_lease_ms(boot.append_activity_lease_ms)?,
+    );
     let executor: Arc<dyn WorkspaceRequestExecutor> = Arc::new(RecoveryPublishingExecutor::new(
         metadata_executor,
         Arc::clone(&recovery),
@@ -755,6 +770,11 @@ pub fn bootstrap_shard(
 }
 
 fn validate_boot(boot: &ShardBoot) -> Result<(), ServerError> {
+    if !(1_000..=crate::MAX_APPEND_ACTIVITY_LEASE_MS).contains(&boot.append_activity_lease_ms) {
+        return Err(ServerError::InvalidBootstrap(
+            "append activity lease must be between 1000 and 86400000 milliseconds".to_owned(),
+        ));
+    }
     if boot.recovery_publication == RecoveryPublicationMode::LocalOnly
         && matches!(boot.open, OpenMode::RecoverLog(_))
     {
@@ -1128,11 +1148,18 @@ fn open_existing_meta(
     path: PathBuf,
     logical_shard_id: nokv_types::LogicalShardId,
 ) -> Result<Arc<meta::MetaShard>, ServerError> {
-    let holt = HoltStore::open(HoltOptions::file(
-        path,
-        metadata_catalog(),
-        meta::store_limits(),
-    ))?;
+    let options = HoltOptions::file(path, metadata_catalog(), meta::store_limits());
+    // A writable Holt open may replay/truncate its WAL and checkpoint pages
+    // before the metadata schema gate runs. Validate the complete existing
+    // authority through Holt's read-only recovery first, so an incompatible or
+    // corrupt store is rejected without changing its persisted files.
+    {
+        let mut inspection_options = options.clone();
+        inspection_options.config = inspection_options.config.read_only();
+        let inspection = HoltStore::open(inspection_options)?;
+        meta::MetaShard::open(Arc::new(inspection), logical_shard_id)?;
+    }
+    let holt = HoltStore::open(options)?;
     let store: Arc<dyn TxnStore> = Arc::new(holt);
     Ok(Arc::new(meta::MetaShard::open(store, logical_shard_id)?))
 }
@@ -1543,6 +1570,13 @@ mod tests {
             self.inner.head(key)
         }
 
+        fn seal_immutable(
+            &self,
+            key: &ObjectKey,
+        ) -> Result<nokv_object::ObjectSealOutcome, ObjectError> {
+            self.inner.seal_immutable(key)
+        }
+
         fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
             self.inner.delete(key)
         }
@@ -1590,6 +1624,13 @@ mod tests {
 
         fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
             self.inner.head(key)
+        }
+
+        fn seal_immutable(
+            &self,
+            key: &ObjectKey,
+        ) -> Result<nokv_object::ObjectSealOutcome, ObjectError> {
+            self.inner.seal_immutable(key)
         }
 
         fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
@@ -2155,6 +2196,7 @@ mod tests {
 
     fn acquire_boot(path: PathBuf, roots: &[RootId]) -> ShardBoot {
         ShardBoot {
+            append_activity_lease_ms: 1_800_000,
             recovery_publication: RecoveryPublicationMode::Shared,
             shard_id: shard(),
             open: OpenMode::New(path),
@@ -2185,6 +2227,7 @@ mod tests {
         seed: u8,
     ) -> ShardBoot {
         ShardBoot {
+            append_activity_lease_ms: 1_800_000,
             recovery_publication: RecoveryPublicationMode::Shared,
             shard_id: shard(),
             open: OpenMode::Existing(path),
@@ -2416,6 +2459,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects,
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
@@ -2819,6 +2863,7 @@ mod tests {
         let registry = Arc::new(RootOwnerRegistry::new());
 
         let boot = ShardBoot {
+            append_activity_lease_ms: 1_800_000,
             recovery_publication: RecoveryPublicationMode::Shared,
             shard_id: shard(),
             open: OpenMode::Existing(database),
@@ -2875,6 +2920,7 @@ mod tests {
             as_control(&control),
             Arc::new(RootOwnerRegistry::new()),
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
@@ -2931,6 +2977,7 @@ mod tests {
             as_control(&control),
             Arc::clone(&registry),
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database.clone()),
@@ -2989,6 +3036,7 @@ mod tests {
             as_control(&control),
             Arc::clone(&registry),
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
@@ -3045,6 +3093,7 @@ mod tests {
             as_control(&control),
             Arc::new(RootOwnerRegistry::new()),
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
@@ -3100,6 +3149,7 @@ mod tests {
             as_control(&control),
             Arc::new(RootOwnerRegistry::new()),
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
@@ -3156,6 +3206,7 @@ mod tests {
             as_control(&control),
             Arc::new(RootOwnerRegistry::new()),
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
@@ -3221,6 +3272,7 @@ mod tests {
             as_control(&control),
             Arc::new(RootOwnerRegistry::new()),
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
@@ -3240,6 +3292,72 @@ mod tests {
         let record = control.get_logical_shard(&shard()).unwrap().unwrap();
         assert_eq!(record.owner_epoch, Some(first_epoch));
         assert_eq!(record.state, LogicalShardState::Unassigned);
+    }
+
+    #[test]
+    fn incompatible_existing_store_is_rejected_without_physical_file_mutation() {
+        use nokv_meta_store::{Commit, Key, Mutation, ReadBatch, ReadOp, ReadResult, WriteTxn};
+
+        fn image(directory: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            let mut result = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    result.extend(image(&path));
+                } else {
+                    result.insert(path.clone(), std::fs::read(path).unwrap());
+                }
+            }
+            result
+        }
+
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        drop(initialize_meta(database.clone(), shard()).unwrap());
+        let system = meta::keyspaces()
+            .iter()
+            .find(|entry| entry.name == "system")
+            .unwrap()
+            .id;
+        let raw = HoltStore::open(HoltOptions::file(
+            &database,
+            metadata_catalog(),
+            meta::store_limits(),
+        ))
+        .unwrap();
+        let values = raw
+            .read(ReadBatch {
+                ops: vec![ReadOp::Get(Key::new(system, b"schema".to_vec()))],
+            })
+            .unwrap();
+        let ReadResult::Get(Some(mut marker)) = values.results.into_iter().next().unwrap() else {
+            panic!("schema marker must exist")
+        };
+        let version_offset = marker.len() - std::mem::size_of::<u32>();
+        marker[version_offset..].copy_from_slice(&11_u32.to_be_bytes());
+        assert_eq!(
+            raw.commit(WriteTxn {
+                checks: vec![],
+                mutations: vec![Mutation::Put {
+                    key: Key::new(system, b"schema".to_vec()),
+                    value: marker,
+                }]
+            })
+            .unwrap(),
+            Commit::Applied
+        );
+        drop(raw);
+        let before = image(&database);
+        assert!(!before.is_empty());
+        let error = open_existing_meta(database.clone(), shard())
+            .err()
+            .expect("old format rejected");
+        assert!(error.to_string().contains("schema"), "{error}");
+        assert_eq!(
+            image(&database),
+            before,
+            "rejection must not replay or checkpoint the original files"
+        );
     }
 
     #[test]
@@ -3296,6 +3414,7 @@ mod tests {
             as_control(&control),
             Arc::new(RootOwnerRegistry::new()),
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(database),
@@ -3349,6 +3468,90 @@ mod tests {
     }
 
     #[test]
+    fn unqualified_append_owner_is_rejected_before_control_files_or_object_io() {
+        struct UnqualifiedOwnerStore {
+            identity: ProviderHandleIdentity,
+            receipt: Option<ProviderAdmissionReceipt>,
+        }
+        impl ArtifactObjectStore for UnqualifiedOwnerStore {
+            fn object_namespace(&self) -> Option<ObjectNamespaceId> {
+                Some(ObjectNamespaceId::from_bytes(
+                    [10; nokv_types::FIXED_ID_BYTES],
+                ))
+            }
+            fn capabilities(&self) -> ArtifactStoreCapabilities {
+                ArtifactStoreCapabilities::default()
+            }
+            fn provider_handle_identity(&self) -> ProviderHandleIdentity {
+                self.identity
+            }
+            fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
+                self.receipt.as_ref()
+            }
+            fn create_immutable(
+                &self,
+                _: &ObjectKey,
+                _: &[u8],
+            ) -> Result<ImmutableCreateOutcome, ObjectError> {
+                panic!("unqualified bootstrap must not write objects")
+            }
+            fn read(&self, _: &ObjectKey, _: Option<ObjectRange>) -> Result<Vec<u8>, ObjectError> {
+                panic!("unqualified bootstrap must not read objects")
+            }
+            fn head(&self, _: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
+                panic!("unqualified bootstrap must not head objects")
+            }
+            fn delete(&self, _: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
+                panic!("unqualified bootstrap must not delete objects")
+            }
+            fn seal_immutable(
+                &self,
+                _: &ObjectKey,
+            ) -> Result<nokv_object::ObjectSealOutcome, ObjectError> {
+                panic!("unqualified bootstrap must not seal objects")
+            }
+        }
+        // Missing receipt, genuine generic-only receipt, and strong receipt
+        // borrowed from another handle all fail before acquiring an epoch.
+        for mode in 0..3 {
+            let temporary = TempDir::new().unwrap();
+            let root_id = root(1);
+            let control = active_control(&[root_id]);
+            let registry = Arc::new(RootOwnerRegistry::new());
+            let database = temporary.path().join("metadata");
+            let raw = MemoryArtifactStore::new();
+            let mut profile = nokv_object::ProviderAdmissionProfile::single_put(4).unwrap();
+            if mode == 2 {
+                profile = profile.with_append_sealing();
+            }
+            let receipt = if mode == 0 {
+                None
+            } else {
+                Some(nokv_object::admit_artifact_provider(&raw, profile).unwrap())
+            };
+            let objects = UnqualifiedOwnerStore {
+                identity: if mode == 2 {
+                    ProviderHandleIdentity::new()
+                } else {
+                    raw.provider_handle_identity()
+                },
+                receipt,
+            };
+            let before = control.get_logical_shard(&shard()).unwrap();
+            let outcome = super::bootstrap_shard(
+                as_control(&control),
+                Arc::clone(&registry),
+                Arc::new(objects),
+                acquire_boot(database.clone(), &[root_id]),
+            );
+            assert!(matches!(outcome, Err(ServerError::InvalidBootstrap(_))));
+            assert_eq!(control.get_logical_shard(&shard()).unwrap(), before);
+            assert_eq!(registry.installed_root_count().unwrap(), 0);
+            assert!(!database.exists());
+        }
+    }
+
+    #[test]
     fn unverified_requested_recovery_frontier_is_rejected_before_acquire() {
         let temporary = TempDir::new().unwrap();
         let root_id = root(1);
@@ -3384,6 +3587,7 @@ mod tests {
         control.release_owner(&lease).unwrap();
 
         let boot = ShardBoot {
+            append_activity_lease_ms: 1_800_000,
             recovery_publication: RecoveryPublicationMode::Shared,
             shard_id: shard(),
             open: OpenMode::New(temporary.path().join("metadata")),
@@ -3599,6 +3803,7 @@ mod tests {
                 Arc::new(RootOwnerRegistry::new()),
                 objects.clone(),
                 ShardBoot {
+                    append_activity_lease_ms: 1_800_000,
                     recovery_publication: RecoveryPublicationMode::Shared,
                     shard_id: shard(),
                     open: OpenMode::RecoverLog(target),
@@ -3661,6 +3866,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects,
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::RecoverLog(target),
@@ -3725,6 +3931,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects.clone(),
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::Existing(behind_path.clone()),
@@ -3787,6 +3994,7 @@ mod tests {
                 Arc::new(RootOwnerRegistry::new()),
                 objects.clone(),
                 ShardBoot {
+                    append_activity_lease_ms: 1_800_000,
                     recovery_publication: RecoveryPublicationMode::Shared,
                     shard_id: shard(),
                     open: OpenMode::Existing(source_path.clone()),
@@ -3838,6 +4046,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects,
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::RecoverLog(target),
@@ -3897,6 +4106,7 @@ mod tests {
         objects.fail_delete_at(2);
         let recovered_path = temporary.path().join("recovered");
         let boot = ShardBoot {
+            append_activity_lease_ms: 1_800_000,
             recovery_publication: RecoveryPublicationMode::Shared,
             shard_id: shard(),
             open: OpenMode::RecoverLog(recovered_path.clone()),
@@ -3973,6 +4183,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects,
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::RecoverLog(temporary.path().join("recovered")),
@@ -4044,6 +4255,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects,
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::RecoverLog(target),
@@ -4107,6 +4319,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects,
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::RecoverLog(target),
@@ -4163,6 +4376,7 @@ mod tests {
             Arc::new(RootOwnerRegistry::new()),
             objects,
             ShardBoot {
+                append_activity_lease_ms: 1_800_000,
                 recovery_publication: RecoveryPublicationMode::Shared,
                 shard_id: shard(),
                 open: OpenMode::RecoverLog(temporary.path().join("recovered")),
@@ -4315,6 +4529,7 @@ mod tests {
         let registry = Arc::new(RootOwnerRegistry::new());
 
         let boot = ShardBoot {
+            append_activity_lease_ms: 1_800_000,
             recovery_publication: RecoveryPublicationMode::Shared,
             shard_id: shard(),
             open: OpenMode::Existing(database),
@@ -4852,6 +5067,7 @@ mod tests {
             ));
         let registry = Arc::new(RootOwnerRegistry::new());
         let boot = ShardBoot {
+            append_activity_lease_ms: 1_800_000,
             recovery_publication: RecoveryPublicationMode::Shared,
             shard_id: shard(),
             open: OpenMode::Existing(database),

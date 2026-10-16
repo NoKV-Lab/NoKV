@@ -96,6 +96,8 @@ pub enum WorkspaceRequest {
     ReadRestoreSourceRunManifest(ReadRestoreSourceRunManifestRequest),
     FinalizeRestore(FinalizeRestoreRequest),
     GetOperation(GetOperationRequest),
+    InspectAppendCleanup(crate::InspectAppendCleanupRequest),
+    RetryAppendCleanup(crate::RetryAppendCleanupRequest),
     BeginGenericIndexRegistration(BeginGenericIndexRegistrationRequest),
     AppendGenericIndexRows(AppendGenericIndexRowsRequest),
     FinalizeGenericIndexRegistration(FinalizeGenericIndexRegistrationRequest),
@@ -136,6 +138,8 @@ impl WorkspaceRequest {
             Self::ReadRestoreSourceRunManifest(request) => request.validate(),
             Self::FinalizeRestore(request) => request.validate(),
             Self::GetOperation(request) => request.validate(),
+            Self::InspectAppendCleanup(request) => request.validate(),
+            Self::RetryAppendCleanup(_) => Ok(()),
             Self::BeginGenericIndexRegistration(request) => request.validate(),
             Self::AppendGenericIndexRows(request) => request.validate(),
             Self::FinalizeGenericIndexRegistration(request) => request.validate(),
@@ -425,6 +429,10 @@ impl RemovePathRequest {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BeginArtifactPublishRequest {
+    /// Logical append identity and monotonic attempt owning this publication.
+    pub append_attempt: Option<crate::AppendAttemptBinding>,
+    /// Exact caller intent for a stable append; binds one publication attempt.
+    pub append_intent_digest: Option<Digest>,
     pub operation_id: OperationIdentity,
     pub artifact_revision_id: ArtifactRevisionIdentity,
     pub target: WorkspacePath,
@@ -449,6 +457,37 @@ pub struct BeginArtifactPublishRequest {
 impl BeginArtifactPublishRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
         self.condition.validate()?;
+        if self.append_attempt.is_some() != self.append_intent_digest.is_some() {
+            return Err(ProtocolError::invalid(
+                "begin_artifact_publish.append_attempt",
+                "attempt binding and intent digest must be supplied together",
+            ));
+        }
+        if self
+            .append_attempt
+            .is_some_and(|binding| binding.operation_id == self.operation_id)
+        {
+            return Err(ProtocolError::invalid(
+                "begin_artifact_publish.append_attempt",
+                "logical and publication identities must differ",
+            ));
+        }
+        if self.append_intent_digest.is_some()
+            && (!matches!(self.authority, PublicationAuthority::Visible)
+                || self.expected_workspace_incarnation_id.is_none()
+                || !matches!(
+                    self.condition,
+                    PublishCondition::CreateOnly
+                        | PublishCondition::Append {
+                            expected_generation: Some(_)
+                        }
+                ))
+        {
+            return Err(ProtocolError::invalid(
+                "begin_artifact_publish.append_intent_digest",
+                "stable append requires visible authority, an incarnation fence, and create-only or generation-bound append",
+            ));
+        }
         if self.expected_workspace_incarnation_id.is_some()
             && !matches!(self.authority, PublicationAuthority::Visible)
         {
@@ -2163,6 +2202,8 @@ mod tests {
         condition: PublishCondition,
     ) -> BeginArtifactPublishRequest {
         BeginArtifactPublishRequest {
+            append_attempt: None,
+            append_intent_digest: None,
             operation_id: OperationIdentity([1; 16]),
             artifact_revision_id: ArtifactRevisionIdentity([2; 16]),
             target: WorkspacePath {
@@ -2206,6 +2247,38 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn stable_append_requires_a_visible_incarnation_and_generation_bound_plan() {
+        let mut request = begin_manifest_publish(
+            "outputs/events.log",
+            PublicationAuthority::Visible,
+            PublishCondition::CreateOnly,
+        );
+        request.append_intent_digest = Some(Digest([0x61; 32]));
+        request.append_attempt = Some(crate::AppendAttemptBinding {
+            operation_id: OperationIdentity([0x62; 16]),
+            attempt: 0,
+        });
+        assert!(request.validate().is_err());
+        request.expected_workspace_incarnation_id = Some(WorkspaceIdentity([9; 16]));
+        request.validate().unwrap();
+        request.condition = PublishCondition::Append {
+            expected_generation: Some(7),
+        };
+        request.validate().unwrap();
+        for condition in [
+            PublishCondition::Append {
+                expected_generation: None,
+            },
+            PublishCondition::ReplaceOnly {
+                expected_generation: 7,
+            },
+        ] {
+            request.condition = condition;
+            assert!(request.validate().is_err());
+        }
     }
 
     #[test]
