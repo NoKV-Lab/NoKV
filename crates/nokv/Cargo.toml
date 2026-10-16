@@ -11,7 +11,8 @@ homepage.workspace = true
 
 [features]
 default = ["etcd"]
-etcd = ["nokv-client/etcd", "nokv-control/etcd", "nokv-server/etcd", "dep:signal-hook"]
+control = ["nokv-client/control", "dep:signal-hook"]
+etcd = ["control", "nokv-client/etcd", "nokv-control/etcd", "nokv-server/etcd"]
 
 [dependencies]
 base64.workspace = true

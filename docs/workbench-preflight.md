@@ -50,9 +50,17 @@ process is the metadata authority: it holds the owner lease, applies every
 metadata command to its local Holt WAL, and acknowledges once that WAL is
 durable. Nothing else has to be running for reads and writes to work.
 
-Control (etcd) is required, but for two narrow jobs: resolving which process
-owns a root, and fencing that ownership with an epoch. It is not on the write
-path and it does not hold metadata.
+Control is required, but for two narrow jobs: resolving which process owns a
+root, and fencing that ownership with an epoch. It holds no metadata. Its only
+step on the write path is the proof, before every acknowledgement, that the
+owner session is still live.
+
+On one host, `--control-dir PATH` keeps the control records in a local
+directory, and the owner session is an exclusive file lock that the kernel
+releases when the owner process exits, so no etcd process runs and the proof
+is an in-process check. The directory must be on a local filesystem. Use
+`--etcd-endpoint` when owners or clients span hosts; the proof is then one
+linearizable etcd read per acknowledgement.
 
 Publishing the recovery log to Control (`--recovery-publication shared`) is
 an option, and an immature one: without checkpoint compaction the shared log
@@ -90,7 +98,8 @@ over it qualifies neither the CLI nor the Python SDK path.
 The selected `--workbench-root` is durable presentation configuration because
 canonical v1 manifests contain its projected paths. Keep it identical across
 restart/replay; it never replaces `RootId` as the storage or routing identity.
-Agent-facing commands require etcd control routing and verify the immutable
+Agent-facing commands require control routing (a local control directory or
+etcd) and verify the immutable
 RootId-to-AgentId binding before RPC preflight, object binding, stdin reads, or
 tool advertisement. This is a fail-closed deployment identity check, not
 authentication. A legacy root without a binding requires a one-time,
