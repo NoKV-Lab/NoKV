@@ -6,6 +6,7 @@
 
 pub mod workspace;
 
+pub use workspace::time_ordered_identity;
 pub use workspace::{
     AgentId, ArtifactRevisionId, BuildCommitPhase, CommandDigest, CommitConsumerKind, CommitId,
     CommitRetirePhase, CommitState, CommitVersion, ConsumerEpoch, DurableNameError, GcClaimState,
@@ -17,5 +18,5 @@ pub use workspace::{
     RootActivationState, RootId, RootPlacementLifecycle, SnapshotAliasName, SnapshotId,
     SnapshotState, StagedCleanupState, StagedProviderState, TagName, UnknownDurableDiscriminant,
     WorkbenchId, WorkbenchIdError, WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState,
-    ZeroValueError, FIXED_ID_BYTES, SHA256_BYTES,
+    ZeroValueError, FIXED_ID_BYTES, SHA256_BYTES, TIME_ORDERED_PREFIX_BYTES,
 };

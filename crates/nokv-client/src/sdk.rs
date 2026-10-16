@@ -151,6 +151,9 @@ where
     }
 
     /// Allocates a process-local unique request id suitable for exact replay.
+    ///
+    /// The id is time-ordered, so the metadata rows keyed by it, and by the
+    /// operation and revision ids minted the same way, land near each other.
     pub fn new_request_id(&self) -> RequestIdentity {
         let sequence = self.request_sequence.fetch_add(1, Ordering::Relaxed);
         let mut hasher = Sha256::new();
@@ -158,9 +161,9 @@ where
         hasher.update(self.request_seed);
         hasher.update(sequence.to_be_bytes());
         let digest = hasher.finalize();
-        let mut request_id = [0_u8; 16];
-        request_id.copy_from_slice(&digest[..16]);
-        RequestIdentity(request_id)
+        let mut entropy = [0_u8; 16];
+        entropy.copy_from_slice(&digest[..16]);
+        RequestIdentity(nokv_types::time_ordered_identity(entropy))
     }
 
     /// Executes one operation. All retries reuse `request_id` exactly.

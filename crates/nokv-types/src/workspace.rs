@@ -6,11 +6,39 @@
 
 use std::fmt;
 use std::num::NonZeroU64;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Width of every fixed-size workspace storage identifier.
 pub const FIXED_ID_BYTES: usize = 16;
 /// Width of SHA-256-backed identities and digests.
 pub const SHA256_BYTES: usize = 32;
+/// Leading bytes of a time-ordered identity: Unix milliseconds, big-endian.
+pub const TIME_ORDERED_PREFIX_BYTES: usize = 6;
+
+/// A fixed identity ordered by when it was minted, laid out like an
+/// RFC 9562 UUIDv7: 48 bits of Unix milliseconds, then the trailing 80 bits
+/// of `entropy`.
+///
+/// Identities minted close together share leading bytes, so an ordered
+/// metadata family keyed by them receives inserts at one end of its key range
+/// instead of across all of it. Uniqueness rests on the entropy, as it does
+/// for a fully random identity; a skewed or stepped clock costs only
+/// locality.
+pub fn time_ordered_identity(entropy: [u8; FIXED_ID_BYTES]) -> [u8; FIXED_ID_BYTES] {
+    let unix_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        });
+    stamp_time_order(unix_millis, entropy)
+}
+
+fn stamp_time_order(unix_millis: u64, entropy: [u8; FIXED_ID_BYTES]) -> [u8; FIXED_ID_BYTES] {
+    let mut identity = entropy;
+    identity[..TIME_ORDERED_PREFIX_BYTES]
+        .copy_from_slice(&unix_millis.to_be_bytes()[8 - TIME_ORDERED_PREFIX_BYTES..]);
+    identity
+}
 
 /// Globally unique routing identity for one Agent root.
 #[repr(transparent)]
@@ -951,6 +979,32 @@ impl std::error::Error for NormalizedRelativePathError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_ordered_identities_sort_by_mint_millisecond_and_keep_their_entropy() {
+        let entropy = [0xab; FIXED_ID_BYTES];
+        let earlier = stamp_time_order(0x0001_0203_0405, entropy);
+        let later = stamp_time_order(0x0001_0203_0406, [0x00; FIXED_ID_BYTES]);
+        assert_eq!(&earlier[..TIME_ORDERED_PREFIX_BYTES], &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(
+            &earlier[TIME_ORDERED_PREFIX_BYTES..],
+            &entropy[TIME_ORDERED_PREFIX_BYTES..]
+        );
+        assert!(
+            earlier < later,
+            "a later millisecond sorts after any entropy"
+        );
+
+        let minted = time_ordered_identity(entropy);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mut stamped = [0; 8];
+        stamped[8 - TIME_ORDERED_PREFIX_BYTES..]
+            .copy_from_slice(&minted[..TIME_ORDERED_PREFIX_BYTES]);
+        assert!(now.abs_diff(u64::from_be_bytes(stamped)) < 60_000);
+    }
 
     fn assert_durable_registry<T>(expected: &[(T, u8)])
     where

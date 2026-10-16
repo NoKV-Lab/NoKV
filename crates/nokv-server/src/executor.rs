@@ -4528,6 +4528,11 @@ fn read_context_from_write(context: meta::RootWriteContext) -> meta::RootReadCon
     }
 }
 
+/// The dedupe identity of one metadata step of a request.
+///
+/// A step id keeps its request's leading time-ordered bytes, so the steps'
+/// dedupe rows land beside each other instead of anywhere in the family; the
+/// remaining 80 bits come from the step digest.
 fn derived_request_id(
     request_id: protocol::RequestIdentity,
     step: &[u8],
@@ -4540,8 +4545,9 @@ fn derived_request_id(
     hasher.update(step);
     hasher.update(sequence.to_be_bytes());
     let digest: [u8; types::SHA256_BYTES] = hasher.finalize().into();
-    let mut bytes = [0_u8; types::FIXED_ID_BYTES];
-    bytes.copy_from_slice(&digest[..types::FIXED_ID_BYTES]);
+    let mut bytes = request_id.0;
+    bytes[types::TIME_ORDERED_PREFIX_BYTES..]
+        .copy_from_slice(&digest[..types::FIXED_ID_BYTES - types::TIME_ORDERED_PREFIX_BYTES]);
     types::RequestId::from_bytes(bytes)
 }
 
@@ -7874,6 +7880,29 @@ mod tests {
             derived_request_id(request, b"commit-members", 0),
             derived_request_id(request, b"commit-revisions", 0)
         );
+    }
+
+    #[test]
+    fn derived_request_ids_keep_their_request_time_order() {
+        let mut first = [0x11; types::FIXED_ID_BYTES];
+        first[..types::TIME_ORDERED_PREFIX_BYTES].copy_from_slice(&[0, 0, 1, 0, 0, 0]);
+        let mut second = first;
+        second[..types::TIME_ORDERED_PREFIX_BYTES].copy_from_slice(&[0, 0, 1, 0, 0, 1]);
+        let steps = |request: [u8; types::FIXED_ID_BYTES]| {
+            [b"publish-begin".as_slice(), b"publish-complete-finalize"].map(|step| {
+                *derived_request_id(protocol::RequestIdentity(request), step, 0).as_bytes()
+            })
+        };
+        for step in steps(first) {
+            assert_eq!(
+                step[..types::TIME_ORDERED_PREFIX_BYTES],
+                first[..types::TIME_ORDERED_PREFIX_BYTES]
+            );
+            assert_ne!(step, first);
+            // Every step of a later request sorts after every step of an
+            // earlier one.
+            assert!(steps(second).iter().all(|later| step < *later));
+        }
     }
 
     fn restore_destination_manifests() -> meta::RestoreDestinationManifests {
