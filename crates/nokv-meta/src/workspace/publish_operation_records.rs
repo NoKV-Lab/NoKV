@@ -19,7 +19,7 @@ use nokv_types::{
 };
 
 /// Durable value format for publication-owned payloads.
-pub const PUBLISH_VALUE_FORMAT_VERSION: u8 = 4;
+pub const PUBLISH_VALUE_FORMAT_VERSION: u8 = 7;
 
 /// Hard safety bound for one publish operation's staged-object ledger.
 pub const MAX_STAGED_OBJECTS: u32 = 1_048_576;
@@ -140,6 +140,9 @@ pub struct PublishTerminalError {
 /// and an exact-identity initialization mismatch remain distinguishable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishOperationRecord {
+    pub append_attempt: Option<AppendAttemptBinding>,
+    /// Full caller intent commitment for one stable append publication attempt.
+    pub append_intent_digest: Option<[u8; SHA256_BYTES]>,
     pub operation_id: OperationId,
     pub identity_digest: [u8; SHA256_BYTES],
     pub initialization_digest: [u8; SHA256_BYTES],
@@ -185,6 +188,8 @@ pub struct PublishOperationRecord {
     /// Number of staged-object and manifest rows durably removed by cleanup.
     pub cleanup_staged_object_cursor: u32,
     pub cleanup_manifest_cursor: u32,
+    /// Accepted owner cleanup retries; monotonic even when the same failure recurs.
+    pub cleanup_retry_count: u64,
 
     /// Required only when cleanup takes over a `Finalizing` operation.
     pub publication_absence_proof: Option<[u8; SHA256_BYTES]>,
@@ -192,6 +197,122 @@ pub struct PublishOperationRecord {
     pub result: Option<PublishResult>,
     /// Present throughout `Aborting`/`Cleaning` and their terminal states.
     pub terminal_error: Option<PublishTerminalError>,
+}
+
+/// A publication attempt belongs permanently to one logical append.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppendAttemptBinding {
+    pub operation_id: OperationId,
+    pub attempt: u64,
+}
+
+/// Root-scoped logical append. Its current publication always exists and its
+/// receipt is installed atomically with the publication and visible path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppendOperationRecord {
+    pub operation_id: OperationId,
+    pub intent_digest: [u8; SHA256_BYTES],
+    pub workbench_id: WorkbenchId,
+    pub workspace_incarnation_id: WorkspaceIncarnationId,
+    pub path: NormalizedRelativePath,
+    pub attempt: u64,
+    pub publication_operation_id: OperationId,
+    pub artifact_revision_id: ArtifactRevisionId,
+    pub result: Option<PublishResult>,
+}
+
+impl AppendOperationRecord {
+    pub fn matches_publication(&self, publication: &PublishOperationRecord) -> bool {
+        publication.append_attempt
+            == Some(AppendAttemptBinding {
+                operation_id: self.operation_id,
+                attempt: self.attempt,
+            })
+            && publication.append_intent_digest == Some(self.intent_digest)
+            && publication.operation_id == self.publication_operation_id
+            && publication.artifact_revision_id == self.artifact_revision_id
+            && publication.workbench_id == self.workbench_id
+            && publication.workspace_incarnation_id == self.workspace_incarnation_id
+            && publication.path == self.path
+            && publication.authority == PublishAuthority::Visible
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, PublishRecordError> {
+        if self.operation_id == self.publication_operation_id {
+            return Err(PublishRecordError::InvalidPhasePayload {
+                phase: PublishPhase::Uploading,
+                reason: "logical and publication identities must differ",
+            });
+        }
+        if let Some(result) = &self.result {
+            validate_publish_result(result)?;
+        }
+        let mut encoded = vec![1];
+        encoded.extend_from_slice(self.operation_id.as_bytes());
+        encoded.extend_from_slice(&self.intent_digest);
+        push_bytes(&mut encoded, "workbench_id", self.workbench_id.as_bytes())?;
+        encoded.extend_from_slice(self.workspace_incarnation_id.as_bytes());
+        push_bytes(&mut encoded, "path", self.path.as_str().as_bytes())?;
+        encoded.extend_from_slice(&self.attempt.to_be_bytes());
+        encoded.extend_from_slice(self.publication_operation_id.as_bytes());
+        encoded.extend_from_slice(self.artifact_revision_id.as_bytes());
+        push_optional_result(&mut encoded, self.result.as_ref())?;
+        require_record_size(
+            "AppendOperationRecord",
+            encoded.len(),
+            MAX_PUBLISH_OPERATION_RECORD_BYTES,
+        )?;
+        Ok(encoded)
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, PublishRecordError> {
+        require_record_size(
+            "AppendOperationRecord",
+            encoded.len(),
+            MAX_PUBLISH_OPERATION_RECORD_BYTES,
+        )?;
+        let mut decoder = Decoder::new(encoded);
+        let actual = decoder.u8("append.value_format_version")?;
+        if actual != 1 {
+            return Err(PublishRecordError::UnsupportedValueVersion {
+                actual,
+                expected: 1,
+            });
+        }
+        let operation_id = OperationId::from_bytes(decoder.fixed("operation_id")?);
+        let intent_digest = decoder.fixed("intent_digest")?;
+        let workbench_id = WorkbenchId::new(
+            decoder.string("workbench_id", WorkbenchId::MAX_BYTES)?,
+        )
+        .map_err(|error| PublishRecordError::InvalidWorkbenchId {
+            reason: error.to_string(),
+        })?;
+        let workspace_incarnation_id =
+            WorkspaceIncarnationId::from_bytes(decoder.fixed("workspace_incarnation_id")?);
+        let path =
+            NormalizedRelativePath::new(decoder.string("path", NormalizedRelativePath::MAX_BYTES)?)
+                .map_err(|error| PublishRecordError::InvalidPath {
+                    reason: error.to_string(),
+                })?;
+        let record = Self {
+            operation_id,
+            intent_digest,
+            workbench_id,
+            workspace_incarnation_id,
+            path,
+            attempt: decoder.u64("attempt")?,
+            publication_operation_id: OperationId::from_bytes(
+                decoder.fixed("publication_operation_id")?,
+            ),
+            artifact_revision_id: ArtifactRevisionId::from_bytes(
+                decoder.fixed("artifact_revision_id")?,
+            ),
+            result: decode_optional_result(&mut decoder)?,
+        };
+        decoder.finish()?;
+        record.encode()?;
+        Ok(record)
+    }
 }
 
 /// Last ordered manifest key included in the durable rolling closure.
@@ -445,6 +566,30 @@ impl std::error::Error for PublishRecordError {}
 
 impl PublishOperationRecord {
     pub fn validate(&self) -> Result<(), PublishRecordError> {
+        if self.append_attempt.is_some() != self.append_intent_digest.is_some() {
+            return Err(PublishRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "append attempt and intent must be present together",
+            });
+        }
+        if self
+            .append_attempt
+            .is_some_and(|binding| binding.operation_id == self.operation_id)
+        {
+            return Err(PublishRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "logical and publication identities must differ",
+            });
+        }
+        if self.append_intent_digest.is_some()
+            && (!matches!(self.authority, PublishAuthority::Visible)
+                || matches!(self.claim, PublishClaim::ReplaceOnly { .. }))
+        {
+            return Err(PublishRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "stable append requires visible create-only or append authority",
+            });
+        }
         if self.activity_deadline_ms == 0 {
             return Err(PublishRecordError::ZeroScalar {
                 field: "activity_deadline_ms",
@@ -490,6 +635,18 @@ impl PublishOperationRecord {
             self.cleanup_manifest_cursor,
             self.manifest_cursor,
         )?;
+        if self.cleanup_retry_count != 0
+            && (self.append_attempt.is_none()
+                || matches!(
+                    self.phase,
+                    PublishPhase::Uploading | PublishPhase::Finalizing | PublishPhase::Published
+                ))
+        {
+            return Err(PublishRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "cleanup retries belong only to failed logical append attempts",
+            });
+        }
         validate_progress_digest(
             "staged_object",
             self.staged_object_count,
@@ -687,6 +844,15 @@ impl PublishOperationRecord {
         encoded.extend_from_slice(self.operation_id.as_bytes());
         encoded.extend_from_slice(&self.identity_digest);
         encoded.extend_from_slice(&self.initialization_digest);
+        push_optional_fixed(&mut encoded, &self.append_intent_digest);
+        match self.append_attempt {
+            None => encoded.push(0),
+            Some(binding) => {
+                encoded.push(1);
+                encoded.extend_from_slice(binding.operation_id.as_bytes());
+                encoded.extend_from_slice(&binding.attempt.to_be_bytes());
+            }
+        }
         encoded.extend_from_slice(&self.initiating_owner_epoch.get().to_be_bytes());
         encoded.extend_from_slice(&self.activity_deadline_ms.to_be_bytes());
         match self.authority {
@@ -732,6 +898,7 @@ impl PublishOperationRecord {
         encoded.extend_from_slice(&self.dependency_digest);
         encoded.extend_from_slice(&self.cleanup_staged_object_cursor.to_be_bytes());
         encoded.extend_from_slice(&self.cleanup_manifest_cursor.to_be_bytes());
+        encoded.extend_from_slice(&self.cleanup_retry_count.to_be_bytes());
         push_optional_fixed(&mut encoded, &self.publication_absence_proof);
         push_optional_result(&mut encoded, self.result.as_ref())?;
         push_optional_terminal_error(&mut encoded, self.terminal_error.as_ref())?;
@@ -754,6 +921,22 @@ impl PublishOperationRecord {
         let operation_id = OperationId::from_bytes(decoder.fixed("operation_id")?);
         let identity_digest = decoder.fixed("identity_digest")?;
         let initialization_digest = decoder.fixed("initialization_digest")?;
+        let append_intent_digest = decoder.optional_fixed("append_intent_digest")?;
+        let append_attempt = match decoder.u8("append_attempt")? {
+            0 => None,
+            1 => Some(AppendAttemptBinding {
+                operation_id: OperationId::from_bytes(
+                    decoder.fixed("append_attempt.operation_id")?,
+                ),
+                attempt: decoder.u64("append_attempt.attempt")?,
+            }),
+            value => {
+                return Err(PublishRecordError::InvalidOptionalTag {
+                    field: "append_attempt",
+                    value,
+                })
+            }
+        };
         let initiating_owner_epoch = OwnerEpoch::new(decoder.u64("initiating_owner_epoch")?)
             .map_err(|_| PublishRecordError::ZeroScalar {
                 field: "initiating_owner_epoch",
@@ -829,6 +1012,7 @@ impl PublishOperationRecord {
         let dependency_digest = decoder.fixed("dependency_digest")?;
         let cleanup_staged_object_cursor = decoder.u32("cleanup_staged_object_cursor")?;
         let cleanup_manifest_cursor = decoder.u32("cleanup_manifest_cursor")?;
+        let cleanup_retry_count = decoder.u64("cleanup_retry_count")?;
         let publication_absence_proof = decoder.optional_fixed("publication_absence_proof")?;
         let result = decode_optional_result(&mut decoder)?;
         let terminal_error = decode_optional_terminal_error(&mut decoder)?;
@@ -838,6 +1022,8 @@ impl PublishOperationRecord {
             operation_id,
             identity_digest,
             initialization_digest,
+            append_attempt,
+            append_intent_digest,
             initiating_owner_epoch,
             activity_deadline_ms,
             authority,
@@ -863,6 +1049,7 @@ impl PublishOperationRecord {
             dependency_digest,
             cleanup_staged_object_cursor,
             cleanup_manifest_cursor,
+            cleanup_retry_count,
             publication_absence_proof,
             result,
             terminal_error,
@@ -972,6 +1159,33 @@ impl PublishOperationRecord {
         next.phase = PublishPhase::Aborting;
         next.publication_absence_proof = Some(publication_absence_proof);
         next.terminal_error = Some(terminal_error);
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+
+    pub(super) fn retry_append_cleanup(&mut self) -> Result<(), PublishRecordError> {
+        self.validate()?;
+        if self.phase != PublishPhase::Quarantined {
+            return Err(PublishRecordError::PhaseMismatch {
+                expected: PublishPhase::Quarantined,
+                actual: self.phase,
+            });
+        }
+        if self.append_attempt.is_none() {
+            return Err(PublishRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "owner cleanup retry requires a logical append child",
+            });
+        }
+        let mut next = self.clone();
+        next.cleanup_retry_count = next.cleanup_retry_count.checked_add(1).ok_or(
+            PublishRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "cleanup retry count exhausted",
+            },
+        )?;
+        next.phase = PublishPhase::Cleaning;
         next.validate()?;
         *self = next;
         Ok(())
@@ -1325,11 +1539,13 @@ fn validate_staged_state_pair(
                 | StagedProviderState::Uploaded
                 | StagedProviderState::AbortPending,
             StagedCleanupState::DeletePending
-        ) | (StagedProviderState::Aborted, StagedCleanupState::Deleted)
-            | (
-                StagedProviderState::Ambiguous,
-                StagedCleanupState::Quarantined
-            )
+        ) | (
+            StagedProviderState::Aborted,
+            StagedCleanupState::Deleted | StagedCleanupState::Sealed
+        ) | (
+            StagedProviderState::Ambiguous,
+            StagedCleanupState::Quarantined
+        )
     );
     if valid {
         Ok(())
@@ -1756,6 +1972,64 @@ impl<'a> Decoder<'a> {
     }
 }
 
+/// Durable acceptance receipt for one exact logical append cleanup state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppendCleanupRetryReceipt {
+    pub operation_id: OperationId,
+    pub publication_operation_id: OperationId,
+    pub expected_state_digest: [u8; SHA256_BYTES],
+    pub cleanup_retry_count: u64,
+    pub original_failure: PublishTerminalError,
+}
+
+impl AppendCleanupRetryReceipt {
+    pub fn encode(&self) -> Result<Vec<u8>, PublishRecordError> {
+        validate_terminal_error(&self.original_failure)?;
+        if self.cleanup_retry_count == 0
+            || self.operation_id == self.publication_operation_id
+            || self.original_failure.evidence_digest.is_none()
+        {
+            return Err(PublishRecordError::InvalidPhasePayload { phase: PublishPhase::Quarantined,
+                reason: "cleanup retry receipt requires distinct identities, positive count, and original quarantine evidence" });
+        }
+        let mut bytes = b"nokv.append.cleanup-retry.v1\0".to_vec();
+        bytes.extend_from_slice(self.operation_id.as_bytes());
+        bytes.extend_from_slice(self.publication_operation_id.as_bytes());
+        bytes.extend_from_slice(&self.expected_state_digest);
+        bytes.extend_from_slice(&self.cleanup_retry_count.to_be_bytes());
+        push_optional_terminal_error(&mut bytes, Some(&self.original_failure))?;
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, PublishRecordError> {
+        let prefix = b"nokv.append.cleanup-retry.v1\0";
+        let mut decoder = Decoder::new(bytes);
+        if decoder.take("cleanup retry receipt tag", prefix.len())? != prefix {
+            return Err(PublishRecordError::InvalidPhasePayload {
+                phase: PublishPhase::Quarantined,
+                reason: "invalid cleanup retry receipt tag",
+            });
+        }
+        let receipt = Self {
+            operation_id: OperationId::from_bytes(decoder.fixed("operation_id")?),
+            publication_operation_id: OperationId::from_bytes(
+                decoder.fixed("publication_operation_id")?,
+            ),
+            expected_state_digest: decoder.fixed("expected_state_digest")?,
+            cleanup_retry_count: decoder.u64("cleanup_retry_count")?,
+            original_failure: decode_optional_terminal_error(&mut decoder)?.ok_or(
+                PublishRecordError::InvalidPhasePayload {
+                    phase: PublishPhase::Quarantined,
+                    reason: "cleanup retry receipt is missing original failure",
+                },
+            )?,
+        };
+        decoder.finish()?;
+        receipt.encode()?;
+        Ok(receipt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1797,6 +2071,8 @@ mod tests {
 
     fn uploading_operation() -> PublishOperationRecord {
         PublishOperationRecord {
+            append_attempt: None,
+            append_intent_digest: None,
             operation_id: OperationId::from_bytes([0x10; 16]),
             identity_digest: [0x11; SHA256_BYTES],
             initialization_digest: [0x12; SHA256_BYTES],
@@ -1829,6 +2105,7 @@ mod tests {
             dependency_digest: [0x18; SHA256_BYTES],
             cleanup_staged_object_cursor: 0,
             cleanup_manifest_cursor: 0,
+            cleanup_retry_count: 0,
             publication_absence_proof: None,
             result: None,
             terminal_error: None,
@@ -1885,6 +2162,7 @@ mod tests {
             &[0x10; 16],
             &[0x11; SHA256_BYTES],
             &[0x12; SHA256_BYTES],
+            &[0, 0],
             &5_u64.to_be_bytes(),
             &50_000_u64.to_be_bytes(),
             &[1],
@@ -1915,6 +2193,7 @@ mod tests {
             &[0x18; SHA256_BYTES],
             &0_u32.to_be_bytes(),
             &0_u32.to_be_bytes(),
+            &0_u64.to_be_bytes(),
             &[0],
             &[1],
             &8_u64.to_be_bytes(),
@@ -1930,6 +2209,25 @@ mod tests {
         assert_eq!(PublishOperationRecord::decode(&expected).unwrap(), record);
         assert_every_proper_prefix_is_truncated(&expected, PublishOperationRecord::decode);
         assert_trailing_byte_is_rejected(expected, PublishOperationRecord::decode);
+    }
+
+    #[test]
+    fn stable_append_intent_round_trips_without_truncation_and_rejects_old_codec() {
+        let mut record = uploading_operation();
+        let mut digest = [0x61; SHA256_BYTES];
+        digest[SHA256_BYTES - 1] = 0x62;
+        record.append_intent_digest = Some(digest);
+        record.append_attempt = Some(AppendAttemptBinding {
+            operation_id: OperationId::from_bytes([0x63; 16]),
+            attempt: 0,
+        });
+        let mut encoded = record.encode().unwrap();
+        assert_eq!(PublishOperationRecord::decode(&encoded).unwrap(), record);
+        encoded[0] = PUBLISH_VALUE_FORMAT_VERSION - 1;
+        assert!(matches!(
+            PublishOperationRecord::decode(&encoded),
+            Err(PublishRecordError::UnsupportedValueVersion { .. })
+        ));
     }
 
     #[test]
@@ -2377,6 +2675,8 @@ mod tests {
             + 16
             + SHA256_BYTES
             + SHA256_BYTES
+            + 1 // absent append_intent_digest tag
+            + 1 // absent append_attempt tag
             + 8
             + 8
             + 1
@@ -2441,6 +2741,8 @@ mod tests {
             + 16
             + SHA256_BYTES
             + SHA256_BYTES
+            + 1 // absent append_intent_digest tag
+            + 1 // absent append_attempt tag
             + 8
             + 8
             + 1

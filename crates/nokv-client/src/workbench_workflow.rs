@@ -2115,6 +2115,8 @@ mod tests {
                 state_digest: Digest([8; 32]),
             },
             kind: OperationKind::Commit,
+            append_preparation: None,
+            publish_preparation: None,
             commit_preparation: Some(Box::new(preparation)),
             restore_preparation: None,
             state: if result.is_some() {
@@ -2178,6 +2180,14 @@ mod tests {
                 state_digest: Digest([0x18; 32]),
             },
             kind: OperationKind::ArtifactPublish,
+            append_preparation: None,
+            publish_preparation: Some(Box::new(nokv_protocol::PublishPreparation {
+                append_intent_digest: None,
+                append_attempt: None,
+                target: options.manifest_target.clone(),
+                workspace_incarnation_id: binding.workspace_incarnation_id,
+                artifact_revision_id: binding.artifact_revision_id,
+            })),
             commit_preparation: None,
             restore_preparation: None,
             state: OperationState::Succeeded,
@@ -2431,6 +2441,8 @@ mod tests {
                 state_digest: Digest([10; 32]),
             },
             kind: OperationKind::Restore,
+            append_preparation: None,
+            publish_preparation: None,
             commit_preparation: None,
             restore_preparation: Some(Box::new(restore_operation_preparation(
                 options,
@@ -2455,6 +2467,8 @@ mod tests {
                 state_digest: Digest([10; 32]),
             },
             kind: OperationKind::Restore,
+            append_preparation: None,
+            publish_preparation: None,
             commit_preparation: None,
             restore_preparation: Some(Box::new(restore_operation_preparation(
                 options,

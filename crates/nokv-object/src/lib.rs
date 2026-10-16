@@ -6,6 +6,15 @@
 //! and in-memory durable stores, and provides local soft caches. Namespace
 //! visibility, revision reachability, metadata transactions, and GC policy live
 //! in `nokv-meta`.
+//!
+//! Failed stable-append attempts additionally use permanent empty-object seals.
+//! Their metadata authority must fence publication and reserve revision keys
+//! forever before calling `seal_immutable`. S3 sealing uses conditional PUTs,
+//! never DELETE, so late immutable uploads cannot restore payload bytes. The
+//! append-specific provider admission profile verifies this stronger boundary;
+//! ordinary publication admission does not imply sealing support. Seal keys
+//! must be excluded from external deletion and expiration. In versioned buckets,
+//! sealing changes the current object only; it does not remove older versions.
 
 mod admission;
 mod artifact;
@@ -59,7 +68,7 @@ pub use recovery_log_segment::{
 pub use store::{
     ArtifactObjectStore, ArtifactStoreCapabilities, ImmutableCreateOutcome, MemoryArtifactStore,
     MemoryArtifactStoreStats, ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectKey, ObjectRange,
-    S3ArtifactStore, S3ArtifactStoreOptions, DEFAULT_S3_MULTIPART_CONCURRENCY,
+    ObjectSealOutcome, S3ArtifactStore, S3ArtifactStoreOptions, DEFAULT_S3_MULTIPART_CONCURRENCY,
     DEFAULT_S3_MULTIPART_PART_SIZE,
 };
 pub use tiered::{TieredArtifactStore, TieredArtifactStoreOptions, TieredArtifactStoreStats};

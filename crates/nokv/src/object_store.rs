@@ -5,15 +5,16 @@
 
 //! Object-provider composition for the custom Agent CLI.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use nokv_object::{
     admit_artifact_provider, ensure_object_namespace, load_object_namespace,
     verify_object_namespace, ArtifactObjectStore, ArtifactStoreCapabilities,
     ImmutableCreateOutcome, LocalHotTier, LocalHotTierOptions, ObjectDeleteOutcome, ObjectError,
-    ObjectInfo, ObjectKey, ObjectRange, ProviderAdmissionError, ProviderAdmissionProfile,
-    ProviderAdmissionReceipt, ProviderHandleIdentity, S3ArtifactStore, S3ArtifactStoreOptions,
-    TieredArtifactStore, TieredArtifactStoreOptions, DEFAULT_ARTIFACT_BLOCK_SIZE,
+    ObjectInfo, ObjectKey, ObjectRange, ObjectSealOutcome, ProviderAdmissionError,
+    ProviderAdmissionProfile, ProviderAdmissionReceipt, ProviderHandleIdentity, S3ArtifactStore,
+    S3ArtifactStoreOptions, TieredArtifactStore, TieredArtifactStoreOptions,
+    DEFAULT_ARTIFACT_BLOCK_SIZE,
 };
 use nokv_types::ObjectNamespaceId;
 
@@ -31,7 +32,9 @@ enum CliObjectStoreInner {
 pub struct CliObjectStore {
     inner: CliObjectStoreInner,
     namespace_id: Option<ObjectNamespaceId>,
-    admission: Arc<OnceLock<Result<ProviderAdmissionReceipt, ProviderAdmissionError>>>,
+    admission: Arc<OnceLock<ProviderAdmissionReceipt>>,
+    append_admission: Arc<OnceLock<ProviderAdmissionReceipt>>,
+    admission_probe: Arc<Mutex<()>>,
 }
 
 impl CliObjectStore {
@@ -82,6 +85,8 @@ impl CliObjectStore {
                 inner: CliObjectStoreInner::S3(durable),
                 namespace_id: None,
                 admission: Arc::new(OnceLock::new()),
+                append_admission: Arc::new(OnceLock::new()),
+                admission_probe: Arc::new(Mutex::new(())),
             });
         };
         let hot = LocalHotTier::new(LocalHotTierOptions::new(cache_root, config.hot_cache_bytes))
@@ -94,26 +99,49 @@ impl CliObjectStore {
             )),
             namespace_id: None,
             admission: Arc::new(OnceLock::new()),
+            append_admission: Arc::new(OnceLock::new()),
+            admission_probe: Arc::new(Mutex::new(())),
         })
     }
 
     /// Verify the immutable object semantics required by every Agent tool
     /// before the CLI advertises its MCP surface.
     pub fn validate_agent_capabilities(&self) -> Result<(), String> {
-        self.cache_admission(|store| {
+        self.cache_admission(&self.admission, |store| {
             let profile = ProviderAdmissionProfile::single_put(DEFAULT_ARTIFACT_BLOCK_SIZE)?;
+            admit_artifact_provider(store, profile)
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    /// Prove monotonic sealing before admitting stable append uploads.
+    pub fn validate_append_capabilities(&self) -> Result<(), ProviderAdmissionError> {
+        self.cache_admission(&self.append_admission, |store| {
+            let profile = ProviderAdmissionProfile::single_put(DEFAULT_ARTIFACT_BLOCK_SIZE)?
+                .with_append_sealing();
             admit_artifact_provider(store, profile)
         })
     }
 
     fn cache_admission(
         &self,
+        admission: &OnceLock<ProviderAdmissionReceipt>,
         probe: impl FnOnce(&S3ArtifactStore) -> Result<ProviderAdmissionReceipt, ProviderAdmissionError>,
-    ) -> Result<(), String> {
-        match self.admission.get_or_init(|| probe(self.durable())) {
-            Ok(_) => Ok(()),
-            Err(error) => Err(error.to_string()),
+    ) -> Result<(), ProviderAdmissionError> {
+        if admission.get().is_some() {
+            return Ok(());
         }
+        let _guard = self
+            .admission_probe
+            .lock()
+            .map_err(|_| ProviderAdmissionError::Inconclusive)?;
+        if admission.get().is_none() {
+            // Cache evidence of success, never a transient outage. A caller
+            // using this same handle may safely try the probe again later.
+            let receipt = probe(self.durable())?;
+            admission.get_or_init(|| receipt);
+        }
+        Ok(())
     }
 
     pub fn bind(mut self, expected: ObjectNamespaceId) -> Result<Self, String> {
@@ -157,7 +185,7 @@ impl ArtifactObjectStore for CliObjectStore {
     }
 
     fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
-        self.admission.get().and_then(|result| result.as_ref().ok())
+        self.append_admission.get().or_else(|| self.admission.get())
     }
 
     fn create_immutable(
@@ -168,6 +196,13 @@ impl ArtifactObjectStore for CliObjectStore {
         match &self.inner {
             CliObjectStoreInner::S3(store) => store.create_immutable(key, bytes),
             CliObjectStoreInner::CachedS3(store) => store.create_immutable(key, bytes),
+        }
+    }
+
+    fn seal_immutable(&self, key: &ObjectKey) -> Result<ObjectSealOutcome, ObjectError> {
+        match &self.inner {
+            CliObjectStoreInner::S3(store) => store.seal_immutable(key),
+            CliObjectStoreInner::CachedS3(store) => store.seal_immutable(key),
         }
     }
 
@@ -240,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn one_provider_handle_runs_admission_at_most_once_even_after_failure() {
+    fn one_provider_handle_retries_admission_after_a_failed_probe() {
         let config = ObjectConfig {
             bucket: Some("artifacts".to_owned()),
             ..ObjectConfig::default()
@@ -250,14 +285,14 @@ mod tests {
 
         for _ in 0..2 {
             let error = store
-                .cache_admission(|_| {
+                .cache_admission(&store.admission, |_| {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Err(ProviderAdmissionError::Inconclusive)
                 })
                 .unwrap_err();
-            assert!(error.contains("inconclusive"));
+            assert_eq!(error, ProviderAdmissionError::Inconclusive);
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(store.provider_admission_receipt().is_none());
     }
 }

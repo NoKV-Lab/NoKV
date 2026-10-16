@@ -31,7 +31,7 @@ use nokv_types::{NormalizedRelativePath, WorkbenchId};
 use serde_json::{json, Value};
 
 use backend::CliWorkbenchBackend;
-use cli::{Command, Invocation, McpProfile, WorkspacePathCommand};
+use cli::{AppendPayload, Command, Invocation, McpProfile, WorkspacePathCommand};
 #[cfg(feature = "etcd")]
 use object_store::CliObjectStore;
 
@@ -61,7 +61,16 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let invocation = cli::parse(std::env::args().skip(1)).map_err(|error| error.to_string())?;
+    let invocation = cli::parse(std::env::args().skip(1)).map_err(|error| match error {
+        cli::CliError::OperationInput {
+            operation_id,
+            message,
+        } => append_error_json(
+            nokv_protocol::OperationIdentity(operation_id),
+            append_input_error(message),
+        ),
+        error => error.to_string(),
+    })?;
     if matches!(invocation.command, Command::Mcp { .. }) {
         // stderr only: stdout carries the line-delimited JSON-RPC stream.
         eprintln!(
@@ -146,6 +155,27 @@ fn run() -> Result<(), String> {
             )
         }
         Command::WorkspacePath(command) => run_workspace_path(&invocation, command),
+        Command::OperationStatus { operation_id } => {
+            run_operation_status(&invocation, nokv_protocol::OperationIdentity(*operation_id))
+        }
+        Command::OperationInspect {
+            operation_id,
+            limit,
+            cursor,
+        } => run_operation_inspect(
+            &invocation,
+            nokv_protocol::OperationIdentity(*operation_id),
+            *limit,
+            cursor.clone(),
+        ),
+        Command::OperationRecover {
+            operation_id,
+            expected_state_digest,
+        } => run_operation_recover(
+            &invocation,
+            nokv_protocol::OperationIdentity(*operation_id),
+            *expected_state_digest,
+        ),
     }
 }
 
@@ -224,7 +254,11 @@ fn build_backend(invocation: &Invocation) -> Result<CliWorkbenchBackend, String>
             control.as_ref(),
             admission.root_id,
             admission.agent_id,
-            || build_backend_after_agent_admission(invocation),
+            || {
+                let client =
+                    connection::connect(&invocation.client).map_err(|error| error.to_string())?;
+                build_backend_after_agent_admission(invocation, client)
+            },
         )
     }
     #[cfg(not(feature = "etcd"))]
@@ -239,23 +273,39 @@ fn build_backend(invocation: &Invocation) -> Result<CliWorkbenchBackend, String>
     }
 }
 
-#[cfg(feature = "etcd")]
 fn build_backend_after_agent_admission(
     invocation: &Invocation,
+    client: connection::CliWorkspaceClient,
 ) -> Result<CliWorkbenchBackend, String> {
-    let client = connection::connect(&invocation.client).map_err(|error| error.to_string())?;
-    let preflight = client
-        .preflight(WORKBENCH_REQUIRED_RPC_CAPABILITIES)
-        .map_err(|error| format!("workspace preflight failed: {error}"))?;
-    let expected_namespace = preflight.value.route.object_namespace_id.into();
-    let objects =
-        Arc::new(CliObjectStore::build(&invocation.client.object)?.bind(expected_namespace)?);
-    objects.validate_agent_capabilities()?;
-    Ok(CliWorkbenchBackend::new(
-        client,
-        objects,
-        invocation.client.max_artifact_bytes,
-    ))
+    #[cfg(feature = "etcd")]
+    {
+        let preflight = client
+            .preflight(WORKBENCH_REQUIRED_RPC_CAPABILITIES)
+            .map_err(|error| format!("workspace preflight failed: {error}"))?;
+        let expected_namespace = preflight.value.route.object_namespace_id.into();
+        let objects =
+            Arc::new(CliObjectStore::build(&invocation.client.object)?.bind(expected_namespace)?);
+        if matches!(
+            invocation.command,
+            Command::WorkspacePath(WorkspacePathCommand::Append { .. })
+        ) {
+            objects
+                .validate_append_capabilities()
+                .map_err(append_provider_admission_error)?;
+        } else {
+            objects.validate_agent_capabilities()?;
+        }
+        Ok(CliWorkbenchBackend::new(
+            client,
+            objects,
+            invocation.client.max_artifact_bytes,
+        ))
+    }
+    #[cfg(not(feature = "etcd"))]
+    {
+        let _ = (invocation, client);
+        Err("Agent-facing commands require the nokv etcd feature".to_owned())
+    }
 }
 
 fn build_handler(invocation: &Invocation) -> Result<CliHandler, String> {
@@ -323,7 +373,76 @@ fn run_workspace_path(
     invocation: &Invocation,
     command: &WorkspacePathCommand,
 ) -> Result<(), String> {
+    if let WorkspacePathCommand::Append {
+        workbench,
+        section,
+        path,
+        operation_id,
+        expected_workspace_incarnation_id,
+        payload,
+        content_type,
+        max_logical_size,
+        block_size,
+    } = command
+    {
+        let operation_id = nokv_protocol::OperationIdentity(*operation_id);
+        let result = (|| {
+            let target =
+                canonical_workspace_path(workbench, section, path).map_err(append_input_error)?;
+            let (delta, default_content_type) = append_payload(
+                payload,
+                invocation
+                    .client
+                    .max_artifact_bytes
+                    .min(nokv_client::MAX_APPEND_DELTA_BYTES),
+            )
+            .map_err(append_input_error)?;
+            let content_type = content_type
+                .as_ref()
+                .map(|value| nokv_protocol::ContentType::new(value.clone()))
+                .transpose()
+                .map_err(|error| append_input_error(error.to_string()))?;
+            let create_content_type = content_type.clone().unwrap_or(
+                nokv_protocol::ContentType::new(default_content_type)
+                    .map_err(|error| append_input_error(error.to_string()))?,
+            );
+            let client = build_workspace_path_client(invocation)?;
+            let incarnation = client
+                .resolve_append_workspace_incarnation(
+                    operation_id,
+                    &target,
+                    expected_workspace_incarnation_id.map(nokv_protocol::WorkspaceIdentity),
+                )
+                .map_err(|error| agent_error(backend::map_append_client_error(error).into()))?;
+            let mut options = nokv_client::IdempotentAppendOptions::new(
+                operation_id,
+                target,
+                incarnation,
+                create_content_type,
+            )
+            .with_block_size(*block_size);
+            if let Some(content_type) = content_type {
+                options = options.with_content_type(content_type);
+            }
+            if let Some(max_logical_size) = max_logical_size {
+                options = options.with_max_logical_size(*max_logical_size);
+            }
+            if let Some(call) = client
+                .recover_append_receipt(&mut options, &delta)
+                .map_err(|error| agent_error(backend::map_append_client_error(error).into()))?
+            {
+                return print_json(&append_receipt_json(&call));
+            }
+            let backend = build_backend_after_agent_admission(invocation, client)?;
+            let call = backend
+                .append_idempotent(options, &delta)
+                .map_err(|error| agent_error(error.into()))?;
+            print_json(&append_receipt_json(&call))
+        })();
+        return result.map_err(|message| append_error_json(operation_id, message));
+    }
     let (request_id, operation) = match command {
+        WorkspacePathCommand::Append { .. } => unreachable!("append dispatched above"),
         WorkspacePathCommand::Rename {
             workbench,
             section,
@@ -369,6 +488,263 @@ fn run_workspace_path(
         }
         _ => unreachable!("workspace-path CLI constructs only path mutations"),
     }
+}
+
+fn append_payload(
+    payload: &AppendPayload,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, &'static str), String> {
+    let (bytes, content_type) = match payload {
+        AppendPayload::Text(text) => {
+            if text.len() > max_bytes {
+                return Err(format!(
+                    "append delta is {} bytes, maximum is {max_bytes}",
+                    text.len()
+                ));
+            }
+            (text.as_bytes().to_vec(), "text/plain; charset=utf-8")
+        }
+        AppendPayload::Base64(encoded) => {
+            let max_encoded_bytes = max_bytes.div_ceil(3).saturating_mul(4);
+            if encoded.len() > max_encoded_bytes {
+                return Err(format!(
+                    "append base64 payload exceeds the encoded limit for {max_bytes} decoded bytes"
+                ));
+            }
+            (
+                STANDARD
+                    .decode(encoded)
+                    .map_err(|error| format!("append base64 payload is invalid: {error}"))?,
+                "application/octet-stream",
+            )
+        }
+        AppendPayload::File(path) => (
+            transfer::read_collect_source(path, max_bytes)?,
+            "application/octet-stream",
+        ),
+    };
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "append delta is {} bytes, maximum is {max_bytes}",
+            bytes.len(),
+        ));
+    }
+    Ok((bytes, content_type))
+}
+
+fn append_result_json(result: &nokv_protocol::AppendResult) -> Value {
+    json!({
+        "operation_id": encode_lowercase_hex(&result.operation_id.0),
+        "publication_operation_id": encode_lowercase_hex(&result.publication_operation_id.0),
+        "artifact_revision_id": encode_lowercase_hex(&result.artifact_revision_id.0),
+        "workbench_id": result.target.workbench.as_str(),
+        "path": result.target.path.as_str(),
+        "workspace_incarnation_id": encode_lowercase_hex(&result.workspace_incarnation_id.0),
+        "workspace_revision": result.workspace_revision,
+        "generation": result.generation,
+        "logical_size": result.logical_size,
+        "body_digest": result.body_digest.as_str(),
+    })
+}
+
+fn append_receipt_json(call: &nokv_client::ClientCall<nokv_protocol::AppendResult>) -> Value {
+    let mut receipt = append_result_json(&call.value);
+    receipt["status"] = json!("success");
+    receipt["operation"] = json!("append");
+    receipt["state"] = json!("committed");
+    receipt["next_action"] = json!("none");
+    receipt["replayed"] = json!(call.replayed);
+    receipt["commit_version"] = json!(call.commit_version);
+    receipt
+}
+
+fn run_operation_status(
+    invocation: &Invocation,
+    operation_id: nokv_protocol::OperationIdentity,
+) -> Result<(), String> {
+    (|| {
+        let client = build_workspace_path_client(invocation)?;
+        let call = client
+            .get_append_operation(operation_id)
+            .map_err(|error| agent_error(backend::map_append_client_error(error).into()))?;
+        print_json(&append_status_json(&call)?)
+    })()
+    .map_err(|message| append_error_json(operation_id, message))
+}
+
+fn append_status_json(
+    call: &nokv_client::ClientCall<nokv_protocol::OperationStatus>,
+) -> Result<Value, String> {
+    let mut result = append_operation_json(&call.value)?;
+    result["commit_version"] = json!(call.commit_version);
+    result["replayed"] = json!(call.replayed);
+    Ok(result)
+}
+
+fn append_operation_json(status: &nokv_protocol::OperationStatus) -> Result<Value, String> {
+    let recovery = nokv_client::append_operation_recovery(status)
+        .map_err(|error| agent_error(backend::map_append_client_error(error).into()))?;
+    let preparation = status
+        .append_preparation
+        .as_ref()
+        .ok_or_else(|| "append status has no preparation".to_owned())?;
+    let receipt = match &status.result {
+        Some(nokv_protocol::OperationResult::ArtifactAppend(result)) => {
+            Some(append_result_json(result))
+        }
+        _ => None,
+    };
+    let attempt_failure = preparation.attempt_failure.as_ref();
+    Ok(json!({
+        "status": "success",
+        "operation": "append",
+        "operation_id": encode_lowercase_hex(&status.token.operation_id.0),
+        "state": recovery.state.as_str(),
+        "next_action": recovery.next_action.as_str(),
+        "observed_state": format!("{:?}", status.state),
+        "publication_operation_id": encode_lowercase_hex(&preparation.publication_operation_id.0),
+        "attempt": preparation.attempt,
+        "cleanup_retry_count": preparation.cleanup_retry_count,
+        "attempt_phase": preparation.attempt_phase,
+        "activity_deadline_ms": preparation.activity_deadline_ms,
+        "workspace_incarnation_id": encode_lowercase_hex(&preparation.workspace_incarnation_id.0),
+        "workbench_id": preparation.target.workbench.as_str(),
+        "path": preparation.target.path.as_str(),
+        "progress": status.progress,
+        "cause_code": attempt_failure.map(|failure| format!("{:?}", failure.code)),
+        "failure_message": attempt_failure.map(|failure| failure.message.as_str()),
+        "attempt_failure": attempt_failure.map(|failure| json!({
+            "code": format!("{:?}", failure.code),
+            "message": failure.message,
+            "retryable": failure.retryable,
+            "conflict": failure.conflict.map(|conflict| format!("{conflict:?}")),
+            "current_generation": failure.current_generation,
+        })),
+        "receipt": receipt,
+    }))
+}
+
+fn operation_token_json(token: nokv_protocol::OperationToken) -> Value {
+    json!({
+        "operation_id": encode_lowercase_hex(&token.operation_id.0),
+        "state_digest": encode_lowercase_hex(&token.state_digest.0),
+    })
+}
+
+fn cleanup_retry_receipt_json(receipt: &nokv_protocol::AppendCleanupRetryResult) -> Value {
+    json!({
+        "operation_id": encode_lowercase_hex(&receipt.operation_id.0),
+        "publication_operation_id": encode_lowercase_hex(&receipt.publication_operation_id.0),
+        "cleanup_retry_count": receipt.cleanup_retry_count,
+        "expected_state_digest": encode_lowercase_hex(&receipt.expected_state_digest.0),
+    })
+}
+
+fn append_inspection_json(
+    call: &nokv_client::ClientCall<nokv_client::AppendOperationInspection>,
+) -> Result<Value, String> {
+    let inspection = &call.value.inspection;
+    let mut result = append_operation_json(&inspection.operation)?;
+    result["action"] = json!("inspect");
+    result["operation_token"] = operation_token_json(inspection.operation.token);
+    result["publication_token"] = operation_token_json(inspection.publication_token);
+    result["object_namespace_id"] = json!(encode_lowercase_hex(&inspection.object_namespace_id.0));
+    result["registered_count"] = json!(inspection.registered_count);
+    result["cleanup_cursor"] = json!(inspection.cleanup_cursor);
+    result["remaining_count"] = json!(inspection.remaining_count);
+    result["entries"] = json!(inspection.entries);
+    result["next_cursor"] = json!(call
+        .value
+        .next_cursor
+        .as_ref()
+        .map(|cursor| STANDARD.encode(cursor)));
+    result["commit_version"] = json!(call.commit_version);
+    result["replayed"] = json!(call.replayed);
+    Ok(result)
+}
+
+fn append_recovery_json(
+    call: &nokv_client::ClientCall<nokv_client::AppendRecoveryRequestResult>,
+) -> Result<Value, String> {
+    let mut result = append_operation_json(&call.value.operation)?;
+    result["action"] = json!("recover");
+    result["operation_token"] = operation_token_json(call.value.operation.token);
+    result["requested"] = json!(call.value.requested);
+    result["recovery_receipt"] = json!(call.value.receipt.as_ref().map(cleanup_retry_receipt_json));
+    result["commit_version"] = json!(call.commit_version);
+    result["replayed"] = json!(call.replayed);
+    Ok(result)
+}
+
+fn run_operation_inspect(
+    invocation: &Invocation,
+    operation_id: nokv_protocol::OperationIdentity,
+    limit: u32,
+    cursor: Option<Vec<u8>>,
+) -> Result<(), String> {
+    (|| {
+        let client = build_workspace_path_client(invocation)?;
+        let call = client
+            .inspect_append_operation(operation_id, nokv_protocol::PageRequest { cursor, limit })
+            .map_err(|error| agent_error(backend::map_append_client_error(error).into()))?;
+        print_json(&append_inspection_json(&call)?)
+    })()
+    .map_err(|message| append_error_json(operation_id, message))
+}
+
+fn run_operation_recover(
+    invocation: &Invocation,
+    operation_id: nokv_protocol::OperationIdentity,
+    expected_state_digest: Option<[u8; 32]>,
+) -> Result<(), String> {
+    (|| {
+        let client = build_workspace_path_client(invocation)?;
+        let expected = expected_state_digest.map(|digest| nokv_protocol::OperationToken {
+            operation_id,
+            state_digest: nokv_protocol::Digest(digest),
+        });
+        let call = client
+            .recover_append_operation(operation_id, expected)
+            .map_err(|error| agent_error(backend::map_append_client_error(error).into()))?;
+        print_json(&append_recovery_json(&call)?)
+    })()
+    .map_err(|message| append_error_json(operation_id, message))
+}
+
+fn append_input_error(message: String) -> String {
+    agent_error(nokv_agent::AgentError::backend(
+        "InvalidArgument",
+        message,
+        false,
+        json!({}),
+    ))
+}
+
+fn append_provider_admission_error(error: nokv_object::ProviderAdmissionError) -> String {
+    agent_error(nokv_agent::AgentError::backend(
+        "AppendFailed",
+        error.to_string(),
+        false,
+        json!({"code": error.code()}),
+    ))
+}
+
+fn append_error_json(operation_id: nokv_protocol::OperationIdentity, message: String) -> String {
+    let mut error = serde_json::from_str::<Value>(&message)
+        .ok()
+        .filter(|value| value["status"] == "error")
+        .unwrap_or_else(|| {
+            nokv_agent::AgentError::backend("AppendFailed", message, false, json!({})).as_value()
+        });
+    error["details"]["operation_id"] = json!(encode_lowercase_hex(&operation_id.0));
+    if error["details"]["next_action"].is_null() {
+        error["details"]["next_action"] = json!("query_same");
+    }
+    error["details"]["cause_code"] = error["details"]["code"].clone();
+    if error["details"]["publication_operation_id"].is_null() {
+        error["details"]["publication_operation_id"] = Value::Null;
+    }
+    serde_json::to_string(&error).expect("append error contains only JSON values")
 }
 
 fn canonical_workspace_path(
@@ -589,8 +965,12 @@ USAGE:
   nokv [connection/object options] mcp [--profile workbench|agent]   (DEPRECATED)
   nokv [connection/object options] materialize <workbench> <section> <path> <destination>
   nokv [connection/object options] collect <workbench> <section> <source> <path> [--replace] [--expected-generation N] [--content-type TYPE]
+  nokv [route/agent options] operation status <HEX32>
+  nokv [route/agent options] operation inspect <HEX32> [--limit N] [--cursor BASE64]
+  nokv [route/agent options] operation recover <HEX32> [--expected-state-digest HEX64]
   nokv [route/agent options] workspace-path rename <workbench> <section> <source> <destination> --expected-generation N --request-id HEX32
   nokv [route/agent options] workspace-path remove <workbench> <section> <path> --expected-generation N --request-id HEX32
+  nokv [route/agent/object options] workspace-path append <workbench> <section> <path> --operation-id HEX32 (--text TEXT | --base64 BASE64 | --file PATH) [--content-type TYPE] [--max-logical-size N] [--block-size N] [--expected-workspace-incarnation-id HEX32]
   nokv --root-id HEX32 --agent-id HEX32 --etcd-endpoint URL provision <logical-shard-id-hex32> [adoption options]
   nokv [owner options] serve
   nokv schema
@@ -599,7 +979,7 @@ USAGE:
 
 AGENT CONTROL ROUTING:
   --root-id HEX32
-  --agent-id HEX32 is required by provision, workbench, mcp, materialize, collect, and workspace-path
+  --agent-id HEX32 is required by provision, workbench, mcp, materialize, collect, workspace-path, and operation commands
   AgentId is a durable deployment identity used to prevent root misconfiguration; it is not an authentication credential
   --metadata-address HOST:PORT --logical-shard-id HEX32 --object-namespace-id HEX32
     --placement-generation N --owner-epoch N
@@ -617,7 +997,16 @@ AGENT PRESENTATION:
   or the direct Python SDK; it is retained only as the live qualification harness transport
   mcp defaults to the 18-tool Workbench profile; --profile agent selects the seven path tools
   workspace-path is a custom CLI surface; it does not add to the fixed 18 Workbench tools
-  workspace-path requires an explicit lowercase HEX32 request id for exact cross-process replay
+  workspace-path rename/remove require an explicit lowercase HEX32 request id for exact cross-process replay
+  workspace-path append requires a stable lowercase HEX32 logical operation id
+  operation status observes append recovery without a payload, workspace, or object-store connection
+  operation inspect returns retained staged entries, default 32 per page (maximum 192); reuse its opaque cursor
+  save inspect.operation_token.state_digest before operation recover and reuse it after an unknown reply
+  operation recover asks the owner to retry quarantined cleanup; it does not resubmit the append payload
+  the first append requires an existing workspace; replays resolve its original incarnation
+  append delta and default total body limits are 16 MiB; --max-logical-size raises the bound body limit
+  append returns the original publication receipt on replay; retain the id and incarnation across restarts
+  append limits the delta with --max-artifact-bytes; --max-logical-size optionally limits the resulting body
 
 OWNER:
   provision first binds RootId to an explicit AgentId, then creates namespace, shard, and affinity
@@ -625,6 +1014,7 @@ OWNER:
   --adopt-legacy-object-namespace is a one-time explicit migration after verifying bucket/prefix
   serve validates every active root's Agent binding; it does not require or compare one shard-wide AgentId
   --root-id HEX32 --etcd-endpoint URL --node-id ID
+  --append-activity-lease-ms N: serve only, range 1000..=86400000, default 1800000; clock-skew grace is additional
   --advertise-endpoint HOST:PORT --bind HOST:PORT
   --etcd-lease-ttl-seconds N (default 10; owner keepalive runs every max(1, N/3) seconds)
   --handshake-timeout-millis N --max-inflight-connections N
@@ -818,7 +1208,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
 
     use nokv_control::{NodeId, RecoveryPublication, RootId};
     use nokv_server::{
-        bootstrap_shard, ArtifactLifecycleDeleter, LeaseMode, LifecycleObjectDeleter,
+        bootstrap_shard, ArtifactLifecycleCleaner, LeaseMode, LifecycleObjectCleaner,
         LifecycleRunner, LifecycleRunnerOptions, OpenMode, RecoveryPublicationMode, RootAttach,
         RootOwnerRegistry, ServerOptions, ShardBoot, WorkspaceServer,
     };
@@ -950,13 +1340,16 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     }
     let objects =
         Arc::new(CliObjectStore::build(&invocation.client.object)?.bind(expected_namespace)?);
-    objects.validate_agent_capabilities()?;
+    objects
+        .validate_append_capabilities()
+        .map_err(|error| error.to_string())?;
     let registry = Arc::new(RootOwnerRegistry::new());
     let owner = bootstrap_shard(
         Arc::clone(&control),
         Arc::clone(&registry),
         objects.clone(),
         ShardBoot {
+            append_activity_lease_ms: invocation.server.append_activity_lease_ms,
             shard_id: placement.logical_shard_id,
             open: metadata,
             lease: LeaseMode::Acquire {
@@ -1007,8 +1400,8 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
     let owner_loss = server.owner_loss_signal();
-    let lifecycle_objects: Arc<dyn LifecycleObjectDeleter> =
-        Arc::new(ArtifactLifecycleDeleter::new(objects));
+    let lifecycle_objects: Arc<dyn LifecycleObjectCleaner> =
+        Arc::new(ArtifactLifecycleCleaner::new(objects));
     let mut lifecycles = Vec::with_capacity(owner_routes.len());
     for route in owner_routes {
         match LifecycleRunner::new(
@@ -1099,6 +1492,281 @@ mod tests {
         assert_eq!(path.logical_path(), "outputs/result.json");
         assert!(scoped_artifact("run-1", "tmp", "result.json").is_err());
         assert!(scoped_artifact("run-1", "outputs", "../result.json").is_err());
+    }
+
+    #[test]
+    fn append_payloads_are_bounded_and_share_explicit_bytes() {
+        let text = append_payload(&AppendPayload::Text("event".to_owned()), 5).unwrap();
+        let binary = append_payload(&AppendPayload::Base64("ZXZlbnQ=".to_owned()), 5).unwrap();
+        assert_eq!(text.0, binary.0);
+        assert_eq!(text.1, "text/plain; charset=utf-8");
+        assert_eq!(binary.1, "application/octet-stream");
+        assert!(append_payload(&AppendPayload::Text("event".to_owned()), 4).is_err());
+        assert!(append_payload(&AppendPayload::Base64("!".to_owned()), 5).is_err());
+        assert!(append_payload(&AppendPayload::Base64("!".repeat(12)), 5)
+            .unwrap_err()
+            .contains("encoded limit"));
+        assert!(append_payload(&AppendPayload::Base64("ZXZlbnQ=".to_owned()), 4).is_err());
+        assert_eq!(
+            append_payload(&AppendPayload::Base64("".to_owned()), 0)
+                .unwrap()
+                .0,
+            b""
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delta.bin");
+        std::fs::write(&path, b"event").unwrap();
+        assert_eq!(
+            append_payload(&AppendPayload::File(path), 5).unwrap(),
+            binary
+        );
+    }
+
+    #[test]
+    fn append_input_validation_keeps_a_distinct_code_from_provider_failures() {
+        let operation_id = nokv_protocol::OperationIdentity([0xaa; 16]);
+        let oversized = append_payload(&AppendPayload::Text("sixsix".to_owned()), 5)
+            .map_err(append_input_error)
+            .unwrap_err();
+        let invalid: Value =
+            serde_json::from_str(&append_error_json(operation_id, oversized)).unwrap();
+        assert_eq!(invalid["code"], "InvalidArgument");
+        assert_eq!(invalid["details"]["operation_id"], "aa".repeat(16));
+        assert_eq!(invalid["details"]["next_action"], "query_same");
+        let provider: Value = serde_json::from_str(&append_error_json(
+            operation_id,
+            "provider unavailable".to_owned(),
+        ))
+        .unwrap();
+        assert_eq!(provider["code"], "AppendFailed");
+    }
+
+    #[test]
+    fn append_admission_errors_keep_machine_readable_causes_and_identity() {
+        use nokv_object::{ProviderAdmissionCapability, ProviderAdmissionError};
+        let operation_id = nokv_protocol::OperationIdentity([0xaa; 16]);
+        for (error, cause) in [
+            (
+                ProviderAdmissionError::Unavailable,
+                "ProviderAdmissionUnavailable",
+            ),
+            (
+                ProviderAdmissionError::Inconclusive,
+                "ProviderAdmissionInconclusive",
+            ),
+            (
+                ProviderAdmissionError::Rejected {
+                    capability: ProviderAdmissionCapability::ImmutableSealing,
+                },
+                "ProviderAdmissionRejected",
+            ),
+        ] {
+            let result: Value = serde_json::from_str(&append_error_json(
+                operation_id,
+                append_provider_admission_error(error),
+            ))
+            .unwrap();
+            assert_eq!(result["code"], "AppendFailed");
+            assert_eq!(result["details"]["cause_code"], cause);
+            assert_eq!(result["details"]["operation_id"], "aa".repeat(16));
+            assert_eq!(result["details"]["next_action"], "query_same");
+            assert_eq!(result["retryable"], false);
+        }
+    }
+
+    #[test]
+    fn append_receipt_keeps_historical_publication_and_error_identity() {
+        let call = nokv_client::ClientCall {
+            value: nokv_protocol::AppendResult {
+                operation_id: nokv_protocol::OperationIdentity([0xaa; 16]),
+                publication_operation_id: nokv_protocol::OperationIdentity([0xee; 16]),
+                artifact_revision_id: nokv_protocol::ArtifactRevisionIdentity([0xbb; 16]),
+                target: canonical_workspace_path("run-42", "logs", "events.jsonl").unwrap(),
+                workspace_incarnation_id: nokv_protocol::WorkspaceIdentity([0xdd; 16]),
+                workspace_revision: 7,
+                generation: 3,
+                logical_size: 12,
+                body_digest: nokv_protocol::sha256_digest_uri(nokv_protocol::Digest([0xcc; 32])),
+            },
+            commit_version: None,
+            replayed: true,
+        };
+        let receipt = append_receipt_json(&call);
+        assert_eq!(receipt["operation_id"], "aa".repeat(16));
+        assert_eq!(receipt["publication_operation_id"], "ee".repeat(16));
+        assert_eq!(receipt["artifact_revision_id"], "bb".repeat(16));
+        assert_eq!(receipt["generation"], 3);
+        assert_eq!(receipt["logical_size"], 12);
+        assert_eq!(receipt["workspace_incarnation_id"], "dd".repeat(16));
+        assert_eq!(receipt["replayed"], true);
+        assert_eq!(receipt["state"], "committed");
+        assert_eq!(receipt["next_action"], "none");
+        assert!(receipt["commit_version"].is_null());
+        let error = nokv_agent::AgentError::backend(
+            "AppendUnresolved",
+            "reply lost",
+            false,
+            json!({"state": "Running"}),
+        );
+        let result: Value = serde_json::from_str(&append_error_json(
+            call.value.operation_id,
+            agent_error(error),
+        ))
+        .unwrap();
+        assert_eq!(result["details"]["state"], "Running");
+        assert_eq!(result["details"]["operation_id"], "aa".repeat(16));
+        assert_eq!(result["code"], "AppendUnresolved");
+    }
+
+    #[test]
+    fn append_status_does_not_report_pending_or_cleaned_attempts_as_committed() {
+        let mut call = nokv_client::ClientCall {
+            value: nokv_protocol::OperationStatus {
+                token: nokv_protocol::OperationToken {
+                    operation_id: nokv_protocol::OperationIdentity([0xaa; 16]),
+                    state_digest: nokv_protocol::Digest([0x11; 32]),
+                },
+                kind: nokv_protocol::OperationKind::ArtifactAppend,
+                append_preparation: Some(Box::new(nokv_protocol::AppendPreparation {
+                    intent_digest: nokv_protocol::Digest([0x22; 32]),
+                    target: canonical_workspace_path("run-42", "logs", "events.jsonl").unwrap(),
+                    workspace_incarnation_id: nokv_protocol::WorkspaceIdentity([0xbb; 16]),
+                    attempt: 2,
+                    publication_operation_id: nokv_protocol::OperationIdentity([0xcc; 16]),
+                    artifact_revision_id: nokv_protocol::ArtifactRevisionIdentity([0xdd; 16]),
+                    attempt_phase: nokv_protocol::AppendAttemptPhase::Finalizing,
+                    activity_deadline_ms: 123_000,
+                    attempt_failure: None,
+                    cleanup_retry_count: 0,
+                })),
+                publish_preparation: None,
+                commit_preparation: None,
+                restore_preparation: None,
+                state: nokv_protocol::OperationState::Running,
+                progress: nokv_protocol::OperationProgress {
+                    completed_rows: 1,
+                    total_rows: Some(1),
+                    completed_bytes: 4,
+                    total_bytes: Some(4),
+                },
+                result: None,
+                failure: None,
+            },
+            commit_version: None,
+            replayed: false,
+        };
+        let pending = append_status_json(&call).unwrap();
+        assert_eq!(pending["state"], "pending");
+        assert_eq!(pending["next_action"], "poll");
+        assert_eq!(pending["attempt_phase"], "finalizing");
+        assert_eq!(pending["attempt"], 2);
+        assert_eq!(pending["activity_deadline_ms"], 123_000);
+        assert_eq!(pending["operation_id"], "aa".repeat(16));
+        assert_eq!(pending["publication_operation_id"], "cc".repeat(16));
+        assert!(pending["receipt"].is_null());
+        let preparation = call.value.append_preparation.as_mut().unwrap();
+        preparation.attempt_phase = nokv_protocol::AppendAttemptPhase::Cleaned;
+        preparation.attempt_failure = Some(nokv_protocol::RpcFailure {
+            code: nokv_protocol::ErrorCode::OperationFailed,
+            message: "append attempt lost its frozen path claim".to_owned(),
+            retryable: false,
+            conflict: None,
+            current_generation: None,
+            route_hint: None,
+        });
+        let cleaned = append_status_json(&call).unwrap();
+        assert_eq!(cleaned["state"], "ready_to_retry");
+        assert_eq!(cleaned["next_action"], "resubmit_same");
+        assert_eq!(cleaned["cause_code"], "OperationFailed");
+        assert_eq!(
+            cleaned["failure_message"],
+            "append attempt lost its frozen path claim"
+        );
+        assert_eq!(cleaned["attempt_failure"]["code"], "OperationFailed");
+        assert!(cleaned["receipt"].is_null());
+        call.value.state = nokv_protocol::OperationState::Quarantined;
+        call.value
+            .append_preparation
+            .as_mut()
+            .unwrap()
+            .attempt_phase = nokv_protocol::AppendAttemptPhase::Quarantined;
+        let quarantined = append_status_json(&call).unwrap();
+        assert_eq!(quarantined["next_action"], "retry_cleanup");
+        assert!(quarantined["receipt"].is_null());
+
+        let inspected = append_inspection_json(&nokv_client::ClientCall {
+            value: nokv_client::AppendOperationInspection {
+                inspection: nokv_protocol::AppendCleanupInspection {
+                    operation: Box::new(call.value.clone()),
+                    object_namespace_id: nokv_protocol::ObjectNamespaceIdentity([0xee; 16]),
+                    publication_token: nokv_protocol::OperationToken {
+                        operation_id: nokv_protocol::OperationIdentity([0xcc; 16]),
+                        state_digest: nokv_protocol::Digest([0x33; 32]),
+                    },
+                    registered_count: 3,
+                    cleanup_cursor: 1,
+                    remaining_count: 2,
+                    entries: vec![nokv_protocol::StagedObject {
+                        sequence: 1,
+                        object_identity: nokv_protocol::ObjectIdentity::new("objects/retained-1")
+                            .unwrap(),
+                        expected_length: 4,
+                        expected_digest: nokv_protocol::sha256_digest_uri(nokv_protocol::Digest(
+                            [0x44; 32],
+                        )),
+                        multipart_token: None,
+                    }],
+                    next_after: Some(1),
+                },
+                next_cursor: Some(vec![1, 2, 3]),
+            },
+            commit_version: None,
+            replayed: false,
+        })
+        .unwrap();
+        assert_eq!(
+            inspected["operation_token"]["state_digest"],
+            "11".repeat(32)
+        );
+        assert_eq!(
+            inspected["publication_token"]["operation_id"],
+            "cc".repeat(16)
+        );
+        assert_eq!(inspected["remaining_count"], 2);
+        assert_eq!(inspected["cleanup_cursor"], 1);
+        assert_eq!(inspected["entries"][0]["expected_length"], 4);
+        assert_eq!(inspected["next_cursor"], "AQID");
+
+        // A replayed cleanup receipt can be older than the current operation.
+        call.value
+            .append_preparation
+            .as_mut()
+            .unwrap()
+            .cleanup_retry_count = 2;
+        let recovery = append_recovery_json(&nokv_client::ClientCall {
+            value: nokv_client::AppendRecoveryRequestResult {
+                operation: call.value.clone(),
+                requested: true,
+                receipt: Some(nokv_protocol::AppendCleanupRetryResult {
+                    operation_id: call.value.token.operation_id,
+                    publication_operation_id: nokv_protocol::OperationIdentity([0xcc; 16]),
+                    cleanup_retry_count: 1,
+                    expected_state_digest: nokv_protocol::Digest([0x55; 32]),
+                }),
+            },
+            commit_version: None,
+            replayed: true,
+        })
+        .unwrap();
+        assert_eq!(recovery["cleanup_retry_count"], 2);
+        assert_eq!(recovery["recovery_receipt"]["cleanup_retry_count"], 1);
+        assert_eq!(
+            recovery["recovery_receipt"]["expected_state_digest"],
+            "55".repeat(32)
+        );
+        assert_eq!(recovery["requested"], true);
+        assert_eq!(recovery["replayed"], true);
+        assert!(recovery["receipt"].is_null());
     }
 
     #[test]

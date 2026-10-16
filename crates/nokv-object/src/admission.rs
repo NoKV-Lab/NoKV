@@ -29,6 +29,7 @@ pub enum AdmittedCreateMode {
 pub enum ProviderAdmissionCapability {
     AtomicCreateIfAbsent,
     ExactRangeRead,
+    ImmutableSealing,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +44,7 @@ pub enum ProviderAdmissionError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProviderAdmissionProfile {
     max_verified_object_bytes: usize,
+    append_sealing: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -51,6 +53,7 @@ pub struct ProviderAdmissionReceipt {
     admitted_create_mode: AdmittedCreateMode,
     max_verified_object_bytes: usize,
     range_read_verified: bool,
+    append_sealing_verified: bool,
     handle_identity: ProviderHandleIdentity,
 }
 
@@ -72,7 +75,14 @@ impl ProviderAdmissionProfile {
         }
         Ok(Self {
             max_verified_object_bytes,
+            append_sealing: false,
         })
+    }
+
+    /// Additionally verify permanent empty-object fences for abandoned append attempts.
+    pub const fn with_append_sealing(mut self) -> Self {
+        self.append_sealing = true;
+        self
     }
 
     pub const fn max_verified_object_bytes(self) -> usize {
@@ -97,6 +107,10 @@ impl ProviderAdmissionReceipt {
         self.range_read_verified
     }
 
+    pub const fn append_sealing_verified(&self) -> bool {
+        self.append_sealing_verified
+    }
+
     pub fn is_bound_to_store(&self, store: &dyn ArtifactObjectStore) -> bool {
         self.contract_version == PROVIDER_ADMISSION_CONTRACT_VERSION
             && self.admitted_create_mode == AdmittedCreateMode::SinglePutIfAbsent
@@ -110,6 +124,10 @@ impl ProviderAdmissionReceipt {
             && block_size <= self.max_verified_object_bytes
     }
 
+    pub fn admits_append_store(&self, store: &dyn ArtifactObjectStore, block_size: usize) -> bool {
+        self.append_sealing_verified && self.admits_store(store, block_size)
+    }
+
     pub(crate) const fn trusted_in_process(
         handle_identity: ProviderHandleIdentity,
         max_verified_object_bytes: usize,
@@ -119,8 +137,14 @@ impl ProviderAdmissionReceipt {
             admitted_create_mode: AdmittedCreateMode::SinglePutIfAbsent,
             max_verified_object_bytes,
             range_read_verified: true,
+            append_sealing_verified: false,
             handle_identity,
         }
+    }
+
+    pub(crate) const fn with_trusted_append_sealing(mut self) -> Self {
+        self.append_sealing_verified = true;
+        self
     }
 }
 
@@ -166,6 +190,14 @@ impl fmt::Debug for ProviderHandleIdentity {
 }
 
 impl ProviderAdmissionError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Rejected { .. } => "ProviderAdmissionRejected",
+            Self::Unavailable => "ProviderAdmissionUnavailable",
+            Self::Inconclusive => "ProviderAdmissionInconclusive",
+        }
+    }
+
     pub const fn retryable(self) -> bool {
         matches!(self, Self::Unavailable)
     }
@@ -194,6 +226,7 @@ impl ProviderAdmissionCapability {
         match self {
             Self::AtomicCreateIfAbsent => "atomic create-if-absent",
             Self::ExactRangeRead => "exact range-read",
+            Self::ImmutableSealing => "permanent immutable sealing",
         }
     }
 }
@@ -202,6 +235,9 @@ impl ProviderAdmissionCapability {
 ///
 /// The receipt qualifies single-PUT objects no larger than the probe payload.
 /// Multipart completion is deliberately not qualified by this contract version.
+/// Optional append sealing verifies empty fences for absent and existing objects,
+/// including a concurrent create and a later rejected payload write. These
+/// fences require permanent key reservations and no external deletion/expiration.
 pub fn admit_artifact_provider(
     store: &(dyn ArtifactObjectStore + Sync),
     profile: ProviderAdmissionProfile,
@@ -283,11 +319,16 @@ pub fn admit_artifact_provider(
             Err(error) => return Err(classify_provider_error(&error)),
         }
 
+        if profile.append_sealing {
+            verify_append_sealing(store, &nonce, &a)?;
+        }
+
         Ok(ProviderAdmissionReceipt {
             contract_version: PROVIDER_ADMISSION_CONTRACT_VERSION,
             admitted_create_mode: AdmittedCreateMode::SinglePutIfAbsent,
             max_verified_object_bytes: profile.max_verified_object_bytes,
             range_read_verified: true,
+            append_sealing_verified: profile.append_sealing,
             handle_identity: store.provider_handle_identity(),
         })
     })();
@@ -298,6 +339,92 @@ pub fn admit_artifact_provider(
     let _ = store.delete(&sequence_key);
     let _ = store.delete(&race_key);
     result
+}
+
+fn verify_append_sealing(
+    store: &(dyn ArtifactObjectStore + Sync),
+    nonce: &str,
+    payload: &[u8],
+) -> Result<(), ProviderAdmissionError> {
+    let empty_key = probe_key(nonce, "seal-empty")?;
+    let payload_key = probe_key(nonce, "seal-payload")?;
+    let race_key = probe_key(nonce, "seal-race")?;
+    let result = (|| {
+        observe_seal(store, &empty_key)?;
+        verify_sealed_key(store, &empty_key, payload)?;
+
+        if !observation_confirms_own_bytes(observe_create(store, &payload_key, payload)?) {
+            return Err(sealing_rejected());
+        }
+        observe_seal(store, &payload_key)?;
+        verify_sealed_key(store, &payload_key, payload)?;
+
+        let barrier = Arc::new(Barrier::new(3));
+        let (create, seal) = std::thread::scope(|scope| {
+            let key = &race_key;
+            let create_barrier = Arc::clone(&barrier);
+            let create = scope.spawn(move || {
+                create_barrier.wait();
+                observe_create(store, key, payload)
+            });
+            let seal_barrier = Arc::clone(&barrier);
+            let seal = scope.spawn(move || {
+                seal_barrier.wait();
+                observe_seal(store, key)
+            });
+            barrier.wait();
+            (create.join(), seal.join())
+        });
+        create.map_err(|_| ProviderAdmissionError::Inconclusive)??;
+        seal.map_err(|_| ProviderAdmissionError::Inconclusive)??;
+        verify_sealed_key(store, &race_key, payload)
+    })();
+
+    // Reserved system probe keys have no metadata claim or publication caller.
+    // Every probe worker has joined before these disposable keys are removed.
+    for key in [&empty_key, &payload_key, &race_key] {
+        let _ = store.delete(key);
+    }
+    result
+}
+
+fn sealing_rejected() -> ProviderAdmissionError {
+    ProviderAdmissionError::Rejected {
+        capability: ProviderAdmissionCapability::ImmutableSealing,
+    }
+}
+
+fn observe_seal(
+    store: &(dyn ArtifactObjectStore + Sync),
+    key: &ObjectKey,
+) -> Result<(), ProviderAdmissionError> {
+    let ambiguous = match store.seal_immutable(key) {
+        Ok(_) => false,
+        Err(ObjectError::SealAmbiguous { .. }) => true,
+        Err(error) => return Err(classify_provider_error(&error)),
+    };
+    match store.head(key) {
+        Ok(Some(info)) if info.size == 0 => Ok(()),
+        Ok(_) if ambiguous => Err(ProviderAdmissionError::Inconclusive),
+        Ok(_) => Err(sealing_rejected()),
+        Err(error) => Err(classify_provider_error(&error)),
+    }
+}
+
+fn verify_sealed_key(
+    store: &(dyn ArtifactObjectStore + Sync),
+    key: &ObjectKey,
+    payload: &[u8],
+) -> Result<(), ProviderAdmissionError> {
+    if !observation_sees_foreign_bytes(observe_create(store, key, payload)?) {
+        return Err(sealing_rejected());
+    }
+    observe_seal(store, key)?;
+    match store.read(key, None) {
+        Ok(bytes) if bytes.is_empty() => Ok(()),
+        Ok(_) => Err(sealing_rejected()),
+        Err(error) => Err(classify_provider_error(&error)),
+    }
 }
 
 fn concurrent_create_has_one_winner(
@@ -385,6 +512,7 @@ fn classify_provider_error(error: &ObjectError) -> ProviderAdmissionError {
         ObjectError::AtomicCreateUnsupported => ProviderAdmissionError::Rejected {
             capability: ProviderAdmissionCapability::AtomicCreateIfAbsent,
         },
+        ObjectError::ImmutableSealingUnsupported => sealing_rejected(),
         ObjectError::Backend {
             retryable: true, ..
         } => ProviderAdmissionError::Unavailable,

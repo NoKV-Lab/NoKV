@@ -658,6 +658,8 @@ durable_enum! {
         CommitRetire = 4,
         Gc = 5,
         RegisterGenericIndex = 6,
+        Append = 7,
+        ActivePublish = 8,
     }
 }
 
@@ -780,6 +782,8 @@ durable_enum! {
         DeletePending = 2,
         Deleted = 3,
         Quarantined = 4,
+        /// Failed append key is permanently occupied by an immutable seal.
+        Sealed = 5,
     }
 }
 
@@ -1176,6 +1180,8 @@ mod tests {
             (OperationKind::CommitRetire, 4),
             (OperationKind::Gc, 5),
             (OperationKind::RegisterGenericIndex, 6),
+            (OperationKind::Append, 7),
+            (OperationKind::ActivePublish, 8),
         ]);
         assert_durable_registry(&[
             (GenericIndexGenerationState::Building, 1),
@@ -1258,6 +1264,7 @@ mod tests {
             (StagedCleanupState::DeletePending, 2),
             (StagedCleanupState::Deleted, 3),
             (StagedCleanupState::Quarantined, 4),
+            (StagedCleanupState::Sealed, 5),
         ]);
         assert_durable_registry(&[
             (GcClaimState::Candidate, 1),

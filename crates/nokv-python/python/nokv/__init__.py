@@ -1,5 +1,7 @@
 """Versioned Python SDK for NoKV Workbenches and immutable artifacts."""
 
+from __future__ import annotations
+
 from importlib.metadata import PackageNotFoundError, version as _distribution_version
 
 from . import checkpoint
@@ -18,6 +20,7 @@ except PackageNotFoundError:  # pragma: no cover - source tree without metadata
 
 __all__ = [
     "API_VERSION",
+    "AppendError",
     "Client",
     "ObjectStoreConfig",
     "RoutingConfig",
@@ -25,6 +28,52 @@ __all__ = [
     "WorkspaceIncarnationMismatch",
     "checkpoint",
 ]
+
+
+class AppendError(RuntimeError):
+    """An append failed or needs recovery under its original operation identity.
+
+    ``state`` is the observed durable operation state, or ``None`` when it is
+    unknown. Neither a timeout nor an unknown state proves that nothing was
+    published. Retry the same intent with the same ``operation_id``; do not
+    generate a replacement identity to bypass an unresolved operation. Query
+    ``Client.operation_status`` and follow its ``next_action``; the exception's
+    ``next_action`` is conservatively ``query_same`` for append errors.
+    ``AppendCleanupUnresolved`` instead supplies ``retry_same_cleanup`` and an
+    ``expected_state_digest``: pass that same digest to ``operation_recover``
+    after an uncertain reply. An already observed ``recovery_receipt`` and its
+    publication identity are retained even when the later status query fails.
+    Without an observed receipt, the publication identity remains ``None``.
+    ``cause_code`` preserves the underlying RPC code, for example
+    ``RequestReplayMismatch`` for a permanently mismatched intent, or ``None``
+    when there is no RPC failure. ``retryable`` is always false: generic retry
+    handlers must not turn an unresolved operation into a new action.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        operation_id: str,
+        state: str | None,
+        code: str,
+        expected: str | None,
+        cause_code: str | None = None,
+        next_action: str = "query_same",
+        publication_operation_id: str | None = None,
+        expected_state_digest: str | None = None,
+        recovery_receipt: dict | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.operation_id = operation_id
+        self.state = state
+        self.code = code
+        self.expected = expected
+        self.cause_code = cause_code
+        self.retryable = False
+        self.next_action = next_action
+        self.publication_operation_id = publication_operation_id
+        self.expected_state_digest = expected_state_digest
+        self.recovery_receipt = recovery_receipt
 
 
 class WorkspaceIncarnationMismatch(RuntimeError):

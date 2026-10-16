@@ -50,6 +50,13 @@ pub enum ObjectDeleteOutcome {
     Absent,
 }
 
+/// A permanently reserved key containing no payload bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectSealOutcome {
+    Sealed,
+    AlreadySealed,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArtifactStoreCapabilities {
     pub range_read: bool,
@@ -98,6 +105,7 @@ pub enum ObjectError {
         actual: ObjectNamespaceId,
     },
     AtomicCreateUnsupported,
+    ImmutableSealingUnsupported,
     ProviderAdmissionRequired,
     ProviderAdmissionBlockSizeExceeded {
         requested: usize,
@@ -108,6 +116,10 @@ pub enum ObjectError {
         detail: String,
     },
     DeleteAmbiguous {
+        key: ObjectKey,
+        detail: String,
+    },
+    SealAmbiguous {
         key: ObjectKey,
         detail: String,
     },
@@ -156,6 +168,17 @@ pub trait ArtifactObjectStore: Send + Sync {
 
     fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError>;
 
+    /// Permanently replace an abandoned object's bytes with an empty object.
+    ///
+    /// Metadata authority must first fence publication and reserve this key
+    /// forever. The implementation must never delete the key, including while
+    /// retrying, and must prevent late immutable creates from restoring payload
+    /// bytes after success. Callers must not subsequently delete sealed keys.
+    /// A post-dispatch error with an unknown result is [`ObjectError::SealAmbiguous`].
+    fn seal_immutable(&self, _key: &ObjectKey) -> Result<ObjectSealOutcome, ObjectError> {
+        Err(ObjectError::ImmutableSealingUnsupported)
+    }
+
     /// Delete one immutable object.
     ///
     /// A backend error after dispatch must be returned as
@@ -197,6 +220,10 @@ where
 
     fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
         (**self).head(key)
+    }
+
+    fn seal_immutable(&self, key: &ObjectKey) -> Result<ObjectSealOutcome, ObjectError> {
+        (**self).seal_immutable(key)
     }
 
     fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
@@ -296,6 +323,7 @@ pub struct MemoryArtifactStoreStats {
     pub reads: u64,
     pub read_bytes: u64,
     pub deletes: u64,
+    pub seals: u64,
 }
 
 impl MemoryArtifactStore {
@@ -317,10 +345,10 @@ impl Default for MemoryArtifactStore {
         Self {
             state: Arc::new(Mutex::new(MemoryArtifactStoreState::default())),
             handle_identity,
-            admission_receipt: Arc::new(ProviderAdmissionReceipt::trusted_in_process(
-                handle_identity,
-                usize::MAX,
-            )),
+            admission_receipt: Arc::new(
+                ProviderAdmissionReceipt::trusted_in_process(handle_identity, usize::MAX)
+                    .with_trusted_append_sealing(),
+            ),
         }
     }
 }
@@ -401,6 +429,24 @@ impl ArtifactObjectStore for MemoryArtifactStore {
             .resident_bytes
             .saturating_sub(bytes.len() as u64);
         Ok(ObjectDeleteOutcome::Deleted)
+    }
+
+    fn seal_immutable(&self, key: &ObjectKey) -> Result<ObjectSealOutcome, ObjectError> {
+        let mut state = self.state.lock().map_err(ObjectError::poisoned)?;
+        match state.objects.insert(key.clone(), Vec::new()) {
+            Some(previous) if previous.is_empty() => return Ok(ObjectSealOutcome::AlreadySealed),
+            Some(previous) => {
+                state.stats.resident_bytes = state
+                    .stats
+                    .resident_bytes
+                    .saturating_sub(previous.len() as u64);
+            }
+            None => {
+                state.stats.resident_objects = state.stats.resident_objects.saturating_add(1);
+            }
+        }
+        state.stats.seals = state.stats.seals.saturating_add(1);
+        Ok(ObjectSealOutcome::Sealed)
     }
 }
 
@@ -613,6 +659,70 @@ impl ArtifactObjectStore for S3ArtifactStore {
         }
     }
 
+    fn seal_immutable(&self, key: &ObjectKey) -> Result<ObjectSealOutcome, ObjectError> {
+        let capabilities = self.operator.info().full_capability();
+        if !capabilities.write_with_if_match || !capabilities.write_with_if_not_exists {
+            return Err(ObjectError::ImmutableSealingUnsupported);
+        }
+
+        // A key may move only from absent/payload to an empty permanent fence.
+        // Never DELETE: a delayed deletion could remove another owner's seal
+        // after metadata has already certified cleanup. Conditional losers
+        // reobserve the winner; all cleanup writers converge on the same fence.
+        for _ in 0..8 {
+            let options = match self.operator.stat(key.as_str()) {
+                Ok(metadata) if metadata.content_length() == 0 => {
+                    return Ok(ObjectSealOutcome::AlreadySealed);
+                }
+                Ok(metadata) => WriteOptions {
+                    if_match: Some(
+                        metadata
+                            .etag()
+                            .filter(|etag| !etag.is_empty())
+                            .ok_or(ObjectError::ImmutableSealingUnsupported)?
+                            .to_owned(),
+                    ),
+                    ..WriteOptions::default()
+                },
+                Err(error) if error.kind() == ErrorKind::NotFound => WriteOptions {
+                    if_not_exists: true,
+                    ..WriteOptions::default()
+                },
+                Err(error) => return Err(ObjectError::opendal_backend(error)),
+            };
+            match self
+                .operator
+                .write_options(key.as_str(), Vec::<u8>::new(), options)
+            {
+                Ok(_) => return Ok(ObjectSealOutcome::Sealed),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
+                    ) => {}
+                Err(error) => {
+                    // A lost response is success only after observing the
+                    // permanent empty object. Absence is never a seal proof.
+                    if self
+                        .operator
+                        .stat(key.as_str())
+                        .is_ok_and(|metadata| metadata.content_length() == 0)
+                    {
+                        return Ok(ObjectSealOutcome::AlreadySealed);
+                    }
+                    return Err(ObjectError::SealAmbiguous {
+                        key: key.clone(),
+                        detail: error.to_string(),
+                    });
+                }
+            }
+        }
+        Err(ObjectError::SealAmbiguous {
+            key: key.clone(),
+            detail: "conditional seal did not converge within its bounded retry budget".to_owned(),
+        })
+    }
+
     fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
         let existed = match self.head(key) {
             Ok(Some(_)) => true,
@@ -765,6 +875,8 @@ impl fmt::Display for ObjectError {
             }
             Self::AtomicCreateUnsupported => formatter
                 .write_str("artifact object provider does not support atomic create-if-absent"),
+            Self::ImmutableSealingUnsupported => formatter
+                .write_str("artifact object provider does not support permanent immutable sealing"),
             Self::ProviderAdmissionRequired => formatter
                 .write_str("artifact object provider has no valid write-conformance admission"),
             Self::ProviderAdmissionBlockSizeExceeded {
@@ -778,6 +890,9 @@ impl fmt::Display for ObjectError {
                 formatter.write_str("immutable create outcome is ambiguous")
             }
             Self::DeleteAmbiguous { .. } => formatter.write_str("delete outcome is ambiguous"),
+            Self::SealAmbiguous { .. } => {
+                formatter.write_str("immutable seal outcome is ambiguous")
+            }
             Self::Backend { .. } => formatter.write_str("artifact object backend is unavailable"),
         }
     }

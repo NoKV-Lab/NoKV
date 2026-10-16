@@ -9,6 +9,7 @@
 //! `nokv-types`, and the wire surface exposes neither Holt layout nor
 //! object-provider configuration.
 
+mod append;
 mod artifact_publish;
 mod codec;
 mod error;
@@ -22,6 +23,11 @@ pub const MAX_ARTIFACT_DEPENDENCY_OWNERS: u32 = 64;
 /// Maximum sealed artifact revision dependency depth.
 pub const MAX_ARTIFACT_DEPENDENCY_DEPTH: u8 = 8;
 
+pub use append::{
+    stable_append_attempt_identities, AppendAttemptBinding, AppendAttemptPhase,
+    AppendCleanupInspection, AppendCleanupRetryResult, AppendPreparation, AppendResult,
+    InspectAppendCleanupRequest, RetryAppendCleanupRequest,
+};
 pub use artifact_publish::{
     parse_sha256_digest_uri, seal_artifact_publish_plan, sha256_digest_uri,
     ArtifactPublishPlanSeal, MAX_ARTIFACT_PUBLISH_BATCH_ROWS, MAX_ARTIFACT_PUBLISH_OBJECTS,
@@ -65,12 +71,12 @@ pub use response::{
     GenericIndexAppendResult, GenericIndexRegistrationPhase, GenericIndexRegistrationStatus,
     GenericNamespaceArtifact, GenericNamespaceHit, GenericNamespaceKind, OperationProgress,
     OperationResult, OperationState, OperationStatus, PathListEntry, PathPage, PathReadResult,
-    PublishResult, RemovePathResult, RenamePathResult, RestoreDestinationBinding,
-    RestoreDestinationManifestBindings, RestoreManifestBinding, RestoreOperationPreparation,
-    RestorePreparation, RestoreResult, RestoreSourceCommitBinding, SearchHit, SearchResult,
-    SearchRow, SnapshotPage, SnapshotResult, SnapshotStatus, WorkspacePreflightResult,
-    WorkspaceResult, WorkspaceRpcOutcome, WorkspaceRpcResponse, WorkspaceSummary,
-    WorkspaceSummaryWithCommit,
+    PublishPreparation, PublishResult, RemovePathResult, RenamePathResult,
+    RestoreDestinationBinding, RestoreDestinationManifestBindings, RestoreManifestBinding,
+    RestoreOperationPreparation, RestorePreparation, RestoreResult, RestoreSourceCommitBinding,
+    SearchHit, SearchResult, SearchRow, SnapshotPage, SnapshotResult, SnapshotStatus,
+    WorkspacePreflightResult, WorkspaceResult, WorkspaceRpcOutcome, WorkspaceRpcResponse,
+    WorkspaceSummary, WorkspaceSummaryWithCommit,
 };
 pub use types::{
     AppendSegment, ArtifactDescriptor, ArtifactManifestRow, ArtifactRevisionIdentity, ByteRange,
