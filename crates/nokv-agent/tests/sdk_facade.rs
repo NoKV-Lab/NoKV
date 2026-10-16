@@ -1376,7 +1376,11 @@ fn generic_builtin_catalog_fields(field_prefix: Option<&str>) -> Vec<CatalogFiel
 }
 
 fn sha256_uri(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    let hex: String = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("sha256:{hex}")
 }
 
 fn fake_committed_summary() -> WorkbenchSummary {
