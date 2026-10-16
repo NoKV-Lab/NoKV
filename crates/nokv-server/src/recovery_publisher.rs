@@ -134,8 +134,9 @@ pub enum RecoveryPublisherError {
     Poisoned,
 }
 
-/// Executor adapter that repairs an earlier pending upload before dispatch and
-/// publishes every local write before returning its response.
+/// Executor adapter that, in `Shared` mode, repairs an earlier pending upload
+/// before dispatch, and in every mode publishes (or proves owner liveness for)
+/// every local write before returning its response.
 pub struct RecoveryPublishingExecutor {
     inner: Arc<dyn WorkspaceRequestExecutor>,
     publisher: Arc<RecoveryPublisher>,
@@ -489,9 +490,16 @@ impl RecoveryPublishingExecutor {
 
 impl WorkspaceRequestExecutor for RecoveryPublishingExecutor {
     fn execute(&self, request: &WorkspaceRpcRequest) -> Result<ExecutedRequest, RpcFailure> {
-        self.publisher
-            .publish_current()
-            .map_err(RecoveryPublisherError::rpc_failure)?;
+        // Shared publication first repairs an earlier interrupted upload. A
+        // local-only owner has nothing to repair, and the barrier below proves
+        // liveness after everything this request observed or wrote, so a
+        // second proof before dispatch would add a control round trip without
+        // fencing anything more.
+        if self.publisher.mode() == RecoveryPublicationMode::Shared {
+            self.publisher
+                .publish_current()
+                .map_err(RecoveryPublisherError::rpc_failure)?;
+        }
         let outcome = self.inner.execute(request);
         self.publisher
             .publish_current()
