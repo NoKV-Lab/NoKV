@@ -129,7 +129,7 @@ jobs:
           ref: ${{ needs.validate.outputs.commit }}
 
       - name: Download exact release candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: nokv-homebrew-${{ needs.validate.outputs.commit }}
           path: ${{ runner.temp }}/nokv-homebrew-release
@@ -209,7 +209,7 @@ jobs:
           ref: ${{ needs.validate.outputs.commit }}
 
       - name: Download tested release candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: nokv-homebrew-${{ needs.validate.outputs.commit }}
           path: ${{ runner.temp }}/nokv-homebrew-release
@@ -310,7 +310,7 @@ jobs:
           persist-credentials: false
 
       - name: Download tested release candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: nokv-homebrew-${{ needs.validate.outputs.commit }}
           path: ${{ runner.temp }}/nokv-homebrew-release
