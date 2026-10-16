@@ -1229,6 +1229,18 @@ fn validate_path_claim(
     claim: &PublishClaim,
     current: Option<&Loaded<PathEntry>>,
 ) -> Result<Generation, PublicationError> {
+    validate_publish_claim(claim, current.map(|loaded| &loaded.record))
+}
+
+/// The generation a publication claim gives its path if it completed against
+/// `current`, or the conflict that completion would report.
+///
+/// Completion applies it to the live path; admission applies the same rule
+/// earlier so a claim that already fails refuses before any object upload.
+pub fn validate_publish_claim(
+    claim: &PublishClaim,
+    current: Option<&PathEntry>,
+) -> Result<Generation, PublicationError> {
     match (claim, current) {
         (PublishClaim::CreateOnly, None) => {
             Generation::new(1).map_err(|_| PublicationError::PathGenerationOverflow)
@@ -1242,7 +1254,7 @@ fn validate_path_claim(
                 expected_generation,
             },
             Some(current),
-        ) => next_generation(*expected_generation, &current.record),
+        ) => next_generation(*expected_generation, current),
         (
             PublishClaim::Append {
                 expected_generation,
@@ -1251,8 +1263,8 @@ fn validate_path_claim(
             },
             Some(current),
         ) => {
-            let generation = next_generation(*expected_generation, &current.record)?;
-            if current.record.artifact_revision_id != *base_revision_id {
+            let generation = next_generation(*expected_generation, current)?;
+            if current.artifact_revision_id != *base_revision_id {
                 return Err(PublicationError::AppendBaseRevisionMismatch);
             }
             Ok(generation)

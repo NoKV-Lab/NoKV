@@ -144,14 +144,14 @@ pub use namespace::{
 pub use publication::{
     advance_manifest_rolling_digest, advance_staged_object_rolling_digest,
     append_operation_state_digest, dependency_owner_digest, manifest_rows_digest,
-    seal_publish_operation, staged_object_ledger_digest, AppendCleanupRetryOutcome,
-    BeginPublishRequest, CleanupPublishBatchRequest, FinalizePublishOutcome,
-    FinalizePublishRequest, FinishReconcileQuarantinedPublishRequest, HeartbeatPublishRequest,
-    ManifestRowInput, MarkObjectsUploadedBatchRequest, PublicationContext, PublicationError,
-    PublicationService, PublishCommandOutcome, PublishedArtifact, QuarantineReconcileResolution,
-    ReconcileQuarantinedPublishBatchRequest, StageManifestBatchRequest, StageObjectsBatchRequest,
-    StagedObjectUpdate, TakeOverOrphanedPublishRequest, TransitionPublishRequest,
-    MAX_PUBLICATION_BATCH_ROWS,
+    seal_publish_operation, staged_object_ledger_digest, validate_publish_claim,
+    AppendCleanupRetryOutcome, BeginPublishRequest, CleanupPublishBatchRequest,
+    FinalizePublishOutcome, FinalizePublishRequest, FinishReconcileQuarantinedPublishRequest,
+    HeartbeatPublishRequest, ManifestRowInput, MarkObjectsUploadedBatchRequest, PublicationContext,
+    PublicationError, PublicationService, PublishCommandOutcome, PublishedArtifact,
+    QuarantineReconcileResolution, ReconcileQuarantinedPublishBatchRequest,
+    StageManifestBatchRequest, StageObjectsBatchRequest, StagedObjectUpdate,
+    TakeOverOrphanedPublishRequest, TransitionPublishRequest, MAX_PUBLICATION_BATCH_ROWS,
 };
 pub use publication_records::{
     ArtifactRevisionClaimRecord, ArtifactRevisionRecord, GcCandidateRecord, PathEntry,

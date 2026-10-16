@@ -1966,9 +1966,10 @@ impl MetadataWorkspaceRequestExecutor {
         // Stable append identity authenticates the original intent before any
         // live path or dependency read. A receipt describes historical success;
         // a later writer or expired historical artifact cannot revoke it.
-        if let Some(existing) =
-            self.find_publish_operation(rpc.route, read.read_version, request.operation_id)?
-        {
+        let existing =
+            self.find_publish_operation(rpc.route, read.read_version, request.operation_id)?;
+        let admitted = existing.is_some();
+        if let Some(existing) = existing {
             if existing.append_intent_digest.is_some() || request.append_intent_digest.is_some() {
                 if existing
                     .append_attempt
@@ -2033,10 +2034,20 @@ impl MetadataWorkspaceRequestExecutor {
                 let current =
                     meta::get_path_at_visible_workspace(&self.meta, read, &workspace, &path)
                         .map_err(namespace_failure)?;
+                let claim = publish_claim(request.condition, current.as_ref())?;
+                // A new publication whose claim already fails on the live path
+                // would fail only at completion, after its upload. Refuse it
+                // before any durable row or provider write; completion still
+                // rechecks the claim, and a retry of an admitted operation
+                // still reaches the engine's exact replay.
+                if !admitted {
+                    meta::validate_publish_claim(&claim, current.as_ref())
+                        .map_err(publication_failure)?;
+                }
                 (
                     meta::PublishAuthority::Visible,
                     workspace.incarnation_id,
-                    publish_claim(request.condition, current.as_ref())?,
+                    claim,
                 )
             }
             protocol::PublicationAuthority::CommitStaging {
@@ -9140,6 +9151,72 @@ mod tests {
             stored + 1,
             lease
         ));
+    }
+
+    #[test]
+    fn a_claim_the_live_path_already_fails_is_refused_before_any_upload() {
+        let (executor, plan, begin) = fused_publication_fixture("fused-early-claim", 0x7d);
+        let prepare = |fill: u8, begin: protocol::BeginArtifactPublishRequest| {
+            restore_rpc(
+                fill,
+                protocol::WorkspaceRequest::PrepareArtifactPublish(
+                    protocol::PrepareArtifactPublishRequest {
+                        begin,
+                        objects: plan.staged_objects.clone(),
+                    },
+                ),
+            )
+        };
+        let prepared = executor.execute(&prepare(0x80, begin.clone())).unwrap();
+        executor
+            .execute(&restore_rpc(
+                0x81,
+                finish_request(&plan, executed_operation(&prepared).token),
+            ))
+            .unwrap();
+
+        let fresh = |operation: u8, revision: u8, condition| {
+            let mut fresh = begin.clone();
+            fresh.operation_id = protocol::OperationIdentity([operation; types::FIXED_ID_BYTES]);
+            fresh.artifact_revision_id =
+                protocol::ArtifactRevisionIdentity([revision; types::FIXED_ID_BYTES]);
+            fresh.condition = condition;
+            fresh
+        };
+        let stale = fresh(
+            0x82,
+            0x83,
+            protocol::PublishCondition::ReplaceOnly {
+                expected_generation: 7,
+            },
+        );
+        let refused = executor.execute(&prepare(0x84, stale.clone())).unwrap_err();
+        assert_eq!(refused.code, protocol::ErrorCode::Conflict);
+        assert_eq!(refused.current_generation, Some(1));
+        let duplicate = fresh(0x85, 0x86, protocol::PublishCondition::CreateOnly);
+        let refused = executor
+            .execute(&prepare(0x87, duplicate.clone()))
+            .unwrap_err();
+        assert_eq!(refused.code, protocol::ErrorCode::AlreadyExists);
+        // Neither refusal admitted an operation that would own uploads.
+        for refused in [&stale, &duplicate] {
+            assert!(executor
+                .find_publish_operation(
+                    route(1),
+                    executor.meta.current_read_version().unwrap(),
+                    refused.operation_id,
+                )
+                .unwrap()
+                .is_none());
+        }
+
+        // The admitted create still replays exactly although its path exists.
+        let replayed = executor.execute(&prepare(0x88, begin)).unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(
+            executed_operation(&replayed).state,
+            protocol::OperationState::Succeeded
+        );
     }
 
     #[test]
