@@ -7,8 +7,8 @@ use std::fmt;
 use std::sync::{Arc, Condvar, Mutex};
 
 use nokv_control::{
-    ControlError, ControlStore, LogRef, LogSegmentRef, LogicalShardLease, LogicalShardRecord,
-    RecoveryPublication, RecoveryUploadIntent, MAX_RECOVERY_LOG_SEGMENTS,
+    CheckpointRef, ControlError, ControlStore, LogRef, LogSegmentRef, LogicalShardLease,
+    LogicalShardRecord, RecoveryPublication, RecoveryUploadIntent, MAX_RECOVERY_LOG_SEGMENTS,
 };
 use nokv_meta::workspace::{
     MetaError, MetaShard, RecoveryOutboxSegment, RecoveryState, MAX_RECOVERY_SEGMENT_RECORDS,
@@ -53,6 +53,29 @@ pub struct RecoveryPublisher {
     object_namespace_id: nokv_types::ObjectNamespaceId,
     mode: RecoveryPublicationMode,
     rounds: CoveringRounds<LogicalShardRecord>,
+    /// Control frontier a local-only round already validated against the
+    /// local recovery state. Only shared publication advances the control
+    /// frontier and the local LSN never moves backwards, so an unchanged
+    /// frontier stays valid without reading local state again.
+    validated_local_only_frontier: Mutex<Option<ControlFrontier>>,
+}
+
+/// The recovery frontier fields of one control record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ControlFrontier {
+    durable_lsn: u64,
+    checkpoint: Option<CheckpointRef>,
+    log: Option<LogRef>,
+}
+
+impl ControlFrontier {
+    fn of(record: &LogicalShardRecord) -> Self {
+        Self {
+            durable_lsn: record.durable_lsn,
+            checkpoint: record.checkpoint.clone(),
+            log: record.log.clone(),
+        }
+    }
 }
 
 /// Rounds of one idempotent proof that run one at a time.
@@ -183,6 +206,7 @@ impl RecoveryPublisher {
             object_namespace_id,
             mode,
             rounds: CoveringRounds::new(),
+            validated_local_only_frontier: Mutex::new(None),
         })
     }
 
@@ -207,10 +231,7 @@ impl RecoveryPublisher {
                 let required = self.meta.recovery_state()?;
                 self.publish_required(required)
             }
-            RecoveryPublicationMode::LocalOnly => {
-                let required = self.meta.recovery_state()?;
-                self.confirm_local_only(required)
-            }
+            RecoveryPublicationMode::LocalOnly => self.confirm_local_only(),
         }
     }
 
@@ -218,12 +239,19 @@ impl RecoveryPublisher {
     /// the local store has not fallen behind a frontier some earlier shared
     /// owner already published, without uploading segments or touching the
     /// control frontier.
-    fn confirm_local_only(
-        &self,
-        required: RecoveryState,
-    ) -> Result<LogicalShardRecord, RecoveryPublisherError> {
+    fn confirm_local_only(&self) -> Result<LogicalShardRecord, RecoveryPublisherError> {
         let record = self.control.prove_owner(&self.lease)?;
-        self.validate_control_frontier(&record, required)?;
+        let frontier = ControlFrontier::of(&record);
+        let mut validated = self
+            .validated_local_only_frontier
+            .lock()
+            .map_err(|_| RecoveryPublisherError::Poisoned)?;
+        if validated.as_ref() != Some(&frontier) {
+            let required = self.meta.recovery_state()?;
+            self.validate_control_frontier(&record, required)?;
+            *validated = Some(frontier);
+        }
+        drop(validated);
         if record.pending_recovery_upload.is_some() {
             return Err(RecoveryPublisherError::InvalidState(
                 "logical shard has a pending shared recovery upload; reopen with shared recovery publication to finish or abort it before serving local-only".to_owned(),
