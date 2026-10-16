@@ -12,6 +12,12 @@ on:
 permissions:
   contents: read
 
+# Pin the toolchain so a new stable release cannot turn main red through lints
+# it adds; Rust 1.97, 1.98, and 1.99 clippy each did. Bump it in a dedicated
+# pull request that also clears whatever the new toolchain reports.
+env:
+  RUST_TOOLCHAIN: "1.99.1"
+
 jobs:
   workbench-contract:
     runs-on: ubuntu-latest
@@ -20,7 +26,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Set up Rust for typed qualification
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Install protobuf compiler for typed qualification
         run: |
@@ -120,7 +128,7 @@ jobs:
 
       - name: Upload source-bound qualification product
         id: qualification_product
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: phase1-product-${{ github.sha }}
           path: target/phase1-qualification/debug/nokv
@@ -318,7 +326,7 @@ jobs:
 
       - name: Upload Phase 1 qualification evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: phase1-qualification-${{ github.sha }}
           path: ${{ runner.temp }}/phase1-qualification
@@ -345,7 +353,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
 
       - name: Install protobuf compiler
         run: |
@@ -457,7 +468,7 @@ jobs:
 
       - name: Upload local-WAL recovery evidence
         if: ${{ always() && steps.local_wal_recovery.outcome != 'skipped' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: local-wal-recovery-${{ github.sha }}
           path: ${{ runner.temp }}/local-wal-recovery-evidence
@@ -527,7 +538,7 @@ jobs:
 
       - name: Upload live Workbench evidence
         if: ${{ always() && steps.live_workbench.outcome != 'skipped' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: live-workbench-${{ github.sha }}
           path: ${{ runner.temp }}/live-workbench
@@ -558,7 +569,7 @@ jobs:
 
       - name: Upload restore composition evidence
         if: ${{ always() && steps.restore_composition.outcome != 'skipped' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: restore-composition-${{ github.sha }}
           path: ${{ runner.temp }}/restore-composition/evidence
@@ -583,7 +594,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Install protobuf compiler
         run: |
@@ -646,7 +659,7 @@ jobs:
 
       - name: Upload object namespace recovery evidence
         if: ${{ always() && steps.object_namespace_recovery.outcome != 'skipped' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: object-namespace-recovery-${{ github.sha }}
           path: ${{ runner.temp }}/object-namespace-recovery-evidence
@@ -664,7 +677,9 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Install protobuf compiler
         run: |
@@ -728,7 +743,7 @@ jobs:
 
       - name: Upload fork restore recovery evidence
         if: ${{ always() && steps.fork_restore_recovery.outcome != 'skipped' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: fork-restore-recovery-${{ github.sha }}
           path: ${{ runner.temp }}/fork-restore-recovery-evidence

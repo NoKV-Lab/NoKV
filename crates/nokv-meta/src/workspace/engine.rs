@@ -4220,7 +4220,7 @@ mod tests {
                 let scan_index = self.history_scan_reads.fetch_add(1, Ordering::AcqRel);
                 if self
                     .remaining_advances
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok()
@@ -4275,14 +4275,14 @@ mod tests {
                 let scan_index = self.recovery_scan_reads.fetch_add(1, Ordering::AcqRel);
                 let skip = self
                     .skipped_recovery_scans
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok();
                 if !skip
                     && self
                         .remaining_advances
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                             remaining.checked_sub(1)
                         })
                         .is_ok()

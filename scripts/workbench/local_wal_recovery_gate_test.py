@@ -166,7 +166,7 @@ class LocalWalRecoveryGateContractTests(unittest.TestCase):
         )
         manifest = (REPO / "Cargo.toml").read_text()
         self.assertIn(
-            'signal-hook = { version = "=0.3.18", default-features = false }',
+            'signal-hook = { version = "=0.4.5", default-features = false }',
             manifest,
         )
 
