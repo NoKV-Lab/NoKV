@@ -204,7 +204,7 @@ def append_loss(s):
     }
     # Admit the workbench first so the one-shot targets only the append publication.
     s.cli("workbench_create", {"id": wb})
-    s.proxy.arm("complete_artifact_publish", lambda: s.owner.kill())
+    s.proxy.arm("finish_artifact_publish", lambda: s.owner.kill())
     failed = s.cli("workbench_append", args, label="append-first-ack-lost", check=False)
     s.proxy.wait_dropped()
     assert failed.get("status") != "success", failed
@@ -356,7 +356,7 @@ def assert_dropped_receipt(result, dropped):
 def terminal_response_loss(stack):
     wb, operation_id, text = "stable-response-loss", "11" * 16, "logical-event-1\n"
     stack.cli("workbench_create", {"id": wb})
-    stack.proxy.arm("complete_artifact_publish", lambda: stack.owner.kill())
+    stack.proxy.arm("finish_artifact_publish", lambda: stack.owner.kill())
     failed = native_append(
         stack, wb, operation_id, text, label="terminal-ack-lost", check=False
     )
@@ -613,7 +613,7 @@ def begin_response_loss(stack, *, change_live):
         "uncertain-event\n",
     )
     stack.cli("workbench_create", {"id": wb})
-    stack.proxy.arm("begin_artifact_publish", lambda: stack.owner.kill())
+    stack.proxy.arm("prepare_artifact_publish", lambda: stack.owner.kill())
     failed = native_append(
         stack, wb, operation_id, text, label="begin-ack-lost-" + suffix, check=False
     )

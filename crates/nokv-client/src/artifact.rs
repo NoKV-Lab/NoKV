@@ -16,12 +16,13 @@ use nokv_protocol::{
     AbortArtifactPublishRequest, AppendAttemptBinding, AppendSegment, ArtifactDescriptor,
     ArtifactManifestRow, ArtifactRevisionIdentity, BeginArtifactPublishRequest, ByteRange,
     CompleteArtifactPublishRequest, ContentType, Digest, ErrorCode, FieldValue,
-    GetOperationRequest, GetPathRequest, LogicalShardIdentity, MarkArtifactObjectsUploadedRequest,
-    ObjectIdentity, ObjectUploadProof, OperationIdentity, OperationKind, OperationResult,
-    OperationState, OperationStatus, OperationToken, PageRequest, PathMetadata, PathReadResult,
-    PublicationAuthority, PublishCondition, PublishResult, ReadRestoreSourceRunManifestRequest,
-    RootRoute, StageArtifactManifestRequest, StageArtifactObjectsRequest, StagedObject,
-    WorkspaceIdentity, WorkspacePath, WorkspaceReadView, WorkspaceRequest, WorkspaceResult,
+    FinishArtifactPublishRequest, GetOperationRequest, GetPathRequest, LogicalShardIdentity,
+    MarkArtifactObjectsUploadedRequest, ObjectIdentity, ObjectUploadProof, OperationIdentity,
+    OperationKind, OperationResult, OperationState, OperationStatus, OperationToken, PageRequest,
+    PathMetadata, PathReadResult, PrepareArtifactPublishRequest, PublicationAuthority,
+    PublishCondition, PublishResult, ReadRestoreSourceRunManifestRequest, RootRoute,
+    StageArtifactManifestRequest, StageArtifactObjectsRequest, StagedObject, WorkspaceIdentity,
+    WorkspacePath, WorkspaceReadView, WorkspaceRequest, WorkspaceResult,
     MAX_ARTIFACT_DEPENDENCY_DEPTH, MAX_ARTIFACT_DEPENDENCY_OWNERS, MAX_ARTIFACT_PUBLISH_BATCH_ROWS,
     MAX_ARTIFACT_READ_PLAN_ROWS,
 };
@@ -442,31 +443,47 @@ where
         let seals =
             seal_artifact_publish_plan(artifact_revision_id, staged_objects, manifest_rows)?;
         descriptor.validate()?;
-        let begin = self.begin_publish_on_shard(
-            logical_shard,
-            BeginArtifactPublishRequest {
-                operation_id,
-                artifact_revision_id,
-                target: target.clone(),
-                authority: *authority,
-                condition: *condition,
-                expected_workspace_incarnation_id,
-                append_intent_digest,
-                append_attempt,
-                staged_object_count: seals.staged_object_count,
-                staged_object_seal: seals.staged_object_seal,
-                manifest_row_count: seals.manifest_row_count,
-                manifest_seal: seals.manifest_seal,
-                dependency_owner_revision_ids: dependencies.to_vec(),
-            },
-        );
+        let begin = BeginArtifactPublishRequest {
+            operation_id,
+            artifact_revision_id,
+            target: target.clone(),
+            authority: *authority,
+            condition: *condition,
+            expected_workspace_incarnation_id,
+            append_intent_digest,
+            append_attempt,
+            staged_object_count: seals.staged_object_count,
+            staged_object_seal: seals.staged_object_seal,
+            manifest_row_count: seals.manifest_row_count,
+            manifest_seal: seals.manifest_seal,
+            dependency_owner_revision_ids: dependencies.to_vec(),
+        };
+        // A plan whose objects fit one batch is admitted and staged under one
+        // durable acknowledgement; a larger plan stages in batches after Begin.
+        let (begin_stage, begin) = if staged_objects.len() <= MAX_ARTIFACT_PUBLISH_BATCH_ROWS {
+            (
+                ArtifactPublishStage::Prepare,
+                self.publish_status_on_shard(
+                    logical_shard,
+                    WorkspaceRequest::PrepareArtifactPublish(PrepareArtifactPublishRequest {
+                        begin,
+                        objects: staged_objects.to_vec(),
+                    }),
+                ),
+            )
+        } else {
+            (
+                ArtifactPublishStage::Begin,
+                self.begin_publish_on_shard(logical_shard, begin),
+            )
+        };
         let (mut token, resume, begin_replayed) = match begin {
             Ok(call) => {
                 let (replayed, commit_version) = (call.replayed, call.commit_version);
                 let status = match validated_publish_status(call.value, operation_id) {
                     Ok(status) => status,
                     Err(source) => {
-                        return Err(fail(None, ArtifactPublishStage::Begin, source));
+                        return Err(fail(None, begin_stage, source));
                     }
                 };
                 // Begin observes whichever durable state the operation row is
@@ -482,7 +499,7 @@ where
                         let value = match published_result_from_status(&status) {
                             Ok(value) => value,
                             Err(source) => {
-                                return Err(fail(None, ArtifactPublishStage::Begin, source));
+                                return Err(fail(None, begin_stage, source));
                             }
                         };
                         // The replay branch is the one path the engine takes
@@ -500,7 +517,7 @@ where
                                 self.confirm_replayed_publication_is_live(logical_shard, &value)
                             {
                                 return Err(ClientError::ArtifactPublishFailed {
-                                    stage: ArtifactPublishStage::Begin,
+                                    stage: begin_stage,
                                     source: Box::new(source),
                                     abort_failure: None,
                                 });
@@ -522,7 +539,7 @@ where
                         // again is meaningless, so report the terminal state
                         // instead of attempting one.
                         return Err(ClientError::ArtifactPublishFailed {
-                            stage: ArtifactPublishStage::Begin,
+                            stage: begin_stage,
                             source: Box::new(ClientError::ResponseMismatch(format!(
                                 "artifact publication operation is durably {:?} and cannot be \
                                  resumed; retry with a new operation identity",
@@ -539,18 +556,13 @@ where
                     ) {
                         Ok(resume) => (resume.token, resume, replayed),
                         Err(source) => {
-                            return Err(fail(None, ArtifactPublishStage::Begin, source));
+                            return Err(fail(None, begin_stage, source));
                         }
                     },
                 }
             }
             Err(source) if is_definitive_append_race(&source) => return Err(source),
-            Err(source) => {
-                return Err(publication_failure_without_abort(
-                    ArtifactPublishStage::Begin,
-                    source,
-                ))
-            }
+            Err(source) => return Err(publication_failure_without_abort(begin_stage, source)),
         };
 
         for batch in
@@ -599,98 +611,118 @@ where
         }
 
         let upload_proofs = upload_proofs(staged_objects);
-        for batch in
-            upload_proofs[resume.uploaded_object_cursor..].chunks(MAX_ARTIFACT_PUBLISH_BATCH_ROWS)
+        let remaining_proofs = &upload_proofs[resume.uploaded_object_cursor..];
+        let remaining_rows = &manifest_rows[resume.manifest_cursor..];
+        let (final_stage, final_result) = if remaining_proofs.len()
+            <= MAX_ARTIFACT_PUBLISH_BATCH_ROWS
+            && remaining_rows.len() <= MAX_ARTIFACT_PUBLISH_BATCH_ROWS
         {
-            let request = MarkArtifactObjectsUploadedRequest {
+            // The remaining upload proofs, the manifest, and the completion
+            // share one durable acknowledgement.
+            let finish = FinishArtifactPublishRequest {
                 token,
-                objects: batch.to_vec(),
+                uploaded_objects: remaining_proofs.to_vec(),
+                manifest_rows: remaining_rows.to_vec(),
+                dependency_owner_revision_ids: dependencies.to_vec(),
+                artifact: descriptor.clone(),
             };
-            match self.publish_status_on_shard(
-                logical_shard,
-                WorkspaceRequest::MarkArtifactObjectsUploaded(request),
-            ) {
-                Ok(status) => match running_publish_token(status.value, operation_id) {
-                    Ok(next_token) => token = next_token,
+            (
+                ArtifactPublishStage::Finish,
+                self.execute_on_logical_shard(
+                    self.new_request_id(),
+                    WorkspaceRequest::FinishArtifactPublish(finish),
+                    logical_shard,
+                ),
+            )
+        } else {
+            for batch in remaining_proofs.chunks(MAX_ARTIFACT_PUBLISH_BATCH_ROWS) {
+                let request = MarkArtifactObjectsUploadedRequest {
+                    token,
+                    objects: batch.to_vec(),
+                };
+                match self.publish_status_on_shard(
+                    logical_shard,
+                    WorkspaceRequest::MarkArtifactObjectsUploaded(request),
+                ) {
+                    Ok(status) => match running_publish_token(status.value, operation_id) {
+                        Ok(next_token) => token = next_token,
+                        Err(source) => {
+                            return Err(fail(
+                                Some(token),
+                                ArtifactPublishStage::MarkObjectsUploaded,
+                                source,
+                            ));
+                        }
+                    },
                     Err(source) => {
-                        return Err(fail(
-                            Some(token),
+                        return Err(fail_or_resume(
+                            token,
                             ArtifactPublishStage::MarkObjectsUploaded,
                             source,
-                        ));
+                        ))
                     }
-                },
-                Err(source) => {
-                    return Err(fail_or_resume(
-                        token,
-                        ArtifactPublishStage::MarkObjectsUploaded,
-                        source,
-                    ))
                 }
             }
-        }
 
-        for batch in manifest_rows[resume.manifest_cursor..].chunks(MAX_ARTIFACT_PUBLISH_BATCH_ROWS)
-        {
-            let request = StageArtifactManifestRequest {
-                token,
-                rows: batch.to_vec(),
-                dependency_owner_revision_ids: dependencies.to_vec(),
-            };
-            match self.publish_status_on_shard(
-                logical_shard,
-                WorkspaceRequest::StageArtifactManifest(request),
-            ) {
-                Ok(status) => match running_publish_token(status.value, operation_id) {
-                    Ok(next_token) => token = next_token,
+            for batch in remaining_rows.chunks(MAX_ARTIFACT_PUBLISH_BATCH_ROWS) {
+                let request = StageArtifactManifestRequest {
+                    token,
+                    rows: batch.to_vec(),
+                    dependency_owner_revision_ids: dependencies.to_vec(),
+                };
+                match self.publish_status_on_shard(
+                    logical_shard,
+                    WorkspaceRequest::StageArtifactManifest(request),
+                ) {
+                    Ok(status) => match running_publish_token(status.value, operation_id) {
+                        Ok(next_token) => token = next_token,
+                        Err(source) => {
+                            return Err(fail(
+                                Some(token),
+                                ArtifactPublishStage::StageManifest,
+                                source,
+                            ));
+                        }
+                    },
                     Err(source) => {
-                        return Err(fail(
-                            Some(token),
+                        return Err(fail_or_resume(
+                            token,
                             ArtifactPublishStage::StageManifest,
                             source,
-                        ));
+                        ))
                     }
-                },
-                Err(source) => {
-                    return Err(fail_or_resume(
-                        token,
-                        ArtifactPublishStage::StageManifest,
-                        source,
-                    ))
                 }
             }
-        }
 
-        let complete = CompleteArtifactPublishRequest {
-            token,
-            artifact: descriptor.clone(),
+            let complete = CompleteArtifactPublishRequest {
+                token,
+                artifact: descriptor.clone(),
+            };
+            (
+                ArtifactPublishStage::Complete,
+                self.execute_on_logical_shard(
+                    self.new_request_id(),
+                    WorkspaceRequest::CompleteArtifactPublish(complete),
+                    logical_shard,
+                ),
+            )
         };
-        let complete_result = self.execute_on_logical_shard(
-            self.new_request_id(),
-            WorkspaceRequest::CompleteArtifactPublish(complete),
-            logical_shard,
-        );
-        let mut publication = match complete_result.and_then(|call| call.map(expect_published)) {
+        let mut publication = match final_result.and_then(|call| call.map(expect_published)) {
             Ok(publication) => publication,
             Err(source) => match self.recover_completed_publish(logical_shard, operation_id) {
                 Ok(Some(recovered)) => recovered,
                 Ok(None) => {
-                    return Err(fail_or_resume(
-                        token,
-                        ArtifactPublishStage::Complete,
-                        source,
-                    ));
+                    return Err(fail_or_resume(token, final_stage, source));
                 }
                 Err(recovery_error) => {
-                    return Err(fail_or_resume(
-                        token,
-                        ArtifactPublishStage::Complete,
-                        recovery_error,
-                    ));
+                    return Err(fail_or_resume(token, final_stage, recovery_error));
                 }
             },
         };
-        publication.replayed |= begin_replayed || resume.completed_rows != 0;
+        // A fresh Prepare reports its own staging as progress; an earlier
+        // attempt of this publication always replays its admission.
+        publication.replayed |= begin_replayed
+            || (begin_stage == ArtifactPublishStage::Begin && resume.completed_rows != 0);
 
         Ok(ArtifactPublishOutcome {
             publication,
@@ -2857,6 +2889,7 @@ mod tests {
         attempts: Vec<(&'static str, RequestIdentity)>,
         begin: Option<BeginArtifactPublishRequest>,
         staged_objects: Vec<StagedObject>,
+        uploaded_objects: usize,
         manifest_rows: Vec<ArtifactManifestRow>,
         manifest_dependency_batches: Vec<Vec<ArtifactRevisionIdentity>>,
         operation: Option<OperationStatus>,
@@ -2874,6 +2907,8 @@ mod tests {
         fence_changed: bool,
         append_begin_conflicts: usize,
         advance_stage_before_response_once: bool,
+        advance_finish_before_response_once: bool,
+        finish_requests: Vec<FinishArtifactPublishRequest>,
     }
 
     impl ScriptedArtifactTransport {
@@ -2884,6 +2919,7 @@ mod tests {
                     attempts: Vec::new(),
                     begin: None,
                     staged_objects: Vec::new(),
+                    uploaded_objects: 0,
                     manifest_rows: Vec::new(),
                     manifest_dependency_batches: Vec::new(),
                     operation: None,
@@ -2901,6 +2937,8 @@ mod tests {
                     fence_changed: false,
                     append_begin_conflicts: 0,
                     advance_stage_before_response_once: false,
+                    advance_finish_before_response_once: false,
+                    finish_requests: Vec::new(),
                 })),
                 events,
             }
@@ -2935,6 +2973,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .advance_stage_before_response_once = true;
+        }
+
+        fn advance_finish_before_response_once(&self) {
+            self.state
+                .lock()
+                .unwrap()
+                .advance_finish_before_response_once = true;
         }
     }
 
@@ -2972,7 +3017,16 @@ mod tests {
             }))
         }
 
+        /// A running status whose progress counts the rows durably recorded so
+        /// far, in the engine's staged, uploaded, then manifest order.
         fn running_status(&mut self, operation_id: OperationIdentity) -> OperationStatus {
+            let begin = self.begin.as_ref().expect("publication has begun");
+            let total_rows = u64::from(begin.staged_object_count)
+                .saturating_mul(2)
+                .saturating_add(u64::from(begin.manifest_row_count));
+            let completed_rows = (self.staged_objects.len()
+                + self.uploaded_objects
+                + self.manifest_rows.len()) as u64;
             OperationStatus {
                 token: self.next_token(operation_id),
                 kind: OperationKind::ArtifactPublish,
@@ -2982,8 +3036,8 @@ mod tests {
                 restore_preparation: None,
                 state: OperationState::Running,
                 progress: OperationProgress {
-                    completed_rows: 0,
-                    total_rows: None,
+                    completed_rows,
+                    total_rows: Some(total_rows),
                     completed_bytes: 0,
                     total_bytes: None,
                 },
@@ -3005,7 +3059,7 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.attempts.push((label, request.request_id));
             if let Some(mut replayed) = state.replay.get(&request.request_id).cloned() {
-                if label == "complete" && state.lose_complete_responses {
+                if matches!(label, "complete" | "finish") && state.lose_complete_responses {
                     return Err(TransportError::new(
                         "injected complete response loss after durable success",
                         true,
@@ -3016,13 +3070,14 @@ mod tests {
                     .map_err(|error| TransportError::new(error.to_string(), false));
             }
 
-            let injected_append_conflict = matches!(
-                &request.operation,
-                WorkspaceRequest::BeginArtifactPublish(BeginArtifactPublishRequest {
-                    condition: PublishCondition::Append { .. },
-                    ..
-                })
-            ) && state.append_begin_conflicts > 0;
+            let begin_condition = match &request.operation {
+                WorkspaceRequest::BeginArtifactPublish(begin) => Some(begin.condition),
+                WorkspaceRequest::PrepareArtifactPublish(prepare) => Some(prepare.begin.condition),
+                _ => None,
+            };
+            let injected_append_conflict =
+                matches!(begin_condition, Some(PublishCondition::Append { .. }))
+                    && state.append_begin_conflicts > 0;
             let missing_path =
                 matches!(&request.operation, WorkspaceRequest::GetPath(_)) && state.path.is_none();
             if injected_append_conflict || missing_path {
@@ -3117,8 +3172,39 @@ mod tests {
                 }
             }
 
+            if let WorkspaceRequest::FinishArtifactPublish(finish) = &request.operation {
+                state.finish_requests.push(finish.clone());
+                if state.advance_finish_before_response_once {
+                    state.advance_finish_before_response_once = false;
+                    // The winner's uploads and manifest are durable; this
+                    // caller's token no longer names the current state.
+                    state.uploaded_objects += finish.uploaded_objects.len();
+                    state.manifest_rows.extend(finish.manifest_rows.clone());
+                    let status = state.running_status(finish.token.operation_id);
+                    state.operation = Some(status);
+                    let response = WorkspaceRpcResponse {
+                        route: request.route,
+                        request_id: request.request_id,
+                        commit_version: None,
+                        replayed: false,
+                        outcome: WorkspaceRpcOutcome::Failure(RpcFailure {
+                            code: ErrorCode::Conflict,
+                            message: "operation token state digest is stale".to_owned(),
+                            retryable: false,
+                            conflict: Some(ConflictKind::OperationState),
+                            current_generation: None,
+                            route_hint: None,
+                        }),
+                    };
+                    state.replay.insert(request.request_id, response.clone());
+                    return encode_response(&response)
+                        .map_err(|error| TransportError::new(error.to_string(), false));
+                }
+            }
+
             self.events.lock().unwrap().push(label);
             state.commit_version = state.commit_version.saturating_add(1);
+            let stage_applies = state.stage_applies;
             let result = apply_request(&mut state, &request)?;
             let response = WorkspaceRpcResponse {
                 route: request.route,
@@ -3128,7 +3214,7 @@ mod tests {
                 outcome: WorkspaceRpcOutcome::Success(Box::new(result)),
             };
             state.replay.insert(request.request_id, response.clone());
-            if matches!(request.operation, WorkspaceRequest::StageArtifactObjects(_))
+            if state.stage_applies > stage_applies
                 && state.lose_stage_response_once
                 && !state.stage_response_lost
             {
@@ -3141,6 +3227,7 @@ mod tests {
             if matches!(
                 request.operation,
                 WorkspaceRequest::CompleteArtifactPublish(_)
+                    | WorkspaceRequest::FinishArtifactPublish(_)
             ) && state.lose_complete_responses
             {
                 return Err(TransportError::new(
@@ -3174,6 +3261,7 @@ mod tests {
                 }
                 state.begin = Some(begin.clone());
                 state.staged_objects.clear();
+                state.uploaded_objects = 0;
                 state.manifest_rows.clear();
                 state.manifest_dependency_batches.clear();
                 let status = state.running_status(begin.operation_id);
@@ -3190,6 +3278,7 @@ mod tests {
             }
             WorkspaceRequest::MarkArtifactObjectsUploaded(mark) => {
                 require_token(state, mark.token)?;
+                state.uploaded_objects += mark.objects.len();
                 let status = state.running_status(mark.token.operation_id);
                 state.operation = Some(status.clone());
                 Ok(WorkspaceResult::Operation(status))
@@ -3203,6 +3292,76 @@ mod tests {
                 let status = state.running_status(stage.token.operation_id);
                 state.operation = Some(status.clone());
                 Ok(WorkspaceResult::Operation(status))
+            }
+            WorkspaceRequest::PrepareArtifactPublish(prepare) => {
+                let begun = apply_request(
+                    state,
+                    &publication_step(
+                        request,
+                        WorkspaceRequest::BeginArtifactPublish(prepare.begin.clone()),
+                    ),
+                )?;
+                let WorkspaceResult::Operation(status) = &begun else {
+                    return Ok(begun);
+                };
+                if prepare.objects.is_empty()
+                    || status.state != OperationState::Running
+                    || status.progress.completed_rows != 0
+                {
+                    return Ok(begun);
+                }
+                apply_request(
+                    state,
+                    &publication_step(
+                        request,
+                        WorkspaceRequest::StageArtifactObjects(StageArtifactObjectsRequest {
+                            token: status.token,
+                            objects: prepare.objects.clone(),
+                        }),
+                    ),
+                )
+            }
+            WorkspaceRequest::FinishArtifactPublish(finish) => {
+                let mut token = finish.token;
+                if !finish.uploaded_objects.is_empty() {
+                    token = running_token(apply_request(
+                        state,
+                        &publication_step(
+                            request,
+                            WorkspaceRequest::MarkArtifactObjectsUploaded(
+                                MarkArtifactObjectsUploadedRequest {
+                                    token,
+                                    objects: finish.uploaded_objects.clone(),
+                                },
+                            ),
+                        ),
+                    )?)?;
+                }
+                if !finish.manifest_rows.is_empty() {
+                    token = running_token(apply_request(
+                        state,
+                        &publication_step(
+                            request,
+                            WorkspaceRequest::StageArtifactManifest(StageArtifactManifestRequest {
+                                token,
+                                rows: finish.manifest_rows.clone(),
+                                dependency_owner_revision_ids: finish
+                                    .dependency_owner_revision_ids
+                                    .clone(),
+                            }),
+                        ),
+                    )?)?;
+                }
+                apply_request(
+                    state,
+                    &publication_step(
+                        request,
+                        WorkspaceRequest::CompleteArtifactPublish(CompleteArtifactPublishRequest {
+                            token,
+                            artifact: finish.artifact.clone(),
+                        }),
+                    ),
+                )
             }
             WorkspaceRequest::CompleteArtifactPublish(complete) => {
                 require_token(state, complete.token)?;
@@ -3417,6 +3576,38 @@ mod tests {
             .map_err(|_| TransportError::new("test cursor exceeds usize", false))
     }
 
+    /// Requests that admitted a publication, stepwise or fused.
+    fn admissions(state: &ScriptedArtifactState) -> usize {
+        state
+            .attempts
+            .iter()
+            .filter(|(label, _)| matches!(*label, "begin" | "prepare"))
+            .count()
+    }
+
+    fn publication_step(
+        request: &WorkspaceRpcRequest,
+        operation: WorkspaceRequest,
+    ) -> WorkspaceRpcRequest {
+        WorkspaceRpcRequest {
+            route: request.route,
+            request_id: request.request_id,
+            operation,
+        }
+    }
+
+    fn running_token(result: WorkspaceResult) -> Result<OperationToken, TransportError> {
+        match result {
+            WorkspaceResult::Operation(status) if status.state == OperationState::Running => {
+                Ok(status.token)
+            }
+            _ => Err(TransportError::new(
+                "intermediate publication step did not stay running",
+                false,
+            )),
+        }
+    }
+
     fn require_token(
         state: &ScriptedArtifactState,
         token: OperationToken,
@@ -3439,6 +3630,8 @@ mod tests {
             WorkspaceRequest::MarkArtifactObjectsUploaded(_) => "mark_uploaded",
             WorkspaceRequest::StageArtifactManifest(_) => "stage_manifest",
             WorkspaceRequest::CompleteArtifactPublish(_) => "complete",
+            WorkspaceRequest::PrepareArtifactPublish(_) => "prepare",
+            WorkspaceRequest::FinishArtifactPublish(_) => "finish",
             WorkspaceRequest::AbortArtifactPublish(_) => "abort",
             WorkspaceRequest::GetOperation(_) => "get_operation",
             WorkspaceRequest::GetPath(_) => "get_path",
@@ -3861,13 +4054,9 @@ mod tests {
             "delta manifest positions must be rebased without rebasing physical object indexes",
         );
         assert_eq!(
-            state
-                .attempts
-                .iter()
-                .filter(|(label, _)| *label == "begin")
-                .count(),
+            admissions(&state),
             3,
-            "base publish plus one rejected and one successful append begin"
+            "base publish plus one rejected and one successful append admission"
         );
         drop(state);
 
@@ -4062,27 +4251,14 @@ mod tests {
             .publish_artifact(&store, publish_options(4), b"abcdefgh")
             .unwrap();
         let creates = store.creates.load(Ordering::SeqCst);
-        let begins = inspector
-            .state()
-            .attempts
-            .iter()
-            .filter(|(label, _)| *label == "begin")
-            .count();
+        let begins = admissions(&inspector.state());
 
         let error = client
             .append_artifact(&store, append_options(2).with_max_logical_size(8), b"!")
             .unwrap_err();
         assert!(matches!(error, ClientError::InvalidOptions(_)));
         assert_eq!(store.creates.load(Ordering::SeqCst), creates);
-        assert_eq!(
-            inspector
-                .state()
-                .attempts
-                .iter()
-                .filter(|(label, _)| *label == "begin")
-                .count(),
-            begins
-        );
+        assert_eq!(admissions(&inspector.state()), begins);
     }
 
     #[test]
@@ -4116,6 +4292,68 @@ mod tests {
             .into_iter()
             .all(|index| index < first_create));
         assert_eq!(events[0], "begin");
+    }
+
+    #[test]
+    fn one_batch_plan_publishes_with_one_request_before_and_one_after_upload() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let client = client(transport);
+        let store = RecordingStore::new(Arc::clone(&events), None);
+
+        client
+            .publish_artifact(&store, publish_options(4), b"abcdefghijkl")
+            .unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events.as_slice(),
+            [
+                "prepare",
+                "object_create",
+                "object_create",
+                "object_create",
+                "finish"
+            ],
+            "the plan is durable before the first provider write and complete after the last"
+        );
+    }
+
+    #[test]
+    fn finish_after_concurrent_progress_resumes_with_only_the_remaining_steps() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        inspector.advance_finish_before_response_once();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+
+        let outcome = client
+            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .unwrap();
+
+        assert_eq!(outcome.publication.value.logical_size, 8);
+        assert_eq!(store.creates.load(Ordering::SeqCst), 2);
+        let state = inspector.state();
+        assert_eq!(state.abort_applies, 0, "a stale token proves progress");
+        assert_eq!(admissions(&state), 2);
+        assert_eq!(state.stage_applies, 1);
+        let [first, resumed] = state.finish_requests.as_slice() else {
+            panic!("expected two finish requests: {:?}", state.finish_requests);
+        };
+        assert_eq!(
+            (first.uploaded_objects.len(), first.manifest_rows.len()),
+            (2, 2)
+        );
+        assert!(
+            resumed.uploaded_objects.is_empty() && resumed.manifest_rows.is_empty(),
+            "the resumed finish carries only the completion"
+        );
+        assert_eq!(
+            state.manifest_rows.len(),
+            2,
+            "no manifest row is applied twice"
+        );
     }
 
     #[test]
@@ -4186,31 +4424,43 @@ mod tests {
             .and_then(|path| path.metadata.as_ref())
             .expect("publication exposes the visible path metadata");
         assert_eq!(metadata.descriptor.index_fields, index_fields);
-        assert!(state.attempts.iter().any(|(label, _)| *label == "complete"));
+        assert!(state.attempts.iter().any(|(label, _)| *label == "finish"));
     }
 
     #[test]
     fn response_loss_replays_the_exact_stage_request_without_duplicate_apply() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), true);
-        let inspector = transport.clone();
-        let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        // A one-batch plan stages inside Prepare; a larger plan stages in
+        // stepwise batches after Begin.
+        for (block_size, bytes, staging_label, stage_applies) in [
+            (4, b"abcdefgh".to_vec(), "prepare", 1),
+            (
+                1,
+                vec![0x5a; MAX_ARTIFACT_PUBLISH_BATCH_ROWS + 1],
+                "stage_objects",
+                2,
+            ),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let transport = ScriptedArtifactTransport::new(Arc::clone(&events), true);
+            let inspector = transport.clone();
+            let client = client(transport);
+            let store = RecordingStore::new(events, None);
 
-        client
-            .publish_artifact(&store, publish_options(4), b"abcdefgh")
-            .unwrap();
+            client
+                .publish_artifact(&store, publish_options(block_size), &bytes)
+                .unwrap();
 
-        let state = inspector.state();
-        let stage_attempts = state
-            .attempts
-            .iter()
-            .filter(|(label, _)| *label == "stage_objects")
-            .map(|(_, request_id)| *request_id)
-            .collect::<Vec<_>>();
-        assert_eq!(stage_attempts.len(), 2);
-        assert_eq!(stage_attempts[0], stage_attempts[1]);
-        assert_eq!(state.stage_applies, 1);
+            let state = inspector.state();
+            let attempts = state
+                .attempts
+                .iter()
+                .filter(|(label, _)| *label == staging_label)
+                .map(|(_, request_id)| *request_id)
+                .collect::<Vec<_>>();
+            assert_eq!(attempts.len(), stage_applies + 1, "{staging_label}");
+            assert_eq!(attempts[0], attempts[1], "{staging_label}");
+            assert_eq!(state.stage_applies, stage_applies, "{staging_label}");
+        }
     }
 
     #[test]
@@ -4222,11 +4472,13 @@ mod tests {
         let client = client(transport);
         let store = RecordingStore::new(events, None);
 
+        // Only a multi-batch plan stages outside Prepare's single session.
+        let bytes = vec![0x5a; MAX_ARTIFACT_PUBLISH_BATCH_ROWS + 1];
         let outcome = client
-            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .publish_artifact(&store, publish_options(1), &bytes)
             .unwrap();
 
-        assert_eq!(outcome.publication.value.logical_size, 8);
+        assert_eq!(outcome.publication.value.logical_size, bytes.len() as u64);
         let state = inspector.state();
         assert_eq!(
             state
@@ -4302,7 +4554,7 @@ mod tests {
             state
                 .attempts
                 .iter()
-                .filter(|(label, _)| *label == "complete")
+                .filter(|(label, _)| *label == "finish")
                 .count(),
             ClientOptions::default().max_attempts as usize
         );
@@ -4391,7 +4643,7 @@ mod tests {
         else {
             panic!("expected a publish failure, got {error:?}");
         };
-        assert_eq!(stage, ArtifactPublishStage::Begin);
+        assert_eq!(stage, ArtifactPublishStage::Prepare);
         assert!(
             abort_failure.is_none(),
             "a terminal row must not be aborted"

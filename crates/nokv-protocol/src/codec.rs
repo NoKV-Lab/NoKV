@@ -10,7 +10,7 @@ use crate::request::WorkspaceRpcRequest;
 use crate::response::WorkspaceRpcResponse;
 
 /// The exact and only accepted wire schema.
-pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v12";
+pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v13";
 /// Exact schema for the versioned workspace RPC preflight exchange.
 pub const WORKSPACE_PREFLIGHT_SCHEMA: &str = "nokv.workspace.rpc_preflight.v1";
 /// Exact schema for the advertised workspace RPC capability set.
@@ -272,8 +272,100 @@ mod tests {
     }
 
     #[test]
+    fn fused_publication_requests_have_one_exact_v13_encoding() {
+        let digest = crate::sha256_digest_uri(Digest([5; 32]));
+        let object = || crate::ObjectIdentity::new("objects/0").unwrap();
+        let prepare = WorkspaceRpcRequest {
+            route: route(),
+            request_id: RequestIdentity([0x51; 16]),
+            operation: WorkspaceRequest::PrepareArtifactPublish(
+                crate::PrepareArtifactPublishRequest {
+                    begin: crate::BeginArtifactPublishRequest {
+                        append_attempt: None,
+                        append_intent_digest: None,
+                        operation_id: OperationIdentity([1; 16]),
+                        artifact_revision_id: crate::ArtifactRevisionIdentity([2; 16]),
+                        target: crate::WorkspacePath {
+                            workbench: WorkbenchName::new("run-42").unwrap(),
+                            path: crate::RelativePath::new("outputs/result.bin").unwrap(),
+                        },
+                        authority: crate::PublicationAuthority::Visible,
+                        condition: crate::PublishCondition::CreateOnly,
+                        expected_workspace_incarnation_id: None,
+                        staged_object_count: 1,
+                        staged_object_seal: Digest([3; 32]),
+                        manifest_row_count: 1,
+                        manifest_seal: Digest([4; 32]),
+                        dependency_owner_revision_ids: Vec::new(),
+                    },
+                    objects: vec![crate::StagedObject {
+                        sequence: 0,
+                        object_identity: object(),
+                        expected_length: 1,
+                        expected_digest: digest.clone(),
+                        multipart_token: None,
+                    }],
+                },
+            ),
+        };
+        let finish = WorkspaceRpcRequest {
+            route: route(),
+            request_id: RequestIdentity([0x52; 16]),
+            operation: WorkspaceRequest::FinishArtifactPublish(
+                crate::FinishArtifactPublishRequest {
+                    token: crate::OperationToken {
+                        operation_id: OperationIdentity([1; 16]),
+                        state_digest: Digest([6; 32]),
+                    },
+                    uploaded_objects: vec![crate::ObjectUploadProof {
+                        sequence: 0,
+                        observed_length: 1,
+                        observed_digest: digest.clone(),
+                    }],
+                    manifest_rows: vec![crate::ArtifactManifestRow {
+                        object_index: 0,
+                        physical_object_index: 0,
+                        logical_offset: 0,
+                        physical_owner_revision_id: crate::ArtifactRevisionIdentity([2; 16]),
+                        object_identity: object(),
+                        object_offset: 0,
+                        length: 1,
+                        digest: digest.clone(),
+                        append_segment: None,
+                    }],
+                    dependency_owner_revision_ids: Vec::new(),
+                    artifact: crate::ArtifactDescriptor {
+                        logical_size: 1,
+                        body_digest: digest,
+                        manifest_digest: crate::sha256_digest_uri(Digest([4; 32])),
+                        content_type: crate::ContentType::new("application/octet-stream").unwrap(),
+                        producer: None,
+                        manifest_identity: None,
+                        index_fields: Vec::new(),
+                    },
+                },
+            ),
+        };
+        let mut golden = Sha256::new();
+        for request in [&prepare, &finish] {
+            let encoded = encode_request(request).unwrap();
+            assert_eq!(&decode_request(&encoded).unwrap(), request);
+            golden.update((encoded.len() as u64).to_be_bytes());
+            golden.update(encoded);
+        }
+        assert_eq!(
+            <[u8; 32]>::from(golden.finalize()),
+            [
+                21, 168, 58, 26, 88, 181, 204, 198, 161, 118, 177, 107, 183, 163, 178, 209, 194,
+                212, 69, 2, 197, 217, 32, 222, 13, 125, 251, 74, 190, 25, 116, 240
+            ],
+            "update only for an intentional fused publication v13 wire change"
+        );
+    }
+
+    #[test]
     fn request_round_trips_with_exact_schema() {
-        assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v12");
+        assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v13");
         let expected = request();
         let encoded = encode_request(&expected).unwrap();
         assert!(encoded
@@ -283,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn get_path_read_version_fence_has_one_exact_v12_encoding() {
+    fn get_path_read_version_fence_has_one_exact_v13_encoding() {
         let expected = WorkspaceRpcRequest {
             route: route(),
             request_id: RequestIdentity([0x41; 16]),
@@ -305,15 +397,15 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(&encoded)),
             [
-                179, 220, 36, 137, 57, 170, 16, 113, 127, 121, 12, 54, 66, 112, 180, 80, 1, 16, 34,
-                48, 206, 193, 195, 10, 114, 163, 6, 16, 114, 126, 230, 28
+                206, 198, 234, 40, 148, 160, 53, 147, 155, 97, 249, 202, 224, 60, 103, 126, 29,
+                253, 83, 137, 41, 53, 202, 129, 196, 194, 75, 46, 24, 111, 247, 152
             ],
-            "update only for an intentional GetPath v12 wire change"
+            "update only for an intentional GetPath v13 wire change"
         );
     }
 
     #[test]
-    fn artifact_v1_query_and_catalog_keep_one_exact_v12_encoding() {
+    fn artifact_v1_query_and_catalog_keep_one_exact_v13_encoding() {
         let search = WorkspaceRpcRequest {
             route: route(),
             request_id: RequestIdentity([0x3a; 16]),
@@ -431,10 +523,10 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(golden.finalize()),
             [
-                48, 253, 178, 231, 50, 193, 139, 175, 49, 139, 216, 226, 90, 13, 27, 136, 102, 252,
-                27, 175, 160, 165, 77, 14, 209, 86, 251, 151, 56, 101, 21, 136
+                43, 149, 45, 161, 70, 136, 119, 20, 242, 125, 2, 20, 201, 196, 208, 101, 64, 66,
+                97, 200, 158, 74, 93, 168, 78, 222, 80, 7, 209, 250, 212, 60
             ],
-            "update only for an intentional ArtifactV1 v12 wire change"
+            "update only for an intentional ArtifactV1 v13 wire change"
         );
         assert_eq!(decode_request(&encoded_search).unwrap(), search);
         assert_eq!(
@@ -448,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_exact_catalog_path_match_has_one_exact_v12_encoding() {
+    fn generic_exact_catalog_path_match_has_one_exact_v13_encoding() {
         let expected = WorkspaceRpcRequest {
             route: route(),
             request_id: RequestIdentity([0x42; 16]),
@@ -475,15 +567,15 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(&encoded)),
             [
-                202, 3, 155, 179, 204, 51, 168, 138, 4, 124, 170, 103, 61, 71, 150, 159, 227, 65,
-                149, 73, 201, 142, 66, 149, 59, 115, 150, 253, 238, 154, 39, 33
+                35, 253, 129, 3, 51, 57, 224, 116, 140, 28, 72, 144, 87, 227, 132, 65, 105, 114,
+                137, 22, 87, 61, 180, 136, 230, 103, 250, 8, 172, 230, 132, 85
             ],
-            "update only for an intentional Catalog Exact v12 wire change"
+            "update only for an intentional Catalog Exact v13 wire change"
         );
     }
 
     #[test]
-    fn generic_registration_surface_has_one_exact_v12_encoding() {
+    fn generic_registration_surface_has_one_exact_v13_encoding() {
         let begin = generic_begin_request();
         let append = generic_append_request();
         let finalize = WorkspaceRpcRequest {
@@ -593,10 +685,10 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(golden.finalize()),
             [
-                76, 148, 117, 180, 52, 151, 228, 127, 234, 140, 75, 192, 248, 29, 46, 94, 196, 4,
-                57, 122, 242, 12, 110, 16, 48, 93, 115, 120, 236, 102, 84, 128
+                59, 42, 114, 247, 14, 121, 35, 49, 9, 67, 116, 84, 24, 250, 120, 225, 154, 8, 158,
+                42, 217, 164, 254, 99, 59, 63, 174, 204, 241, 104, 56, 102
             ],
-            "update only for an intentional Generic registration v12 wire change"
+            "update only for an intentional Generic registration v13 wire change"
         );
         for request in [&begin, &append, &finalize, &abort, &get] {
             assert_eq!(
@@ -1003,8 +1095,8 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(&encoded_prepare)),
             [
-                19, 184, 126, 255, 221, 167, 62, 204, 167, 139, 10, 50, 60, 97, 62, 227, 184, 120,
-                216, 104, 208, 37, 254, 45, 160, 157, 145, 121, 149, 84, 66, 80
+                118, 99, 253, 243, 1, 255, 91, 11, 41, 31, 70, 155, 220, 51, 4, 28, 41, 92, 156,
+                134, 196, 106, 216, 249, 219, 35, 105, 11, 178, 252, 151, 162
             ],
             "update only for an intentional restore-v12 wire change"
         );
@@ -1132,8 +1224,8 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(complete_v12_golden.finalize()),
             [
-                67, 211, 249, 84, 52, 53, 130, 176, 253, 198, 101, 67, 121, 119, 167, 220, 59, 152,
-                156, 165, 126, 213, 114, 37, 229, 198, 254, 20, 94, 148, 15, 3
+                233, 4, 11, 205, 161, 254, 80, 3, 175, 167, 210, 230, 161, 82, 133, 203, 160, 220,
+                79, 212, 165, 220, 86, 26, 112, 160, 78, 247, 55, 124, 128, 206
             ],
             "update only for an intentional restore-v12 wire change"
         );
@@ -1254,7 +1346,7 @@ mod tests {
 
     #[test]
     fn schema_mismatch_fails_closed() {
-        for previous in ["nokv.workspace.rpc.v8", "nokv.workspace.rpc.v11"] {
+        for previous in ["nokv.workspace.rpc.v8", "nokv.workspace.rpc.v12"] {
             let encoded = rmp_serde::to_vec_named(&Frame {
                 schema: previous.to_owned(),
                 payload: request(),
@@ -1264,7 +1356,7 @@ mod tests {
                 decode_request(&encoded),
                 Err(ProtocolError::SchemaMismatch {
                     actual: previous.to_owned(),
-                    expected: "nokv.workspace.rpc.v12",
+                    expected: "nokv.workspace.rpc.v13",
                 })
             );
         }
@@ -1318,7 +1410,7 @@ mod tests {
             decode_request(&actual_v4),
             Err(ProtocolError::SchemaMismatch {
                 actual: "nokv.workspace.rpc.v4".to_owned(),
-                expected: "nokv.workspace.rpc.v12",
+                expected: "nokv.workspace.rpc.v13",
             })
         );
 
@@ -1346,7 +1438,7 @@ mod tests {
             decode_response(&encoded),
             Err(ProtocolError::SchemaMismatch {
                 actual: "nokv.workspace.rpc.v4".to_owned(),
-                expected: "nokv.workspace.rpc.v12",
+                expected: "nokv.workspace.rpc.v13",
             })
         );
     }
@@ -1460,8 +1552,8 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(encode_request(&expected).unwrap())),
             [
-                136, 147, 125, 201, 247, 93, 58, 26, 17, 129, 123, 181, 179, 183, 26, 230, 10, 178,
-                187, 91, 218, 24, 107, 190, 100, 8, 47, 131, 64, 28, 68, 16
+                97, 28, 148, 253, 129, 177, 104, 195, 86, 69, 126, 47, 216, 205, 187, 92, 179, 118,
+                113, 19, 231, 38, 44, 1, 44, 228, 74, 102, 213, 233, 245, 128
             ],
             "update only for an intentional capability-v2 wire change"
         );

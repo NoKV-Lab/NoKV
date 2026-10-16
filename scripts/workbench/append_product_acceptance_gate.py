@@ -43,15 +43,15 @@ def require(condition, message, evidence=None):
 
 
 class PublicationProxy(base.EvidenceDropProxy):
-    """Metadata proxy with an exact pre-Begin rendezvous and observed ACK loss."""
+    """Metadata proxy with an exact pre-admission rendezvous and observed ACK loss."""
 
     def __init__(self, port, timeout, stack):
         super().__init__(port, timeout, stack)
         self.rendezvous = None
-        self.rendezvous_operation = "begin_artifact_publish"
+        self.rendezvous_operation = "prepare_artifact_publish"
         self.rendezvous_entries = []
 
-    def begin_rendezvous(self, count, *, operation_name="begin_artifact_publish"):
+    def begin_rendezvous(self, count, *, operation_name="prepare_artifact_publish"):
         require(self.rendezvous is None, "only one admission rendezvous")
         self.rendezvous = threading.Barrier(count)
         self.rendezvous_operation = operation_name
@@ -2733,11 +2733,11 @@ def recover_same_identity(
 
 
 def owner_begin_completion(stack, deadline):
-    """Committed Begin, lost response, real owner SIGKILL, same-ID completion."""
+    """Committed Prepare, lost response, real owner SIGKILL, same-ID completion."""
     workbench = "product-owner-begin-completion"
     operation_id, text = "b1" * 16, "one-recoverable-event\n"
     stack.cli("workbench_create", {"id": workbench})
-    stack.proxy.arm("begin_artifact_publish", lambda: stack.owner.kill())
+    stack.proxy.arm("prepare_artifact_publish", lambda: stack.owner.kill())
     first = base.native_append(
         stack,
         workbench,
@@ -2802,12 +2802,11 @@ def main():
                     stack, args.completion_timeout_seconds, operation
                 )
             )
+            # A one-batch append has two durable publication boundaries:
+            # Prepare (admission and staged objects) and Finish.
             for operation in (
-                "begin_artifact_publish",
-                "stage_artifact_objects",
-                "mark_artifact_objects_uploaded",
-                "stage_artifact_manifest",
-                "complete_artifact_publish",
+                "prepare_artifact_publish",
+                "finish_artifact_publish",
             )
         },
         "deterministic_same_identity": lambda stack, args: deterministic_same_identity(

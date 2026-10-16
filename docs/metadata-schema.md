@@ -328,7 +328,7 @@ WorkspaceIncarnationClaim
   key: root_id | workspace_incarnation_id
   val: stable workbench_id
 
-Publish fence: `BeginArtifactPublish` may carry `expected_workspace_incarnation_id`.
+Publish fence: `BeginArtifactPublish`, alone or inside `PrepareArtifactPublish`, may carry `expected_workspace_incarnation_id`.
 The owner compares it with the `WorkspaceCurrent` incarnation on the same read
 version as the path-generation claim and refuses the publish with
 `ConflictKind::WorkspaceIncarnation` before writing the operation row, the
