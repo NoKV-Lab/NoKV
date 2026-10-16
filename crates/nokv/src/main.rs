@@ -306,7 +306,7 @@ fn build_backend_after_agent_admission(
             objects
                 .validate_append_capabilities()
                 .map_err(append_provider_admission_error)?;
-        } else {
+        } else if invocation.command.creates_objects() {
             objects.validate_agent_capabilities()?;
         }
         Ok(CliWorkbenchBackend::new(
