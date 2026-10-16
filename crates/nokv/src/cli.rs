@@ -119,6 +119,8 @@ pub enum Command {
         tool: String,
         arguments: String,
     },
+    /// Sequential Workbench calls, one JSON line each, over one client.
+    WorkbenchSession,
     Mcp {
         profile: McpProfile,
     },
@@ -571,7 +573,10 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     }
     if matches!(
         &command,
-        Command::Workbench { .. } | Command::Mcp { .. } | Command::Collect { .. }
+        Command::Workbench { .. }
+            | Command::WorkbenchSession
+            | Command::Mcp { .. }
+            | Command::Collect { .. }
     ) && workbench_root.is_none()
     {
         return Err(CliError::MissingOption("--workbench-root"));
@@ -579,6 +584,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     if matches!(
         &command,
         Command::Workbench { .. }
+            | Command::WorkbenchSession
             | Command::Mcp { .. }
             | Command::Materialize { .. }
             | Command::Collect { .. }
@@ -642,6 +648,7 @@ fn parse_command(
                 .ok_or(CliError::MissingArgument("Workbench tool name"))?,
             arguments: arguments.next().unwrap_or_else(|| "{}".to_owned()),
         }),
+        "workbench-session" => Ok(Command::WorkbenchSession),
         "mcp" => parse_mcp(arguments),
         "materialize" => Ok(Command::Materialize {
             workbench: arguments
@@ -1085,6 +1092,31 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn workbench_session_requires_the_same_identity_and_presentation_root() {
+        assert_eq!(
+            parse(args(&["workbench-session"])),
+            Err(CliError::MissingOption("--workbench-root"))
+        );
+        assert_eq!(
+            parse(args(&[
+                "--workbench-root",
+                "/agents/test/wb",
+                "workbench-session"
+            ])),
+            Err(CliError::MissingOption("--agent-id"))
+        );
+        let parsed = parse(args(&[
+            "--workbench-root",
+            "/agents/test/wb",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "workbench-session",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.command, Command::WorkbenchSession);
     }
 
     #[test]

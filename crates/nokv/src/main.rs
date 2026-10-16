@@ -13,6 +13,7 @@ mod object_store;
 mod provision;
 mod transfer;
 mod workbench_mcp;
+mod workbench_session;
 
 use std::io::{self, BufReader};
 use std::path::Path;
@@ -103,6 +104,19 @@ fn run() -> Result<(), String> {
                 .map_err(|error| format!("Workbench arguments are not valid JSON: {error}"))?;
             let result = execute_tool(&handler, tool, &arguments).map_err(agent_error)?;
             print_json(&result)
+        }
+        Command::WorkbenchSession => {
+            let backend = build_backend(&invocation)?;
+            let handler = handler_for_backend(&invocation, backend.clone())?;
+            let input = io::stdin();
+            let output = io::stdout();
+            workbench_session::serve(
+                &handler,
+                &SessionMaterializer { backend },
+                input.lock(),
+                output.lock(),
+            )
+            .map_err(|error| format!("Workbench session transport failed: {error}"))
         }
         Command::Mcp { profile } => {
             let input = io::stdin();
@@ -309,12 +323,19 @@ fn build_backend_after_agent_admission(
 }
 
 fn build_handler(invocation: &Invocation) -> Result<CliHandler, String> {
+    handler_for_backend(invocation, build_backend(invocation)?)
+}
+
+fn handler_for_backend(
+    invocation: &Invocation,
+    backend: CliWorkbenchBackend,
+) -> Result<CliHandler, String> {
     let workbench_root = invocation
         .workbench_root
         .as_deref()
         .ok_or_else(|| "--workbench-root is required for Agent-facing commands".to_owned())?;
     SdkWorkbenchToolHandler::with_limits(
-        build_backend(invocation)?,
+        backend,
         invocation.client.max_artifact_bytes,
         usize::try_from(invocation.client.max_attempts)
             .map_err(|_| "--max-attempts does not fit this platform".to_owned())?,
@@ -829,6 +850,54 @@ fn remove_path_json(
     }))
 }
 
+/// Session form of `materialize`: the whole live artifact inline.
+struct SessionMaterializer {
+    backend: CliWorkbenchBackend,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaterializeArguments {
+    id: String,
+    section: String,
+    path: String,
+}
+
+impl workbench_session::SessionCommands for SessionMaterializer {
+    fn materialize(&self, arguments: &Value) -> Result<Value, nokv_agent::AgentError> {
+        let arguments: MaterializeArguments =
+            serde_json::from_value(arguments.clone()).map_err(|error| {
+                nokv_agent::AgentError::invalid_arguments(format!("materialize: {error}"))
+            })?;
+        let scoped = scoped_artifact(&arguments.id, &arguments.section, &arguments.path)
+            .map_err(nokv_agent::AgentError::invalid_arguments)?;
+        let artifact = self
+            .backend
+            .read(ReadRequest {
+                path: scoped,
+                view: ReadView::Live,
+            })
+            .map_err(|error| {
+                nokv_agent::AgentError::backend("ReadFailed", error.to_string(), false, json!({}))
+            })?
+            .ok_or_else(|| {
+                nokv_agent::AgentError::backend(
+                    "NotFound",
+                    format!("{}/{} does not exist", arguments.section, arguments.path),
+                    false,
+                    json!({}),
+                )
+            })?;
+        Ok(json!({
+            "status": "success",
+            "size_bytes": artifact.bytes.len(),
+            "generation": artifact.metadata.generation,
+            "digest_uri": artifact.metadata.digest_uri,
+            "base64": STANDARD.encode(&artifact.bytes),
+        }))
+    }
+}
+
 fn materialize(
     backend: &CliWorkbenchBackend,
     workbench: &str,
@@ -962,6 +1031,7 @@ NoKV Agent-workspace CLI
 
 USAGE:
   nokv [connection/object options] workbench <tool> '<json arguments>'
+  nokv [connection/object options] workbench-session < requests.jsonl
   nokv [connection/object options] mcp [--profile workbench|agent]   (DEPRECATED)
   nokv [connection/object options] materialize <workbench> <section> <path> <destination>
   nokv [connection/object options] collect <workbench> <section> <source> <path> [--replace] [--expected-generation N] [--content-type TYPE]
