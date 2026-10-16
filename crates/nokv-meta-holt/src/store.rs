@@ -6,16 +6,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[cfg(test)]
 use std::sync::Mutex;
 
-use holt::{DBView, RangeEntry, RecordVersion, DB};
+use holt::{AtomicSubmission, PendingDurability, RangeEntry, RecordVersion, DB};
 use nokv_meta_store::{
-    AckBoundary, Authority, Check, Commit, Keyspace, Mutation, ReadBatch, ReadOp, ReadResult,
-    ReadSnapshot, Scan, ScanItem, ScanPage, StoreCheckpointEnvelope, StoreError, StoreLimits,
-    StoreProfile, TxnStore, UnknownCommit, WriteTxn,
+    AckBoundary, Authority, Check, CheckpointCatalogCommitment, Commit, Keyspace, Mutation,
+    PendingCommit, ReadBatch, ReadOp, ReadResult, ReadSnapshot, Scan, ScanItem, ScanPage,
+    StoreCheckpointEnvelope, StoreError, StoreLimits, StoreProfile, Submission, TxnStore,
+    UnknownCommit, WriteTxn,
 };
 
 #[cfg(any(test, feature = "test-support"))]
@@ -27,8 +28,11 @@ static STORE_INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// Embedded Holt transaction store for one local metadata authority.
 pub struct HoltStore {
     profile: StoreProfile,
-    // Writers and poison transitions are exclusive. Healthy reads share the state.
-    state: RwLock<State>,
+    // Applying a write and poison transitions are exclusive. Healthy reads
+    // share the state and materialize their results before releasing it, so a
+    // read batch observes one consistent set of applied writes. WAL
+    // acknowledgement waits run after the exclusive section ends.
+    state: Arc<RwLock<State>>,
     #[cfg(feature = "read-stats")]
     pub(crate) read_stats: crate::stats::ReadStatsState,
     #[cfg(test)]
@@ -38,6 +42,9 @@ pub struct HoltStore {
 struct State {
     db: DB,
     trees: BTreeMap<Keyspace, String>,
+    // Live handles for `trees`; the catalog is fixed for the instance lifetime.
+    tree_handles: BTreeMap<Keyspace, holt::Tree>,
+    catalog_commitment: CheckpointCatalogCommitment,
     poisoned: Option<String>,
     location: Option<PathBuf>,
     expected_recovery_staging_identity: Option<HoltRecoveryStagingIdentity>,
@@ -118,13 +125,7 @@ impl HoltStore {
             Some(expected),
             expected_catalog,
         )?;
-        Ok(Self::from_parts(
-            profile,
-            db,
-            trees,
-            location,
-            Some(expected.clone()),
-        ))
+        Self::from_parts(profile, db, trees, location, Some(expected.clone()))
     }
 
     /// Adopt recovery staging only after the caller durably finalizes control state.
@@ -162,7 +163,7 @@ impl HoltStore {
             location.as_deref().expect("file-backed adoption location"),
             &expected,
         )?;
-        Ok(Self::from_parts(profile, db, trees, location, None))
+        Self::from_parts(profile, db, trees, location, None)
     }
 
     fn open_inner(
@@ -180,7 +181,7 @@ impl HoltStore {
         };
         let db = DB::open(options.config).map_err(map_open_error)?;
         prepare_trees(&db, &trees, action)?;
-        Ok(Self::from_parts(profile, db, trees, location, None))
+        Self::from_parts(profile, db, trees, location, None)
     }
 
     fn from_parts(
@@ -189,17 +190,28 @@ impl HoltStore {
         trees: BTreeMap<Keyspace, String>,
         location: Option<PathBuf>,
         expected_recovery_staging_identity: Option<HoltRecoveryStagingIdentity>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, StoreError> {
+        let tree_handles = trees
+            .iter()
+            .map(|(keyspace, name)| {
+                db.open_tree(name)
+                    .map(|tree| (*keyspace, tree))
+                    .map_err(map_holt_error)
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let catalog_commitment = crate::checkpoint::catalog_commitment(&trees);
+        Ok(Self {
             profile,
-            state: RwLock::new(State {
+            state: Arc::new(RwLock::new(State {
                 db,
                 trees,
+                tree_handles,
+                catalog_commitment,
                 poisoned: None,
                 location,
                 expected_recovery_staging_identity,
                 instance_id: STORE_INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-            }),
+            })),
             #[cfg(feature = "read-stats")]
             read_stats: crate::stats::ReadStatsState::default(),
             #[cfg(test)]
@@ -212,7 +224,7 @@ impl HoltStore {
                 commit_entered: Mutex::new(None),
                 pause_export_after_clone: Mutex::new(None),
             },
-        }
+        })
     }
 
     pub(crate) fn from_installed_checkpoint(
@@ -222,7 +234,7 @@ impl HoltStore {
         expected_recovery_staging_identity: HoltRecoveryStagingIdentity,
     ) -> Result<Self, StoreError> {
         let location = options.file_path()?.map(std::path::Path::to_path_buf);
-        Ok(Self::from_parts(
+        Self::from_parts(
             StoreProfile {
                 limits: options.limits,
                 ack: AckBoundary::LocalSync,
@@ -232,7 +244,7 @@ impl HoltStore {
             trees,
             location,
             Some(expected_recovery_staging_identity),
-        ))
+        )
     }
 
     /// Open an in-memory store for tests.
@@ -249,7 +261,7 @@ impl HoltStore {
     }
 
     /// Force one checkpoint round for adapter-backed storage tests.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn checkpoint_for_test(&self) -> Result<(), StoreError> {
         let state = self.read_state()?;
         ensure_ready(&state)?;
@@ -270,8 +282,8 @@ impl HoltStore {
                 keyspace.get()
             ))
         })?;
-        let tree = state.db.open_tree(name).map_err(map_holt_error)?;
-        tree.stats().map_err(map_holt_error)
+        let _ = name;
+        live_tree(&state, keyspace)?.stats().map_err(map_holt_error)
     }
 
     fn read_state(&self) -> Result<RwLockReadGuard<'_, State>, StoreError> {
@@ -307,6 +319,12 @@ impl HoltStore {
         let state = self.read_state()?;
         ensure_ready(&state)?;
         Ok(crate::stats::storage_snapshot(&state.db.stats()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wal_syncs_for_test(&self) -> u64 {
+        let state = self.read_state().expect("read HoltStore state");
+        state.db.stats().journal.map_or(0, |journal| journal.syncs)
     }
 
     #[cfg(test)]
@@ -449,6 +467,21 @@ impl HoltStore {
         }
     }
 
+    /// Wrap a Holt durability wait. A failed wait leaves applied state whose
+    /// durability is unknown, so it poisons this instance before returning.
+    fn pending_commit(&self, pending: PendingDurability) -> PendingCommit {
+        let state = Arc::clone(&self.state);
+        PendingCommit::new(move || match pending.wait() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let mut state = state.write().map_err(|_| {
+                    StoreError::Unavailable("HoltStore state lock is poisoned".to_owned())
+                })?;
+                Err(poison(&mut state, error.to_string()))
+            }
+        })
+    }
+
     pub(crate) fn export_whole_store_checkpoint(
         &self,
     ) -> Result<StoreCheckpointEnvelope, nokv_meta_store::CheckpointError> {
@@ -457,7 +490,7 @@ impl HoltStore {
         let db = state.db.clone();
         let trees = state.trees.clone();
         let instance_id = state.instance_id;
-        let catalog_commitment = crate::checkpoint::catalog_commitment(&trees);
+        let catalog_commitment = state.catalog_commitment;
         drop(state);
 
         #[cfg(test)]
@@ -478,9 +511,7 @@ impl HoltStore {
 
         let state = self.read_state().map_err(checkpoint_store_error)?;
         ensure_ready(&state).map_err(checkpoint_store_error)?;
-        if state.instance_id != instance_id
-            || crate::checkpoint::catalog_commitment(&state.trees) != catalog_commitment
-        {
+        if state.instance_id != instance_id || state.catalog_commitment != catalog_commitment {
             return Err(nokv_meta_store::CheckpointError::Corrupt(
                 "HoltStore identity or catalog changed during checkpoint export".to_owned(),
             ));
@@ -510,29 +541,25 @@ impl TxnStore for HoltStore {
         self.pause_read_after_lock();
         validate_keyspaces(&state, batch_keyspaces(&batch))?;
 
-        let owned_scopes = read_scopes(&state, &batch)?;
-        let scopes = owned_scopes
-            .iter()
-            .map(|(name, prefix)| (name.as_str(), prefix.as_slice()))
-            .collect::<Vec<_>>();
-        let read_stats_key = self.read_stats_key();
-        let snapshot = state
-            .db
-            .view(&scopes, |view| {
-                Ok::<_, holt::Error>(build_snapshot(
-                    view,
-                    &state.trees,
-                    &batch,
-                    &self.profile.limits,
-                    read_stats_key,
-                ))
-            })
-            .map_err(map_holt_error)??;
+        // The shared guard excludes every logical writer and poison transition
+        // until all results are materialized, so live tree reads form one
+        // consistent snapshot without a separate Holt view capture.
+        let snapshot = build_snapshot(&state, &batch, &self.profile.limits, self.read_stats_key())?;
         snapshot.validate(&batch, &self.profile.limits)?;
         Ok(snapshot)
     }
 
     fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+        match self.submit(txn)? {
+            Submission::Applied(pending) => {
+                pending.acknowledge()?;
+                Ok(Commit::Applied)
+            }
+            Submission::Conflict => Ok(Commit::Conflict),
+        }
+    }
+
+    fn submit(&self, txn: WriteTxn) -> Result<Submission, StoreError> {
         txn.validate(&self.profile.limits)?;
         #[cfg(test)]
         self.signal_commit_entry();
@@ -541,7 +568,7 @@ impl TxnStore for HoltStore {
         validate_keyspaces(&state, txn_keyspaces(&txn))?;
 
         let Some(value_versions) = read_value_versions(&state, &txn)? else {
-            return Ok(Commit::Conflict);
+            return Ok(Submission::Conflict);
         };
 
         #[cfg(test)]
@@ -550,7 +577,7 @@ impl TxnStore for HoltStore {
             .fail_before_atomic
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
-            return map_atomic_result(
+            return Err(map_submission(
                 &mut state,
                 Err(holt::Error::Atomic {
                     kind: holt::AtomicErrorKind::DefinitelyNotApplied,
@@ -558,10 +585,11 @@ impl TxnStore for HoltStore {
                         "injected error before Holt atomic apply",
                     ))),
                 }),
-            );
+            )
+            .expect_err("an injected Holt failure maps to an error"));
         }
 
-        let applied = state.db.atomic(|batch| {
+        let applied = state.db.atomic_submit(|batch| {
             for guard in &value_versions {
                 batch.assert_version(tree_name(&state, guard.keyspace), &guard.key, guard.version);
             }
@@ -596,10 +624,10 @@ impl TxnStore for HoltStore {
         #[cfg(not(test))]
         let injected = false;
 
-        if injected && matches!(applied, Ok(true)) {
+        if injected && matches!(applied, Ok(AtomicSubmission::Applied(_))) {
             #[cfg(test)]
             self.pause_before_poison();
-            return map_atomic_result(
+            return Err(map_submission(
                 &mut state,
                 Err(holt::Error::Atomic {
                     kind: holt::AtomicErrorKind::OutcomeUnknown,
@@ -607,9 +635,24 @@ impl TxnStore for HoltStore {
                         "injected error after Holt atomic apply",
                     )),
                 }),
-            );
+            )
+            .expect_err("an injected Holt failure maps to an error"));
         }
-        map_atomic_result(&mut state, applied)
+        let pending = match map_submission(&mut state, applied)? {
+            Some(pending) => pending,
+            None => return Ok(Submission::Conflict),
+        };
+        drop(state);
+        Ok(Submission::Applied(self.pending_commit(pending)))
+    }
+
+    fn durability_barrier(&self) -> Result<(), StoreError> {
+        let pending = {
+            let state = self.read_state()?;
+            ensure_ready(&state)?;
+            state.db.pending_durability()
+        };
+        self.pending_commit(pending).acknowledge()
     }
 
     fn ready(&self) -> Result<(), StoreError> {
@@ -807,7 +850,7 @@ fn ensure_ready(state: &State) -> Result<(), StoreError> {
         crate::checkpoint::validate_install_markers(
             path,
             state.expected_recovery_staging_identity.as_ref(),
-            crate::checkpoint::catalog_commitment(&state.trees),
+            state.catalog_commitment,
         )?;
     }
     Ok(())
@@ -854,48 +897,17 @@ fn txn_keyspaces(txn: &WriteTxn) -> impl Iterator<Item = Keyspace> + '_ {
         }))
 }
 
-fn read_scopes(state: &State, batch: &ReadBatch) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
-    let mut prefixes = BTreeMap::<Keyspace, Vec<u8>>::new();
-    for op in &batch.ops {
-        let (keyspace, prefix) = match op {
-            ReadOp::Get(key) => (key.keyspace, key.bytes.as_slice()),
-            ReadOp::Scan(scan) => (scan.keyspace, scan.prefix.as_slice()),
-        };
-        prefixes
-            .entry(keyspace)
-            .and_modify(|current| truncate_to_common_prefix(current, prefix))
-            .or_insert_with(|| prefix.to_vec());
-    }
-    prefixes
-        .into_iter()
-        .map(|(keyspace, prefix)| {
-            state
-                .trees
-                .get(&keyspace)
-                .cloned()
-                .map(|name| (name, prefix))
-                .ok_or_else(|| {
-                    StoreError::InvalidRequest(format!(
-                        "keyspace {:04x} is not configured for this HoltStore",
-                        keyspace.get()
-                    ))
-                })
-        })
-        .collect()
-}
-
-fn truncate_to_common_prefix(current: &mut Vec<u8>, other: &[u8]) {
-    let length = current
-        .iter()
-        .zip(other)
-        .take_while(|(left, right)| left == right)
-        .count();
-    current.truncate(length);
+fn live_tree(state: &State, keyspace: Keyspace) -> Result<&holt::Tree, StoreError> {
+    state.tree_handles.get(&keyspace).ok_or_else(|| {
+        StoreError::InvalidRequest(format!(
+            "keyspace {:04x} is not configured for this HoltStore",
+            keyspace.get()
+        ))
+    })
 }
 
 fn build_snapshot(
-    view: &DBView,
-    trees: &BTreeMap<Keyspace, String>,
+    state: &State,
     batch: &ReadBatch,
     limits: &StoreLimits,
     read_stats_key: Option<usize>,
@@ -904,14 +916,14 @@ fn build_snapshot(
     for op in &batch.ops {
         match op {
             ReadOp::Get(key) => {
-                let tree = captured_tree(view, trees, key.keyspace)?;
-                let value = tree.get(&key.bytes).map_err(map_holt_error)?;
+                let value = live_tree(state, key.keyspace)?
+                    .get(&key.bytes)
+                    .map_err(map_holt_error)?;
                 results.push(ReadResult::Get(value));
             }
             ReadOp::Scan(scan) => {
-                let tree = captured_tree(view, trees, scan.keyspace)?;
                 results.push(ReadResult::Scan(scan_page(
-                    tree,
+                    live_tree(state, scan.keyspace)?,
                     scan,
                     limits,
                     read_stats_key,
@@ -922,32 +934,13 @@ fn build_snapshot(
     Ok(ReadSnapshot { results })
 }
 
-fn captured_tree<'a>(
-    view: &'a DBView,
-    trees: &BTreeMap<Keyspace, String>,
-    keyspace: Keyspace,
-) -> Result<&'a holt::View, StoreError> {
-    let name = trees.get(&keyspace).ok_or_else(|| {
-        StoreError::InvalidRequest(format!(
-            "keyspace {:04x} is not configured for this HoltStore",
-            keyspace.get()
-        ))
-    })?;
-    view.tree(name).ok_or_else(|| {
-        StoreError::Corrupt(format!(
-            "Holt read view omitted configured keyspace {:04x}",
-            keyspace.get()
-        ))
-    })
-}
-
 fn scan_page(
-    view: &holt::View,
+    tree: &holt::Tree,
     scan: &Scan,
     limits: &StoreLimits,
     read_stats_key: Option<usize>,
 ) -> Result<ScanPage, StoreError> {
-    let mut range = view.scan(&scan.prefix).map_err(map_holt_error)?;
+    let mut range = tree.scan(&scan.prefix);
     if let Some(after) = &scan.after {
         range = range.start_after(after);
     }
@@ -1047,47 +1040,26 @@ fn read_value_versions(
         return Ok(Some(Vec::new()));
     }
 
-    let mut scope_prefixes = BTreeMap::<Keyspace, Vec<u8>>::new();
-    for (key, _) in &value_checks {
-        scope_prefixes
-            .entry(key.keyspace)
-            .and_modify(|current| truncate_to_common_prefix(current, &key.bytes))
-            .or_insert_with(|| key.bytes.clone());
+    // The caller holds the exclusive state guard through the following apply,
+    // which still asserts each version; live lookups avoid a view capture.
+    let mut versions = Vec::with_capacity(value_checks.len());
+    for (key, expected) in value_checks {
+        let Some(record) = live_tree(state, key.keyspace)?
+            .get_record(&key.bytes)
+            .map_err(map_holt_error)?
+        else {
+            return Ok(None);
+        };
+        if record.value != *expected {
+            return Ok(None);
+        }
+        versions.push(ValueVersion {
+            keyspace: key.keyspace,
+            key: key.bytes.clone(),
+            version: record.version,
+        });
     }
-    let owned_scopes = scope_prefixes
-        .into_iter()
-        .map(|(keyspace, prefix)| (tree_name(state, keyspace).to_owned(), prefix))
-        .collect::<Vec<_>>();
-    let scopes = owned_scopes
-        .iter()
-        .map(|(name, prefix)| (name.as_str(), prefix.as_slice()))
-        .collect::<Vec<_>>();
-    state
-        .db
-        .view(&scopes, |view| {
-            let mut versions = Vec::with_capacity(value_checks.len());
-            for (key, expected) in &value_checks {
-                let Some(record) = view
-                    .tree(tree_name(state, key.keyspace))
-                    .ok_or_else(|| holt::Error::TreeNotFound {
-                        name: tree_name(state, key.keyspace).to_owned(),
-                    })?
-                    .get_record(&key.bytes)?
-                else {
-                    return Ok(None);
-                };
-                if record.value != **expected {
-                    return Ok(None);
-                }
-                versions.push(ValueVersion {
-                    keyspace: key.keyspace,
-                    key: key.bytes.clone(),
-                    version: record.version,
-                });
-            }
-            Ok(Some(versions))
-        })
-        .map_err(map_holt_error)
+    Ok(Some(versions))
 }
 
 fn poison(state: &mut State, reason: impl Into<String>) -> StoreError {
@@ -1099,13 +1071,14 @@ fn poison(state: &mut State, reason: impl Into<String>) -> StoreError {
     }
 }
 
-fn map_atomic_result(
+/// `None` means a guard rejected the batch and nothing was applied.
+fn map_submission(
     state: &mut State,
-    applied: Result<bool, holt::Error>,
-) -> Result<Commit, StoreError> {
+    applied: Result<AtomicSubmission, holt::Error>,
+) -> Result<Option<PendingDurability>, StoreError> {
     match applied {
-        Ok(true) => Ok(Commit::Applied),
-        Ok(false) => Ok(Commit::Conflict),
+        Ok(AtomicSubmission::Applied(pending)) => Ok(Some(pending)),
+        Ok(AtomicSubmission::Rejected) => Ok(None),
         Err(holt::Error::Atomic {
             kind: holt::AtomicErrorKind::DefinitelyNotApplied,
             source,
