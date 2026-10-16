@@ -1942,19 +1942,18 @@ impl MetadataWorkspaceRequestExecutor {
         rpc: &protocol::WorkspaceRpcRequest,
         request: &protocol::BeginArtifactPublishRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
-        if let Some(binding) = request.append_attempt {
-            let (operation_id, revision_id) = protocol::stable_append_attempt_identities(
-                rpc.route.root_id,
-                binding.operation_id,
-                binding.attempt,
-            );
-            if request.operation_id != operation_id || request.artifact_revision_id != revision_id {
-                return Err(invalid_argument(
-                    "append publication identities must match the logical operation and attempt",
-                ));
-            }
-        }
+        require_append_attempt_identities(rpc, request)?;
         self.claim_mutation(rpc)?;
+        self.begin_claimed_artifact_publish(rpc, request)
+    }
+
+    /// The Begin step of a request whose identity `rpc` has already claimed.
+    /// Its durable steps derive their request identities from `rpc`.
+    fn begin_claimed_artifact_publish(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::BeginArtifactPublishRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let step_id = derived_request_id(rpc.request_id, b"publish-begin", 0);
         if let Some(outcome) = self.replayed_publish(rpc.route, step_id)? {
             // A request-id replay reaches here only with byte-identical inputs
@@ -2225,6 +2224,14 @@ impl MetadataWorkspaceRequestExecutor {
         request: &protocol::StageArtifactObjectsRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
+        self.stage_claimed_artifact_objects(rpc, request)
+    }
+
+    fn stage_claimed_artifact_objects(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::StageArtifactObjectsRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let step_id = derived_request_id(rpc.request_id, b"publish-stage-objects", 0);
         if let Some(outcome) = self.replayed_publish(rpc.route, step_id)? {
             return publish_operation_response(outcome);
@@ -2265,6 +2272,14 @@ impl MetadataWorkspaceRequestExecutor {
         request: &protocol::MarkArtifactObjectsUploadedRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
+        self.mark_claimed_artifact_objects_uploaded(rpc, request)
+    }
+
+    fn mark_claimed_artifact_objects_uploaded(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::MarkArtifactObjectsUploadedRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let step_id = derived_request_id(rpc.request_id, b"publish-mark-uploaded", 0);
         if let Some(outcome) = self.replayed_publish(rpc.route, step_id)? {
             return publish_operation_response(outcome);
@@ -2327,6 +2342,14 @@ impl MetadataWorkspaceRequestExecutor {
         request: &protocol::StageArtifactManifestRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
+        self.stage_claimed_artifact_manifest(rpc, request)
+    }
+
+    fn stage_claimed_artifact_manifest(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::StageArtifactManifestRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let step_id = derived_request_id(rpc.request_id, b"publish-stage-manifest", 0);
         if let Some(outcome) = self.replayed_publish(rpc.route, step_id)? {
             return publish_operation_response(outcome);
@@ -2373,20 +2396,18 @@ impl MetadataWorkspaceRequestExecutor {
     }
 
     /// Begin a publication and, when it is fresh, stage its complete object
-    /// plan in the same write session. Each half runs as the stepwise RPC it
-    /// replaces under a request identity derived from this one, so replay,
-    /// heartbeat, and token rules are exactly those of the stepwise protocol.
+    /// plan in the same write session. This request's claim binds both steps;
+    /// each step derives its durable request identities from this one under
+    /// its own labels, so replay, heartbeat, and token rules are exactly those
+    /// of the stepwise protocol.
     fn prepare_artifact_publish(
         &self,
         rpc: &protocol::WorkspaceRpcRequest,
         request: &protocol::PrepareArtifactPublishRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        require_append_attempt_identities(rpc, &request.begin)?;
         self.claim_mutation(rpc)?;
-        let begun = self.execute_publication_step(
-            rpc,
-            b"prepare-begin",
-            protocol::WorkspaceRequest::BeginArtifactPublish(request.begin.clone()),
-        )?;
+        let begun = self.begin_claimed_artifact_publish(rpc, &request.begin)?;
         let protocol::WorkspaceResult::Operation(status) = &begun.result else {
             return Err(internal(
                 "artifact publication begin returned the wrong result variant",
@@ -2400,23 +2421,21 @@ impl MetadataWorkspaceRequestExecutor {
         {
             return Ok(begun);
         }
-        let mut staged = self.execute_publication_step(
+        let mut staged = self.stage_claimed_artifact_objects(
             rpc,
-            b"prepare-stage-objects",
-            protocol::WorkspaceRequest::StageArtifactObjects(
-                protocol::StageArtifactObjectsRequest {
-                    token: status.token,
-                    objects: request.objects.clone(),
-                },
-            ),
+            &protocol::StageArtifactObjectsRequest {
+                token: status.token,
+                objects: request.objects.clone(),
+            },
         )?;
         staged.replayed |= begun.replayed;
         Ok(staged)
     }
 
     /// Mark the remaining uploaded objects, stage the remaining manifest rows,
-    /// and complete the publication in one write session, each step as the
-    /// stepwise RPC it replaces under a request identity derived from this one.
+    /// and complete the publication in one write session under this request's
+    /// single claim, each step with the identities and rules of its stepwise
+    /// request.
     fn finish_artifact_publish(
         &self,
         rpc: &protocol::WorkspaceRpcRequest,
@@ -2426,61 +2445,37 @@ impl MetadataWorkspaceRequestExecutor {
         let mut token = request.token;
         let mut replayed = false;
         if !request.uploaded_objects.is_empty() {
-            let marked = self.execute_publication_step(
+            let marked = self.mark_claimed_artifact_objects_uploaded(
                 rpc,
-                b"finish-mark-uploaded",
-                protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
-                    protocol::MarkArtifactObjectsUploadedRequest {
-                        token,
-                        objects: request.uploaded_objects.clone(),
-                    },
-                ),
+                &protocol::MarkArtifactObjectsUploadedRequest {
+                    token,
+                    objects: request.uploaded_objects.clone(),
+                },
             )?;
             token = running_publication_token(&marked)?;
             replayed |= marked.replayed;
         }
         if !request.manifest_rows.is_empty() {
-            let staged = self.execute_publication_step(
+            let staged = self.stage_claimed_artifact_manifest(
                 rpc,
-                b"finish-stage-manifest",
-                protocol::WorkspaceRequest::StageArtifactManifest(
-                    protocol::StageArtifactManifestRequest {
-                        token,
-                        rows: request.manifest_rows.clone(),
-                        dependency_owner_revision_ids: request
-                            .dependency_owner_revision_ids
-                            .clone(),
-                    },
-                ),
+                &protocol::StageArtifactManifestRequest {
+                    token,
+                    rows: request.manifest_rows.clone(),
+                    dependency_owner_revision_ids: request.dependency_owner_revision_ids.clone(),
+                },
             )?;
             token = running_publication_token(&staged)?;
             replayed |= staged.replayed;
         }
-        let mut completed = self.execute_publication_step(
+        let mut completed = self.complete_claimed_artifact_publish(
             rpc,
-            b"finish-complete",
-            protocol::WorkspaceRequest::CompleteArtifactPublish(
-                protocol::CompleteArtifactPublishRequest {
-                    token,
-                    artifact: request.artifact.clone(),
-                },
-            ),
+            &protocol::CompleteArtifactPublishRequest {
+                token,
+                artifact: request.artifact.clone(),
+            },
         )?;
         completed.replayed |= replayed;
         Ok(completed)
-    }
-
-    fn execute_publication_step(
-        &self,
-        rpc: &protocol::WorkspaceRpcRequest,
-        step: &'static [u8],
-        operation: protocol::WorkspaceRequest,
-    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
-        self.execute_request(&protocol::WorkspaceRpcRequest {
-            route: rpc.route,
-            request_id: derived_request_id(rpc.request_id, step, 0).into(),
-            operation,
-        })
     }
 
     fn complete_artifact_publish(
@@ -2489,6 +2484,14 @@ impl MetadataWorkspaceRequestExecutor {
         request: &protocol::CompleteArtifactPublishRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
+        self.complete_claimed_artifact_publish(rpc, request)
+    }
+
+    fn complete_claimed_artifact_publish(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::CompleteArtifactPublishRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let transition_id = derived_request_id(rpc.request_id, b"publish-complete-transition", 0);
         let finalizing_operation =
             if let Some(outcome) = self.replayed_publish(rpc.route, transition_id)? {
@@ -4523,6 +4526,27 @@ fn require_publish_token(
             "operation token state digest is stale",
             None,
         ));
+    }
+    Ok(())
+}
+
+/// Reject an append publication whose identities do not derive from its
+/// logical operation and attempt, before any durable row exists.
+fn require_append_attempt_identities(
+    rpc: &protocol::WorkspaceRpcRequest,
+    request: &protocol::BeginArtifactPublishRequest,
+) -> Result<(), protocol::RpcFailure> {
+    if let Some(binding) = request.append_attempt {
+        let (operation_id, revision_id) = protocol::stable_append_attempt_identities(
+            rpc.route.root_id,
+            binding.operation_id,
+            binding.attempt,
+        );
+        if request.operation_id != operation_id || request.artifact_revision_id != revision_id {
+            return Err(invalid_argument(
+                "append publication identities must match the logical operation and attempt",
+            ));
+        }
     }
     Ok(())
 }
@@ -8972,11 +8996,7 @@ mod tests {
         // Begin step, without the staging step.
         assert!(!executor.claim_mutation(&prepare).unwrap());
         let begun = executor
-            .execute_publication_step(
-                &prepare,
-                b"prepare-begin",
-                protocol::WorkspaceRequest::BeginArtifactPublish(begin),
-            )
+            .begin_claimed_artifact_publish(&prepare, &begin)
             .unwrap();
         assert_eq!(executed_operation(&begun).progress.completed_rows, 0);
 
@@ -9016,15 +9036,12 @@ mod tests {
             unreachable!();
         };
         executor
-            .execute_publication_step(
+            .mark_claimed_artifact_objects_uploaded(
                 &finish,
-                b"finish-mark-uploaded",
-                protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
-                    protocol::MarkArtifactObjectsUploadedRequest {
-                        token: request.token,
-                        objects: request.uploaded_objects.clone(),
-                    },
-                ),
+                &protocol::MarkArtifactObjectsUploadedRequest {
+                    token: request.token,
+                    objects: request.uploaded_objects.clone(),
+                },
             )
             .unwrap();
 
