@@ -8,6 +8,11 @@
 //! Metadata and lifecycle semantics remain in `nokv-client`. Durable bytes
 //! remain behind `nokv-object`. The only local-filesystem behavior in this
 //! crate is the explicit materialize/collect adapter.
+//!
+//! `Client.append_bytes` accepts a caller-persisted logical operation ID and
+//! preserves the shared SDK append contract across process restarts. Metadata-only
+//! status and inspection, and owner-executed recovery, do not require a caller
+//! object store. The caller still owns its durable delivery record and queue ACK.
 
 mod client;
 mod local_adapter;

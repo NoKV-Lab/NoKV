@@ -62,74 +62,13 @@ not for installing the SDK.
   `expected`) with nothing written. Callers that omit the argument keep the
   0.11.0 behaviour; a server older than 0.11.1 rejects a fenced request as an
   invalid argument instead of ignoring the fence.
-- `Client.append_bytes(workbench, path, data, operation_id, ...)` accepts Python
-  `bytes` under a caller-owned stable logical identity. The first admission
-  requires an existing workspace. An omitted `expected_workspace_incarnation_id`
-  first resolves a recorded operation's original incarnation, then observes the
-  live workspace only when no operation was found. Explicit incarnation fences
-  are always checked. Save the identity before the first call and reuse the
-  exact inputs after a lost reply.
-  The result matches native `workspace-path append`: `status`, `operation`,
-  `state=committed`, `next_action=none`, logical `operation_id`, successful
-  `publication_operation_id`, `workbench_id`, `path`, `artifact_revision_id`,
-  `generation`, `workspace_revision`, `logical_size`, `body_digest`, and
-  `workspace_incarnation_id`. These describe the original publication.
-  `replayed` and nullable `commit_version` are call metadata.
-  `content_type=None` inherits an existing artifact's type and uses
-  `application/octet-stream` on creation; an explicit type applies to both.
-  Use an explicit matching type when replaying between Python and CLI text.
-  The delta limit is 16 MiB, checked before copying the Python bytes.
-  `max_logical_size=None` means a 16 MiB resulting-body limit; an explicit larger
-  bound is part of the intent and must be retained across retries. The default
-  block size is 4 MiB and maps to CLI `--block-size`. A retry may start a successor publication only after the
-  predecessor is fenced and cleaned; the logical identity never changes.
-- `Client.operation_status(operation_id)` queries an append without resending
-  its payload or depending on a current workspace. `Client(root_id, routing)`
-  needs no object-store configuration; configured object stores are initialized
-  lazily on object operations, so a fresh status client works during an S3
-  outage. The result reports `state` and `next_action` from the shared Rust SDK:
-  `committed/none` with the original `receipt`, `pending/poll`,
-  `ready_to_retry/resubmit_same`, or `quarantined/retry_cleanup`. It also
-  contains the logical and publication identities, attempt number and phase,
-  activity deadline, original target and incarnation, progress, `cause_code`,
-  `failure_message`, and `attempt_failure` for a failed physical attempt. The
-  logical operation may still be `ready_to_retry` while retaining that failure.
-  A query never advances an attempt. Retain or reproduce the original delta
-  until commitment; follow `resubmit_same` using `append_bytes`.
-- `Client.operation_inspect(operation_id, *, cursor=None, limit=32)` returns the
-  same status plus logical `operation_token`, child `publication_token`, object
-  namespace, `registered_count`, `cleanup_cursor`, `remaining_count`, and a page
-  of retained staged `entries`. Each entry has `sequence`, `object_identity`,
-  `expected_length`, `expected_digest`, and optional `multipart_token`. Retired
-  keys are not a historical inventory. The limit is 1 to 192; `next_cursor` is
-  opaque `bytes` or `None`. Continue with the unchanged cursor. A changed state
-  returns `Conflict`; restart inspection rather than combining different pages.
-- `Client.operation_recover(operation_id, expected_state_digest=None)` asks the
-  owner to retry quarantined cleanup. Both inspection and recovery are metadata
-  only and work with `Client(root_id, routing)` without S3 credentials. Persist
-  the inspected `operation_token["state_digest"]` (a lowercase hex string) and
-  pass it on every retry of one recovery request. `requested=True` means durable
-  acceptance, including replay; `recovery_receipt` preserves that round's
-  logical id, publication id, cleanup retry count, and expected state digest.
-  Top-level status is a fresh observation and may be newer than the receipt.
-  Acceptance is not cleanup completion. Without a digest, the method targets
-  the current state once and is a no-op for pending, cleaned, or committed
-  operations. A later quarantine requires a new intentional recovery request.
-  When status reaches `ready_to_retry`, redeliver the original append inputs;
-  recovery does not reconstruct or publish the delta.
-- Append and status failures carry `operation_id`, observed `state`, `code`,
-  expected incarnation in `expected`, `cause_code`, and `next_action=query_same`.
-  `publication_operation_id` is `None` until status supplies an observed
-  publication. `AppendError` is a `RuntimeError`; incarnation conflicts retain
-  the `WorkspaceIncarnationMismatch` subtype with the same recovery attributes.
-  `cause_code=RequestReplayMismatch` identifies changed inputs or another
-  lifecycle, so recover the original intent instead of blindly resubmitting.
-  `retryable` is false for generic retry handlers. An unknown result or a
-  `NotFound` observation never authorizes a replacement logical identity.
-  Cleanup errors use `code=AppendCleanupUnresolved` and
-  `next_action=retry_same_cleanup`, retain `expected_state_digest`, and expose
-  any known `recovery_receipt` and its publication id. Retry using that exact
-  digest; do not automatically choose a fresh token after a lost reply.
+- `Client.append_bytes(workbench, path, data, operation_id, ...)` appends Python
+  `bytes` under a caller-persisted logical identity. `operation_status`,
+  `operation_inspect`, and `operation_recover` query its outcome and request
+  owner-executed cleanup without payloads or object credentials. These methods
+  share the native CLI's durable append state machine; see
+  [Durable append](../../docs/append.md) for the CLI-first guide, a shared
+  persisted-input example, all defaults and result fields, and recovery steps.
 - `WorkbenchFileSystem` is an fsspec compatibility adapter bound to one explicit
   Workbench. Paths must be one of `input`, `scripts`, `outputs`, `logs`, or
   `metadata`, optionally followed by an artifact-relative path. Sections and
@@ -151,8 +90,86 @@ Snapshots require a committed Workbench. Commit and restore must be driven by
 the canonical Workbench lifecycle facade; clients must not synthesize a
 run-manifest or duplicate the durable workflow locally.
 
-Stable append's size, retention, owner recovery, and release contract is specified
-in [the append product specification](../../docs/development/append-product-spec.md).
-The fsspec adapter's append mode remains outside this contract; retrying harnesses
-should use native `nokv workspace-path append` first, or `Client.append_bytes`
-when embedded Python execution is required.
+## Durable append in Python
+
+These methods describe the checked-in API. Do not assume the example `0.11.0`
+release wheel above includes them. A main-branch merge does not publish a new
+wheel. Use a matching qualified source build, or a release that explicitly
+includes durable append; record the exact commit/asset identity rather than
+only `nokv.__version__`. Source builds and the owner must satisfy the same
+[format and release boundary](../../docs/development/append-product-spec.md).
+
+| Method | Input and result |
+| --- | --- |
+| `append_bytes(workbench, path, data, operation_id, content_type=None, block_size=4194304, max_logical_size=None, expected_workspace_incarnation_id=None)` | `data` is `bytes`; `path` includes the section, such as `logs/events.jsonl`. Returns the original committed receipt. |
+| `operation_status(operation_id)` | Metadata-only observation with `state`, `next_action`, and nullable historical `receipt`. |
+| `operation_inspect(operation_id, *, cursor=None, limit=32)` | Metadata-only retained staging page. `next_cursor` is opaque `bytes`; limits are 1–192. |
+| `operation_recover(operation_id, expected_state_digest=None)` | Ask the owner to retry quarantined cleanup. The digest is a saved 64-character lowercase hex string. Acceptance is not completion. |
+
+The following reads a previously persisted application intent. It needs a
+reachable, provisioned root and etcd endpoint, but no `ObjectStoreConfig`:
+
+```python
+import json
+import os
+from pathlib import Path
+
+from nokv import Client, RoutingConfig
+
+job = json.loads(Path("append-intent.json").read_text())
+routing = RoutingConfig.etcd(
+    [os.environ["ETCD_ENDPOINT"]],
+    key_prefix=os.environ.get("ETCD_KEY_PREFIX", "/nokv/control"),
+)
+client = Client(job["root_id"], routing)
+status = client.operation_status(job["operation_id"])
+print(status["state"], status["next_action"], status["receipt"])
+```
+
+See the [complete input record and CLI/Python submission example](../../docs/append.md)
+for a new append or redelivery. Save the root, logical ID, exact bytes, target,
+content-type policy, block size, and resulting-size limit before dispatch.
+The first admission needs an existing workspace. If incarnation is omitted,
+the SDK resolves an admitted operation's original incarnation before consulting
+the live workspace name. Explicit fences are never replaced silently.
+
+The delta limit and default total-body limit are each 16 MiB; increasing
+`max_logical_size` does not increase the delta limit. `content_type=None`
+inherits an existing type and defaults to `application/octet-stream` on
+creation. An explicit type applies to both and is a different intent policy
+from omission, even when the strings match the current file. For CLI/Python
+redelivery, use the same explicit type from the first call. Keep block size and
+all other options identical. Existing producer, manifest identity, and index
+fields are inherited.
+
+Follow `committed/none`, `pending/poll`, `ready_to_retry/resubmit_same`, or
+`quarantined/retry_cleanup`. Queries do not advance an attempt. Inspection's
+cursor continues one exact observation; its logical
+`operation_token["state_digest"]` identifies a cleanup recovery request.
+Persist that digest before `operation_recover` and reuse it after an uncertain
+reply. A later quarantine needs an intentional new recovery round. Once cleanup
+finishes, redeliver the original append input; cleanup cannot reconstruct it.
+
+Runtime append errors expose `operation_id`, optional raw `state`, `code`,
+`cause_code`, `next_action`, and `retryable=False`. `AppendError` and
+`WorkspaceIncarnationMismatch` are separate `RuntimeError` subtypes; catch both
+when handling fenced append errors. Local argument type/hex errors may instead
+be `TypeError` or `ValueError`. `RequestReplayMismatch` as a cause means the
+original intent or lifecycle differs, not a transient retry. A timeout or
+`NotFound` observation does not authorize a replacement ID.
+`AppendCleanupUnresolved` additionally retains `expected_state_digest`, any
+known `recovery_receipt` and publication ID, and
+`next_action="retry_same_cleanup"`. Reuse that digest instead of selecting a
+new token automatically.
+
+Persist the stable receipt before acknowledging an external queue. Its ten
+fields identify the original logical action, successful publication/revision,
+target/incarnation, versions, complete body size, and digest. `replayed` and
+nullable `commit_version` are call metadata, not stable receipt fields. A
+retained receipt does not permanently retain historical body bytes.
+
+The [product specification](../../docs/development/append-product-spec.md)
+defines owner leases, provider sealing, retention, and qualification.
+`WorkbenchFileSystem` has no append mode, and the legacy 18-tool
+`workbench_append` operation is not the durable identity API. Use native
+`nokv workspace-path append` first, or `Client.append_bytes` for embedded work.

@@ -363,13 +363,15 @@ ArtifactRevisionClaim (reserved key inside the artifact_revision tree)
   begin with a different operation id fails while it exists. Staged rows
   derive permanent object keys from the revision id alone, so without the
   claim two operations could own identical provider keys and an aborted
-  loser's cleanup could delete the winner's published objects. The claim is
-  deleted in the same command that publishes the revision or finishes the
-  owning operation's cleanup. A quarantined operation keeps its claim
-  fail-closed: its provider-side object state is unresolved, so the revision
-  identity stays unclaimable until `ReconcileQuarantinedArtifactPublish`
-  resolves the operation under an operator verdict and releases the claim in
-  the same command that transitions it to `Cleaned`.
+  loser's cleanup could delete the winner's published objects. Successful
+  publication deletes the claim atomically with the new ArtifactRevision.
+  Generic publication cleanup also releases its own claim when it reaches
+  Cleaned, including an authorized ReconcileQuarantinedArtifactPublish.
+  Stable append cleanup instead retains the failed child's claim permanently:
+  its unpublished revision owns zero-byte object seals that must never become
+  reusable keys. Quarantine never releases that ownership. Append recovery
+  uses RetryAppendCleanup and owner-executed sealing, not a caller's generic
+  reconciliation verdict.
   Exact revision keys are 32 bytes, so the 33-byte discriminated key can
   never collide with one.
 
@@ -477,19 +479,30 @@ operation's later lookup by admitting the same identity. Internal manifest
 publications retain distinct operation IDs. Terminal operation retention keeps
 this exclusion after success or cleanup.
 
+An `Operation(Append)` parent records the full 32-byte intent digest, original
+target and workspace incarnation, current attempt number, child publication
+ID, artifact revision ID, and optional compact success result. The child's
+`Operation(Publish)` record carries the matching logical ID/attempt binding
+and immutable plan. Its `cleanup_retry_count` counts owner cleanup requests for
+that child; it is not the parent attempt number and is zero on each successor.
+
 A logical append parent and its child publication are admitted together. Only a
 current child proven `Cleaned` permits atomically advancing the parent and
 admitting a successor. Final publication writes the parent receipt together
 with the child `Published` result and visible path/revision/index/reference
 changes. Parent and child records are retained for replay; they do not create
 an extra body-retention reference. See the
-[append product contract](development/append-product-spec.md).
+[append product contract](development/append-product-spec.md) and
+[caller/operator guide](append.md).
 
 `Operation(ActivePublish)` is an internal recovery index keyed by the physical
 publication ID. It contains only Uploading, Finalizing, Aborting, and Cleaning
 children. Publication transitions add or remove it in the same command that
 changes the child. The lifecycle scans this index instead of retained terminal
-history. A malformed marker or missing referenced child fails closed.
+history after its initial read-only validation of all retained parents,
+publications, and markers. Missing or orphan markers, an inconsistent binding,
+or a missing child fail closed; the scan does not silently repair the index.
+Startup validation therefore still grows with retained history.
 
 `ReadChanges` treats `(commit_version, event_sequence)` as an append-only log
 position. Its opaque cursor is bound to the root, query scope, and optional
@@ -718,11 +731,13 @@ Finalizing -> Aborting # fenced proof of no path/dedupe publication
 Finalization first CASes `Uploading -> Finalizing`; cleanup first CASes
 `Uploading -> Aborting`, so only one can win. The metadata publication command
 changes `Finalizing -> Published` atomically with the new path/revision. A
-crash in `Finalizing` is resumed from the ledger; cleanup may take it over only
-through the shown `Finalizing -> Aborting` CAS after proving that no
-path/dedupe publication exists. Publication and takeover both change the same
-operation row, so one wins. Cleanup may mutate the ledger or issue external
-DELETE only while it owns `Aborting`/`Cleaning`.
+crash in `Finalizing` is resolved against the durable ledger and publication
+evidence; it is not a promise to reconstruct and resume the caller's frozen
+upload. Cleanup may take it over only through the shown
+`Finalizing -> Aborting` CAS after proving that no path/dedupe publication
+exists. Publication and takeover both change the same operation row, so one
+wins. Cleanup advances only under the authoritative abort/cleaning state;
+provider deletion or sealing is performed by the fenced lifecycle worker.
 
 For a stable append child, successful cleanup is `Aborted/Sealed`, not
 `Aborted/Deleted`. Its exact staged keys become permanent zero-byte objects
@@ -740,10 +755,21 @@ Metadata-only `InspectAppendCleanup` returns bounded contiguous pages of actual
 retained staged rows, bound to the exact current logical/child state. Generic publications and published
 revision GC retain their existing deletion semantics.
 
-A late upload completion must observe the operation state; after abort it joins
-cleanup instead of publishing. Ambiguous multipart completion, late PUT, or
-DELETE remains ledger-owned and `Quarantined` until reconciled. Object listing
-is never used to discover staged ownership.
+Inspection reports `registered_count = staged_object_cursor` and the remaining
+interval `[cleanup_cursor, registered_count)`, not all keys ever planned or
+previously sealed. Published children may still retain staged rows, but reading
+those rows does not authorize cleanup. Missing rows cause an error, not a
+partial successful page. A changed state or successor invalidates continuation.
+`RetryAppendCleanup` binds the full expected logical state token in its durable
+command receipt. Replaying that token returns the original cleanup admission
+and commit version even after a later failure or successor; omitting a token
+at the SDK/CLI layer deliberately observes the current state for a new request.
+
+A client reporting upload completion must observe the operation state; after
+abort it cannot revive publication. The durable ledger retains cleanup
+ownership. For stable append, an unproved seal outcome quarantines the child;
+ordinary publication retains its existing ambiguous-upload/delete handling.
+Object listing is never used to discover staged ownership.
 
 For generic publications, reconciliation is operator-driven, never scanner-driven. The operator verifies
 provider-side object state for the operation's staged keys out-of-band and
@@ -761,8 +787,10 @@ owns it.
 
 The final metadata command creates the `ArtifactRevision` as `Available`, its
 manifest, the first path reference, `PathCurrent`, workspace revision, indexes,
-event, and dedupe result. A failed upload is invisible. A response-loss retry
-returns the stored result without allocating another revision.
+event, and dedupe result. A failed upload is invisible. Once publication has
+committed, an exact response-loss retry returns its stored result without
+allocating another revision. A stable append whose earlier child failed may
+admit a new revision only after predecessor cleanup is proven.
 
 Append stores immutable segments in the new revision manifest and atomically
 advances the path generation. A manifest row names the revision that physically

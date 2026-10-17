@@ -14,11 +14,15 @@ The normative behavior is [Workbench Contract](../workbench-contract.md).
 ## Package Position
 
 ```text
-native full CLI (primary)
+native CLI: nokv workbench <tool> (primary Workbench surface)
   -> nokv-agent
   -> nokv-client traits
   -> versioned protocol and direct object data path
 ```
+
+The native `workspace-path append` and `operation status/inspect/recover`
+commands call the shared client append lifecycle directly. They are not extra
+Workbench tools and do not change this crate's frozen schemas.
 
 The direct Python SDK is the secondary embedded product surface and calls the
 client boundary directly. Downstream Agent frameworks should normally implement
@@ -66,7 +70,10 @@ workbench_restore
 The normalized input schemas are frozen in
 `crates/nokv-agent/workbench_contract_schema.json`. Tool registration
 fails closed when a name or normalized schema differs. The native CLI exposes
-the same operations directly.
+the same operations directly. `workbench_append` allocates per-invocation
+identities and has no caller-supplied durable operation ID. Retrying a business
+action from another process requires the separate
+[stable append entrypoints](../append.md), not an added field in that tool.
 
 ## Adapter Responsibilities
 
@@ -93,7 +100,9 @@ The crate must delegate:
 - `workbench_put_file(replace=false)` is create-only.
 - `workbench_put_file(replace=true)` is replace-only.
 - Append, edit, and replace preserve generation CAS behavior.
-- An exact retry returns the same result.
+- An exact retry that preserves the operation identity returns the same result;
+  a new `workbench_append` invocation does not preserve a previous invocation's
+  identity.
 - Reusing a request identity with different inputs fails.
 - Snapshot reads stay at their fixed read version.
 - Snapshot renewal extends only and never revives a reaped snapshot.

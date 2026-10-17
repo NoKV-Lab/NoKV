@@ -25,9 +25,10 @@ The contract sources are:
 - `scripts/workbench/workbench_contract.py` for checking tool names and
   normalized input schemas.
 
-CLI and SDK wiring are consumers of this contract, not schema authorities.
-Every surface delegates to the transport-free facade and is neither a required
-deployment component nor a separate state machine.
+CLI and SDK wiring for these tools are consumers of this contract, not schema
+authorities. They delegate to the transport-free facade. The full native CLI
+and direct SDKs also expose operations beyond this frozen tool profile; those
+operations use the client state machines and their own documented contracts.
 
 The native CLI accepts exactly these 18 names under `nokv workbench`. It fails
 closed unless every possible destination owner supports the durable restore
@@ -154,6 +155,30 @@ appended bytes.
 Workbench responses do not contain `inode`, `source_root`, or
 `destination_root`. Those names are not Workbench identities, routing inputs,
 conditional-write tokens, provenance fields, or result projections.
+
+### Append Across Process Retries
+
+`workbench_append` has no caller-supplied operation id. Its identity is allocated
+per invocation: retrying the whole tool call in a new process can append the
+same bytes again after a lost success response. Its generation CAS protects
+concurrent writes, but cannot identify a redelivered business event.
+
+For a queue consumer or durable workflow, use native
+`nokv workspace-path append ... --operation-id HEX32`, or Python
+`Client.append_bytes(..., operation_id=...)`. Persist the root, logical id,
+complete intent, and delta before dispatch. Reuse them on redelivery; an
+independent event needs a different id even when its bytes are identical.
+Successful replay returns the original receipt without advancing the live
+generation. Its `body_digest` describes the complete resulting body, unlike
+the Workbench tool's delta `digest`.
+
+The native `operation status`, `operation inspect`, and `operation recover`
+commands provide metadata-only observation and owner-executed cleanup recovery.
+Recovery acceptance is distinct from append commitment; only the committed
+append receipt acknowledges the business event. These commands do not add
+tools or fields to the frozen 18-tool schema. See the
+[durable append guide](./append.md) and
+[product specification](./development/append-product-spec.md).
 
 ## Commit Identity
 

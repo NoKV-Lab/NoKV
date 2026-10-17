@@ -5,6 +5,11 @@ SPDX-License-Identifier: Apache-2.0
 
 # Durable append product contract
 
+This is the normative implementation contract. The
+[durable append guide](../append.md) provides CLI/Python examples; the
+[qualification record](append-qualification.md) separates executed evidence
+from requirements below.
+
 A queue worker saves an action ID and its event before appending the event to a
 workspace file. If its process dies, its replacement submits the same action
 and receives one durable result. Concurrent writers may change the file while
@@ -28,6 +33,9 @@ retained staged ledger. `nokv operation recover` / `Client.operation_recover`
 request owner-executed cleanup through `artifact_append_recovery_v1`. Neither
 operation requires the delta, a current workspace binding, object credentials
 on the caller, or a transcript captured before the failure.
+Metadata routing and caller configuration are still required; metadata-only
+does not mean an offline lookup or that the serving owner needs no object
+provider for cleanup.
 The frozen Workbench tool schemas remain unchanged.
 
 The caller must durably retain the following before its first submission:
@@ -77,6 +85,16 @@ The parent contains the canonical intent, original target/incarnation, current
 attempt identity, and eventual compact receipt. Each child publication carries
 its parent/attempt binding and its immutable generation-dependent plan. An
 active child cannot be replaced by a newly planned child.
+
+The identities and counters have different lifetimes:
+
+| Field | Scope and meaning |
+| --- | --- |
+| `operation_id` | Caller-owned logical action; unchanged across all redeliveries and safe successors. |
+| `attempt` | Current child number, starting at zero; advances only with atomic predecessor-cleaned admission. |
+| `publication_operation_id` / `artifact_revision_id` | Derived immutable identities of that numbered child. |
+| `cleanup_retry_count` | Number of accepted operator cleanup retries for this child; a new child starts at zero. |
+| `operation_token.state_digest` | Exact observed logical parent/current-child state; retaining it identifies one operator recovery request. |
 
 ## Atomicity and recovery invariants
 
@@ -133,6 +151,14 @@ deadline, original incarnation/target, current attempt failure when present,
 cleanup retry count, and receipt. An attempt failure describes its child, not a terminal failure of
 the logical action. Applications must use
 structured fields, not parse human-readable messages.
+
+The compact successful append receipt binds the logical and publication IDs,
+target/incarnation, artifact revision, workspace revision, path generation,
+whole-body size and digest. These historical fields are immutable.
+`commit_version` and `replayed` are call-envelope metadata, not fields of the
+append receipt: a later metadata-only lookup may have no commit version, and a
+replay may report different call metadata. Do not compare entire response
+envelopes to decide whether an append happened twice.
 
 A missing logical operation is a point-in-time observation. Another caller may
 admit it immediately afterward. Resubmitting the same ID is safe because atomic
@@ -234,6 +260,15 @@ means the request has a durable admission receipt, including replay;
 `replayed` distinguishes replay from fresh admission. Neither field means the
 append committed or cleanup finished.
 
+For example, cleanup token T can admit round 1 for child A. If that cleanup
+quarantines again, resending T returns the same round-1 receipt; it does not
+start round 2. A deliberate request using a new observation can admit round 2.
+After A reaches `Cleaned` and the same logical append publishes child B,
+replaying T still returns A's original recovery receipt while the response's
+current operation describes B with `cleanup_retry_count=0`. This is not a
+counter regression. The recovery call's commit version belongs to the original
+cleanup-admission command and is preserved on exact-token replay.
+
 Omitting the expected digest explicitly requests recovery against the currently
 observed state. Active, cleaned and committed attempts return an observation
 with `requested=false` and no recovery receipt. A quarantined attempt can start
@@ -301,8 +336,9 @@ a promise for a deployment using the default lease.
 
 Published and cleaned child records and logical receipts are currently retained
 without automatic expiration. This is an explicit identity-retention cost. Failed attempts also retain their
-revision reservations and zero-byte object seals; seals retain no former payload
-bytes but still incur provider key/metadata overhead.
+revision reservations and zero-byte object seals; the live sealed object has
+no former payload bytes but still incurs provider key/metadata overhead.
+Historical provider versions, if enabled, are a separate retention concern.
 Removing these records without an equivalent tombstone/replay protocol would
 allow forgotten IDs to execute again. Receipts preserve metadata, not permanent
 access to the old revision's object bytes. Ordinary snapshot/hold/GC policies
@@ -355,13 +391,15 @@ The workspace RPC schema is `nokv.workspace.rpc.v12`, the system format is 13,
 and the publication value format is 7. A parent row is a new operation kind;
 the child includes the monotonic cleanup retry counter. These version gates
 also reject the preceding unreleased append candidate's v11/system-12 layout.
-Older stores and protocol clients are rejected explicitly. Existing Holt stores
-are inspected through the locked backend's read-only open path before writable
-recovery, so a format rejection does not rewrite their files. There is no silent
-migration, compatibility decoder, marker-only upgrade, or mixed-version write
-mode. Operators must preserve existing data and use the repository's qualified
-upgrade/export path when one exists; this feature does not manufacture an
-upgrade procedure for an incompatible store.
+Older stores and protocol clients are rejected explicitly. The serving backend
+is the published Holt 0.8.6 dependency pinned in Cargo. Existing Holt stores
+are inspected through its read-only open path before writable recovery, so a
+format rejection does not rewrite their files. There is no automatic
+system-format migration, marker-only upgrade, or mixed-version write mode.
+This feature provides no qualified migration/export-import procedure for an
+incompatible store. Preserve that namespace intact; do not edit its marker or
+reuse it as a fresh current-format store. Object-namespace adoption is a
+separate binding operation and cannot upgrade the system format.
 
 Red and green fault tests initialize separate version-appropriate stores. A
 green restart test must reopen the exact same green Holt directory. NoKV's

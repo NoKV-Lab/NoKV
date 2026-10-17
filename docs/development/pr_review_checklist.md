@@ -101,6 +101,18 @@ boundaries, or Workbench behavior.
   index rather than the child manifest's ordered row position?
 - Do publish finalization and staged-object cleanup race through one durable
   operation CAS before either metadata visibility or external deletion?
+- Does stable append bind a caller-persisted logical id to the complete intent,
+  with the parent receipt and path publication atomic and a successor fenced by
+  its cleaned predecessor?
+- Do historical append receipts survive later live changes without another
+  effect, while different logical ids with identical payloads remain distinct?
+- Does failed-append cleanup preserve conditional zero-byte seals and revision
+  reservations against late PUTs, quarantining an uncertain outcome?
+- Do inspection cursors bind the exact parent/child state and retained ledger,
+  rejecting missing rows and stale pages rather than mixing observations?
+- Does recovery replay the receipt for the saved state digest after response
+  loss, concurrent calls, repeated quarantine, and owner restart, without
+  silently choosing a newer recovery round or accepting a provider verdict?
 
 ## Snapshot, Commit, Restore, And GC
 
@@ -156,6 +168,9 @@ boundaries, or Workbench behavior.
   second, and the Rust SDK third, without presenting the deprecated `nokv mcp`
   sidecar as a supported integration surface?
 - Do all 18 tool names and normalized input schemas remain stable?
+- Is caller-owned stable append documented as a separate native CLI/SDK API,
+  without adding an operation id to `workbench_append` or changing its delta
+  digest into a whole-body digest?
 - Does golden-transcript validation cover observable result and error behavior,
   rather than treating input-schema validation as equivalent?
 - Is put still create-only or replace-only, never upsert?
@@ -177,6 +192,9 @@ boundaries, or Workbench behavior.
 - Does every applicable
   [acceptance gate](./workspace-acceptance.md) report `PASS`, `FAIL`, or
   `NOT QUALIFIED`?
+- Do append claims distinguish safety from completion, local fault matrices
+  from remotely executed jobs, overlapping cases from distinct requirements,
+  and consumer redelivery from whole-platform or performance qualification?
 
 ## Required Validation
 

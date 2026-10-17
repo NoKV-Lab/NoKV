@@ -57,6 +57,30 @@ a NoKV deployment: callers must still supply the selected control-plane
 endpoint, object-store configuration, root identity, and stable Agent
 presentation root.
 
+## Durable append availability and upgrade boundary
+
+The [durable append guide](../../docs/append.md) describes the checked-in source
+contract. A merged feature PR, a passing Linux wheel check, or an unchanged
+18-tool schema does not establish that an older Formula or wheel contains
+`workspace-path append` and `operation status/inspect/recover`. Verify the
+release's source identity with `nokv version --json`, its command help and its
+release-specific qualification before deploying it. For Python, use a wheel
+built from the matching source revision and follow the
+[SDK installation instructions](../../crates/nokv-python/README.md).
+
+The append contract requires workspace RPC v12, metadata system format 13 and
+publication value format 7. An older store is rejected without mutation; this
+feature does not include an in-place migration, a mixed-version serving mode or
+a cross-format rollback procedure. Plan a separately qualified migration before
+upgrading an existing deployment. Do not delete an old store or change its
+format marker to make startup succeed.
+
+An upgraded owner must also qualify conditional failed-key sealing on its
+object provider. Keep the retained zero-byte seals, failed-revision reservations
+and operation receipts; a blanket bucket expiration rule can invalidate the
+retry guarantee. See the [provider contract](../../docs/rustfs.md) and the
+[append qualification record](../../docs/development/append-qualification.md).
+
 ## Release invariants
 
 `.github/workflows/release-homebrew.yml` accepts only a canonical stable tag of

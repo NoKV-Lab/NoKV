@@ -4,12 +4,15 @@ layout: home
 hero:
   name: NoKV
   text: Agent-native distributed workspace and artifact storage.
-  tagline: A native full CLI and direct Python SDK over path-primary ordered metadata.
+  tagline: Durable workspaces and recoverable append identities through a native CLI and direct SDKs.
   image:
     src: /img/logo.png
     alt: NoKV
   actions:
     - theme: brand
+      text: Durable Append
+      link: /append
+    - theme: alt
       text: Architecture
       link: /architecture
     - theme: alt
@@ -23,7 +26,9 @@ hero:
       link: /development/workspace-acceptance
 features:
   - title: Stable Agent surface
-    details: Use the native full CLI first, the direct Python SDK for embedded callers, and the lower-level Rust SDK for native integrations. One 18-tool Workbench contract fixes behavior across all three.
+    details: Use the native CLI first, Python for embedded callers and Rust for native integrations. The frozen 18-tool Workbench facade and the explicit append recovery APIs share one metadata lifecycle.
+  - title: Durable append identity
+    details: Save an operation ID and its inputs before dispatch. Replacement workers can retrieve the original receipt or resume safely cleaned work under that same ID.
   - title: Path-primary metadata
     details: One normalized full path is namespace truth. Exact artifacts use point reads; child listing uses component-safe delimiter scans.
   - title: Immutable revisions
@@ -50,8 +55,9 @@ SPDX-License-Identifier: Apache-2.0
       <div class="nokv-card-kicker">Application surface</div>
       <h3>CLI · Python SDK · Rust SDK</h3>
       <p>Downstream skills use the native CLI by default; embedded callers use
-      the Python SDK, and native integrations use the Rust SDK. All three share
-      the same 18-tool semantics.</p>
+      the Python SDK, and native integrations use the Rust SDK. The full CLI
+      includes the stable 18-tool Workbench facade plus explicit append
+      submission and recovery commands.</p>
     </div>
     <div class="nokv-card">
       <div class="nokv-card-kicker">Metadata layer</div>
@@ -82,10 +88,16 @@ SPDX-License-Identifier: Apache-2.0
   <div class="nokv-callout"><strong>Recovery is explicit.</strong>
   Leased snapshots pin MVCC history. Durable commits retain exact revisions.
   Restore stages a new Workbench incarnation and reveals it only after a
-  verified member seal.</div>
+  verified member seal. For an interrupted append, query its saved logical ID;
+  inspect the staged ledger and request owner cleanup when needed.
+  <a href="/append">Follow the append recovery guide</a>.</div>
 </div>
 
 ## Documentation Map
+
+- Append a durable event: [Caller guide](./append.md),
+  [Product Contract](./development/append-product-spec.md), and
+  [Qualification Record](./development/append-qualification.md).
 
 - Product and interface: [Product Design](./product-design.md),
   [Architecture](./architecture.md), and
@@ -125,7 +137,8 @@ SPDX-License-Identifier: Apache-2.0
     evidence required for release.</p>
   </div>
   <div class="nokv-actions">
-    <a class="nokv-btn nokv-btn--primary" href="/workbench-contract">Workbench contract <span class="arrow">→</span></a>
+    <a class="nokv-btn nokv-btn--primary" href="/append">Durable append guide <span class="arrow">→</span></a>
+    <a class="nokv-btn nokv-btn--ghost" href="/workbench-contract">Workbench contract</a>
     <a class="nokv-btn nokv-btn--ghost" href="/metadata-schema">Metadata schema</a>
     <a class="nokv-btn nokv-btn--ghost" href="/development/workspace-acceptance">Acceptance plan</a>
     <a class="nokv-btn nokv-btn--ghost" href="/development/path-native-metadata-comparison">Path model comparison</a>
