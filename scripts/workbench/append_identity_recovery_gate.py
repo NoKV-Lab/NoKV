@@ -1615,7 +1615,7 @@ class IsolatedStack:
                     [self.binary, "version", "--json"], label="binary-identity"
                 ).stdout
             )
-            assert identity["holt"]["version"] == "0.8.6", identity
+            assert identity["holt"]["version"] == "0.8.7", identity
             self.json(
                 "environment.json",
                 {
