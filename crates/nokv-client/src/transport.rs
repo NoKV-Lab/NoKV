@@ -3,9 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nokv_protocol::{
@@ -48,9 +49,38 @@ impl Default for FramedTcpOptions {
     }
 }
 
+/// Idle admitted connections kept for reuse per endpoint.
+const MAX_IDLE_CONNECTIONS_PER_ENDPOINT: usize = 8;
+/// Reuse a connection only while it is well inside the server's idle read
+/// timeout; older ones are closed instead of risking a stale exchange.
+const MAX_IDLE_CONNECTION_AGE: Duration = Duration::from_secs(10);
+
+/// Framed request/response transport over admitted TCP connections.
+///
+/// Every exchange is one complete request/response on one connection. A
+/// connection that completes an exchange returns to a bounded idle pool shared
+/// by clones of this transport, so later requests skip the TCP connect and
+/// protocol handshake. A pooled connection that fails before any response byte
+/// arrives was closed by its peer; the request is resent once on a fresh
+/// connection. Workspace requests carry their own request identity, so that
+/// resend has the same replay semantics as any client retry.
 #[derive(Clone, Debug)]
 pub struct FramedTcpTransport {
     options: FramedTcpOptions,
+    idle: Arc<Mutex<HashMap<SocketAddr, Vec<IdleConnection>>>>,
+}
+
+#[derive(Debug)]
+struct IdleConnection {
+    stream: TcpStream,
+    idle_since: Instant,
+}
+
+/// Exchange failure, split by whether any response byte arrived.
+#[derive(Debug)]
+enum ExchangeError {
+    BeforeResponse(TransportError),
+    AfterResponse(TransportError),
 }
 
 impl FramedTcpTransport {
@@ -65,7 +95,10 @@ impl FramedTcpTransport {
                 false,
             ));
         }
-        Ok(Self { options })
+        Ok(Self {
+            options,
+            idle: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     /// Opens one connection and completes the exact-schema handshake. Nagle's
@@ -84,13 +117,79 @@ impl FramedTcpTransport {
             .map_err(io_error)?;
         Ok(stream)
     }
+
+    /// Take the most recently returned live connection for `endpoint`.
+    fn take_idle(&self, endpoint: SocketAddr) -> Option<TcpStream> {
+        let mut idle = self.idle.lock().ok()?;
+        let connections = idle.get_mut(&endpoint)?;
+        while let Some(connection) = connections.pop() {
+            if connection.idle_since.elapsed() < MAX_IDLE_CONNECTION_AGE
+                && connection_is_quiet(&connection.stream)
+            {
+                return Some(connection.stream);
+            }
+        }
+        None
+    }
+
+    fn return_idle(&self, endpoint: SocketAddr, stream: TcpStream) {
+        if let Ok(mut idle) = self.idle.lock() {
+            let connections = idle.entry(endpoint).or_default();
+            if connections.len() < MAX_IDLE_CONNECTIONS_PER_ENDPOINT {
+                connections.push(IdleConnection {
+                    stream,
+                    idle_since: Instant::now(),
+                });
+            }
+        }
+    }
+
+    /// Close every pooled connection for `endpoint` after one proved stale.
+    fn discard_idle(&self, endpoint: SocketAddr) {
+        if let Ok(mut idle) = self.idle.lock() {
+            idle.remove(&endpoint);
+        }
+    }
+}
+
+/// A reusable connection has nothing to read: unread bytes or end of stream
+/// mean the peer closed or desynchronized it.
+fn connection_is_quiet(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut probe = [0_u8; 1];
+    let quiet = matches!(
+        stream.peek(&mut probe),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    );
+    stream.set_nonblocking(false).is_ok() && quiet
 }
 
 impl RpcTransport for FramedTcpTransport {
     fn round_trip(&self, endpoint: SocketAddr, request: &[u8]) -> Result<Vec<u8>, TransportError> {
         let frame = length_prefixed_frame(request)?;
+        if let Some(mut stream) = self.take_idle(endpoint) {
+            match exchange_frame(&mut stream, &frame) {
+                Ok(response) => {
+                    self.return_idle(endpoint, stream);
+                    return Ok(response);
+                }
+                Err(ExchangeError::AfterResponse(error)) => return Err(error),
+                // The peer closed this pooled connection; so are its siblings.
+                Err(ExchangeError::BeforeResponse(_)) => self.discard_idle(endpoint),
+            }
+        }
         let mut stream = self.connect(endpoint)?;
-        exchange_frame(&mut stream, &frame)
+        match exchange_frame(&mut stream, &frame) {
+            Ok(response) => {
+                self.return_idle(endpoint, stream);
+                Ok(response)
+            }
+            Err(ExchangeError::BeforeResponse(error) | ExchangeError::AfterResponse(error)) => {
+                Err(error)
+            }
+        }
     }
 }
 
@@ -118,26 +217,53 @@ fn length_prefixed_frame(request: &[u8]) -> Result<Vec<u8>, TransportError> {
 }
 
 /// Writes one complete request frame with a single `write_all` and reads one
-/// length-prefixed response.
+/// length-prefixed response, reporting whether a failure came before or after
+/// the first response byte.
 fn exchange_frame(
     stream: &mut (impl Read + Write),
     frame: &[u8],
-) -> Result<Vec<u8>, TransportError> {
-    stream.write_all(frame).map_err(io_error)?;
-    stream.flush().map_err(io_error)?;
+) -> Result<Vec<u8>, ExchangeError> {
+    stream
+        .write_all(frame)
+        .and_then(|()| stream.flush())
+        .map_err(|error| ExchangeError::BeforeResponse(io_error(error)))?;
 
     let mut response_length = [0_u8; 4];
-    stream.read_exact(&mut response_length).map_err(io_error)?;
-    let response_length = usize::try_from(u32::from_be_bytes(response_length))
-        .map_err(|_| TransportError::new("response length does not fit usize", false))?;
+    let first = loop {
+        match stream.read(&mut response_length[..1]) {
+            Ok(0) => {
+                return Err(ExchangeError::BeforeResponse(io_error(
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "workspace RPC connection closed before a response",
+                    ),
+                )));
+            }
+            Ok(read) => break read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(ExchangeError::BeforeResponse(io_error(error))),
+        }
+    };
+    debug_assert_eq!(first, 1);
+    stream
+        .read_exact(&mut response_length[1..])
+        .map_err(|error| ExchangeError::AfterResponse(io_error(error)))?;
+    let response_length = usize::try_from(u32::from_be_bytes(response_length)).map_err(|_| {
+        ExchangeError::AfterResponse(TransportError::new(
+            "response length does not fit usize",
+            false,
+        ))
+    })?;
     if response_length > MAX_FRAME_BYTES {
-        return Err(TransportError::new(
+        return Err(ExchangeError::AfterResponse(TransportError::new(
             format!("response frame is {response_length} bytes, maximum is {MAX_FRAME_BYTES}"),
             false,
-        ));
+        )));
     }
     let mut response = vec![0_u8; response_length];
-    stream.read_exact(&mut response).map_err(io_error)?;
+    stream
+        .read_exact(&mut response)
+        .map_err(|error| ExchangeError::AfterResponse(io_error(error)))?;
     Ok(response)
 }
 
@@ -296,13 +422,7 @@ mod tests {
 
     fn accept_one_handshake(listener: TcpListener) -> TcpStream {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut hello = [0_u8; HANDSHAKE_FRAME_BYTES];
-        stream.read_exact(&mut hello).unwrap();
-        let accepted =
-            WorkspaceHandshake::new(HandshakeKind::Accepted, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
-        stream
-            .write_all(&encode_handshake_frame(&accepted).unwrap())
-            .unwrap();
+        accept_hello(&mut stream);
         stream
     }
 
@@ -385,6 +505,71 @@ mod tests {
             transport().round_trip(endpoint, &expected_request).unwrap(),
             b"ok!"
         );
+        server.join().unwrap();
+    }
+
+    fn accept_hello(stream: &mut TcpStream) {
+        let mut hello = [0_u8; HANDSHAKE_FRAME_BYTES];
+        stream.read_exact(&mut hello).unwrap();
+        decode_handshake_frame(&hello).unwrap();
+        let accepted =
+            WorkspaceHandshake::new(HandshakeKind::Accepted, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
+        stream
+            .write_all(&encode_handshake_frame(&accepted).unwrap())
+            .unwrap();
+    }
+
+    fn echo_one(stream: &mut TcpStream) {
+        let mut length = [0_u8; 4];
+        stream.read_exact(&mut length).unwrap();
+        let mut request = vec![0_u8; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut request).unwrap();
+        stream.write_all(&length).unwrap();
+        stream.write_all(&request).unwrap();
+    }
+
+    #[test]
+    fn sequential_requests_reuse_one_admitted_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            accept_hello(&mut stream);
+            echo_one(&mut stream);
+            echo_one(&mut stream);
+            listener.set_nonblocking(true).unwrap();
+            assert!(listener.accept().is_err(), "a second connection was opened");
+        });
+
+        let transport = transport();
+        assert_eq!(transport.round_trip(endpoint, b"first").unwrap(), b"first");
+        assert_eq!(
+            transport.clone().round_trip(endpoint, b"second").unwrap(),
+            b"second"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_pooled_connection_closed_by_the_server_is_replaced() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            accept_hello(&mut first);
+            echo_one(&mut first);
+            drop(first);
+            closed_tx.send(()).unwrap();
+            let (mut second, _) = listener.accept().unwrap();
+            accept_hello(&mut second);
+            echo_one(&mut second);
+        });
+
+        let transport = transport();
+        assert_eq!(transport.round_trip(endpoint, b"one").unwrap(), b"one");
+        closed_rx.recv().unwrap();
+        assert_eq!(transport.round_trip(endpoint, b"two").unwrap(), b"two");
         server.join().unwrap();
     }
 
