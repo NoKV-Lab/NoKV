@@ -318,7 +318,22 @@ impl MetadataWorkspaceRequestExecutor {
         &self,
         request: &protocol::WorkspaceRpcRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
-        retry_internal_metadata_conflicts(|| self.execute_request(request))
+        if mutates_metadata(&request.operation) {
+            // Plan and apply inside one sequenced session so an unrelated
+            // writer cannot invalidate this request's read version; the
+            // session returns only after its commands are acknowledged.
+            retry_internal_metadata_conflicts(|| {
+                self.meta
+                    .write_session(|| self.execute_request(request))
+                    .map_err(meta_failure)?
+            })
+        } else {
+            let executed = retry_internal_metadata_conflicts(|| self.execute_request(request));
+            // A read may have observed another session's applied but not yet
+            // acknowledged commands; do not let it leave the shard before them.
+            self.meta.durability_barrier().map_err(meta_failure)?;
+            executed
+        }
     }
 
     fn preflight(
@@ -1263,6 +1278,10 @@ impl MetadataWorkspaceRequestExecutor {
             if let Some(registration) = &self.restore_initialization_barrier {
                 let operation_id = protocol::OperationIdentity::from(operation.operation_id);
                 if operation_id == registration.target_operation_id {
+                    // The barrier stands for a crash after initialization is
+                    // durable, but this request's write session acknowledges
+                    // its commands only when it ends: wait for them first.
+                    self.meta.durability_barrier().map_err(meta_failure)?;
                     let evidence = restore_initialization_barrier_evidence(
                         rpc.route,
                         durable_read_version,
@@ -6189,6 +6208,31 @@ fn meta_failure(error: meta::MetaError) -> protocol::RpcFailure {
     }
 }
 
+/// Whether a request may execute metadata commands. Read-only requests share
+/// the command gate and pay only a durability barrier; every other request
+/// runs as one write session. Misclassifying a read as a write costs
+/// concurrency, never correctness: a command outside a session acknowledges
+/// before it returns.
+fn mutates_metadata(operation: &protocol::WorkspaceRequest) -> bool {
+    !matches!(
+        operation,
+        protocol::WorkspaceRequest::Preflight(_)
+            | protocol::WorkspaceRequest::GetWorkspace(_)
+            | protocol::WorkspaceRequest::GetPath(_)
+            | protocol::WorkspaceRequest::ListPaths(_)
+            | protocol::WorkspaceRequest::GetSnapshot(_)
+            | protocol::WorkspaceRequest::ListSnapshots(_)
+            | protocol::WorkspaceRequest::GetOperation(_)
+            | protocol::WorkspaceRequest::InspectAppendCleanup(_)
+            | protocol::WorkspaceRequest::GetGenericIndexRegistration(_)
+            | protocol::WorkspaceRequest::Search(_)
+            | protocol::WorkspaceRequest::Aggregate(_)
+            | protocol::WorkspaceRequest::Catalog(_)
+            | protocol::WorkspaceRequest::FindWorkspaces(_)
+            | protocol::WorkspaceRequest::ReadChanges(_)
+    )
+}
+
 fn internal_metadata_conflict(failure: &protocol::RpcFailure) -> bool {
     failure.code == protocol::ErrorCode::Conflict
         && failure.retryable
@@ -7913,7 +7957,7 @@ mod tests {
 
     #[cfg(feature = "restore-crash-test-support")]
     #[test]
-    fn every_concurrent_destination_building_request_stops_at_the_shared_barrier() {
+    fn every_sequenced_destination_building_request_stops_at_the_shared_barrier() {
         struct OneShotTestBarrier {
             state: std::sync::atomic::AtomicU8,
             arrivals: std::sync::mpsc::Sender<(&'static str, RestoreInitializationBarrierEvidence)>,
@@ -7939,9 +7983,7 @@ mod tests {
                     }
                     Err(1) => {
                         self.arrivals.send(("parked", evidence)).unwrap();
-                        loop {
-                            std::thread::park();
-                        }
+                        panic!("simulate the later request stopping at the barrier");
                     }
                     Err(state) => panic!("unexpected one-shot barrier state {state}"),
                 }
@@ -7973,13 +8015,23 @@ mod tests {
             .expect("first exact target must enter Firing");
         assert_eq!(first_state, "firing");
 
+        // Mutating requests on one shard run as sequenced write sessions, so
+        // the second request cannot reach the barrier while the first holds it.
         let second_executor = executor.clone();
         let second_request = restore_rpc(0xe2, request);
         let second = std::thread::spawn(move || second_executor.execute(&second_request));
+        assert!(arrival_rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err());
+        assert!(!second.is_finished());
+
+        winner_release.wait();
+        assert!(first.join().is_err());
         let (second_state, second_evidence) = arrival_rx
             .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("second exact target must park after Firing");
+            .expect("second exact target must stop at the barrier after the winner exits");
         assert_eq!(second_state, "parked");
+        assert!(second.join().is_err());
         assert_eq!(first_evidence.operation_id, second_evidence.operation_id);
         assert_eq!(first_evidence.built_commit_members, 0);
         assert_eq!(second_evidence.built_commit_members, 0);
@@ -8002,13 +8054,6 @@ mod tests {
         .unwrap();
         let provenance = restore_commit_provenance(&persisted).unwrap();
         assert!(restore_closure_is_pristine(&provenance.closure));
-
-        assert!(!first.is_finished());
-        assert!(!second.is_finished());
-        winner_release.wait();
-        assert!(first.join().is_err());
-        assert!(!second.is_finished());
-        drop(second);
     }
 
     #[cfg(feature = "restore-crash-test-support")]
@@ -12537,7 +12582,7 @@ mod tests {
     /// the one it expected and must converge on B's durable result.
     #[cfg(feature = "restore-crash-test-support")]
     #[test]
-    fn stale_finalizer_converges_on_a_peer_that_completed_the_restore() {
+    fn queued_finalizer_converges_on_the_session_that_completed_the_restore() {
         struct HoldAfterLoad {
             loaded_phase: std::sync::mpsc::Sender<types::RestorePhase>,
             release: Arc<std::sync::Barrier>,
@@ -12638,7 +12683,7 @@ mod tests {
                 release: Arc::clone(&release),
             }),
         );
-        let stale = std::thread::spawn(move || held.execute(&finalize(0xc1)));
+        let holder = std::thread::spawn(move || held.execute(&finalize(0xc1)));
         assert_eq!(
             loaded_rx
                 .recv_timeout(std::time::Duration::from_secs(5))
@@ -12646,27 +12691,36 @@ mod tests {
             types::RestorePhase::SourceSealed
         );
 
-        // The peer finalizer runs every step to Complete while A is held.
-        let peer = executor.execute(&finalize(0xc2)).unwrap();
-        let protocol::WorkspaceResult::Restored(restored) = &peer.result else {
+        // A peer finalizer queues behind the holder's write session instead of
+        // interleaving with the phase the holder already loaded.
+        let peer_executor = executor.clone();
+        let peer = std::thread::spawn(move || peer_executor.execute(&finalize(0xc2)));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!peer.is_finished());
+
+        release.wait();
+        let completed = holder
+            .join()
+            .unwrap()
+            .expect("the holder finalizes from the phase it loaded");
+        let protocol::WorkspaceResult::Restored(restored) = &completed.result else {
             panic!("finalize returned the wrong result variant");
         };
-        assert!(!peer.replayed);
+        assert!(!completed.replayed);
         assert_eq!(restored.operation_id, restore_operation_id);
         assert!(restored.destination.commit_head.is_some());
 
-        release.wait();
-        let converged = stale
+        let converged = peer
             .join()
             .unwrap()
-            .expect("a finalizer that fell behind a completed peer must converge");
+            .expect("a queued finalizer must converge on the completed restore");
         assert!(converged.replayed);
-        assert_eq!(converged.result, peer.result);
+        assert_eq!(converged.result, completed.result);
 
         // The terminal row is unchanged and a fresh finalizer still replays it.
         let fresh = executor.execute(&finalize(0xc3)).unwrap();
         assert!(fresh.replayed);
-        assert_eq!(fresh.result, peer.result);
+        assert_eq!(fresh.result, completed.result);
     }
 
     #[test]

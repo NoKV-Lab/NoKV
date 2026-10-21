@@ -185,6 +185,56 @@ pub enum Mutation {
     Delete { key: Key },
 }
 
+/// Acknowledgement handle for one transaction applied by
+/// [`crate::TxnStore::submit`].
+#[must_use = "a submitted transaction is acknowledged only after `acknowledge` succeeds"]
+pub struct PendingCommit {
+    acknowledge: Option<Box<dyn FnOnce() -> Result<(), StoreError> + Send>>,
+}
+
+impl PendingCommit {
+    /// A transaction that already reached the acknowledgement boundary.
+    pub fn acknowledged() -> Self {
+        Self { acknowledge: None }
+    }
+
+    /// A transaction acknowledged when `acknowledge` returns success.
+    pub fn new(acknowledge: impl FnOnce() -> Result<(), StoreError> + Send + 'static) -> Self {
+        Self {
+            acknowledge: Some(Box::new(acknowledge)),
+        }
+    }
+
+    /// Block until the transaction reaches the profile's acknowledgement
+    /// boundary. Success also acknowledges every transaction the store applied
+    /// before it. A failure is an unknown outcome that poisons the store.
+    pub fn acknowledge(self) -> Result<(), StoreError> {
+        match self.acknowledge {
+            Some(acknowledge) => acknowledge(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::fmt::Debug for PendingCommit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingCommit")
+            .field("pending", &self.acknowledge.is_some())
+            .finish()
+    }
+}
+
+/// Result of [`crate::TxnStore::submit`].
+#[derive(Debug)]
+pub enum Submission {
+    /// Every mutation applied and is visible to later reads and submissions
+    /// on this store instance. It is acknowledged only by its handle.
+    Applied(PendingCommit),
+    /// At least one check was false and no mutation applied.
+    Conflict,
+}
+
 /// Definite result of a conditional commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Commit {

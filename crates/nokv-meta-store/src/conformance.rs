@@ -14,10 +14,12 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::{
-    Check, Commit, Key, Keyspace, LimitKind, Mutation, ReadBatch, ReadOp, ReadResult, Scan,
-    ScanItem, ScanPage, StoreError, StoreProfile, TxnStore, UnknownCommit, WriteTxn,
+    Check, Commit, Key, Keyspace, LimitKind, Mutation, PendingCommit, ReadBatch, ReadOp,
+    ReadResult, Scan, ScanItem, ScanPage, StoreError, StoreProfile, Submission, TxnStore,
+    UnknownCommit, WriteTxn,
 };
 
 const LINEAR: Keyspace = Keyspace::new(0x7f01);
@@ -51,6 +53,7 @@ pub fn run<S>(
     check_profile(profile);
     check_empty_initial_state(store.as_ref());
     check_read_after_applied(store.as_ref());
+    check_submitted_transactions(store.as_ref());
     check_atomic_snapshots(Arc::clone(&store));
     check_exact_checks(store.as_ref());
     check_empty_prefix(store.as_ref());
@@ -75,6 +78,7 @@ pub fn run<S>(
         (Key::new(EMPTY_PREFIX, b"e1"), b"first".to_vec()),
         (Key::new(SCANS, b"a"), b"a".to_vec()),
         (Key::new(REOPEN, b"r"), b"durable".to_vec()),
+        (Key::new(LINEAR, b"submit/second"), b"s2".to_vec()),
     ];
     drop(store);
 
@@ -239,6 +243,72 @@ fn check_read_after_applied(store: &dyn TxnStore) {
     );
 }
 
+fn check_submitted_transactions(store: &dyn TxnStore) {
+    let first = Key::new(LINEAR, b"submit/first");
+    let second = Key::new(LINEAR, b"submit/second");
+    let first_pending = applied_submission(
+        store.submit(WriteTxn {
+            checks: vec![Check::Absent { key: first.clone() }],
+            mutations: vec![Mutation::Put {
+                key: first.clone(),
+                value: b"s1".to_vec(),
+            }],
+        }),
+        "submit first row",
+    );
+    assert_eq!(
+        read_values(store, vec![first.clone()]),
+        vec![Some(b"s1".to_vec())],
+        "a read did not observe an applied submission"
+    );
+    let second_pending = applied_submission(
+        store.submit(WriteTxn {
+            checks: vec![Check::Value {
+                key: first.clone(),
+                expected: b"s1".to_vec(),
+            }],
+            mutations: vec![Mutation::Put {
+                key: second.clone(),
+                value: b"s2".to_vec(),
+            }],
+        }),
+        "submit dependent row",
+    );
+    match store.submit(WriteTxn {
+        checks: vec![Check::Absent { key: first.clone() }],
+        mutations: vec![Mutation::Put {
+            key: second.clone(),
+            value: b"lost".to_vec(),
+        }],
+    }) {
+        Ok(Submission::Conflict) => {}
+        other => panic!("a false check on a submission returned {other:?}"),
+    }
+    second_pending
+        .acknowledge()
+        .unwrap_or_else(|error| panic!("acknowledge dependent submission: {error}"));
+    // Acknowledging a later submission covers the earlier one; its own handle
+    // stays safe to acknowledge.
+    first_pending
+        .acknowledge()
+        .unwrap_or_else(|error| panic!("acknowledge first submission: {error}"));
+    store
+        .durability_barrier()
+        .unwrap_or_else(|error| panic!("durability barrier after submissions: {error}"));
+    assert_eq!(
+        read_values(store, vec![first, second]),
+        vec![Some(b"s1".to_vec()), Some(b"s2".to_vec())],
+        "acknowledged submissions are not both visible"
+    );
+}
+
+fn applied_submission(submitted: Result<Submission, StoreError>, operation: &str) -> PendingCommit {
+    match submitted {
+        Ok(Submission::Applied(pending)) => pending,
+        other => panic!("{operation} was not applied: {other:?}"),
+    }
+}
+
 fn check_atomic_snapshots<S>(store: Arc<S>)
 where
     S: TxnStore + 'static,
@@ -287,8 +357,16 @@ where
         "atomicity reader started before the writer committed"
     );
     let reader = catch_unwind(AssertUnwindSafe(|| {
-        for _ in 0..512 {
+        // Reads can be much faster than one acknowledged write, so keep reading
+        // until the writer has committed concurrently with them.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut reads = 0_usize;
+        while reads < 512
+            || (writes.load(Ordering::Acquire) <= writes_before_reads + 1
+                && Instant::now() < deadline)
+        {
             check_mixed_snapshot(store.as_ref(), &first, &second);
+            reads += 1;
             thread::yield_now();
         }
     }));

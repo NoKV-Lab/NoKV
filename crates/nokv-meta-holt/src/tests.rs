@@ -18,7 +18,7 @@ use nokv_meta_store::{
     Check, CheckpointCatalogCommitment, CheckpointError, CheckpointFormatId,
     CheckpointInstallState, Commit, FreshStoreCheckpointInstaller, Key, Keyspace, Mutation,
     ReadBatch, ReadOp, ReadResult, Scan, ScanItem, StoreCheckpointEnvelope, StoreError,
-    StoreLimits, TxnStore, UnknownCommit, WholeStoreCheckpointSource, WriteTxn,
+    StoreLimits, Submission, TxnStore, UnknownCommit, WholeStoreCheckpointSource, WriteTxn,
 };
 use tempfile::tempdir;
 
@@ -887,6 +887,16 @@ fn reopened_file_session_reports_rollups_and_storage_activity() {
         for key in [b"p/a/1".as_slice(), b"p/a/2".as_slice(), b"p/b".as_slice()] {
             assert_eq!(put(&store, FIRST, key, b"value"), Commit::Applied);
         }
+        // Spill past the resident root frame so the reopened scan must fault
+        // in tree frames; a root-only tree is served from the open handle.
+        let filler = vec![b'f'; 1024];
+        for index in 0..2048_u32 {
+            let key = format!("p/a/filler-{index:05}");
+            assert_eq!(put(&store, FIRST, key.as_bytes(), &filler), Commit::Applied);
+        }
+        store
+            .checkpoint_for_test()
+            .expect("checkpoint before reopen");
     }
 
     let store = HoltStore::open(HoltOptions::file(&path, catalog([FIRST]), limits()))
@@ -894,16 +904,20 @@ fn reopened_file_session_reports_rollups_and_storage_activity() {
     let session = store.begin_read_stats_session().expect("start read stats");
     store
         .read(ReadBatch {
-            ops: vec![ReadOp::Scan(Scan {
-                keyspace: FIRST,
-                prefix: b"p/".to_vec(),
-                after: None,
-                limit: 2,
-                max_bytes: 1280,
-                delimiter: Some(b'/'),
-            })],
+            ops: vec![
+                ReadOp::Scan(Scan {
+                    keyspace: FIRST,
+                    prefix: b"p/".to_vec(),
+                    after: None,
+                    limit: 2,
+                    max_bytes: 1280,
+                    delimiter: Some(b'/'),
+                }),
+                // A cold filler leaf lives outside the resident root frame.
+                ReadOp::Get(Key::new(FIRST, b"p/a/filler-01024".to_vec())),
+            ],
         })
-        .expect("read delimiter page");
+        .expect("read delimiter page and cold leaf");
     let stats = session.finish().expect("finish read stats");
 
     assert_eq!(stats.scan_cursors, 1);
@@ -919,6 +933,45 @@ fn reopened_file_session_reports_rollups_and_storage_activity() {
             > 0,
         "file-backed session did not report Holt read activity"
     );
+}
+
+#[test]
+fn submitted_transactions_share_one_wal_sync() {
+    let directory = tempdir().expect("create HoltStore directory");
+    let store = HoltStore::initialize(HoltOptions::file(
+        directory.path().join("meta"),
+        catalog([FIRST]),
+        limits(),
+    ))
+    .expect("initialize file HoltStore");
+    let syncs = store.wal_syncs_for_test();
+
+    let submit = |key: &[u8]| match store
+        .submit(WriteTxn {
+            checks: vec![],
+            mutations: vec![Mutation::Put {
+                key: Key::new(FIRST, key),
+                value: b"value".to_vec(),
+            }],
+        })
+        .expect("submit put")
+    {
+        Submission::Applied(pending) => pending,
+        Submission::Conflict => panic!("unguarded submission conflicted"),
+    };
+    let first = submit(b"a");
+    // The adapter releases its exclusive state before the WAL wait, so a
+    // second writer applies while the first acknowledgement is pending.
+    let second = submit(b"b");
+    assert_eq!(get(&store, FIRST, b"a").as_deref(), Some(&b"value"[..]));
+    second.acknowledge().expect("acknowledge second submission");
+    first.acknowledge().expect("acknowledge first submission");
+    assert_eq!(store.wal_syncs_for_test() - syncs, 1);
+
+    store
+        .durability_barrier()
+        .expect("barrier with nothing pending");
+    assert_eq!(store.wal_syncs_for_test() - syncs, 1);
 }
 
 #[test]
