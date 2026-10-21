@@ -16,14 +16,20 @@ const HOLT_MAX_VALUE_BYTES: usize = u16::MAX as usize;
 const HOLT_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const HOLT_DB_RECORD_FIXED_BYTES: usize = 33;
 const HOLT_DB_MUTATION_OVERHEAD_BYTES: usize = 17;
-/// Cache budget in 512 KiB Holt frames: 512 MiB. Metadata keys are mostly
-/// random identities spread over every frame of their tree, so a budget
-/// smaller than the written set turns a miss into a frame read plus an
-/// eviction that waits for the checkpointer to clean a dirty frame.
+/// Cache budget in 512 KiB Holt frames: 512 MiB in total. A file-backed Holt
+/// store gives half of the budget, at most 256 MiB, to its read-index and
+/// read-page caches, so the frame cache holds 512 slots (256 MiB). Metadata
+/// keys are mostly random identities spread over every frame of their tree,
+/// so a frame cache smaller than the written set turns a miss into a frame
+/// read plus an eviction that waits for the checkpointer to clean a dirty
+/// frame.
 const HOLT_BUFFER_POOL_FRAMES: usize = 1024;
 /// Interval between background checkpoint rounds. A round rewrites every
 /// dirty 512 KiB frame, so a longer interval folds more metadata commands
-/// into each frame write; recovery replays at most that much journal.
+/// into each frame write; recovery replays at most that much journal. Holt
+/// checks its early-round dirty-frame threshold (512 by default) only when
+/// the checkpointer wakes, after this interval or when a retired orphan
+/// wakes it, so that threshold does not bound the dirty set between rounds.
 const HOLT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Physical Holt configuration for one local metadata authority.
