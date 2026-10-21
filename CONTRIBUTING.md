@@ -111,7 +111,8 @@ and run `git diff --check`.
 ## Pull Request Rules
 
 - Rebase on latest `upstream/main` before opening or updating a PR.
-- PR description must include: what changed, why it changed, and how you validated it (commands + key results).
+- Follow the [PR description format](#pr-description-format) and the
+  [pull request template](.github/pull_request_template.md).
 - Link related issue(s).
 - Include docs updates when behavior/config/CLI changes.
 - Keep PRs small enough for focused review.
@@ -130,6 +131,90 @@ and run `git diff --check`.
   Holt layout, object-store, docs, benchmark, or unrelated refactors.
 - Every non-merge commit must include a `Signed-off-by` trailer matching the Developer Certificate of Origin in [`DCO`](./DCO).
 - If you use Codex or another agent to review a PR, point it at [`docs/development/code_contract.md`](./docs/development/code_contract.md) and [`docs/development/pr_review_checklist.md`](./docs/development/pr_review_checklist.md).
+
+### PR Description Format
+
+Use a concise English title in the form `<type>: <outcome>`. Describe the final
+change for a reviewer who has not read the discussion. Write short, plain
+English paragraphs focused on the problem and observable behavior. Mention
+code, symbols, and file paths only when needed to explain a decision or risk;
+do not turn the description into a file-by-file change log or paste the diff.
+
+Every PR description uses these headings in this order:
+
+| Heading | What to write |
+| --- | --- |
+| `TLDR` | One or two sentences stating the problem and resulting behavior. |
+| `Problem` | The concrete trigger and current behavior. Link the related issue here. |
+| `Consequences` | Why the problem matters to users or maintainers. |
+| `Example` | A short, concrete before/after scenario. Use a code snippet only if it makes the behavior clearer. |
+| `Solution` | How the change solves the problem, in plain English. |
+| `Gain` | The resulting benefit. Quantified claims require linked evidence. |
+| `Tradeoffs` | Relevant costs, limitations, breaking changes, or remaining risks. |
+| `Validation` | Exact commands and key results; explain relevant checks not run and link raw evidence for storage or performance claims. |
+
+Keep all headings. Usually one or two sentences per narrative section are
+enough; validation may use a short list. Do not repeat the same explanation
+across sections or invent benefits, risks, or examples to fill space. If a
+section does not apply, say so briefly with a reason. Update the title and
+description when the final scope changes, and omit abandoned approaches unless
+they explain a remaining tradeoff.
+
+Every non-trivial PR needs an existing issue linked with `Closes`, `Fixes`, or
+`Relates to`. Typo-only docs edits, CI/dependency chores, release chores, and
+maintainer-approved emergency fixes may omit an issue; explain the exception
+under `Problem`.
+
+For example, a documentation-only PR could read:
+
+```markdown
+## TLDR
+Make every PR explain its user impact with the same short structure.
+
+## Problem
+The template and contributor guide ask for different descriptions. Relates to #123.
+
+## Consequences
+Reviewers have to ask follow-up questions to understand the change.
+
+## Example
+Before: a list of edited files. After: a concrete problem and before/after behavior.
+
+## Solution
+Use one description format across the template, contributor guide, and agent instructions.
+
+## Gain
+Authors and reviewers have one clear writing standard.
+
+## Tradeoffs
+Small PRs still keep each heading, with brief answers where appropriate.
+
+## Validation
+
+- git diff --check: passed.
+- Local Markdown links: checked.
+- Rust checks: not applicable; documentation only.
+```
+
+This format does not replace DCO, scope, review, or evidence requirements.
+Use the [PR Review Checklist](docs/development/pr_review_checklist.md) for the
+engineering review; keep the description focused on this PR's behavior and
+validation.
+
+The required `pr-description` check enforces the title structure, exact section
+order, and filled-in content. It ignores HTML comments and does not treat
+headings inside fenced code examples as sections. Bare placeholders such as
+`TODO` or `N/A` fail; explain why a section does not apply. The check reruns on
+PR creation, reopening, pushes, title/body edits, and ready-for-review events.
+Plain English, brevity, factual claims, and relevance still require review.
+
+Run the same policy locally before opening or editing a PR:
+
+```bash
+gh pr view PR_NUMBER --json title,body > /tmp/nokv-pr-description.json
+python3 scripts/ci/pr_description.py --pull-request-json /tmp/nokv-pr-description.json
+python3 scripts/ci/pr_description_test.py
+```
 
 ## Code Guidelines
 
