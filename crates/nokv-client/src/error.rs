@@ -7,14 +7,16 @@ use std::fmt;
 
 use nokv_object::{ArtifactUploadFailure, ObjectError};
 use nokv_protocol::{
-    AppendCleanupRetryResult, ErrorCode, OperationIdentity, OperationState, OperationToken,
-    ProtocolError, RpcFailure, WorkspaceCapability,
+    AppendCleanupRetryResult, ConflictKind, ErrorCode, OperationIdentity, OperationState,
+    OperationToken, ProtocolError, RpcFailure, WorkspaceCapability,
 };
+use nokv_types::ErrorClass;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransportError {
     message: String,
     retryable: bool,
+    incompatible: bool,
 }
 
 impl TransportError {
@@ -22,7 +24,22 @@ impl TransportError {
         Self {
             message: message.into(),
             retryable,
+            incompatible: false,
         }
+    }
+
+    /// The owner refused this client's protocol in the handshake, so no
+    /// request was sent and repeating it cannot succeed.
+    pub fn incompatible(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+            incompatible: true,
+        }
+    }
+
+    pub const fn is_incompatible(&self) -> bool {
+        self.incompatible
     }
 
     pub fn message(&self) -> &str {
@@ -123,7 +140,8 @@ impl ClientError {
         }
     }
 
-    pub(crate) fn rpc_failure(&self) -> Option<&RpcFailure> {
+    /// The owner's typed refusal this error carries, through any wrapping.
+    pub fn rpc_failure(&self) -> Option<&RpcFailure> {
         match self {
             Self::Rpc(failure) => Some(failure),
             Self::ArtifactPublishFailed { source, .. } => source.rpc_failure(),
@@ -136,6 +154,97 @@ impl ClientError {
 
     pub(crate) fn rpc_code(&self) -> Option<ErrorCode> {
         self.rpc_failure().map(|failure| failure.code)
+    }
+
+    /// What this failure means for durable state when it ends a mutation.
+    ///
+    /// A failure that may follow delivery is an unknown outcome: an owner can
+    /// apply a request and then lose its response, its connection, or its
+    /// ownership proof. A read changes nothing and applies
+    /// [`ErrorClass::for_read`].
+    pub fn class(&self) -> ErrorClass {
+        match self {
+            Self::InvalidOptions(_) => ErrorClass::InvalidInput,
+            // An unresolvable route sends nothing.
+            Self::InvalidRoute(_) => ErrorClass::Transient,
+            Self::Transport(error) if error.is_incompatible() => ErrorClass::Incompatible,
+            Self::Transport(_) | Self::Protocol(_) | Self::ResponseMismatch(_) => {
+                ErrorClass::OutcomeUnknown
+            }
+            Self::Rpc(failure) => rpc_failure_class(failure),
+            Self::MissingCapabilities(_) => ErrorClass::Incompatible,
+            Self::ArtifactIntegrity(_) => ErrorClass::OperatorRequired,
+            Self::ArtifactReadFenceChanged => ErrorClass::Transient,
+            Self::Object(error) => error.class(),
+            Self::ArtifactUpload(error) => {
+                if error.retryable() {
+                    ErrorClass::Transient
+                } else {
+                    ErrorClass::OutcomeUnknown
+                }
+            }
+            Self::ArtifactPublishFailed {
+                source,
+                abort_failure,
+                ..
+            } => {
+                if abort_failure.is_some() {
+                    // The publication's durable state was not confirmed.
+                    ErrorClass::OutcomeUnknown
+                } else {
+                    source.class()
+                }
+            }
+            Self::AppendUnresolved { state, source, .. } => {
+                if source.rpc_code() == Some(ErrorCode::RequestReplayMismatch) {
+                    return ErrorClass::IdentityConflict;
+                }
+                match state {
+                    Some(OperationState::Running | OperationState::Aborting) => {
+                        ErrorClass::InProgress
+                    }
+                    Some(OperationState::Quarantined) => ErrorClass::OperatorRequired,
+                    Some(OperationState::Succeeded | OperationState::Failed) | None => {
+                        ErrorClass::OutcomeUnknown
+                    }
+                }
+            }
+            Self::AppendCleanupUnresolved { .. } => ErrorClass::OutcomeUnknown,
+            Self::RetryExhausted { last_error, .. } => last_error.class(),
+        }
+    }
+}
+
+/// What an owner's typed refusal means for a mutation. The owner marks a
+/// refusal retryable only when it applied nothing, except for internal and
+/// ownership failures, which a local-only owner can report after it applied
+/// the request.
+pub fn rpc_failure_class(failure: &RpcFailure) -> ErrorClass {
+    match failure.code {
+        ErrorCode::InvalidArgument => ErrorClass::InvalidInput,
+        ErrorCode::NotFound => ErrorClass::NotFound,
+        ErrorCode::AlreadyExists => ErrorClass::PreconditionFailed,
+        ErrorCode::Conflict | ErrorCode::PreconditionFailed => {
+            if failure.conflict == Some(ConflictKind::RootPlacement) {
+                ErrorClass::OutcomeUnknown
+            } else if failure.retryable {
+                ErrorClass::Transient
+            } else {
+                ErrorClass::PreconditionFailed
+            }
+        }
+        ErrorCode::RequestReplayMismatch => ErrorClass::IdentityConflict,
+        ErrorCode::NotOwner | ErrorCode::ObjectUnavailable => ErrorClass::OutcomeUnknown,
+        ErrorCode::SnapshotExpired | ErrorCode::SnapshotReaped => ErrorClass::NotFound,
+        ErrorCode::CommitRetiring | ErrorCode::OperationFailed => ErrorClass::PreconditionFailed,
+        ErrorCode::Quarantined | ErrorCode::ResourceExhausted => ErrorClass::OperatorRequired,
+        ErrorCode::Internal => {
+            if failure.retryable {
+                ErrorClass::OutcomeUnknown
+            } else {
+                ErrorClass::Internal
+            }
+        }
     }
 }
 

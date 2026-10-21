@@ -236,10 +236,12 @@ real-service acceptance gate is still **not qualified**.
 | `nokv version --json` | Report the exact NoKV revision, lockfile identity, Holt source/version/checksum, schema, and tool count. | Identity/readback only. |
 | `nokv schema` | Emit the exact 18 normalized Workbench input schemas. | Contract inventory, not a live health check. |
 | `nokv materialize` | Copy a verified workspace artifact to a new local path. | The destination is disposable scratch, not a namespace or mount. |
-| `nokv collect` | Publish one bounded regular local file, create-only or generation-fenced replace. | Symlinks and unbounded/non-regular inputs fail closed. |
+| `nokv collect` | Publish one bounded regular local file, create-only or generation-fenced replace. | Symlinks and unbounded/non-regular inputs fail closed. With `--operation-id` it publishes like `workspace-path put`. |
+| `nokv workspace-path put` | Publish one whole body, create-only or pinned to `--expected-generation`, under a caller `--operation-id`. | A retry with the same id and inputs from any process returns the original receipt; other inputs are an `identity_conflict`. |
+| `nokv workspace-path stat` | Read a path's incarnation, workspace revision, generation, and artifact revision in one metadata read. | Read-only; no object-store connection. |
 | `nokv workspace-path rename` / `nokv workspace-path remove` | Apply an explicit generation- and request-id-fenced path mutation. | Custom CLI surface; not one of the 18 Workbench tools. |
 | `nokv workspace-path append` | Append bytes under a durable logical identity and recover the original receipt across process restarts. | The first admission requires an existing workspace. Retries use fenced publication attempts under the same identity; the 18-tool schema is unchanged. |
-| `nokv operation status` | Query an append by its logical identity and report its receipt or next recovery action. | Metadata only: no payload, current workspace, or object-store connection is required. |
+| `nokv operation status` | Query an append, publish, commit (`--commit-identity`), or restore by its identity and report its stored receipt or next action. | Metadata only: no payload, current workspace, or object-store connection is required. |
 | `nokv operation inspect` | Inspect a bounded page of retained staged objects and save the exact operation token. | Metadata only; the cursor binds one observation and fails if state changes. |
 | `nokv operation recover` | Ask the owner to retry quarantined append cleanup. | No payload or object credentials; an explicit saved state digest replays one durable recovery request. |
 | `nokv provision` | Bind `RootId` to `AgentId`, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. |
@@ -331,7 +333,8 @@ An interrupted publication must be fenced and cleaned before a successor
 attempt can start. Status queries only observe this lifecycle. Persist the delta
 or a way to reproduce the exact bytes until the operation commits. An unknown
 result or `NotFound` observation is not proof that a concurrent request cannot
-commit; errors preserve the logical id and use `next_action=query_same`.
+commit; errors preserve the logical id, and an unknown outcome uses
+`next_action=query_same`.
 `cause_code=RequestReplayMismatch` means the identity belongs to different
 inputs or a different lifecycle: recover the original intent before retrying.
 Never generate a replacement id merely to bypass an uncertain outcome.
@@ -377,7 +380,9 @@ Native control plane or provider
 ```
 
 Use the native CLI for agent skills because it provides one inspectable schema,
-stable JSON envelopes, and fail-closed admission. Use Python when the caller
+stable JSON envelopes, and fail-closed admission. A failed command writes one
+JSON line to stderr with its failure `class` and `next_action` and exits with
+that class's code; see the [CLI Contract](docs/cli-contract.md). Use Python when the caller
 needs in-process range reads, fsspec/checkpoint integration, or direct typed
 methods. Use Rust for provider, routing, change-feed, or recovery-aware work.
 
@@ -621,6 +626,7 @@ immutable revisions are visible and retained by a workspace.
 - [Product design](docs/product-design.md)
 - [Architecture](docs/architecture.md)
 - [Workbench contract](docs/workbench-contract.md)
+- [CLI contract](docs/cli-contract.md)
 - [Metadata schema](docs/metadata-schema.md)
 - [Object layout](docs/object-layout.md)
 - [Path-native metadata comparison](docs/development/path-native-metadata-comparison.md)

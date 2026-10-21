@@ -15,6 +15,8 @@ mod body_digest;
 mod error;
 mod generic_index;
 mod idempotent_append;
+mod idempotent_publish;
+mod operation_status;
 mod route;
 mod sdk;
 mod snapshot_workflow;
@@ -27,13 +29,13 @@ pub use append_operations::{
     MAX_APPEND_INSPECTION_LIMIT,
 };
 pub use artifact::{
-    ArtifactAppendOptions, ArtifactAppendOutcome, ArtifactPublishOptions, ArtifactPublishOutcome,
-    ArtifactRangeBatchItem, ArtifactRangeBatchOutcome, ArtifactRangeBatchRequest,
-    ArtifactReadAuthority, ArtifactReadOutcome, MAX_ARTIFACT_RANGE_BATCH_OUTPUT_BYTES,
-    MAX_ARTIFACT_RANGE_BATCH_RANGES, MAX_ARTIFACT_RANGE_BATCH_READ_BYTES,
-    MAX_ARTIFACT_RANGE_BATCH_REQUESTS,
+    visible_body_publishes_inline, ArtifactAppendOptions, ArtifactAppendOutcome,
+    ArtifactPublishOptions, ArtifactPublishOutcome, ArtifactRangeBatchItem,
+    ArtifactRangeBatchOutcome, ArtifactRangeBatchRequest, ArtifactReadAuthority,
+    ArtifactReadOutcome, MAX_ARTIFACT_RANGE_BATCH_OUTPUT_BYTES, MAX_ARTIFACT_RANGE_BATCH_RANGES,
+    MAX_ARTIFACT_RANGE_BATCH_READ_BYTES, MAX_ARTIFACT_RANGE_BATCH_REQUESTS,
 };
-pub use error::{ArtifactPublishStage, ClientError, TransportError};
+pub use error::{rpc_failure_class, ArtifactPublishStage, ClientError, TransportError};
 pub use generic_index::{
     GenericIndexAbortOutcome, GenericIndexRegistrationOutcome, GenericIndexRegistrationPlan,
 };
@@ -41,6 +43,11 @@ pub use idempotent_append::{
     append_operation_recovery, AppendNextAction, AppendRecovery, AppendRecoveryState,
     IdempotentAppendOptions, DEFAULT_APPEND_MAX_LOGICAL_SIZE, MAX_APPEND_DELTA_BYTES,
 };
+pub use idempotent_publish::{
+    publish_attempt_identity, IdempotentPublishError, IdempotentPublishOptions,
+    IdempotentPublishReceipt, PublishAttemptIdentity, MAX_IDEMPOTENT_PUBLISH_ATTEMPTS,
+};
+pub use operation_status::{operation_observation, OperationObservation, OperationObservedState};
 #[cfg(feature = "control")]
 pub use route::ControlRouteResolver;
 #[cfg(feature = "etcd")]

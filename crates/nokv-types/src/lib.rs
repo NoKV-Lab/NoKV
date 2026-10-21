@@ -1,11 +1,13 @@
 //! Storage-neutral Agent workspace domain model.
 //!
 //! This crate owns root, workbench, path, artifact, commit, snapshot, operation,
-//! and lifecycle identities. It does not own metadata layout, routing
+//! and lifecycle identities, and the caller-facing failure classes. It does not own metadata layout, routing
 //! implementation, object providers, or wire encoding.
 
+pub mod failure;
 pub mod workspace;
 
+pub use failure::{ErrorClass, IdempotencyScope, NextAction};
 pub use workspace::time_ordered_identity;
 pub use workspace::{
     AgentId, ArtifactRevisionId, BuildCommitPhase, CommandDigest, CommitConsumerKind, CommitId,

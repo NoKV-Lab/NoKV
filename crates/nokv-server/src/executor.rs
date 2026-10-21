@@ -2098,8 +2098,16 @@ impl MetadataWorkspaceRequestExecutor {
                 // rechecks the claim, and a retry of an admitted operation
                 // still reaches the engine's exact replay.
                 if !admitted {
-                    meta::validate_publish_claim(&claim, current.as_ref())
-                        .map_err(publication_failure)?;
+                    meta::validate_publish_claim(&claim, current.as_ref()).map_err(|error| {
+                        let mut failure = publication_failure(error);
+                        // Name the generation a create-only caller would
+                        // have to pin to replace the path instead.
+                        if failure.current_generation.is_none() {
+                            failure.current_generation =
+                                current.as_ref().map(|entry| entry.generation.get());
+                        }
+                        failure
+                    })?;
                 }
                 (
                     meta::PublishAuthority::Visible,
@@ -9708,6 +9716,8 @@ mod tests {
             .execute(&prepare(0x87, duplicate.clone()))
             .unwrap_err();
         assert_eq!(refused.code, protocol::ErrorCode::AlreadyExists);
+        // The refusal names the generation a replace would have to pin.
+        assert_eq!(refused.current_generation, Some(1));
         // Neither refusal admitted an operation that would own uploads.
         for refused in [&stale, &duplicate] {
             assert!(executor

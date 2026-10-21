@@ -16,7 +16,8 @@
 
 use std::io::{self, BufRead, Read, Write};
 
-use nokv_agent::{execute_tool, AgentError, WorkbenchToolHandler};
+use nokv_agent::{execute_tool, workbench_tool_idempotency, AgentError, WorkbenchToolHandler};
+use nokv_types::IdempotencyScope;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -66,6 +67,28 @@ fn dispatch(
     }
 }
 
+/// One error response line: the stable Agent envelope, with the failure class
+/// and next action beside it, as a single CLI invocation reports them.
+fn error_line(id: Option<&str>, error: &AgentError, scope: IdempotencyScope) -> Value {
+    let class = match scope {
+        IdempotencyScope::ReadOnly => error.class().for_read(),
+        _ => error.class(),
+    };
+    json!({
+        "id": id,
+        "error": error.as_value(),
+        "class": class.as_str(),
+        "next_action": class.next_action(scope).as_str(),
+    })
+}
+
+fn request_scope(request: &SessionRequest) -> IdempotencyScope {
+    match (&request.tool, request.command.as_deref()) {
+        (Some(tool), None) => workbench_tool_idempotency(tool),
+        _ => IdempotencyScope::ReadOnly,
+    }
+}
+
 fn serve_bounded(
     handler: &impl WorkbenchToolHandler,
     commands: &impl SessionCommands,
@@ -93,16 +116,16 @@ fn serve_bounded(
             Ok(request) if !request.id.is_empty() && request.id.len() <= MAX_REQUEST_ID_BYTES => {
                 match dispatch(handler, commands, &request) {
                     Ok(result) => json!({"id": request.id, "result": result}),
-                    Err(error) => json!({"id": request.id, "error": error.as_value()}),
+                    Err(error) => error_line(Some(&request.id), &error, request_scope(&request)),
                 }
             }
-            _ => json!({
-                "id": null,
-                "error": AgentError::invalid_arguments(
-                    "expected {id, tool or command, arguments} with a 1-128 byte id; unknown fields are rejected"
-                )
-                .as_value(),
-            }),
+            _ => error_line(
+                None,
+                &AgentError::invalid_arguments(
+                    "expected {id, tool or command, arguments} with a 1-128 byte id; unknown fields are rejected",
+                ),
+                IdempotencyScope::ReadOnly,
+            ),
         };
         serde_json::to_writer(&mut writer, &response)?;
         writer.write_all(b"\n")?;
@@ -156,7 +179,35 @@ mod tests {
         assert_eq!(lines[0]["result"]["workbench"], "run-1");
         assert_eq!(lines[1]["id"], "b");
         assert!(lines[1]["error"].is_object());
+        assert_eq!(lines[1]["class"], "invalid_input");
+        assert_eq!(lines[1]["next_action"], "fix_input");
         assert_eq!(lines[2]["result"]["workbench"], "run-2");
+    }
+
+    #[test]
+    fn an_error_line_reports_the_class_of_its_tool_call() {
+        let handler = |name: &str, _: &Value| -> Result<Value, AgentError> {
+            // The owner applied the call, then its reply was lost.
+            Err(
+                AgentError::backend("Transport", "connection reset", true, json!({}))
+                    .with_class(nokv_types::ErrorClass::OutcomeUnknown),
+            )
+            .map(|_: ()| json!({"tool": name}))
+        };
+        let lines = run(
+            &handler,
+            concat!(
+                "{\"id\":\"w\",\"tool\":\"workbench_put_file\",\"arguments\":{\"id\":\"run\",\"section\":\"outputs\",\"path\":\"a.txt\",\"text\":\"a\"}}\n",
+                "{\"id\":\"r\",\"tool\":\"workbench_read\",\"arguments\":{\"id\":\"run\",\"section\":\"outputs\",\"path\":\"a.txt\"}}\n",
+            ),
+        );
+        // A write without a caller identity must be read back before a retry.
+        assert_eq!(lines[0]["class"], "outcome_unknown");
+        assert_eq!(lines[0]["next_action"], "reread_then_retry");
+        // A read changed nothing.
+        assert_eq!(lines[1]["class"], "transient");
+        assert_eq!(lines[1]["next_action"], "resubmit_same");
+        assert_eq!(lines[0]["error"]["code"], "Transport");
     }
 
     #[test]

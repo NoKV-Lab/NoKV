@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::OnceLock;
 
+use nokv_types::{ErrorClass, IdempotencyScope};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -148,34 +149,33 @@ pub struct AgentError {
     pub message: String,
     pub retryable: bool,
     pub details: Value,
+    /// The failure class the SDK determined, when the error came from it.
+    /// Transports report it beside the stable envelope; it is not part of
+    /// [`AgentError::as_value`].
+    pub class: Option<ErrorClass>,
 }
 
 impl AgentError {
     pub fn invalid_arguments(message: impl Into<String>) -> Self {
-        Self {
-            code: "InvalidArguments".to_owned(),
-            message: message.into(),
-            retryable: false,
-            details: json!({}),
-        }
+        Self::backend("InvalidArguments", message, false, json!({}))
     }
 
     pub fn unknown_tool(name: &str) -> Self {
-        Self {
-            code: "UnknownTool".to_owned(),
-            message: format!("unknown Workbench tool {name}"),
-            retryable: false,
-            details: json!({"tool": name}),
-        }
+        Self::backend(
+            "UnknownTool",
+            format!("unknown Workbench tool {name}"),
+            false,
+            json!({"tool": name}),
+        )
     }
 
     pub fn unknown_generic_agent_tool(name: &str) -> Self {
-        Self {
-            code: "UnknownTool".to_owned(),
-            message: format!("unknown Agent tool {name}"),
-            retryable: false,
-            details: json!({"tool": name}),
-        }
+        Self::backend(
+            "UnknownTool",
+            format!("unknown Agent tool {name}"),
+            false,
+            json!({"tool": name}),
+        )
     }
 
     pub fn backend(
@@ -189,7 +189,20 @@ impl AgentError {
             message: message.into(),
             retryable,
             details,
+            class: None,
         }
+    }
+
+    pub fn with_class(mut self, class: ErrorClass) -> Self {
+        self.class = Some(class);
+        self
+    }
+
+    /// The failure class: the SDK's when it supplied one, otherwise the class
+    /// of the Agent adapter's own error code.
+    pub fn class(&self) -> ErrorClass {
+        self.class
+            .unwrap_or_else(|| agent_error_code_class(&self.code, self.retryable))
     }
 
     pub fn as_value(&self) -> Value {
@@ -200,6 +213,32 @@ impl AgentError {
             "retryable": self.retryable,
             "details": self.details,
         })
+    }
+}
+
+/// The class of an error code the Agent adapter raises itself.
+fn agent_error_code_class(code: &str, retryable: bool) -> ErrorClass {
+    match code {
+        "InvalidArguments" | "InvalidArgument" | "UnknownTool" | "PayloadTooLarge"
+        | "NotDirectory" | "NotArtifact" => ErrorClass::InvalidInput,
+        "NotFound" | "SnapshotNotFound" | "SnapshotExpired" => ErrorClass::NotFound,
+        // A lost race inside the adapter's own retry loop.
+        "Conflict" | "ReadFenceChanged" if retryable => ErrorClass::Transient,
+        "AlreadyExists"
+        | "Conflict"
+        | "WorkbenchCommitConflict"
+        | "NoMatch"
+        | "AmbiguousEdit"
+        | "ForkRetentionActive"
+        | "InvalidState" => ErrorClass::PreconditionFailed,
+        "BackendProtocolMismatch"
+        | "WorkbenchCommitProtocolMismatch"
+        | "RestoreProtocolMismatch" => ErrorClass::Incompatible,
+        "ResourceExhausted" | "Quarantined" => ErrorClass::OperatorRequired,
+        "ObjectUnavailable" | "AppendUnresolved" | "AppendCleanupUnresolved" | "Transport" => {
+            ErrorClass::OutcomeUnknown
+        }
+        _ => ErrorClass::Internal,
     }
 }
 
@@ -239,6 +278,29 @@ where
 {
     fn execute(&self, name: &str, arguments: &Value) -> Result<Value, AgentError> {
         self(name, arguments)
+    }
+}
+
+/// How one Workbench tool identifies its effect, which decides how a caller
+/// resolves a failure whose outcome is unknown.
+pub fn workbench_tool_idempotency(name: &str) -> IdempotencyScope {
+    match name {
+        "workbench_list"
+        | "workbench_stat"
+        | "workbench_read"
+        | "workbench_grep"
+        | "workbench_search"
+        | "workbench_aggregate"
+        | "workbench_catalog"
+        | "workbench_find"
+        | "workbench_snapshot_list" => IdempotencyScope::ReadOnly,
+        "workbench_create" | "workbench_snapshot_renew" | "workbench_snapshot_retire" => {
+            IdempotencyScope::Convergent
+        }
+        "workbench_commit" | "workbench_restore" => IdempotencyScope::ContentDerived,
+        // put_file, append, edit and snapshot mint a fresh identity per call,
+        // and an unknown name is treated the same way.
+        _ => IdempotencyScope::Unidentified,
     }
 }
 
@@ -562,6 +624,35 @@ fn schema_array<'a>(value: &'a Value, path: &str, keyword: &str) -> Result<&'a [
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_workbench_tool_has_a_declared_idempotency_scope() {
+        let tools = tool_definitions();
+        assert_eq!(tools.len(), 18);
+        let read_only: Vec<_> = tools
+            .iter()
+            .filter(|tool| workbench_tool_idempotency(&tool.name) == IdempotencyScope::ReadOnly)
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(read_only.len(), 9, "{read_only:?}");
+        for mutating in [
+            "workbench_create",
+            "workbench_put_file",
+            "workbench_append",
+            "workbench_edit",
+            "workbench_commit",
+            "workbench_snapshot",
+            "workbench_snapshot_renew",
+            "workbench_snapshot_retire",
+            "workbench_restore",
+        ] {
+            assert!(tools.iter().any(|tool| tool.name == mutating));
+            assert_ne!(
+                workbench_tool_idempotency(mutating),
+                IdempotencyScope::ReadOnly
+            );
+        }
+    }
+
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;

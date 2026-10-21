@@ -106,12 +106,11 @@ impl CliObjectStore {
 
     /// Verify the immutable object semantics required by every Agent tool
     /// before the CLI advertises its MCP surface.
-    pub fn validate_agent_capabilities(&self) -> Result<(), String> {
+    pub fn validate_agent_capabilities(&self) -> Result<(), ProviderAdmissionError> {
         self.cache_admission(&self.admission, |store| {
             let profile = ProviderAdmissionProfile::single_put(DEFAULT_ARTIFACT_BLOCK_SIZE)?;
             admit_artifact_provider(store, profile)
         })
-        .map_err(|error| error.to_string())
     }
 
     /// Prove monotonic sealing before admitting stable append uploads.
@@ -144,8 +143,8 @@ impl CliObjectStore {
         Ok(())
     }
 
-    pub fn bind(mut self, expected: ObjectNamespaceId) -> Result<Self, String> {
-        verify_object_namespace(self.durable(), expected).map_err(|error| error.to_string())?;
+    pub fn bind(mut self, expected: ObjectNamespaceId) -> Result<Self, ObjectError> {
+        verify_object_namespace(self.durable(), expected)?;
         self.namespace_id = Some(expected);
         Ok(self)
     }

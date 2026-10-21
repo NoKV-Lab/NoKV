@@ -48,8 +48,10 @@ A line may instead name the session command `materialize` with `{"id",
 returns the whole live artifact as `base64` with its `generation`,
 `digest_uri` and `size_bytes`, because `workbench_read` pages at most 300
 lines or bytes per call. Each request is answered by one flushed JSON line
-carrying the same `id` and either `result` or `error`; a malformed line is answered with `id: null`, and a
-line over 128 MiB ends the session before dispatch. Ids are 1-128 bytes and
+carrying the same `id` and either `result` or `error`; an `error` line also
+carries the failure `class` and `next_action` of the
+[CLI Contract](./cli-contract.md). A malformed line is answered with
+`id: null`, and a line over 128 MiB ends the session before dispatch. Ids are 1-128 bytes and
 only correlate responses. Every call keeps its tool's own publication,
 durability and retry boundary; the session is not a transaction. If the output
 breaks, the current mutation may already be committed, so a caller reconciles

@@ -88,8 +88,9 @@ SPDX-License-Identifier: Apache-2.0
 ## Documentation Map
 
 - Product and interface: [Product Design](./product-design.md),
-  [Architecture](./architecture.md), and
-  [Workbench Contract](./workbench-contract.md).
+  [Architecture](./architecture.md),
+  [Workbench Contract](./workbench-contract.md), and
+  [CLI Contract](./cli-contract.md).
 - Storage and distribution: [Metadata Schema](./metadata-schema.md),
   [Object Layout](./object-layout.md), and
   [RustFS Provider Profile](./rustfs.md).
