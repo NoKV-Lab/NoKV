@@ -425,20 +425,49 @@ where
                 }
                 Err(error) => error,
             };
-            // The request may have committed before its response was lost.
-            if let Ok(Some(recovered)) = self.recover_completed_publish(logical_shard, operation_id)
-            {
-                return Ok(ArtifactPublishOutcome {
-                    publication: recovered,
-                    upload_stats: ArtifactUploadStats::default(),
-                });
-            }
-            if !should_resume_artifact_publication(&error) {
-                return Err(if append_intent_digest.is_some() {
-                    publication_failure_without_abort(stage, error)
-                } else {
-                    self.failed_publication(logical_shard, operation_id, None, stage, error)
-                });
+            // A lost response, the refusal of an epoch-bound identity after an
+            // owner restart, and a reused identity all arrive here. Only this
+            // publication's own durable row may stand in for its response.
+            let resumable = should_resume_artifact_publication(&error);
+            match self.observe_inline_publication(logical_shard, &request.begin, descriptor) {
+                InlinePublicationRow::Succeeded(call) => {
+                    if append_intent_digest.is_none()
+                        && matches!(authority, PublicationAuthority::Visible)
+                    {
+                        self.confirm_replayed_publication_is_live(logical_shard, &call.value)
+                            .map_err(|source| publication_failure_without_abort(stage, source))?;
+                    }
+                    return Ok(ArtifactPublishOutcome {
+                        publication: call,
+                        upload_stats: ArtifactUploadStats::default(),
+                    });
+                }
+                InlinePublicationRow::Running(token) if !resumable => {
+                    return Err(if append_intent_digest.is_some() {
+                        publication_failure_without_abort(stage, error)
+                    } else {
+                        self.failed_publication(
+                            logical_shard,
+                            operation_id,
+                            Some(token),
+                            stage,
+                            error,
+                        )
+                    });
+                }
+                InlinePublicationRow::Unobserved if !resumable => {
+                    return Err(if append_intent_digest.is_some() {
+                        publication_failure_without_abort(stage, error)
+                    } else {
+                        self.failed_publication(logical_shard, operation_id, None, stage, error)
+                    });
+                }
+                // Nothing was admitted, or the row is terminal or belongs to
+                // other inputs: there is nothing of this publication to abort.
+                InlinePublicationRow::Absent | InlinePublicationRow::Unrelated if !resumable => {
+                    return Err(publication_failure_without_abort(stage, error));
+                }
+                _ => {}
             }
             if attempt == self.max_attempts() {
                 return Err(ClientError::RetryExhausted {
@@ -1762,6 +1791,47 @@ where
             commit_version: operation.commit_version,
             replayed: operation.replayed,
         }))
+    }
+
+    /// Read the durable row of one inline publication after its request
+    /// failed, accepting a receipt only when it records this publication.
+    fn observe_inline_publication(
+        &self,
+        logical_shard: LogicalShardIdentity,
+        begin: &BeginArtifactPublishRequest,
+        descriptor: &ArtifactDescriptor,
+    ) -> InlinePublicationRow {
+        let observed = match self.load_operation_on_shard(logical_shard, begin.operation_id) {
+            Ok(observed) => observed,
+            Err(error) if error.rpc_code() == Some(ErrorCode::NotFound) => {
+                return InlinePublicationRow::Absent
+            }
+            Err(_) => return InlinePublicationRow::Unobserved,
+        };
+        let Ok(status) = validated_publish_status(observed.value, begin.operation_id) else {
+            return InlinePublicationRow::Unrelated;
+        };
+        let prepared_here = status
+            .publish_preparation
+            .as_deref()
+            .is_some_and(|preparation| {
+                preparation.target == begin.target
+                    && preparation.artifact_revision_id == begin.artifact_revision_id
+            });
+        match status.state {
+            OperationState::Running if prepared_here => InlinePublicationRow::Running(status.token),
+            OperationState::Succeeded => match published_result_from_status(&status) {
+                Ok(value) if records_inline_publication(&value, begin, descriptor) => {
+                    InlinePublicationRow::Succeeded(ClientCall {
+                        value,
+                        commit_version: observed.commit_version,
+                        replayed: true,
+                    })
+                }
+                _ => InlinePublicationRow::Unrelated,
+            },
+            _ => InlinePublicationRow::Unrelated,
+        }
     }
 
     fn read_artifact_once(
@@ -3335,6 +3405,49 @@ fn running_publish_token(
     Ok(status.token)
 }
 
+/// The durable state of one inline publication, observed after its request
+/// failed.
+enum InlinePublicationRow {
+    /// This publication succeeded; carries its stored receipt.
+    Succeeded(ClientCall<PublishResult>),
+    /// This publication was admitted and is still running.
+    Running(OperationToken),
+    /// No operation row exists, so nothing was admitted.
+    Absent,
+    /// The row is terminal without success, or records other inputs.
+    Unrelated,
+    /// The row could not be read.
+    Unobserved,
+}
+
+/// Whether a stored receipt records exactly this inline publication. The
+/// engine binds the target, revision, body, and claim into the identity, so a
+/// receipt that differs in any of them belongs to another publication.
+fn records_inline_publication(
+    published: &PublishResult,
+    begin: &BeginArtifactPublishRequest,
+    descriptor: &ArtifactDescriptor,
+) -> bool {
+    let generation_follows_claim = match begin.condition {
+        PublishCondition::CreateOnly => published.generation == 1,
+        PublishCondition::ReplaceOnly {
+            expected_generation,
+        }
+        | PublishCondition::Append {
+            expected_generation: Some(expected_generation),
+        } => expected_generation.checked_add(1) == Some(published.generation),
+        PublishCondition::Append {
+            expected_generation: None,
+        } => true,
+    };
+    published.operation_id == begin.operation_id
+        && published.target == begin.target
+        && published.artifact_revision_id == begin.artifact_revision_id
+        && published.logical_size == descriptor.logical_size
+        && published.body_digest == descriptor.body_digest
+        && generation_follows_claim
+}
+
 fn validated_publish_status(
     status: OperationStatus,
     operation_id: OperationIdentity,
@@ -3444,6 +3557,10 @@ mod tests {
         advance_stage_before_response_once: bool,
         advance_finish_before_response_once: bool,
         finish_requests: Vec<FinishArtifactPublishRequest>,
+        lose_inline_responses: bool,
+        /// Inline retries of the stored intent to refuse as the engine does
+        /// once the owner epoch bound into a visible identity has moved.
+        inline_replay_rejections: usize,
     }
 
     impl ScriptedArtifactTransport {
@@ -3475,6 +3592,8 @@ mod tests {
                     advance_stage_before_response_once: false,
                     advance_finish_before_response_once: false,
                     finish_requests: Vec::new(),
+                    lose_inline_responses: false,
+                    inline_replay_rejections: 0,
                 })),
                 events,
             }
@@ -3498,6 +3617,14 @@ mod tests {
 
         fn lose_complete_responses(&self) {
             self.state.lock().unwrap().lose_complete_responses = true;
+        }
+
+        fn lose_inline_responses(&self) {
+            self.state.lock().unwrap().lose_inline_responses = true;
+        }
+
+        fn reject_inline_replays(&self, count: usize) {
+            self.state.lock().unwrap().inline_replay_rejections = count;
         }
 
         fn conflict_append_begins(&self, count: usize) {
@@ -3526,6 +3653,63 @@ mod tests {
                 operation_id,
                 state_digest: Digest([self.token_sequence; 32]),
             }
+        }
+
+        /// The typed refusal the engine returns before it writes any row: an
+        /// operation identity reused with other immutable inputs, a create-only
+        /// claim on a path that already exists, or an unknown operation.
+        fn admission_failure(&mut self, operation: &WorkspaceRequest) -> Option<RpcFailure> {
+            let failure = |code, message: &str, conflict| RpcFailure {
+                code,
+                message: message.to_owned(),
+                retryable: false,
+                conflict,
+                current_generation: None,
+                route_hint: None,
+            };
+            let begin = match operation {
+                WorkspaceRequest::BeginArtifactPublish(begin) => begin,
+                WorkspaceRequest::PrepareArtifactPublish(prepare) => &prepare.begin,
+                WorkspaceRequest::PublishInlineArtifact(publish) => &publish.begin,
+                WorkspaceRequest::GetOperation(get) => {
+                    let known = self
+                        .operation
+                        .as_ref()
+                        .is_some_and(|status| status.token.operation_id == get.operation_id);
+                    return (!known)
+                        .then(|| failure(ErrorCode::NotFound, "operation does not exist", None));
+                }
+                _ => return None,
+            };
+            let mismatch = failure(
+                ErrorCode::RequestReplayMismatch,
+                "publish operation id was reused with different immutable inputs",
+                None,
+            );
+            if let Some(stored) = self
+                .begin
+                .as_ref()
+                .filter(|stored| stored.operation_id == begin.operation_id)
+            {
+                if stored != begin {
+                    return Some(mismatch);
+                }
+                if matches!(operation, WorkspaceRequest::PublishInlineArtifact(_))
+                    && self.inline_replay_rejections > 0
+                {
+                    self.inline_replay_rejections -= 1;
+                    return Some(mismatch);
+                }
+                return None;
+            }
+            if begin.condition == PublishCondition::CreateOnly && self.path.is_some() {
+                return Some(failure(
+                    ErrorCode::AlreadyExists,
+                    "path already exists",
+                    Some(ConflictKind::PathGeneration),
+                ));
+            }
+            None
         }
 
         /// The durable operation row the engine would replay for `operation_id`
@@ -3601,8 +3785,27 @@ mod tests {
                         true,
                     ));
                 }
+                if label == "publish_inline" && state.lose_inline_responses {
+                    return Err(TransportError::new(
+                        "injected inline response loss after durable success",
+                        true,
+                    ));
+                }
                 replayed.replayed = true;
                 return encode_response(&replayed)
+                    .map_err(|error| TransportError::new(error.to_string(), false));
+            }
+
+            if let Some(failure) = state.admission_failure(&request.operation) {
+                let response = WorkspaceRpcResponse {
+                    route: request.route,
+                    request_id: request.request_id,
+                    commit_version: None,
+                    replayed: false,
+                    outcome: WorkspaceRpcOutcome::Failure(failure),
+                };
+                state.replay.insert(request.request_id, response.clone());
+                return encode_response(&response)
                     .map_err(|error| TransportError::new(error.to_string(), false));
             }
 
@@ -3757,6 +3960,16 @@ mod tests {
                 state.stage_response_lost = true;
                 return Err(TransportError::new(
                     "injected response loss after durable stage",
+                    true,
+                ));
+            }
+            if matches!(
+                request.operation,
+                WorkspaceRequest::PublishInlineArtifact(_)
+            ) && state.lose_inline_responses
+            {
+                return Err(TransportError::new(
+                    "injected inline response loss after durable success",
                     true,
                 ));
             }
@@ -4963,6 +5176,143 @@ mod tests {
             matches!(error, ClientError::ArtifactIntegrity(_)),
             "{error:?}"
         );
+    }
+
+    fn expect_inline_failure_without_abort(error: &ClientError, code: ErrorCode) {
+        match error {
+            ClientError::ArtifactPublishFailed {
+                stage: ArtifactPublishStage::PublishInline,
+                source,
+                abort_failure: None,
+            } => assert_eq!(source.rpc_code(), Some(code), "{error:?}"),
+            other => panic!("expected an inline {code:?} failure without abort: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_inline_identity_reused_for_other_inputs_is_refused_without_a_stale_receipt() {
+        for (bytes, revision) in [(&b"other"[..], [8; 16]), (&b"first"[..], [0x38; 16])] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+            let inspector = transport.clone();
+            let client = client(transport);
+            let store = RecordingStore::new(events, None);
+            client
+                .publish_artifact(
+                    &store,
+                    publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE),
+                    b"first",
+                )
+                .unwrap();
+
+            let mut options = publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE);
+            options.artifact_revision_id = ArtifactRevisionIdentity(revision);
+            let error = client.publish_artifact(&store, options, bytes).unwrap_err();
+
+            expect_inline_failure_without_abort(&error, ErrorCode::RequestReplayMismatch);
+            let state = inspector.state();
+            assert_eq!(state.abort_applies, 0);
+            assert_eq!(
+                state
+                    .path
+                    .as_ref()
+                    .and_then(|path| path.inline_body.as_deref()),
+                Some(&b"first"[..])
+            );
+        }
+    }
+
+    #[test]
+    fn an_inline_publication_whose_response_was_lost_returns_its_receipt_as_a_replay() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        inspector.lose_inline_responses();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+
+        let outcome = client
+            .publish_artifact(
+                &store,
+                publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE),
+                b"exact",
+            )
+            .unwrap();
+
+        assert!(outcome.publication.replayed);
+        assert_eq!(
+            outcome.publication.value.artifact_revision_id,
+            ArtifactRevisionIdentity([8; 16])
+        );
+        let state = inspector.state();
+        // Transport resends repeat one request; the client admits no second one.
+        let requests: std::collections::BTreeSet<_> = state
+            .attempts
+            .iter()
+            .filter(|(label, _)| *label == "publish_inline")
+            .map(|(_, request_id)| *request_id)
+            .collect();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(state.abort_applies, 0);
+    }
+
+    #[test]
+    fn an_inline_retry_refused_across_owner_epochs_recovers_its_own_receipt() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        let first = client
+            .publish_artifact(
+                &store,
+                publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE),
+                b"exact",
+            )
+            .unwrap();
+        // A visible identity binds its initiating owner epoch, so after an
+        // owner restart the engine refuses even an exact retry.
+        inspector.reject_inline_replays(1);
+
+        let retried = client
+            .publish_artifact(
+                &store,
+                publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE),
+                b"exact",
+            )
+            .unwrap();
+
+        assert!(retried.publication.replayed);
+        assert_eq!(retried.publication.value, first.publication.value);
+        assert_eq!(inspector.state().abort_applies, 0);
+    }
+
+    #[test]
+    fn an_inline_create_refused_at_admission_does_not_abort_an_absent_operation() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(
+                &store,
+                publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE),
+                b"first",
+            )
+            .unwrap();
+        let mut options = publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE);
+        options.operation_id = OperationIdentity([0x27; 16]);
+        options.artifact_revision_id = ArtifactRevisionIdentity([0x28; 16]);
+
+        let error = client
+            .publish_artifact(&store, options, b"second")
+            .unwrap_err();
+
+        expect_inline_failure_without_abort(&error, ErrorCode::AlreadyExists);
+        let state = inspector.state();
+        assert_eq!(state.abort_applies, 0);
+        assert!(!state.attempts.iter().any(|(label, _)| *label == "abort"));
     }
 
     #[test]
