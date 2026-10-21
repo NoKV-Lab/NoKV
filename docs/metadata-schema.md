@@ -686,6 +686,25 @@ caller must rebuild the command. An exact request-id replay is checked before
 that fence and returns the stored result. Reusing a request id with different
 inputs is an error. A failed predicate applies no mutation.
 
+A mutating RPC first claims its request id with an empty command whose
+deterministic result is the request fingerprint:
+
+```text
+SHA-256("nokv.server.request-fingerprint.v1\0"
+        || principal            (0x00; 0x01 || agent_id is reserved)
+        || root_id || logical_shard_id || object_namespace_id
+        || request_id || u64be(len(operation)) || operation)
+```
+
+`operation` is the MessagePack encoding of the request's operation. The owner
+epoch, the placement generation and the protocol schema are not part of it, so
+a same-id retry of the same operation replays after an owner restart; reads
+and commits fence ownership and placement instead. The claim binds the
+operation, not its result: a step that failed records nothing, and a same-id
+retry evaluates it again. The fingerprint and the step identities derived from
+a request id are part of the metadata format. A store whose claim rows hold an
+earlier fingerprint refuses those request ids as reused.
+
 Ordinary put/replace/remove has a fixed upper bound on predicates and mutations
 apart from bounded manifest and index rows. It performs no namespace prefix
 scan.
