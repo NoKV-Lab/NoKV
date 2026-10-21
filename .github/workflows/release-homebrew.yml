@@ -232,24 +232,33 @@ jobs:
           RELEASE_DIR: ${{ runner.temp }}/nokv-homebrew-release
         run: |
           set -euo pipefail
-          archive="nokv-$RELEASE_VERSION-source.tar.gz"
-          manifest="nokv-$RELEASE_VERSION-homebrew.json"
+          cd "$RELEASE_DIR"
+          assets=( "nokv-$RELEASE_VERSION-source.tar.gz" \
+                   "nokv-$RELEASE_VERSION-homebrew.json" \
+                   SHA256SUMS )
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            # The Python SDK workflow may have created the release with only
+            # its own assets: compare the assets already published, add the rest.
             existing="$RUNNER_TEMP/existing-homebrew-release"
             mkdir -p "$existing"
-            gh release download "$RELEASE_TAG" \
-              --dir "$existing" \
-              --pattern "$archive" \
-              --pattern "$manifest" \
-              --pattern SHA256SUMS
-            cmp "$RELEASE_DIR/$archive" "$existing/$archive"
-            cmp "$RELEASE_DIR/$manifest" "$existing/$manifest"
-            cmp "$RELEASE_DIR/SHA256SUMS" "$existing/SHA256SUMS"
+            published="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+            to_upload=()
+            for asset in "${assets[@]}"; do
+              if grep -qxF "$asset" <<<"$published"; then
+                gh release download "$RELEASE_TAG" --dir "$existing" --pattern "$asset"
+                if ! cmp "$asset" "$existing/$asset"; then
+                  echo "::error title=Immutable asset conflict::release asset already exists with different bytes: $asset"
+                  exit 1
+                fi
+              else
+                to_upload+=("$asset")
+              fi
+            done
+            if (( ${#to_upload[@]} > 0 )); then
+              gh release upload "$RELEASE_TAG" "${to_upload[@]}"
+            fi
           else
-            gh release create "$RELEASE_TAG" \
-              "$RELEASE_DIR/$archive" \
-              "$RELEASE_DIR/$manifest" \
-              "$RELEASE_DIR/SHA256SUMS" \
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
               --verify-tag \
               --latest \
               --title "NoKV $RELEASE_VERSION" \
