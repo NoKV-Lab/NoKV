@@ -159,7 +159,8 @@ continuations retain one exact root read version. Live continuations may move
 to a newer root read version only while the target workspace incarnation and
 revision remain unchanged; target drift fails closed, and an initial bounded
 collection may restart in full but never merges workspace revisions. This
-contract is gated by operation schema `nokv.workspace.rpc.v12`; v12 adds
+contract is gated by operation schema `nokv.workspace.rpc.v13`; v13 adds the
+fused `PrepareArtifactPublish` and `FinishArtifactPublish` requests. V12 added
 metadata-only append ledger inspection and exact-token owner cleanup retry.
 V11 added durable logical append parents,
 predecessor-fenced publication attempts, and metadata-only append status. The
@@ -172,13 +173,13 @@ added the provider-neutral object namespace identity to every root route.
 
 Each TCP connection starts with the fixed-width, schema-neutral transport
 handshake v1. The client offers one exact operation schema, and the server
-accepts only `nokv.workspace.rpc.v12`; the handshake version remains stable when
+accepts only `nokv.workspace.rpc.v13`; the handshake version remains stable when
 the operation schema changes. For upgrade diagnostics, the server recognizes
 only operation-first envelopes from the public v2 client and the post-tag v3
 client. It parses a bounded route/request header, ignores the operation, emits
 one schema-readable failure, and closes without dispatch. The v2 client gets
-its exact v2 failure envelope; the v3 client gets a v12 failure envelope so its
-decoder reports the v12/v3 schema mismatch. Unknown legacy schemas, malformed
+its exact v2 failure envelope; the v3 client gets a v13 failure envelope so its
+decoder reports the v13/v3 schema mismatch. Unknown legacy schemas, malformed
 envelopes, and malformed handshakes fail closed. This is a read-only rejection
 path, not a legacy response decoder or operation fallback.
 
@@ -210,10 +211,10 @@ sequenceDiagram
     participant O as Object backend
     participant S as TxnStore (Holt local profile)
 
-    C->>M: begin publish + request id
-    M-->>C: operation/revision/object plan
+    C->>M: prepare: begin + staged object plan + request id
+    M-->>C: durable operation token
     C->>O: stream immutable blocks
-    C->>M: complete(lengths, digests)
+    C->>M: finish: upload proofs + manifest + complete
     M->>O: verify completion evidence
     M->>S: one fenced MetadataCommand transaction
     S-->>M: deterministic commit result
@@ -231,6 +232,13 @@ mutation. It atomically publishes:
 - one typed event;
 - GC candidacy for a replaced revision;
 - the deterministic replay result.
+
+A plan whose staged objects and manifest rows each fit one batch publishes with
+two metadata requests, each one write session and one durable acknowledgement:
+Prepare before the first provider write and Finish after the last. Each request
+runs the stepwise Begin, StageObjects, MarkUploaded, StageManifest, and Complete
+steps under request identities derived from its own, so replay and token rules
+are unchanged; a larger plan, or a resumed one, uses the stepwise requests.
 
 Failed uploads never become visible. Response loss after commit returns the
 same result on retry. Generic random writes are absent; append is immutable

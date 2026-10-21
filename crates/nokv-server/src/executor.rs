@@ -258,6 +258,12 @@ impl MetadataWorkspaceRequestExecutor {
             protocol::WorkspaceRequest::CompleteArtifactPublish(complete) => {
                 self.complete_artifact_publish(request, complete)
             }
+            protocol::WorkspaceRequest::PrepareArtifactPublish(prepare) => {
+                self.prepare_artifact_publish(request, prepare)
+            }
+            protocol::WorkspaceRequest::FinishArtifactPublish(finish) => {
+                self.finish_artifact_publish(request, finish)
+            }
             protocol::WorkspaceRequest::AbortArtifactPublish(abort) => {
                 self.abort_artifact_publish(request, abort)
             }
@@ -396,9 +402,12 @@ impl MetadataWorkspaceRequestExecutor {
         rpc: &protocol::WorkspaceRpcRequest,
         request: &protocol::GetWorkspaceRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
-        let workspace = meta::get_workspace_at(
+        let route = route_parts(rpc.route)?;
+        let workspace = meta::get_current_workspace(
             &self.meta,
-            self.read_context(rpc.route)?,
+            route.root_id,
+            route.placement_generation,
+            route.owner_epoch,
             &workbench_id(&request.workbench)?,
         )
         .map_err(query_failure)?
@@ -1933,19 +1942,18 @@ impl MetadataWorkspaceRequestExecutor {
         rpc: &protocol::WorkspaceRpcRequest,
         request: &protocol::BeginArtifactPublishRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
-        if let Some(binding) = request.append_attempt {
-            let (operation_id, revision_id) = protocol::stable_append_attempt_identities(
-                rpc.route.root_id,
-                binding.operation_id,
-                binding.attempt,
-            );
-            if request.operation_id != operation_id || request.artifact_revision_id != revision_id {
-                return Err(invalid_argument(
-                    "append publication identities must match the logical operation and attempt",
-                ));
-            }
-        }
+        require_append_attempt_identities(rpc, request)?;
         self.claim_mutation(rpc)?;
+        self.begin_claimed_artifact_publish(rpc, request)
+    }
+
+    /// The Begin step of a request whose identity `rpc` has already claimed.
+    /// Its durable steps derive their request identities from `rpc`.
+    fn begin_claimed_artifact_publish(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::BeginArtifactPublishRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let step_id = derived_request_id(rpc.request_id, b"publish-begin", 0);
         if let Some(outcome) = self.replayed_publish(rpc.route, step_id)? {
             // A request-id replay reaches here only with byte-identical inputs
@@ -1958,9 +1966,10 @@ impl MetadataWorkspaceRequestExecutor {
         // Stable append identity authenticates the original intent before any
         // live path or dependency read. A receipt describes historical success;
         // a later writer or expired historical artifact cannot revoke it.
-        if let Some(existing) =
-            self.find_publish_operation(rpc.route, read.read_version, request.operation_id)?
-        {
+        let existing =
+            self.find_publish_operation(rpc.route, read.read_version, request.operation_id)?;
+        let admitted = existing.is_some();
+        if let Some(existing) = existing {
             if existing.append_intent_digest.is_some() || request.append_intent_digest.is_some() {
                 if existing
                     .append_attempt
@@ -2025,10 +2034,20 @@ impl MetadataWorkspaceRequestExecutor {
                 let current =
                     meta::get_path_at_visible_workspace(&self.meta, read, &workspace, &path)
                         .map_err(namespace_failure)?;
+                let claim = publish_claim(request.condition, current.as_ref())?;
+                // A new publication whose claim already fails on the live path
+                // would fail only at completion, after its upload. Refuse it
+                // before any durable row or provider write; completion still
+                // rechecks the claim, and a retry of an admitted operation
+                // still reaches the engine's exact replay.
+                if !admitted {
+                    meta::validate_publish_claim(&claim, current.as_ref())
+                        .map_err(publication_failure)?;
+                }
                 (
                     meta::PublishAuthority::Visible,
                     workspace.incarnation_id,
-                    publish_claim(request.condition, current.as_ref())?,
+                    claim,
                 )
             }
             protocol::PublicationAuthority::CommitStaging {
@@ -2216,6 +2235,14 @@ impl MetadataWorkspaceRequestExecutor {
         request: &protocol::StageArtifactObjectsRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
+        self.stage_claimed_artifact_objects(rpc, request)
+    }
+
+    fn stage_claimed_artifact_objects(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::StageArtifactObjectsRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let step_id = derived_request_id(rpc.request_id, b"publish-stage-objects", 0);
         if let Some(outcome) = self.replayed_publish(rpc.route, step_id)? {
             return publish_operation_response(outcome);
@@ -2256,6 +2283,14 @@ impl MetadataWorkspaceRequestExecutor {
         request: &protocol::MarkArtifactObjectsUploadedRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
+        self.mark_claimed_artifact_objects_uploaded(rpc, request)
+    }
+
+    fn mark_claimed_artifact_objects_uploaded(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::MarkArtifactObjectsUploadedRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let step_id = derived_request_id(rpc.request_id, b"publish-mark-uploaded", 0);
         if let Some(outcome) = self.replayed_publish(rpc.route, step_id)? {
             return publish_operation_response(outcome);
@@ -2318,6 +2353,14 @@ impl MetadataWorkspaceRequestExecutor {
         request: &protocol::StageArtifactManifestRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
+        self.stage_claimed_artifact_manifest(rpc, request)
+    }
+
+    fn stage_claimed_artifact_manifest(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::StageArtifactManifestRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let step_id = derived_request_id(rpc.request_id, b"publish-stage-manifest", 0);
         if let Some(outcome) = self.replayed_publish(rpc.route, step_id)? {
             return publish_operation_response(outcome);
@@ -2363,12 +2406,103 @@ impl MetadataWorkspaceRequestExecutor {
         publish_operation_response(outcome)
     }
 
+    /// Begin a publication and, when it is fresh, stage its complete object
+    /// plan in the same write session. This request's claim binds both steps;
+    /// each step derives its durable request identities from this one under
+    /// its own labels, so replay, heartbeat, and token rules are exactly those
+    /// of the stepwise protocol.
+    fn prepare_artifact_publish(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::PrepareArtifactPublishRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        require_append_attempt_identities(rpc, &request.begin)?;
+        self.claim_mutation(rpc)?;
+        let begun = self.begin_claimed_artifact_publish(rpc, &request.begin)?;
+        let protocol::WorkspaceResult::Operation(status) = &begun.result else {
+            return Err(internal(
+                "artifact publication begin returned the wrong result variant",
+            ));
+        };
+        // A publication that already made progress or reached a terminal
+        // state answers with its Begin status; the caller resumes it.
+        if request.objects.is_empty()
+            || status.state != protocol::OperationState::Running
+            || status.progress.completed_rows != 0
+        {
+            return Ok(begun);
+        }
+        let mut staged = self.stage_claimed_artifact_objects(
+            rpc,
+            &protocol::StageArtifactObjectsRequest {
+                token: status.token,
+                objects: request.objects.clone(),
+            },
+        )?;
+        staged.replayed |= begun.replayed;
+        Ok(staged)
+    }
+
+    /// Mark the remaining uploaded objects, stage the remaining manifest rows,
+    /// and complete the publication in one write session under this request's
+    /// single claim, each step with the identities and rules of its stepwise
+    /// request.
+    fn finish_artifact_publish(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::FinishArtifactPublishRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        self.claim_mutation(rpc)?;
+        let mut token = request.token;
+        let mut replayed = false;
+        if !request.uploaded_objects.is_empty() {
+            let marked = self.mark_claimed_artifact_objects_uploaded(
+                rpc,
+                &protocol::MarkArtifactObjectsUploadedRequest {
+                    token,
+                    objects: request.uploaded_objects.clone(),
+                },
+            )?;
+            token = running_publication_token(&marked)?;
+            replayed |= marked.replayed;
+        }
+        if !request.manifest_rows.is_empty() {
+            let staged = self.stage_claimed_artifact_manifest(
+                rpc,
+                &protocol::StageArtifactManifestRequest {
+                    token,
+                    rows: request.manifest_rows.clone(),
+                    dependency_owner_revision_ids: request.dependency_owner_revision_ids.clone(),
+                },
+            )?;
+            token = running_publication_token(&staged)?;
+            replayed |= staged.replayed;
+        }
+        let mut completed = self.complete_claimed_artifact_publish(
+            rpc,
+            &protocol::CompleteArtifactPublishRequest {
+                token,
+                artifact: request.artifact.clone(),
+            },
+        )?;
+        completed.replayed |= replayed;
+        Ok(completed)
+    }
+
     fn complete_artifact_publish(
         &self,
         rpc: &protocol::WorkspaceRpcRequest,
         request: &protocol::CompleteArtifactPublishRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
+        self.complete_claimed_artifact_publish(rpc, request)
+    }
+
+    fn complete_claimed_artifact_publish(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::CompleteArtifactPublishRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let transition_id = derived_request_id(rpc.request_id, b"publish-complete-transition", 0);
         let finalizing_operation =
             if let Some(outcome) = self.replayed_publish(rpc.route, transition_id)? {
@@ -3570,15 +3704,18 @@ impl MetadataWorkspaceRequestExecutor {
             token.operation_id,
         )?;
         require_publish_token(&operation, token)?;
-        let activity_deadline_ms = publish_activity_deadline_ms(
-            &self.meta,
-            if operation.append_attempt.is_some() {
-                self.append_activity_lease_ms
-            } else {
-                PUBLISH_ACTIVITY_LEASE_MS
-            },
-        )?;
-        if activity_deadline_ms <= operation.activity_deadline_ms {
+        let lease_ms = if operation.append_attempt.is_some() {
+            self.append_activity_lease_ms
+        } else {
+            PUBLISH_ACTIVITY_LEASE_MS
+        };
+        let activity_deadline_ms = publish_activity_deadline_ms(&self.meta, lease_ms)?;
+        if !activity_extension_needed(
+            &operation,
+            heartbeat_context.owner_epoch,
+            activity_deadline_ms,
+            lease_ms,
+        ) {
             return Ok(operation);
         }
         meta::PublicationService::new(&self.meta)
@@ -4247,6 +4384,33 @@ fn decode_manifest_plan_cursor(
     ))
 }
 
+/// Upper bound of the window within which repeated activity of the
+/// initiating owner does not rewrite a publication's deadline.
+const MAX_ACTIVITY_COALESCING_MS: u64 = 1_000;
+
+/// Whether a step must durably extend the publication's activity deadline.
+///
+/// The steps of one publication arrive milliseconds apart, so the initiating
+/// owner extends the deadline only once it would move by more than
+/// `min(lease / 10, MAX_ACTIVITY_COALESCING_MS)`; recovery after the last
+/// activity therefore waits at least the lease minus that window. Any other
+/// owner always reaches the heartbeat, which refuses a non-initiating owner.
+fn activity_extension_needed(
+    operation: &meta::PublishOperationRecord,
+    owner_epoch: types::OwnerEpoch,
+    requested_deadline_ms: u64,
+    lease_ms: u64,
+) -> bool {
+    if requested_deadline_ms <= operation.activity_deadline_ms {
+        return false;
+    }
+    if owner_epoch != operation.initiating_owner_epoch {
+        return true;
+    }
+    let window_ms = (lease_ms / 10).min(MAX_ACTIVITY_COALESCING_MS);
+    requested_deadline_ms > operation.activity_deadline_ms.saturating_add(window_ms)
+}
+
 fn publish_activity_deadline_ms(
     meta: &meta::MetaShard,
     lease_ms: u64,
@@ -4405,6 +4569,43 @@ fn require_publish_token(
         ));
     }
     Ok(())
+}
+
+/// Reject an append publication whose identities do not derive from its
+/// logical operation and attempt, before any durable row exists.
+fn require_append_attempt_identities(
+    rpc: &protocol::WorkspaceRpcRequest,
+    request: &protocol::BeginArtifactPublishRequest,
+) -> Result<(), protocol::RpcFailure> {
+    if let Some(binding) = request.append_attempt {
+        let (operation_id, revision_id) = protocol::stable_append_attempt_identities(
+            rpc.route.root_id,
+            binding.operation_id,
+            binding.attempt,
+        );
+        if request.operation_id != operation_id || request.artifact_revision_id != revision_id {
+            return Err(invalid_argument(
+                "append publication identities must match the logical operation and attempt",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The token an intermediate publication step leaves for the next step.
+fn running_publication_token(
+    step: &ExecutedRequest,
+) -> Result<protocol::OperationToken, protocol::RpcFailure> {
+    match &step.result {
+        protocol::WorkspaceResult::Operation(status)
+            if status.state == protocol::OperationState::Running =>
+        {
+            Ok(status.token)
+        }
+        _ => Err(internal(
+            "an intermediate artifact publication step did not leave the operation running",
+        )),
+    }
 }
 
 fn publish_state_digest(
@@ -8570,6 +8771,501 @@ mod tests {
         }
     }
 
+    /// The sealed one-object, one-row plan of a one-byte artifact.
+    struct OneBytePlan {
+        staged_objects: Vec<protocol::StagedObject>,
+        upload_proofs: Vec<protocol::ObjectUploadProof>,
+        manifest_rows: Vec<protocol::ArtifactManifestRow>,
+        seals: protocol::ArtifactPublishPlanSeal,
+        artifact: protocol::ArtifactDescriptor,
+    }
+
+    impl OneBytePlan {
+        fn new(artifact_revision_id: protocol::ArtifactRevisionIdentity, byte: u8) -> Self {
+            let revision_id: types::ArtifactRevisionId = artifact_revision_id.into();
+            let object_key = meta::object_block_key(shard(), root(), revision_id, 0);
+            let body_digest =
+                protocol::sha256_digest_uri(protocol::Digest(Sha256::digest([byte]).into()));
+            let staged_objects = vec![protocol::StagedObject {
+                sequence: 0,
+                object_identity: protocol::ObjectIdentity::new(object_key.clone()).unwrap(),
+                expected_length: 1,
+                expected_digest: body_digest.clone(),
+                multipart_token: None,
+            }];
+            let manifest_rows = vec![protocol::ArtifactManifestRow {
+                object_index: 0,
+                physical_object_index: 0,
+                logical_offset: 0,
+                physical_owner_revision_id: artifact_revision_id,
+                object_identity: protocol::ObjectIdentity::new(object_key).unwrap(),
+                object_offset: 0,
+                length: 1,
+                digest: body_digest.clone(),
+                append_segment: None,
+            }];
+            let seals = protocol::seal_artifact_publish_plan(
+                artifact_revision_id,
+                &staged_objects,
+                &manifest_rows,
+            )
+            .unwrap();
+            let artifact = protocol::ArtifactDescriptor {
+                logical_size: 1,
+                body_digest: body_digest.clone(),
+                manifest_digest: protocol::sha256_digest_uri(seals.manifest_seal),
+                content_type: protocol::ContentType::new("application/json").unwrap(),
+                producer: None,
+                manifest_identity: None,
+                index_fields: Vec::new(),
+            };
+            Self {
+                staged_objects,
+                upload_proofs: vec![protocol::ObjectUploadProof {
+                    sequence: 0,
+                    observed_length: 1,
+                    observed_digest: body_digest,
+                }],
+                manifest_rows,
+                seals,
+                artifact,
+            }
+        }
+
+        fn begin(
+            &self,
+            operation_id: protocol::OperationIdentity,
+            artifact_revision_id: protocol::ArtifactRevisionIdentity,
+            target: protocol::WorkspacePath,
+            authority: protocol::PublicationAuthority,
+        ) -> protocol::BeginArtifactPublishRequest {
+            protocol::BeginArtifactPublishRequest {
+                append_attempt: None,
+                append_intent_digest: None,
+                operation_id,
+                artifact_revision_id,
+                target,
+                authority,
+                condition: protocol::PublishCondition::CreateOnly,
+                expected_workspace_incarnation_id: None,
+                staged_object_count: self.seals.staged_object_count,
+                staged_object_seal: self.seals.staged_object_seal,
+                manifest_row_count: self.seals.manifest_row_count,
+                manifest_seal: self.seals.manifest_seal,
+                dependency_owner_revision_ids: Vec::new(),
+            }
+        }
+    }
+
+    fn fused_publication_fixture(
+        name: &str,
+        fill: u8,
+    ) -> (
+        MetadataWorkspaceRequestExecutor,
+        OneBytePlan,
+        protocol::BeginArtifactPublishRequest,
+    ) {
+        let (_store, executor) = ready_executor();
+        let workbench = protocol::WorkbenchName::new(name).unwrap();
+        executor
+            .execute(&restore_rpc(
+                fill,
+                protocol::WorkspaceRequest::CreateWorkspace(protocol::CreateWorkspaceRequest {
+                    workbench: workbench.clone(),
+                    workspace_incarnation_id: protocol::WorkspaceIdentity(
+                        [fill; types::FIXED_ID_BYTES],
+                    ),
+                }),
+            ))
+            .unwrap();
+        let revision =
+            protocol::ArtifactRevisionIdentity([fill.wrapping_add(1); types::FIXED_ID_BYTES]);
+        let plan = OneBytePlan::new(revision, fill);
+        let begin = plan.begin(
+            protocol::OperationIdentity([fill.wrapping_add(2); types::FIXED_ID_BYTES]),
+            revision,
+            protocol::WorkspacePath {
+                workbench,
+                path: protocol::RelativePath::new("outputs/result.bin").unwrap(),
+            },
+            protocol::PublicationAuthority::Visible,
+        );
+        (executor, plan, begin)
+    }
+
+    fn executed_operation(executed: &ExecutedRequest) -> protocol::OperationStatus {
+        let protocol::WorkspaceResult::Operation(status) = &executed.result else {
+            panic!("artifact publication step returned the wrong result variant");
+        };
+        status.clone()
+    }
+
+    fn executed_publication(executed: &ExecutedRequest) -> protocol::PublishResult {
+        let protocol::WorkspaceResult::Published(published) = &executed.result else {
+            panic!("artifact publication finish returned the wrong result variant");
+        };
+        published.clone()
+    }
+
+    fn finish_request(
+        plan: &OneBytePlan,
+        token: protocol::OperationToken,
+    ) -> protocol::WorkspaceRequest {
+        protocol::WorkspaceRequest::FinishArtifactPublish(protocol::FinishArtifactPublishRequest {
+            token,
+            uploaded_objects: plan.upload_proofs.clone(),
+            manifest_rows: plan.manifest_rows.clone(),
+            dependency_owner_revision_ids: Vec::new(),
+            artifact: plan.artifact.clone(),
+        })
+    }
+
+    #[test]
+    fn fused_publication_stages_before_upload_completes_after_and_replays_exactly() {
+        let (executor, plan, begin) = fused_publication_fixture("fused-publish", 0x40);
+        let prepare = restore_rpc(
+            0x43,
+            protocol::WorkspaceRequest::PrepareArtifactPublish(
+                protocol::PrepareArtifactPublishRequest {
+                    begin: begin.clone(),
+                    objects: plan.staged_objects.clone(),
+                },
+            ),
+        );
+        let prepared = executor.execute(&prepare).unwrap();
+        let status = executed_operation(&prepared);
+        assert_eq!(status.state, protocol::OperationState::Running);
+        // The complete object plan is staged in the same acknowledgement.
+        assert_eq!(status.progress.completed_rows, 1);
+        assert!(!prepared.replayed);
+        let replayed = executor.execute(&prepare).unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(executed_operation(&replayed), status);
+
+        let finish = restore_rpc(0x44, finish_request(&plan, status.token));
+        let finished = executor.execute(&finish).unwrap();
+        let published = executed_publication(&finished);
+        assert!(!finished.replayed);
+        assert_eq!(published.target, begin.target);
+        assert_eq!(published.artifact_revision_id, begin.artifact_revision_id);
+        assert_eq!(published.generation, 1);
+        let replayed = executor.execute(&finish).unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(executed_publication(&replayed), published);
+
+        let read = executor
+            .execute(&restore_rpc(
+                0x45,
+                protocol::WorkspaceRequest::GetPath(protocol::GetPathRequest {
+                    target: begin.target.clone(),
+                    view: protocol::WorkspaceReadView::Live,
+                    expected_read_version: None,
+                    range: None,
+                    plan_page: None,
+                    if_none_match: None,
+                }),
+            ))
+            .unwrap();
+        let protocol::WorkspaceResult::Path(read) = read.result else {
+            panic!("path read returned the wrong result variant");
+        };
+        let metadata = read.metadata.expect("published path has metadata");
+        assert_eq!(metadata.artifact_revision_id, begin.artifact_revision_id);
+        assert_eq!(metadata.generation, 1);
+        assert_eq!(metadata.descriptor, plan.artifact);
+    }
+
+    #[test]
+    fn prepare_returns_the_begin_status_of_a_publication_with_progress() {
+        let (executor, plan, begin) = fused_publication_fixture("fused-resume", 0x50);
+        let begun = executor
+            .execute(&restore_rpc(
+                0x53,
+                protocol::WorkspaceRequest::BeginArtifactPublish(begin.clone()),
+            ))
+            .unwrap();
+        let staged = executor
+            .execute(&restore_rpc(
+                0x54,
+                protocol::WorkspaceRequest::StageArtifactObjects(
+                    protocol::StageArtifactObjectsRequest {
+                        token: executed_operation(&begun).token,
+                        objects: plan.staged_objects.clone(),
+                    },
+                ),
+            ))
+            .unwrap();
+        let staged = executed_operation(&staged);
+
+        // A new attempt of the same publication observes its progress instead
+        // of staging the plan again; it resumes with the stepwise protocol.
+        let prepared = executor
+            .execute(&restore_rpc(
+                0x55,
+                protocol::WorkspaceRequest::PrepareArtifactPublish(
+                    protocol::PrepareArtifactPublishRequest {
+                        begin,
+                        objects: plan.staged_objects.clone(),
+                    },
+                ),
+            ))
+            .unwrap();
+        assert!(prepared.replayed);
+        let status = executed_operation(&prepared);
+        assert_eq!(status.progress.completed_rows, 1);
+        assert_eq!(status.token, staged.token);
+
+        let finished = executor
+            .execute(&restore_rpc(0x56, finish_request(&plan, status.token)))
+            .unwrap();
+        assert_eq!(executed_publication(&finished).generation, 1);
+    }
+
+    #[test]
+    fn prepare_replay_stages_a_plan_whose_begin_alone_became_durable() {
+        let (executor, plan, begin) = fused_publication_fixture("fused-cut", 0x60);
+        let prepare = restore_rpc(
+            0x63,
+            protocol::WorkspaceRequest::PrepareArtifactPublish(
+                protocol::PrepareArtifactPublishRequest {
+                    begin: begin.clone(),
+                    objects: plan.staged_objects.clone(),
+                },
+            ),
+        );
+        // The durable prefix a crash can leave: the composite claim and its
+        // Begin step, without the staging step.
+        assert!(!executor.claim_mutation(&prepare).unwrap());
+        let begun = executor
+            .begin_claimed_artifact_publish(&prepare, &begin)
+            .unwrap();
+        assert_eq!(executed_operation(&begun).progress.completed_rows, 0);
+
+        let resumed = executor.execute(&prepare).unwrap();
+        let status = executed_operation(&resumed);
+        assert_eq!(status.state, protocol::OperationState::Running);
+        assert_eq!(status.progress.completed_rows, 1);
+        assert!(resumed.replayed);
+        let finished = executor
+            .execute(&restore_rpc(0x64, finish_request(&plan, status.token)))
+            .unwrap();
+        assert_eq!(executed_publication(&finished).generation, 1);
+    }
+
+    #[test]
+    fn finish_replay_completes_a_composite_cut_after_marking_uploads() {
+        let (executor, plan, begin) = fused_publication_fixture("fused-finish-cut", 0x68);
+        let prepared = executor
+            .execute(&restore_rpc(
+                0x6b,
+                protocol::WorkspaceRequest::PrepareArtifactPublish(
+                    protocol::PrepareArtifactPublishRequest {
+                        begin,
+                        objects: plan.staged_objects.clone(),
+                    },
+                ),
+            ))
+            .unwrap();
+        let finish = restore_rpc(
+            0x6c,
+            finish_request(&plan, executed_operation(&prepared).token),
+        );
+        // The durable prefix a crash can leave: the composite claim and the
+        // upload proofs, without the manifest or the completion.
+        assert!(!executor.claim_mutation(&finish).unwrap());
+        let protocol::WorkspaceRequest::FinishArtifactPublish(request) = &finish.operation else {
+            unreachable!();
+        };
+        executor
+            .mark_claimed_artifact_objects_uploaded(
+                &finish,
+                &protocol::MarkArtifactObjectsUploadedRequest {
+                    token: request.token,
+                    objects: request.uploaded_objects.clone(),
+                },
+            )
+            .unwrap();
+
+        let resumed = executor.execute(&finish).unwrap();
+        assert!(resumed.replayed);
+        assert_eq!(executed_publication(&resumed).generation, 1);
+    }
+
+    #[test]
+    fn initiating_owner_activity_coalesces_within_a_bounded_window() {
+        let (executor, plan, begin) = fused_publication_fixture("fused-activity", 0x78);
+        executor
+            .execute(&restore_rpc(
+                0x7b,
+                protocol::WorkspaceRequest::PrepareArtifactPublish(
+                    protocol::PrepareArtifactPublishRequest {
+                        begin: begin.clone(),
+                        objects: plan.staged_objects.clone(),
+                    },
+                ),
+            ))
+            .unwrap();
+        let operation = executor
+            .find_publish_operation(
+                route(1),
+                executor.meta.current_read_version().unwrap(),
+                begin.operation_id,
+            )
+            .unwrap()
+            .unwrap();
+        let stored = operation.activity_deadline_ms;
+        let owner = operation.initiating_owner_epoch;
+        let lease = PUBLISH_ACTIVITY_LEASE_MS;
+
+        assert!(!activity_extension_needed(&operation, owner, stored, lease));
+        assert!(!activity_extension_needed(
+            &operation,
+            owner,
+            stored + MAX_ACTIVITY_COALESCING_MS,
+            lease
+        ));
+        assert!(activity_extension_needed(
+            &operation,
+            owner,
+            stored + MAX_ACTIVITY_COALESCING_MS + 1,
+            lease
+        ));
+        // A short lease bounds the window by a tenth of the lease.
+        assert!(!activity_extension_needed(
+            &operation,
+            owner,
+            stored + 100,
+            1_000
+        ));
+        assert!(activity_extension_needed(
+            &operation,
+            owner,
+            stored + 101,
+            1_000
+        ));
+        // Any other owner always reaches the heartbeat that refuses it.
+        let successor = types::OwnerEpoch::new(owner.get() + 1).unwrap();
+        assert!(activity_extension_needed(
+            &operation,
+            successor,
+            stored + 1,
+            lease
+        ));
+    }
+
+    #[test]
+    fn a_claim_the_live_path_already_fails_is_refused_before_any_upload() {
+        let (executor, plan, begin) = fused_publication_fixture("fused-early-claim", 0x7d);
+        let prepare = |fill: u8, begin: protocol::BeginArtifactPublishRequest| {
+            restore_rpc(
+                fill,
+                protocol::WorkspaceRequest::PrepareArtifactPublish(
+                    protocol::PrepareArtifactPublishRequest {
+                        begin,
+                        objects: plan.staged_objects.clone(),
+                    },
+                ),
+            )
+        };
+        let prepared = executor.execute(&prepare(0x80, begin.clone())).unwrap();
+        executor
+            .execute(&restore_rpc(
+                0x81,
+                finish_request(&plan, executed_operation(&prepared).token),
+            ))
+            .unwrap();
+
+        let fresh = |operation: u8, revision: u8, condition| {
+            let mut fresh = begin.clone();
+            fresh.operation_id = protocol::OperationIdentity([operation; types::FIXED_ID_BYTES]);
+            fresh.artifact_revision_id =
+                protocol::ArtifactRevisionIdentity([revision; types::FIXED_ID_BYTES]);
+            fresh.condition = condition;
+            fresh
+        };
+        let stale = fresh(
+            0x82,
+            0x83,
+            protocol::PublishCondition::ReplaceOnly {
+                expected_generation: 7,
+            },
+        );
+        let refused = executor.execute(&prepare(0x84, stale.clone())).unwrap_err();
+        assert_eq!(refused.code, protocol::ErrorCode::Conflict);
+        assert_eq!(refused.current_generation, Some(1));
+        let duplicate = fresh(0x85, 0x86, protocol::PublishCondition::CreateOnly);
+        let refused = executor
+            .execute(&prepare(0x87, duplicate.clone()))
+            .unwrap_err();
+        assert_eq!(refused.code, protocol::ErrorCode::AlreadyExists);
+        // Neither refusal admitted an operation that would own uploads.
+        for refused in [&stale, &duplicate] {
+            assert!(executor
+                .find_publish_operation(
+                    route(1),
+                    executor.meta.current_read_version().unwrap(),
+                    refused.operation_id,
+                )
+                .unwrap()
+                .is_none());
+        }
+
+        // The admitted create still replays exactly although its path exists.
+        let replayed = executor.execute(&prepare(0x88, begin)).unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(
+            executed_operation(&replayed).state,
+            protocol::OperationState::Succeeded
+        );
+    }
+
+    #[test]
+    fn finish_carries_only_the_steps_that_remain() {
+        let (executor, plan, begin) = fused_publication_fixture("fused-remaining", 0x70);
+        let prepared = executor
+            .execute(&restore_rpc(
+                0x73,
+                protocol::WorkspaceRequest::PrepareArtifactPublish(
+                    protocol::PrepareArtifactPublishRequest {
+                        begin,
+                        objects: plan.staged_objects.clone(),
+                    },
+                ),
+            ))
+            .unwrap();
+        let marked = executor
+            .execute(&restore_rpc(
+                0x74,
+                protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
+                    protocol::MarkArtifactObjectsUploadedRequest {
+                        token: executed_operation(&prepared).token,
+                        objects: plan.upload_proofs.clone(),
+                    },
+                ),
+            ))
+            .unwrap();
+        let finish = protocol::WorkspaceRequest::FinishArtifactPublish(
+            protocol::FinishArtifactPublishRequest {
+                token: executed_operation(&marked).token,
+                uploaded_objects: Vec::new(),
+                manifest_rows: plan.manifest_rows.clone(),
+                dependency_owner_revision_ids: Vec::new(),
+                artifact: plan.artifact.clone(),
+            },
+        );
+        let finished = executor.execute(&restore_rpc(0x75, finish)).unwrap();
+        assert_eq!(executed_publication(&finished).generation, 1);
+
+        // A stale token fails like the stepwise step it replaces.
+        let stale = executor
+            .execute(&restore_rpc(
+                0x76,
+                finish_request(&plan, executed_operation(&prepared).token),
+            ))
+            .unwrap_err();
+        assert_eq!(stale.code, protocol::ErrorCode::Conflict);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn publish_one_byte_artifact(
         executor: &MetadataWorkspaceRequestExecutor,
@@ -8581,43 +9277,7 @@ mod tests {
         authority: protocol::PublicationAuthority,
         byte: u8,
     ) -> protocol::ArtifactDescriptor {
-        let revision_id: types::ArtifactRevisionId = artifact_revision_id.into();
-        let object_key = meta::object_block_key(shard(), root(), revision_id, 0);
-        let body_digest =
-            protocol::sha256_digest_uri(protocol::Digest(Sha256::digest([byte]).into()));
-        let staged_objects = vec![protocol::StagedObject {
-            sequence: 0,
-            object_identity: protocol::ObjectIdentity::new(object_key.clone()).unwrap(),
-            expected_length: 1,
-            expected_digest: body_digest.clone(),
-            multipart_token: None,
-        }];
-        let manifest_rows = vec![protocol::ArtifactManifestRow {
-            object_index: 0,
-            physical_object_index: 0,
-            logical_offset: 0,
-            physical_owner_revision_id: artifact_revision_id,
-            object_identity: protocol::ObjectIdentity::new(object_key).unwrap(),
-            object_offset: 0,
-            length: 1,
-            digest: body_digest.clone(),
-            append_segment: None,
-        }];
-        let seals = protocol::seal_artifact_publish_plan(
-            artifact_revision_id,
-            &staged_objects,
-            &manifest_rows,
-        )
-        .unwrap();
-        let artifact = protocol::ArtifactDescriptor {
-            logical_size: 1,
-            body_digest: body_digest.clone(),
-            manifest_digest: protocol::sha256_digest_uri(seals.manifest_seal),
-            content_type: protocol::ContentType::new("application/json").unwrap(),
-            producer: None,
-            manifest_identity: None,
-            index_fields: Vec::new(),
-        };
+        let plan = OneBytePlan::new(artifact_revision_id, byte);
         let target = protocol::WorkspacePath {
             workbench: protocol::WorkbenchName::new(workbench).unwrap(),
             path: protocol::RelativePath::new(path).unwrap(),
@@ -8632,23 +9292,12 @@ mod tests {
             executor
                 .execute(&restore_rpc(
                     first_request_fill,
-                    protocol::WorkspaceRequest::BeginArtifactPublish(
-                        protocol::BeginArtifactPublishRequest {
-                            append_attempt: None,
-                            append_intent_digest: None,
-                            operation_id,
-                            artifact_revision_id,
-                            target: target.clone(),
-                            authority,
-                            condition: protocol::PublishCondition::CreateOnly,
-                            expected_workspace_incarnation_id: None,
-                            staged_object_count: seals.staged_object_count,
-                            staged_object_seal: seals.staged_object_seal,
-                            manifest_row_count: seals.manifest_row_count,
-                            manifest_seal: seals.manifest_seal,
-                            dependency_owner_revision_ids: Vec::new(),
-                        },
-                    ),
+                    protocol::WorkspaceRequest::BeginArtifactPublish(plan.begin(
+                        operation_id,
+                        artifact_revision_id,
+                        target.clone(),
+                        authority,
+                    )),
                 ))
                 .unwrap(),
         );
@@ -8659,9 +9308,9 @@ mod tests {
             assert_eq!(result.operation_id, operation_id);
             assert_eq!(result.target, target);
             assert_eq!(result.artifact_revision_id, artifact_revision_id);
-            assert_eq!(result.logical_size, artifact.logical_size);
-            assert_eq!(result.body_digest, artifact.body_digest);
-            return artifact;
+            assert_eq!(result.logical_size, plan.artifact.logical_size);
+            assert_eq!(result.body_digest, plan.artifact.body_digest);
+            return plan.artifact;
         }
         assert_eq!(status.state, protocol::OperationState::Running);
         let status = operation_status(
@@ -8671,7 +9320,7 @@ mod tests {
                     protocol::WorkspaceRequest::StageArtifactObjects(
                         protocol::StageArtifactObjectsRequest {
                             token: status.token,
-                            objects: staged_objects,
+                            objects: plan.staged_objects.clone(),
                         },
                     ),
                 ))
@@ -8684,11 +9333,7 @@ mod tests {
                     protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
                         protocol::MarkArtifactObjectsUploadedRequest {
                             token: status.token,
-                            objects: vec![protocol::ObjectUploadProof {
-                                sequence: 0,
-                                observed_length: 1,
-                                observed_digest: body_digest,
-                            }],
+                            objects: plan.upload_proofs.clone(),
                         },
                     ),
                 ))
@@ -8701,7 +9346,7 @@ mod tests {
                     protocol::WorkspaceRequest::StageArtifactManifest(
                         protocol::StageArtifactManifestRequest {
                             token: status.token,
-                            rows: manifest_rows,
+                            rows: plan.manifest_rows.clone(),
                             dependency_owner_revision_ids: Vec::new(),
                         },
                     ),
@@ -8714,7 +9359,7 @@ mod tests {
                 protocol::WorkspaceRequest::CompleteArtifactPublish(
                     protocol::CompleteArtifactPublishRequest {
                         token: status.token,
-                        artifact: artifact.clone(),
+                        artifact: plan.artifact.clone(),
                     },
                 ),
             ))
@@ -8723,7 +9368,7 @@ mod tests {
             panic!("artifact finalization returned the wrong result variant");
         };
         assert_eq!(published.target, target);
-        artifact
+        plan.artifact
     }
 
     #[test]

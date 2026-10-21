@@ -1754,6 +1754,7 @@ mod tests {
         logical_shard_override: Mutex<Option<LogicalShardRecord>>,
         advance_before_successor: Mutex<Option<(Arc<RecoveryPublisher>, LogicalShardLease)>>,
         bootstrap_lease_probe: Option<Arc<BootstrapLeaseProbe>>,
+        renewed_durable_lsn: Mutex<Option<u64>>,
     }
 
     impl LoseFinalizeAckControlStore {
@@ -1765,6 +1766,7 @@ mod tests {
                 logical_shard_override: Mutex::new(None),
                 advance_before_successor: Mutex::new(None),
                 bootstrap_lease_probe: None,
+                renewed_durable_lsn: Mutex::new(None),
             }
         }
 
@@ -1779,6 +1781,7 @@ mod tests {
                 logical_shard_override: Mutex::new(Some(record)),
                 advance_before_successor: Mutex::new(None),
                 bootstrap_lease_probe: None,
+                renewed_durable_lsn: Mutex::new(None),
             }
         }
 
@@ -1794,6 +1797,7 @@ mod tests {
                 logical_shard_override: Mutex::new(None),
                 advance_before_successor: Mutex::new(Some((publisher, lease))),
                 bootstrap_lease_probe: None,
+                renewed_durable_lsn: Mutex::new(None),
             }
         }
 
@@ -1808,7 +1812,13 @@ mod tests {
                 logical_shard_override: Mutex::new(None),
                 advance_before_successor: Mutex::new(None),
                 bootstrap_lease_probe: Some(bootstrap_lease_probe),
+                renewed_durable_lsn: Mutex::new(None),
             }
+        }
+
+        /// Renewals report the control frontier at `durable_lsn` once set.
+        fn shift_renewed_frontier(&self, durable_lsn: u64) {
+            *self.renewed_durable_lsn.lock().unwrap() = Some(durable_lsn);
         }
 
         fn fail_finalize_before_apply(inner: Arc<InMemoryControlStore>) -> Self {
@@ -1819,6 +1829,7 @@ mod tests {
                 logical_shard_override: Mutex::new(None),
                 advance_before_successor: Mutex::new(None),
                 bootstrap_lease_probe: None,
+                renewed_durable_lsn: Mutex::new(None),
             }
         }
     }
@@ -1969,7 +1980,11 @@ mod tests {
             if let Some(probe) = &self.bootstrap_lease_probe {
                 probe.note_renewal(lease)?;
             }
-            self.inner.renew_owner(lease)
+            let mut record = self.inner.renew_owner(lease)?;
+            if let Some(durable_lsn) = *self.renewed_durable_lsn.lock().unwrap() {
+                record.durable_lsn = durable_lsn;
+            }
+            Ok(record)
         }
 
         fn mark_serving(
@@ -2394,6 +2409,61 @@ mod tests {
         assert_eq!(released.durable_lsn, 0);
         assert!(released.log.is_none());
         assert_eq!(raw.stats().unwrap().resident_objects, objects_before);
+    }
+
+    #[test]
+    fn local_only_owner_revalidates_a_moved_control_frontier() {
+        let temporary = TempDir::new().unwrap();
+        let root_id = root(1);
+        let inner = active_control(&[root_id]);
+        let control = Arc::new(LoseFinalizeAckControlStore::fail_finalize_before_apply(
+            Arc::clone(&inner),
+        ));
+        control
+            .fail_next_finalize_before_apply
+            .store(false, Ordering::SeqCst);
+        let namespace = ObjectNamespaceId::from_bytes([10; nokv_types::FIXED_ID_BYTES]);
+        let raw = MemoryArtifactStore::new();
+        ensure_object_namespace(&raw, namespace).unwrap();
+        let objects = Arc::new(BoundArtifactStore::open(raw, namespace).unwrap());
+        let mut boot = acquire_boot(temporary.path().join("metadata"), &[root_id]);
+        boot.recovery_publication = RecoveryPublicationMode::LocalOnly;
+        let owner = super::bootstrap_shard(
+            control.clone(),
+            Arc::new(RootOwnerRegistry::new()),
+            objects,
+            boot,
+        )
+        .unwrap();
+        let route = owner.routes()[0];
+        let executor = RecoveryPublishingExecutor::new(
+            Arc::new(LeaseClockExecutor {
+                meta: Arc::clone(owner.meta()),
+                root_id,
+                placement_generation: PlacementGeneration::new(route.placement_generation).unwrap(),
+                owner_epoch: owner.lease().owner_epoch,
+            }),
+            Arc::clone(owner.recovery_publisher()),
+        );
+        let preflight = |fill: u8| nokv_protocol::WorkspaceRpcRequest {
+            route,
+            request_id: nokv_protocol::RequestIdentity([fill; nokv_types::FIXED_ID_BYTES]),
+            operation: nokv_protocol::WorkspaceRequest::Preflight(
+                nokv_protocol::WorkspacePreflightRequest::new([]),
+            ),
+        };
+        executor.execute(&preflight(0x81)).unwrap();
+        executor.execute(&preflight(0x82)).unwrap();
+
+        // A frontier that moved past the local state since the last round
+        // must be validated again, not served from the earlier validation.
+        let local = owner.meta().recovery_state().unwrap().applied_recovery_lsn;
+        control.shift_renewed_frontier(local + 1_000);
+        let failure = executor.execute(&preflight(0x83)).unwrap_err();
+        assert!(
+            failure.message.contains("ahead of local"),
+            "unexpected failure: {failure:?}"
+        );
     }
 
     #[test]
