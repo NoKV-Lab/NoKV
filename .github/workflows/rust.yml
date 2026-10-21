@@ -63,6 +63,7 @@ jobs:
             scripts/workbench/object_namespace_recovery_gate.py \
             scripts/workbench/restore_composition_gate.py \
             scripts/workbench/fork_restore_recovery_gate.py \
+            scripts/workbench/cli_contract_gate.py \
             scripts/workbench/loopx_stage2a_stack.py
           python3 scripts/workbench/pre423_contract_ledger.py
           python3 scripts/workbench/pre423_contract_ledger_test.py
@@ -72,6 +73,7 @@ jobs:
           python3 scripts/workbench/object_namespace_recovery_gate_test.py
           python3 scripts/workbench/restore_composition_gate_test.py
           python3 scripts/workbench/fork_restore_recovery_gate_test.py
+          python3 scripts/workbench/cli_contract_gate_test.py
           python3 scripts/workbench/loopx_stage2a_stack_test.py
           bash -n scripts/workbench/start_rustfs.sh
 
@@ -542,6 +544,33 @@ jobs:
         with:
           name: live-workbench-${{ github.sha }}
           path: ${{ runner.temp }}/live-workbench
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Qualify the native CLI contract
+        id: cli_contract
+        shell: bash
+        env:
+          CLI_CONTRACT_EVIDENCE_DIR: ${{ runner.temp }}/cli-contract
+          AWS_ACCESS_KEY_ID: rustfsadmin
+          AWS_SECRET_ACCESS_KEY: rustfsadmin
+        run: |
+          set -euo pipefail
+          python3 scripts/workbench/cli_contract_gate.py \
+            --nokv-bin target/debug/nokv \
+            --evidence-dir "$CLI_CONTRACT_EVIDENCE_DIR" \
+            --object-endpoint http://127.0.0.1:9000 \
+            --object-bucket nokv-local-wal-recovery-gate \
+            --object-root "cli-contract-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --timeout 45
+          jq -e '.overall_status == "PASS"' "$CLI_CONTRACT_EVIDENCE_DIR/qualification.json"
+
+      - name: Upload native CLI contract evidence
+        if: ${{ always() && steps.cli_contract.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: cli-contract-${{ github.sha }}
+          path: ${{ runner.temp }}/cli-contract
           if-no-files-found: error
           retention-days: 7
 
