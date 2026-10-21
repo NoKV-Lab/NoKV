@@ -19,16 +19,16 @@ Every logical-shard store has one authoritative marker:
 System("schema")
   -> value_format_version = 1
      schema_id = "nokv_workspace"
-     format_version = 13
+     format_version = 14
 ```
 
 Startup is fail-closed:
 
 - an empty store is initialized with the exact supported marker and logical
   keyspace catalog;
-- format-12 and older stores are rejected without writes; there is no marker-only
-  upgrade because format 13 adds the monotonic append cleanup retry counter and
-  changes the durable publication operation codec;
+- format-13 and older stores are rejected without writes; there is no marker-only
+  upgrade because format 14 adds the `ArtifactInlineBody` family and changes
+  the durable publish operation codec;
 - a nonempty current store opens only when its marker, value format, and
   configured adapter catalog match this contract;
 - a missing, malformed, unknown-version, or inconsistent store is rejected.
