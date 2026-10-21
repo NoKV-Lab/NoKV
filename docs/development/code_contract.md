@@ -151,6 +151,20 @@ that owns them. Do not move domain-specific or single-use logic into a generic
   S3-compatible boundary.
 - Prefer explicit invariants and local reasoning over manager-style wrappers.
 
+## PR Communication And DCO
+
+The [contribution guide](../../CONTRIBUTING.md#pr-description-format) owns the
+PR writing format. Use `TLDR`, `Problem`, `Consequences`, `Example`, `Solution`,
+`Gain`, `Tradeoffs`, and `Validation`, in that order, following the
+[template](../../.github/pull_request_template.md). Keep descriptions concise
+and in plain English, with minimal code details and a concrete before/after
+example. Include exact validation results and evidence for storage or
+performance claims; state relevant limits and checks not run.
+
+Every non-merge commit must carry a DCO `Signed-off-by` trailer as required by
+the [contribution guide](../../CONTRIBUTING.md#branch-and-commit-conventions)
+and [DCO](../../DCO).
+
 ## Validation
 
 Before pushing substantial code changes:

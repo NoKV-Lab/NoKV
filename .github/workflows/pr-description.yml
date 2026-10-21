@@ -1,0 +1,47 @@
+# Copyright 2024-2026 The NoKV Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+name: PR Description
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: PR number to recheck against the current protected policy
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-description-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr-description:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      POLICY_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pull_request }}
+    steps:
+      # Never check out PR code or interpolate PR titles/bodies into shell code.
+      - name: Validate live PR metadata with the protected base policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          policy="$RUNNER_TEMP/pr_description.py"
+          metadata="$RUNNER_TEMP/pr-description.json"
+          gh api \
+            "repos/$GITHUB_REPOSITORY/contents/scripts/ci/pr_description.py?ref=$POLICY_SHA" \
+            --jq .content | base64 --decode > "$policy"
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
+            --jq '{title, body}' > "$metadata"
+          python3 "$policy" --pull-request-json "$metadata"
