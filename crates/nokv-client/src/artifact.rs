@@ -29,6 +29,7 @@ use nokv_protocol::{
 use nokv_types::{ArtifactRevisionId, LogicalShardId, RootId};
 use sha2::{Digest as _, Sha256};
 
+use crate::body_digest::BodyDigestState;
 use crate::{
     ArtifactPublishStage, ClientCall, ClientError, RouteResolver, RpcTransport, WorkspaceClient,
 };
@@ -823,7 +824,8 @@ where
             descriptor,
             base_read_stats,
             created,
-            rematerialized_body,
+            owned_body,
+            body_digest,
         ) = match metadata {
             None => {
                 enforce_append_size(delta_len, options.max_logical_size)?;
@@ -855,6 +857,8 @@ where
                     manifest_identity: None,
                     index_fields: Vec::new(),
                 };
+                let mut body_digest = BodyDigestState::new();
+                body_digest.update(delta);
                 (
                     PublishCondition::CreateOnly,
                     object_plan,
@@ -865,6 +869,7 @@ where
                     ArtifactReadStats::default(),
                     true,
                     None,
+                    body_digest,
                 )
             }
             Some(metadata) => {
@@ -896,133 +901,112 @@ where
                 };
                 let base_manifest =
                     manifest_from_rows(self.root_id(), logical_shard, &metadata, &base_rows)?;
-                let dependency_plan =
-                    append_dependency_plan(&metadata, artifact_revision_id, &base_rows)?;
+                let layout = append_layout(&metadata, artifact_revision_id, &base_rows, delta_len)?;
                 let condition = PublishCondition::Append {
                     expected_generation: Some(metadata.generation),
                 };
 
-                if dependency_plan.requires_rematerialization {
-                    let (mut body, base_read_stats) =
-                        materialize_artifact_body(store, &base_manifest)?;
-                    body.try_reserve(delta.len()).map_err(|_| {
-                        ClientError::InvalidOptions(
-                            "append result cannot be materialized in client memory".to_owned(),
-                        )
-                    })?;
-                    body.extend_from_slice(delta);
-                    let object_plan = plan_artifact_upload(
-                        ArtifactUploadOptions::new(
-                            LogicalShardId::from(logical_shard),
-                            RootId::from(self.root_id()),
-                            ArtifactRevisionId::from(artifact_revision_id),
-                        )
-                        .with_block_size(options.block_size),
-                        &body,
-                    )?;
-                    let (staged_objects, manifest_rows) =
-                        publication_rows(artifact_revision_id, &object_plan.manifest)?;
-                    let seals = seal_artifact_publish_plan(
-                        artifact_revision_id,
-                        &staged_objects,
-                        &manifest_rows,
-                    )?;
-                    let mut descriptor = metadata.descriptor;
-                    descriptor.logical_size = logical_size;
-                    descriptor.body_digest = sha256_digest_uri(Digest(object_plan.manifest.sha256));
-                    descriptor.manifest_digest = sha256_digest_uri(seals.manifest_seal);
-                    if let Some(content_type) = &options.content_type {
-                        descriptor.content_type = content_type.clone();
-                    }
-                    (
-                        condition,
-                        object_plan,
-                        staged_objects,
-                        manifest_rows,
-                        Vec::new(),
-                        descriptor,
-                        base_read_stats,
-                        false,
-                        Some(body),
+                // The new revision owns the re-owned base suffix, if any, and
+                // the delta; it borrows every row before that suffix.
+                let base = self.append_base(
+                    store,
+                    &metadata,
+                    &base_rows,
+                    &base_manifest,
+                    layout.reown_from_row,
+                )?;
+                let mut body_digest = base.digest;
+                body_digest.update(delta);
+                let reowns_base = layout.reown_from_row < base_rows.len();
+                let mut owned = base.reowned;
+                owned.try_reserve(delta.len()).map_err(|_| {
+                    ClientError::InvalidOptions(
+                        "append result cannot be materialized in client memory".to_owned(),
                     )
+                })?;
+                owned.extend_from_slice(delta);
+                let object_plan = plan_artifact_upload(
+                    ArtifactUploadOptions::new(
+                        LogicalShardId::from(logical_shard),
+                        RootId::from(self.root_id()),
+                        ArtifactRevisionId::from(artifact_revision_id),
+                    )
+                    .with_block_size(options.block_size),
+                    &owned,
+                )?;
+                let (staged_objects, mut owned_rows) =
+                    publication_rows(artifact_revision_id, &object_plan.manifest)?;
+                let first_owned_index = u64::try_from(layout.reown_from_row).map_err(|_| {
+                    ClientError::InvalidOptions("base manifest row count exceeds u64".to_owned())
+                })?;
+                let owned_offset = base_rows
+                    .get(layout.reown_from_row)
+                    .map_or(metadata.descriptor.logical_size, |row| row.logical_offset);
+                // Only a delta appended after every borrowed row is a new
+                // append segment; re-owned bytes are recorded like a
+                // rematerialized body.
+                let segment_sequence = if reowns_base {
+                    None
                 } else {
-                    let object_plan = plan_artifact_upload(
-                        ArtifactUploadOptions::new(
-                            LogicalShardId::from(logical_shard),
-                            RootId::from(self.root_id()),
-                            ArtifactRevisionId::from(artifact_revision_id),
-                        )
-                        .with_block_size(options.block_size),
-                        delta,
-                    )?;
-                    let (staged_objects, mut delta_rows) =
-                        publication_rows(artifact_revision_id, &object_plan.manifest)?;
-                    let (mut body_hasher, base_read_stats) =
-                        stream_artifact_digest(store, &base_manifest)?;
-                    body_hasher.update(delta);
-                    let body_digest = Digest(body_hasher.finalize().into());
-
-                    let first_delta_index = u64::try_from(base_rows.len()).map_err(|_| {
-                        ClientError::InvalidOptions(
-                            "base manifest row count exceeds u64".to_owned(),
-                        )
-                    })?;
-                    let segment_sequence = next_append_segment_sequence(&base_rows)?;
-                    for row in &mut delta_rows {
-                        let segment_offset = row.logical_offset;
-                        row.object_index = row
-                            .object_index
-                            .checked_add(first_delta_index)
+                    Some(next_append_segment_sequence(&base_rows)?)
+                };
+                for row in &mut owned_rows {
+                    let segment_offset = row.logical_offset;
+                    row.object_index =
+                        row.object_index
+                            .checked_add(first_owned_index)
                             .ok_or_else(|| {
                                 ClientError::InvalidOptions(
                                     "append manifest object index overflows".to_owned(),
                                 )
                             })?;
-                        row.logical_offset = row
-                            .logical_offset
-                            .checked_add(metadata.descriptor.logical_size)
+                    row.logical_offset =
+                        row.logical_offset
+                            .checked_add(owned_offset)
                             .ok_or_else(|| {
                                 ClientError::InvalidOptions(
                                     "append manifest logical offset overflows".to_owned(),
                                 )
                             })?;
-                        row.append_segment = Some(AppendSegment {
-                            segment_sequence,
-                            segment_offset,
-                        });
-                    }
-
-                    let mut manifest_rows = base_rows;
-                    manifest_rows.extend(delta_rows);
-                    let seals = seal_artifact_publish_plan(
-                        artifact_revision_id,
-                        &staged_objects,
-                        &manifest_rows,
-                    )?;
-                    let mut descriptor = metadata.descriptor;
-                    descriptor.logical_size = logical_size;
-                    descriptor.body_digest = sha256_digest_uri(body_digest);
-                    descriptor.manifest_digest = sha256_digest_uri(seals.manifest_seal);
-                    if let Some(content_type) = &options.content_type {
-                        descriptor.content_type = content_type.clone();
-                    }
-                    (
-                        condition,
-                        object_plan,
-                        staged_objects,
-                        manifest_rows,
-                        dependency_plan.owners,
-                        descriptor,
-                        base_read_stats,
-                        false,
-                        None,
-                    )
+                    row.append_segment = segment_sequence.map(|segment_sequence| AppendSegment {
+                        segment_sequence,
+                        segment_offset,
+                    });
                 }
+
+                let mut manifest_rows = base_rows;
+                manifest_rows.truncate(layout.reown_from_row);
+                manifest_rows.extend(owned_rows);
+                let seals = seal_artifact_publish_plan(
+                    artifact_revision_id,
+                    &staged_objects,
+                    &manifest_rows,
+                )?;
+                let mut descriptor = metadata.descriptor;
+                descriptor.logical_size = logical_size;
+                descriptor.body_digest = sha256_digest_uri(Digest(body_digest.digest()));
+                descriptor.manifest_digest = sha256_digest_uri(seals.manifest_seal);
+                if let Some(content_type) = &options.content_type {
+                    descriptor.content_type = content_type.clone();
+                }
+                (
+                    condition,
+                    object_plan,
+                    staged_objects,
+                    manifest_rows,
+                    layout.owners,
+                    descriptor,
+                    base.read_stats,
+                    false,
+                    Some(owned),
+                    body_digest,
+                )
             }
         };
 
         let result_descriptor = descriptor.clone();
-        let upload_bytes = rematerialized_body.as_deref().unwrap_or(delta);
+        let upload_bytes = owned_body.as_deref().unwrap_or(delta);
+        let published_rows = manifest_rows.clone();
         let outcome = self.publish_artifact_plan(
             store,
             logical_shard,
@@ -1041,6 +1025,8 @@ where
             descriptor,
             upload_bytes,
         )?;
+        self.body_digests()
+            .insert(artifact_revision_id, body_digest, &published_rows);
         Ok(ArtifactAppendOutcome {
             publication: outcome.publication,
             descriptor: result_descriptor,
@@ -1247,6 +1233,34 @@ where
             }
         }
         unreachable!("validated max_attempts is non-zero")
+    }
+
+    /// The base digest state and re-owned bytes of an append, read from the
+    /// longest body prefix whose digest state this client already holds.
+    fn append_base(
+        &self,
+        store: &dyn ArtifactObjectStore,
+        metadata: &PathMetadata,
+        rows: &[ArtifactManifestRow],
+        manifest: &ArtifactManifest,
+        reown_from_row: usize,
+    ) -> Result<AppendBase, ClientError> {
+        let cached = {
+            let digests = self.body_digests();
+            digests
+                .exact(metadata.artifact_revision_id, rows)
+                .map(|digest| (rows.len(), digest))
+                .or_else(|| digests.longest_prefix(rows))
+        };
+        if let Some((covered_rows, digest)) = cached {
+            match read_append_base(store, manifest, covered_rows, digest, reown_from_row) {
+                // A cached state that does not reproduce the sealed body
+                // digest is discarded for a complete read.
+                Err(ClientError::ArtifactIntegrity(_)) => {}
+                result => return result,
+            }
+        }
+        read_append_base(store, manifest, 0, BodyDigestState::new(), reown_from_row)
     }
 
     fn begin_publish_on_shard(
@@ -1511,6 +1525,10 @@ where
             manifest_from_rows(self.root_id(), route.logical_shard_id, &metadata, &rows)?;
         verify_artifact_bytes(&manifest, &bytes)
             .map_err(|error| ClientError::ArtifactIntegrity(error.to_string()))?;
+        let mut digest = BodyDigestState::new();
+        digest.update(&bytes);
+        self.body_digests()
+            .insert(metadata.artifact_revision_id, digest, &rows);
         Ok(ArtifactReadOutcome {
             metadata,
             bytes,
@@ -2348,49 +2366,128 @@ fn require_provider_admission(
     Ok(())
 }
 
-fn stream_artifact_digest(
-    store: &dyn ArtifactObjectStore,
-    manifest: &ArtifactManifest,
-) -> Result<(Sha256, ArtifactReadStats), ClientError> {
-    stream_artifact_blocks(store, manifest, |_| Ok(()))
+fn next_append_segment_sequence(rows: &[ArtifactManifestRow]) -> Result<u32, ClientError> {
+    rows.iter()
+        .filter_map(|row| row.append_segment.map(|segment| segment.segment_sequence))
+        .max()
+        .map_or(Ok(0), |sequence| {
+            sequence.checked_add(1).ok_or_else(|| {
+                ClientError::InvalidOptions("append segment sequence overflows u32".to_owned())
+            })
+        })
 }
 
-fn materialize_artifact_body(
-    store: &dyn ArtifactObjectStore,
-    manifest: &ArtifactManifest,
-) -> Result<(Vec<u8>, ArtifactReadStats), ClientError> {
-    let expected_len = usize::try_from(manifest.logical_len).map_err(|_| {
-        ClientError::InvalidOptions(
-            "append base is too large to rematerialize in client memory".to_owned(),
-        )
-    })?;
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(expected_len).map_err(|_| {
-        ClientError::InvalidOptions(
-            "append base cannot be rematerialized in client memory".to_owned(),
-        )
-    })?;
-    let (_, stats) = stream_artifact_blocks(store, manifest, |block| {
-        bytes.extend_from_slice(block);
-        Ok(())
-    })?;
-    if bytes.len() != expected_len {
-        return Err(ClientError::ArtifactIntegrity(format!(
-            "materialized base has {} bytes but descriptor declares {expected_len}",
-            bytes.len()
-        )));
+/// Which base rows a new append revision borrows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AppendLayout {
+    /// First base row the new revision re-owns; every earlier row is
+    /// borrowed. Zero rematerializes the whole body; the row count borrows
+    /// every row.
+    reown_from_row: usize,
+    /// Sorted owners of the borrowed rows.
+    owners: Vec<ArtifactRevisionIdentity>,
+}
+
+/// Consecutive base rows with one physical owner.
+struct OwnerRun {
+    owner: ArtifactRevisionIdentity,
+    first_row: usize,
+    bytes: u64,
+}
+
+fn owner_runs(rows: &[ArtifactManifestRow]) -> Vec<OwnerRun> {
+    let mut runs: Vec<OwnerRun> = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        match runs.last_mut() {
+            Some(run) if run.owner == row.physical_owner_revision_id => {
+                run.bytes = run.bytes.saturating_add(row.length);
+            }
+            _ => runs.push(OwnerRun {
+                owner: row.physical_owner_revision_id,
+                first_row: index,
+                bytes: row.length,
+            }),
+        }
     }
-    Ok((bytes, stats))
+    runs
 }
 
-fn stream_artifact_blocks(
+/// Plan an append as a binary counter over the base's owner runs.
+///
+/// In a body built by appends, the owner of the i-th run was published
+/// borrowing the i runs before it, so its dependency depth is i and a
+/// revision that borrows the first k runs has depth k. The newest runs merge
+/// into the new revision while the next one is no larger than the bytes it
+/// would join, or while the depth would exceed its bound, so each byte is
+/// rewritten O(log n) times rather than with every rematerialization of the
+/// whole body. A base whose runs do not reproduce its sealed depth keeps the
+/// conservative rule: borrow every row within the bounds, else rematerialize.
+fn append_layout(
+    metadata: &PathMetadata,
+    artifact_revision_id: ArtifactRevisionIdentity,
+    rows: &[ArtifactManifestRow],
+    delta_len: u64,
+) -> Result<AppendLayout, ClientError> {
+    let dependency_plan = append_dependency_plan(metadata, artifact_revision_id, rows)?;
+    let runs = owner_runs(rows);
+    let distinct_owners = runs
+        .iter()
+        .map(|run| run.owner)
+        .collect::<BTreeSet<_>>()
+        .len()
+        == runs.len();
+    let base_owns_last_run = runs
+        .last()
+        .is_some_and(|run| run.owner == metadata.artifact_revision_id);
+    let inferred_depth = runs.len() - usize::from(base_owns_last_run);
+    let append_chain =
+        distinct_owners && u8::try_from(inferred_depth).ok() == Some(metadata.dependency_depth);
+    let borrowed_runs = if append_chain {
+        let mut keep = runs.len();
+        let mut pending = delta_len;
+        while keep > 0
+            && (runs[keep - 1].bytes <= pending
+                || keep > usize::from(MAX_ARTIFACT_DEPENDENCY_DEPTH))
+        {
+            pending = pending.saturating_add(runs[keep - 1].bytes);
+            keep -= 1;
+        }
+        keep
+    } else if dependency_plan.requires_rematerialization {
+        0
+    } else {
+        runs.len()
+    };
+    let reown_from_row = runs
+        .get(borrowed_runs)
+        .map_or(rows.len(), |run| run.first_row);
+    Ok(AppendLayout {
+        reown_from_row,
+        owners: manifest_dependency_owners(artifact_revision_id, &rows[..reown_from_row]),
+    })
+}
+
+/// A base body's digest state and the bytes of the rows it hands over.
+struct AppendBase {
+    digest: BodyDigestState,
+    reowned: Vec<u8>,
+    read_stats: ArtifactReadStats,
+}
+
+/// Continue `digest`, which covers the first `covered_rows` rows, over the
+/// rest of the base, and collect the bytes of every row from
+/// `reown_from_row` on. The result must reproduce the sealed body digest.
+fn read_append_base(
     store: &dyn ArtifactObjectStore,
     manifest: &ArtifactManifest,
-    mut consume: impl FnMut(&[u8]) -> Result<(), ClientError>,
-) -> Result<(Sha256, ArtifactReadStats), ClientError> {
-    let mut hasher = Sha256::new();
-    let mut stats = ArtifactReadStats::default();
-    for block in &manifest.blocks {
+    covered_rows: usize,
+    mut digest: BodyDigestState,
+    reown_from_row: usize,
+) -> Result<AppendBase, ClientError> {
+    let mut reowned = Vec::new();
+    let mut read_stats = ArtifactReadStats::default();
+    let first_row = covered_rows.min(reown_from_row);
+    for (index, block) in manifest.blocks.iter().enumerate().skip(first_row) {
         let len = usize::try_from(block.len).map_err(|_| {
             ClientError::ArtifactIntegrity("artifact block length is not addressable".to_owned())
         })?;
@@ -2402,28 +2499,29 @@ fn stream_artifact_blocks(
             blocks: vec![block.clone()],
         };
         let read = read_artifact_window(store, None, &window, block.logical_offset, len)?;
-        consume(&read.bytes)?;
-        hasher.update(&read.bytes);
-        merge_read_stats(&mut stats, read.stats);
+        if index >= covered_rows {
+            digest.update(&read.bytes);
+        }
+        if index >= reown_from_row {
+            reowned.try_reserve(read.bytes.len()).map_err(|_| {
+                ClientError::InvalidOptions(
+                    "append base cannot be rematerialized in client memory".to_owned(),
+                )
+            })?;
+            reowned.extend_from_slice(&read.bytes);
+        }
+        merge_read_stats(&mut read_stats, read.stats);
     }
-    let streamed_digest: [u8; 32] = hasher.clone().finalize().into();
-    if streamed_digest != manifest.sha256 {
+    if digest.length() != manifest.logical_len || digest.digest() != manifest.sha256 {
         return Err(ClientError::ArtifactIntegrity(
-            "streamed base body digest does not match its descriptor".to_owned(),
+            "append base body digest does not match its descriptor".to_owned(),
         ));
     }
-    Ok((hasher, stats))
-}
-
-fn next_append_segment_sequence(rows: &[ArtifactManifestRow]) -> Result<u32, ClientError> {
-    rows.iter()
-        .filter_map(|row| row.append_segment.map(|segment| segment.segment_sequence))
-        .max()
-        .map_or(Ok(0), |sequence| {
-            sequence.checked_add(1).ok_or_else(|| {
-                ClientError::InvalidOptions("append segment sequence overflows u32".to_owned())
-            })
-        })
+    Ok(AppendBase {
+        digest,
+        reowned,
+        read_stats,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2895,6 +2993,8 @@ mod tests {
         operation: Option<OperationStatus>,
         path: Option<PathReadResult>,
         token_sequence: u8,
+        /// Sealed dependency depth of every revision the model published.
+        revision_depths: BTreeMap<ArtifactRevisionIdentity, u8>,
         commit_version: u64,
         lose_stage_response_once: bool,
         stage_response_lost: bool,
@@ -2925,6 +3025,7 @@ mod tests {
                     operation: None,
                     path: None,
                     token_sequence: 0,
+                    revision_depths: BTreeMap::new(),
                     commit_version: 0,
                     lose_stage_response_once,
                     stage_response_lost: false,
@@ -3402,15 +3503,27 @@ mod tests {
                     .unwrap_or(1);
                 let dependency_count = u32::try_from(begin.dependency_owner_revision_ids.len())
                     .map_err(|_| TransportError::new("dependency count exceeds u32", false))?;
-                let dependency_depth = if dependency_count == 0 {
-                    0
-                } else {
-                    current
-                        .map(|metadata| metadata.dependency_depth)
-                        .unwrap_or(0)
+                // Like the engine: one more than the deepest direct owner.
+                let dependency_depth = match begin
+                    .dependency_owner_revision_ids
+                    .iter()
+                    .map(|owner| state.revision_depths.get(owner).copied())
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| TransportError::new("unknown dependency owner", false))?
+                    .into_iter()
+                    .max()
+                {
+                    None => 0,
+                    Some(deepest) => deepest
                         .checked_add(1)
-                        .ok_or_else(|| TransportError::new("dependency depth exceeds u8", false))?
+                        .filter(|depth| *depth <= MAX_ARTIFACT_DEPENDENCY_DEPTH)
+                        .ok_or_else(|| {
+                            TransportError::new("dependency depth exceeds bound", false)
+                        })?,
                 };
+                state
+                    .revision_depths
+                    .insert(begin.artifact_revision_id, dependency_depth);
                 let published = PublishResult {
                     operation_id: begin.operation_id,
                     target: begin.target.clone(),
@@ -4067,26 +4180,53 @@ mod tests {
     }
 
     #[test]
-    fn ninth_append_rematerializes_and_survives_ancestor_object_gc() {
+    fn appends_merge_owner_runs_like_a_binary_counter_and_survive_ancestor_gc() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
         let store = RecordingStore::new(events, None);
         let mut expected_body = vec![b'a'];
-
         client
             .publish_artifact(&store, publish_options(1), &expected_body)
             .unwrap();
-        for append_index in 0_u8..8 {
-            let delta = [b'b'.checked_add(append_index).unwrap()];
+
+        // One-byte runs merge like a binary counter. Per append: objects
+        // uploaded, dependency owners, and dependency depth afterwards.
+        let expected = [
+            (2, 0, 0),
+            (1, 1, 1),
+            (4, 0, 0),
+            (1, 1, 1),
+            (2, 1, 1),
+            (1, 2, 2),
+            (8, 0, 0),
+        ];
+        let mut ancestor_keys = BTreeSet::new();
+        for (index, (uploaded, owners, depth)) in expected.into_iter().enumerate() {
+            let index = u8::try_from(index).unwrap();
+            ancestor_keys.extend(
+                inspector
+                    .state()
+                    .manifest_rows
+                    .iter()
+                    .map(|row| ObjectKey::new(row.object_identity.as_str()).unwrap()),
+            );
+            let delta = [b'b' + index];
             expected_body.extend_from_slice(&delta);
-            client
+            let reowns_everything = owners == 0;
+            if reowns_everything {
+                // A rejected admission precedes every upload, so re-owning
+                // the whole body uploads it once.
+                inspector.conflict_append_begins(1);
+            }
+            let creates_before = store.creates.load(Ordering::SeqCst);
+            let outcome = client
                 .append_artifact(
                     &store,
                     ArtifactAppendOptions::new(
-                        OperationIdentity([0x30 + append_index; 16]),
-                        ArtifactRevisionIdentity([0x50 + append_index; 16]),
+                        OperationIdentity([0x30 + index; 16]),
+                        ArtifactRevisionIdentity([0x50 + index; 16]),
                         target(),
                         ContentType::new("text/plain").unwrap(),
                     )
@@ -4094,79 +4234,39 @@ mod tests {
                     &delta,
                 )
                 .unwrap();
-        }
-
-        let ancestor_keys = {
+            assert_eq!(
+                store.creates.load(Ordering::SeqCst) - creates_before,
+                uploaded,
+                "append {index}"
+            );
+            assert_eq!(
+                outcome.descriptor.body_digest,
+                sha256_digest_uri(Digest(Sha256::digest(&expected_body).into()))
+            );
             let state = inspector.state();
             let metadata = state
                 .path
                 .as_ref()
                 .and_then(|path| path.metadata.as_ref())
                 .unwrap();
-            assert_eq!(metadata.dependency_count, 8);
-            assert_eq!(metadata.dependency_depth, MAX_ARTIFACT_DEPENDENCY_DEPTH);
-            state
-                .manifest_rows
-                .iter()
-                .map(|row| ObjectKey::new(row.object_identity.as_str()).unwrap())
-                .collect::<BTreeSet<_>>()
-        };
+            assert_eq!(
+                (metadata.dependency_count, metadata.dependency_depth),
+                (owners, depth),
+                "append {index}"
+            );
+        }
 
-        let final_delta = *b"j";
-        expected_body.extend_from_slice(&final_delta);
-        let creates_before_squash = store.creates.load(Ordering::SeqCst);
-        inspector.conflict_append_begins(1);
-        let outcome = client
-            .append_artifact(
-                &store,
-                ArtifactAppendOptions::new(
-                    OperationIdentity([0x38; 16]),
-                    ArtifactRevisionIdentity([0x58; 16]),
-                    target(),
-                    ContentType::new("text/plain").unwrap(),
-                )
-                .with_block_size(1),
-                &final_delta,
-            )
-            .unwrap();
-
-        assert_eq!(outcome.base_read_stats.store_read_bytes, 9);
-        assert_eq!(outcome.upload_stats.created, 10);
-        assert_eq!(
-            store.creates.load(Ordering::SeqCst) - creates_before_squash,
-            10,
-            "a rejected squash Begin must not upload the full body"
-        );
-        assert_eq!(
-            outcome.descriptor.body_digest,
-            sha256_digest_uri(Digest(Sha256::digest(&expected_body).into()))
-        );
+        // The last append re-owned the whole body, so no ancestor object is
+        // still referenced.
         let state = inspector.state();
-        let begin = state.begin.as_ref().unwrap();
-        assert!(matches!(
-            begin.condition,
-            PublishCondition::Append {
-                expected_generation: Some(9)
-            }
-        ));
-        assert!(begin.dependency_owner_revision_ids.is_empty());
-        let final_revision = begin.artifact_revision_id;
-        assert_eq!(state.staged_objects.len(), expected_body.len());
+        let final_revision = state.begin.as_ref().unwrap().artifact_revision_id;
         assert_eq!(state.manifest_rows.len(), expected_body.len());
         assert!(state.manifest_rows.iter().all(|row| {
             row.physical_owner_revision_id == final_revision
                 && row.append_segment.is_none()
                 && row.object_index == row.physical_object_index
         }));
-        let metadata = state
-            .path
-            .as_ref()
-            .and_then(|path| path.metadata.as_ref())
-            .unwrap();
-        assert_eq!(metadata.dependency_count, 0);
-        assert_eq!(metadata.dependency_depth, 0);
         drop(state);
-
         for key in ancestor_keys {
             assert_eq!(store.delete(&key).unwrap(), ObjectDeleteOutcome::Deleted);
         }

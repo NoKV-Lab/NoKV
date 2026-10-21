@@ -11,6 +11,7 @@
 
 mod append_operations;
 mod artifact;
+mod body_digest;
 mod error;
 mod generic_index;
 mod idempotent_append;
