@@ -318,7 +318,7 @@ fn serve_socket_loop(
                     .map_err(ServerError::Connection)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                sleep_until_runtime_event(next_renewal);
+                wait_for_connection(&listener, next_renewal);
             }
             Err(error) => return Err(ServerError::Connection(error)),
         }
@@ -352,7 +352,37 @@ fn require_owner_retained(owner_loss: &OwnerLossSignal) -> Result<(), ServerErro
 
 fn sleep_until_runtime_event(next_renewal: Instant) {
     let until_renewal = next_renewal.saturating_duration_since(Instant::now());
-    thread::sleep(until_renewal.min(Duration::from_millis(10)));
+    thread::sleep(until_renewal.min(RUNTIME_EVENT_POLL));
+}
+
+/// Shutdown and owner-loss checks run at least this often while idle.
+const RUNTIME_EVENT_POLL: Duration = Duration::from_millis(10);
+
+/// Block until the listener has a pending connection, the next renewal is
+/// due, or the runtime poll interval elapses. A pending connection wakes the
+/// loop at once instead of waiting out a fixed sleep.
+#[cfg(unix)]
+fn wait_for_connection(listener: &TcpListener, next_renewal: Instant) {
+    use std::os::fd::AsRawFd;
+
+    let until_renewal = next_renewal.saturating_duration_since(Instant::now());
+    let timeout = until_renewal.min(RUNTIME_EVENT_POLL);
+    let mut descriptor = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: `descriptor` is one valid pollfd for a listener this function
+    // borrows for the whole call; poll writes only its `revents` field.
+    unsafe {
+        libc::poll(&mut descriptor, 1, timeout_ms);
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_for_connection(_listener: &TcpListener, next_renewal: Instant) {
+    sleep_until_runtime_event(next_renewal);
 }
 
 fn validate_ownership(

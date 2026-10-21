@@ -1406,6 +1406,7 @@ dependencies = [
 name = "nokv-server"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "nokv-control",
  "nokv-meta",
  "nokv-meta-holt",
