@@ -36,6 +36,7 @@ pub struct ClientConfig {
 pub enum RoutingConfig {
     Static(StaticRoutingConfig),
     Etcd(EtcdRoutingConfig),
+    Local(LocalRoutingConfig),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +53,12 @@ pub struct EtcdRoutingConfig {
     pub endpoints: Vec<String>,
     pub key_prefix: String,
     pub lease_ttl_seconds: i64,
+}
+
+/// Single-host control directory shared by the owner and its clients.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalRoutingConfig {
+    pub directory: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -293,7 +300,7 @@ impl fmt::Display for CliError {
             ),
             Self::OperationInput { message, .. } => formatter.write_str(message),
             Self::MixedRoutingOptions => formatter.write_str(
-                "static metadata routing options and etcd routing options cannot be combined",
+                "static metadata routing, etcd routing, and --control-dir cannot be combined",
             ),
             Self::MixedMetadataStoreOptions => formatter
                 .write_str("--metadata-create, --metadata-reopen, and --metadata-recover-log are mutually exclusive"),
@@ -389,6 +396,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     let mut append_activity_lease_explicit = false;
     let mut static_routing = StaticRoutingConfig::default();
     let mut etcd_routing = EtcdRoutingConfig::default();
+    let mut control_directory = None;
     let mut routing_kind = None;
     let mut agent_id = None;
     let mut workbench_root = None;
@@ -441,6 +449,10 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             "--etcd-key-prefix" => {
                 select_routing(&mut routing_kind, RoutingKind::Etcd)?;
                 etcd_routing.key_prefix = next_value(&mut arguments, &argument)?;
+            }
+            "--control-dir" => {
+                select_routing(&mut routing_kind, RoutingKind::Local)?;
+                control_directory = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
             }
             "--etcd-lease-ttl-seconds" => {
                 select_routing(&mut routing_kind, RoutingKind::Etcd)?;
@@ -589,6 +601,9 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     client.routing = match routing_kind.unwrap_or(RoutingKind::Static) {
         RoutingKind::Static => RoutingConfig::Static(static_routing),
         RoutingKind::Etcd => RoutingConfig::Etcd(etcd_routing),
+        RoutingKind::Local => RoutingConfig::Local(LocalRoutingConfig {
+            directory: control_directory.ok_or(CliError::MissingOption("--control-dir"))?,
+        }),
     };
     if let Some(argument) = arguments.next() {
         return Err(CliError::UnexpectedArgument(argument));
@@ -637,6 +652,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
 enum RoutingKind {
     Static,
     Etcd,
+    Local,
 }
 
 fn select_routing(
@@ -1779,6 +1795,42 @@ mod tests {
             ])),
             Err(CliError::MixedRoutingOptions)
         );
+    }
+
+    #[test]
+    fn local_control_routing_names_one_directory_and_mixes_with_nothing() {
+        let parsed = parse(args(&[
+            "--root-id",
+            "11",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--control-dir",
+            "/var/lib/nokv/control",
+            "provision",
+            "22222222222222222222222222222222",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.client.routing,
+            RoutingConfig::Local(LocalRoutingConfig {
+                directory: PathBuf::from("/var/lib/nokv/control"),
+            })
+        );
+        for other in [
+            ["--etcd-endpoint", "http://127.0.0.1:2379"],
+            ["--metadata-address", "127.0.0.1:7750"],
+        ] {
+            assert_eq!(
+                parse(args(&[
+                    "--control-dir",
+                    "/var/lib/nokv/control",
+                    other[0],
+                    other[1],
+                    "serve",
+                ])),
+                Err(CliError::MixedRoutingOptions)
+            );
+        }
     }
 
     #[test]

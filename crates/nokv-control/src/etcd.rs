@@ -1610,6 +1610,74 @@ mod tests {
         ));
     }
 
+    struct EtcdHarness {
+        store: EtcdControlStore,
+        prefix: String,
+    }
+
+    impl EtcdHarness {
+        fn connect(label: &str) -> Self {
+            let endpoint = std::env::var("NOKV_TEST_ETCD_ENDPOINT")
+                .expect("NOKV_TEST_ETCD_ENDPOINT must name an isolated test etcd endpoint");
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let prefix = format!("/nokv/test/{label}-{}-{nonce}", std::process::id());
+            let options = EtcdControlStoreOptions::new([endpoint]).with_key_prefix(prefix.clone());
+            Self {
+                store: EtcdControlStore::connect(options).unwrap(),
+                prefix,
+            }
+        }
+    }
+
+    impl Drop for EtcdHarness {
+        fn drop(&mut self) {
+            let mut client = self.store.client.clone();
+            let prefix = self.prefix.clone();
+            let _ = self.store.block_on(async move {
+                client
+                    .delete(prefix, Some(DeleteOptions::new().with_prefix()))
+                    .await
+                    .map_err(etcd_backend)?;
+                Ok::<(), ControlError>(())
+            });
+        }
+    }
+
+    impl crate::conformance::ConformanceHarness for EtcdHarness {
+        fn store(&self) -> &dyn ControlStore {
+            &self.store
+        }
+
+        fn lose_session(&self, lease: &LogicalShardLease) {
+            // Revoke the real etcd lease: etcd deletes the attached session
+            // key synchronously while the durable record remains.
+            let mut client = self.store.client.clone();
+            let lease_id = lease.lease_id;
+            self.store
+                .block_on(async move {
+                    client
+                        .lease_revoke(lease_id_i64(lease_id)?)
+                        .await
+                        .map_err(etcd_backend)?;
+                    Ok::<(), ControlError>(())
+                })
+                .unwrap();
+        }
+
+        fn fresh_shard(&self, scenario: u8) -> (RootId, LogicalShardId) {
+            (root(scenario), shard(scenario))
+        }
+    }
+
+    #[test]
+    #[ignore = "requires NOKV_TEST_ETCD_ENDPOINT"]
+    fn etcd_store_passes_provider_conformance() {
+        crate::conformance::run_all(&EtcdHarness::connect("conformance"));
+    }
+
     #[test]
     #[ignore = "requires NOKV_TEST_ETCD_ENDPOINT"]
     fn logical_shard_revision_cas_rejects_aba_and_classifies_exact_readback() {

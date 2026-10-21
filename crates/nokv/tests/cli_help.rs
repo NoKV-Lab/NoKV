@@ -18,5 +18,5 @@ fn static_route_help_exposes_required_fences_and_refresh_limit() {
     assert!(help.contains("--owner-epoch"));
     assert!(help.contains("static routing is a point-in-time pin"));
     assert!(help.contains("cannot refresh after placement changes or owner restarts"));
-    assert!(help.contains("use --etcd-endpoint for self-refreshing routing"));
+    assert!(help.contains("use --etcd-endpoint or --control-dir for self-refreshing routing"));
 }

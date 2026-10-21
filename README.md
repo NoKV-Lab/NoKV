@@ -381,9 +381,11 @@ stable JSON envelopes, and fail-closed admission. Use Python when the caller
 needs in-process range reads, fsspec/checkpoint integration, or direct typed
 methods. Use Rust for provider, routing, change-feed, or recovery-aware work.
 
-Every agent-facing CLI command requires self-refreshing etcd routing plus the
-durable `RootId` to `AgentId` binding. Static route pins remain an SDK/testing
-option and are rejected by the agent-facing CLI.
+Every agent-facing CLI command requires self-refreshing control routing plus
+the durable `RootId` to `AgentId` binding: `--control-dir PATH` when the owner
+and its clients share one host, `--etcd-endpoint URL` when they span hosts.
+Static route pins remain an SDK/testing option and are rejected by the
+agent-facing CLI.
 
 ## Core Semantics
 

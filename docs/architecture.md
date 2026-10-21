@@ -400,8 +400,10 @@ is therefore an opt-in, not the resting state.
 
 - `local-only` (**default**) keeps the exclusive Holt WAL as the only recovery
   authority, publishes no segments, leaves any earlier shared frontier frozen,
-  and still proves owner liveness before every acknowledgement. Control (etcd)
-  is used for routing and the owner lease only. A `local-only` shard has no
+  and still proves owner liveness before every acknowledgement. Control is used
+  for routing and the owner session only: a local control directory, whose
+  session is a file lock released with the owner process, or etcd, whose
+  session is a lease. A `local-only` shard has no
   shared-log successor path: losing its Holt directory loses the metadata,
   exactly as with the `local` mode above.
 - `shared` is the object-first boundary described above. It is implied by

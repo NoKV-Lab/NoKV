@@ -144,6 +144,14 @@ impl ControlRouteResolver {
         }
     }
 
+    /// Use the single-host control directory shared with the owner as the
+    /// sole route source.
+    #[cfg(unix)]
+    pub fn open_local(directory: impl Into<std::path::PathBuf>) -> Result<Self, ClientError> {
+        let store = nokv_control::LocalControlStore::open(directory).map_err(control_error)?;
+        Ok(Self::new(Arc::new(store)))
+    }
+
     /// Connect an etcd-backed control store and use it as the sole route source.
     #[cfg(feature = "etcd")]
     pub fn connect_etcd(options: EtcdRouteOptions) -> Result<Self, ClientError> {
@@ -329,6 +337,14 @@ mod control_tests {
         nokv_control::LogicalShardLease,
     ) {
         let store = Arc::new(InMemoryControlStore::new());
+        let (root_id, lease) = serve_root(store.as_ref(), endpoint);
+        (store, root_id, lease)
+    }
+
+    fn serve_root(
+        store: &dyn ControlStore,
+        endpoint: &str,
+    ) -> (RootIdentity, nokv_control::LogicalShardLease) {
         let root_id = RootId::from_bytes(id(1));
         let logical_shard_id = LogicalShardId::from_bytes(id(2));
         store.create_logical_shard(logical_shard_id).unwrap();
@@ -371,7 +387,25 @@ mod control_tests {
                 },
             )
             .unwrap();
-        (store, RootIdentity(id(1)), lease)
+        (RootIdentity(id(1)), lease)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_local_control_directory_routes_to_its_serving_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = nokv_control::LocalControlStore::open(directory.path()).unwrap();
+        let (root_id, _lease) = serve_root(&owner, "127.0.0.1:7751");
+
+        // A client opens the same directory and holds no session of its own.
+        let resolver = ControlRouteResolver::open_local(directory.path()).unwrap();
+        let resolved = resolver.resolve(root_id, true).unwrap();
+        assert_eq!(resolved.route.placement_generation, 2);
+        assert_eq!(resolved.route.owner_epoch, 1);
+        assert_eq!(
+            resolved.endpoint,
+            "127.0.0.1:7751".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[test]

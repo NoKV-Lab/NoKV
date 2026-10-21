@@ -169,14 +169,19 @@ pub trait ControlStore: Send + Sync {
     fn release_owner(&self, lease: &LogicalShardLease) -> Result<LogicalShardRecord, ControlError>;
 }
 
+/// Control records plus the owner sessions that are live for them.
+///
+/// The in-memory store owns one instance. The local store rebuilds one from
+/// its durable records for every mutation, with the session of the touched
+/// logical shard taken from its OS lock, so both run the same transitions.
 #[derive(Default)]
-struct InMemoryState {
-    root_agents: BTreeMap<RootId, RootAgentBinding>,
-    root_object_namespaces: BTreeMap<RootId, RootObjectNamespaceBinding>,
-    root_placements: BTreeMap<RootId, RootPlacement>,
-    logical_shards: BTreeMap<LogicalShardId, LogicalShardRecord>,
-    owner_sessions: BTreeMap<LogicalShardId, LogicalShardLease>,
-    next_lease_id: u64,
+pub(crate) struct InMemoryState {
+    pub(crate) root_agents: BTreeMap<RootId, RootAgentBinding>,
+    pub(crate) root_object_namespaces: BTreeMap<RootId, RootObjectNamespaceBinding>,
+    pub(crate) root_placements: BTreeMap<RootId, RootPlacement>,
+    pub(crate) logical_shards: BTreeMap<LogicalShardId, LogicalShardRecord>,
+    pub(crate) owner_sessions: BTreeMap<LogicalShardId, LogicalShardLease>,
+    pub(crate) next_lease_id: u64,
 }
 
 #[derive(Default)]
@@ -187,6 +192,18 @@ pub struct InMemoryControlStore {
 impl InMemoryControlStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn with_state(state: InMemoryState) -> Self {
+        Self {
+            state: Mutex::new(state),
+        }
+    }
+
+    pub(crate) fn into_state(self) -> InMemoryState {
+        self.state
+            .into_inner()
+            .expect("control store mutex poisoned")
     }
 }
 
@@ -1632,6 +1649,36 @@ mod tests {
             root_id: root_id(root),
             agent_id: AgentId::from_bytes([agent; 16]),
         }
+    }
+
+    struct InMemoryHarness(InMemoryControlStore);
+
+    impl crate::conformance::ConformanceHarness for InMemoryHarness {
+        fn store(&self) -> &dyn ControlStore {
+            &self.0
+        }
+
+        fn lose_session(&self, lease: &LogicalShardLease) {
+            // Simulate owner-process death: the durable record stays, the
+            // liveness session disappears without a clean release.
+            let removed = self
+                .0
+                .state
+                .lock()
+                .expect("control store mutex poisoned")
+                .owner_sessions
+                .remove(&lease.logical_shard_id);
+            assert_eq!(removed.as_ref(), Some(lease));
+        }
+
+        fn fresh_shard(&self, scenario: u8) -> (RootId, LogicalShardId) {
+            (root_id(scenario), shard_id(scenario))
+        }
+    }
+
+    #[test]
+    fn in_memory_store_passes_provider_conformance() {
+        crate::conformance::run_all(&InMemoryHarness(InMemoryControlStore::new()));
     }
 
     #[test]
