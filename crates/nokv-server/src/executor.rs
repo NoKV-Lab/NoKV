@@ -264,6 +264,9 @@ impl MetadataWorkspaceRequestExecutor {
             protocol::WorkspaceRequest::FinishArtifactPublish(finish) => {
                 self.finish_artifact_publish(request, finish)
             }
+            protocol::WorkspaceRequest::PublishInlineArtifact(publish) => {
+                self.publish_inline_artifact(request, publish)
+            }
             protocol::WorkspaceRequest::AbortArtifactPublish(abort) => {
                 self.abort_artifact_publish(request, abort)
             }
@@ -482,14 +485,15 @@ impl MetadataWorkspaceRequestExecutor {
                     range: None,
                     blocks: Vec::new(),
                     next_cursor: None,
+                    inline_body: None,
                 }),
                 commit_version: None,
                 replayed: false,
             });
         }
         let metadata = Self::path_metadata(&request.target.workbench, workspace, path, entry)?;
-        let (blocks, next_cursor) = match request.range {
-            None => (Vec::new(), None),
+        let (blocks, next_cursor, inline_body) = match request.range {
+            None => (Vec::new(), None, None),
             Some(range) => {
                 let end = range
                     .offset
@@ -500,15 +504,30 @@ impl MetadataWorkspaceRequestExecutor {
                         "requested byte range exceeds the artifact logical size",
                     ));
                 }
-                self.manifest_read_plan(
-                    context,
-                    metadata.artifact_revision_id.into(),
-                    range,
-                    request
-                        .plan_page
-                        .as_ref()
-                        .expect("protocol validation requires ranged plan pagination"),
-                )?
+                let page = request
+                    .plan_page
+                    .as_ref()
+                    .expect("protocol validation requires ranged plan pagination");
+                let inline_body = match page.cursor {
+                    None => self.inline_artifact_body(
+                        context,
+                        metadata.artifact_revision_id.into(),
+                        metadata.descriptor.logical_size,
+                    )?,
+                    Some(_) => None,
+                };
+                match inline_body {
+                    Some(body) => (Vec::new(), None, Some(body)),
+                    None => {
+                        let (blocks, next_cursor) = self.manifest_read_plan(
+                            context,
+                            metadata.artifact_revision_id.into(),
+                            range,
+                            page,
+                        )?;
+                        (blocks, next_cursor, None)
+                    }
+                }
             }
         };
         Ok(ExecutedRequest {
@@ -518,10 +537,46 @@ impl MetadataWorkspaceRequestExecutor {
                 range: request.range,
                 blocks,
                 next_cursor,
+                inline_body,
             }),
             commit_version: None,
             replayed: false,
         })
+    }
+
+    /// The body of an inline revision, read at the same root version as its
+    /// path. A revision of this size published through objects has none.
+    fn inline_artifact_body(
+        &self,
+        context: meta::RootReadContext,
+        revision_id: types::ArtifactRevisionId,
+        logical_size: u64,
+    ) -> Result<Option<Vec<u8>>, protocol::RpcFailure> {
+        if logical_size == 0 || logical_size > types::MAX_INLINE_ARTIFACT_BODY_BYTES as u64 {
+            return Ok(None);
+        }
+        let Some(payload) = self
+            .meta
+            .read_at(
+                context.root_id,
+                context.placement_generation,
+                context.owner_epoch,
+                meta::MetadataFamily::ArtifactInlineBody,
+                &meta::artifact_inline_body_key(context.root_id, revision_id),
+                context.read_version,
+            )
+            .map_err(meta_failure)?
+        else {
+            return Ok(None);
+        };
+        let record = meta::ArtifactInlineBodyRecord::decode(&payload)
+            .map_err(|error| internal(format!("invalid artifact inline body: {error}")))?;
+        if record.body.len() as u64 != logical_size {
+            return Err(internal(
+                "artifact inline body length differs from its path metadata",
+            ));
+        }
+        Ok(Some(record.body))
     }
 
     fn list_paths(
@@ -1192,6 +1247,7 @@ impl MetadataWorkspaceRequestExecutor {
                 range: request.range,
                 blocks,
                 next_cursor,
+                inline_body: None,
             }),
             commit_version: None,
             replayed: false,
@@ -2215,6 +2271,7 @@ impl MetadataWorkspaceRequestExecutor {
                 .expect("protocol dependency bound fits u8"),
             dependency_depth,
             dependency_digest,
+            inline_body_digest: request.inline_body_digest.map(|digest| digest.0),
             cleanup_staged_object_cursor: 0,
             cleanup_manifest_cursor: 0,
             cleanup_retry_count: 0,
@@ -2484,8 +2541,42 @@ impl MetadataWorkspaceRequestExecutor {
                 token,
                 artifact: request.artifact.clone(),
             },
+            None,
         )?;
         completed.replayed |= replayed;
+        Ok(completed)
+    }
+
+    /// Admit a publication and complete it with its inline body in one write
+    /// session under this request's single claim. No provider write sits
+    /// between the steps, so they share one durable acknowledgement; each
+    /// keeps the identities and rules of its stepwise request. A publication
+    /// that already reached a terminal state answers with its Begin status.
+    fn publish_inline_artifact(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::PublishInlineArtifactRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        require_append_attempt_identities(rpc, &request.begin)?;
+        self.claim_mutation(rpc)?;
+        let begun = self.begin_claimed_artifact_publish(rpc, &request.begin)?;
+        let protocol::WorkspaceResult::Operation(status) = &begun.result else {
+            return Err(internal(
+                "artifact publication begin returned the wrong result variant",
+            ));
+        };
+        if status.state != protocol::OperationState::Running {
+            return Ok(begun);
+        }
+        let mut completed = self.complete_claimed_artifact_publish(
+            rpc,
+            &protocol::CompleteArtifactPublishRequest {
+                token: status.token,
+                artifact: request.artifact.clone(),
+            },
+            Some(request.body.clone()),
+        )?;
+        completed.replayed |= begun.replayed;
         Ok(completed)
     }
 
@@ -2495,13 +2586,14 @@ impl MetadataWorkspaceRequestExecutor {
         request: &protocol::CompleteArtifactPublishRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
-        self.complete_claimed_artifact_publish(rpc, request)
+        self.complete_claimed_artifact_publish(rpc, request, None)
     }
 
     fn complete_claimed_artifact_publish(
         &self,
         rpc: &protocol::WorkspaceRpcRequest,
         request: &protocol::CompleteArtifactPublishRequest,
+        inline_body: Option<Vec<u8>>,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let transition_id = derived_request_id(rpc.request_id, b"publish-complete-transition", 0);
         let finalizing_operation =
@@ -2579,6 +2671,7 @@ impl MetadataWorkspaceRequestExecutor {
             expected_operation: finalizing_operation.clone(),
             artifact,
             dependency_owner_revision_ids,
+            inline_body,
         }) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -6290,6 +6383,7 @@ fn publication_failure(error: meta::PublicationError) -> protocol::RpcFailure {
         | meta::PublicationError::ManifestOrder
         | meta::PublicationError::ManifestPositionMismatch
         | meta::PublicationError::ManifestDigestMismatch
+        | meta::PublicationError::InlineBodyMismatch { .. }
         | meta::PublicationError::ManifestOwnershipMismatch { .. }
         | meta::PublicationError::DuplicateStagedObjectKey { .. }
         | meta::PublicationError::DependencyCountMismatch { .. }
@@ -8811,14 +8905,23 @@ mod tests {
 
     impl OneBytePlan {
         fn new(artifact_revision_id: protocol::ArtifactRevisionIdentity, byte: u8) -> Self {
+            Self::single_object(artifact_revision_id, &[byte])
+        }
+
+        /// The sealed plan of a body uploaded as one object.
+        fn single_object(
+            artifact_revision_id: protocol::ArtifactRevisionIdentity,
+            body: &[u8],
+        ) -> Self {
             let revision_id: types::ArtifactRevisionId = artifact_revision_id.into();
             let object_key = meta::object_block_key(shard(), root(), revision_id, 0);
+            let length = body.len() as u64;
             let body_digest =
-                protocol::sha256_digest_uri(protocol::Digest(Sha256::digest([byte]).into()));
+                protocol::sha256_digest_uri(protocol::Digest(Sha256::digest(body).into()));
             let staged_objects = vec![protocol::StagedObject {
                 sequence: 0,
                 object_identity: protocol::ObjectIdentity::new(object_key.clone()).unwrap(),
-                expected_length: 1,
+                expected_length: length,
                 expected_digest: body_digest.clone(),
                 multipart_token: None,
             }];
@@ -8829,7 +8932,7 @@ mod tests {
                 physical_owner_revision_id: artifact_revision_id,
                 object_identity: protocol::ObjectIdentity::new(object_key).unwrap(),
                 object_offset: 0,
-                length: 1,
+                length,
                 digest: body_digest.clone(),
                 append_segment: None,
             }];
@@ -8840,7 +8943,7 @@ mod tests {
             )
             .unwrap();
             let artifact = protocol::ArtifactDescriptor {
-                logical_size: 1,
+                logical_size: length,
                 body_digest: body_digest.clone(),
                 manifest_digest: protocol::sha256_digest_uri(seals.manifest_seal),
                 content_type: protocol::ContentType::new("application/json").unwrap(),
@@ -8852,7 +8955,7 @@ mod tests {
                 staged_objects,
                 upload_proofs: vec![protocol::ObjectUploadProof {
                     sequence: 0,
-                    observed_length: 1,
+                    observed_length: length,
                     observed_digest: body_digest,
                 }],
                 manifest_rows,
@@ -8882,6 +8985,7 @@ mod tests {
                 manifest_row_count: self.seals.manifest_row_count,
                 manifest_seal: self.seals.manifest_seal,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body_digest: None,
             }
         }
     }
@@ -9002,6 +9106,281 @@ mod tests {
         assert_eq!(metadata.artifact_revision_id, begin.artifact_revision_id);
         assert_eq!(metadata.generation, 1);
         assert_eq!(metadata.descriptor, plan.artifact);
+    }
+
+    fn inline_publication(
+        operation_fill: u8,
+        begin: &protocol::BeginArtifactPublishRequest,
+        condition: protocol::PublishCondition,
+        body: &[u8],
+    ) -> protocol::PublishInlineArtifactRequest {
+        let digest = protocol::inline_artifact_body_digest(body);
+        let empty_closure = protocol::Digest([0; types::SHA256_BYTES]);
+        protocol::PublishInlineArtifactRequest {
+            begin: protocol::BeginArtifactPublishRequest {
+                operation_id: protocol::OperationIdentity([operation_fill; types::FIXED_ID_BYTES]),
+                condition,
+                staged_object_count: 0,
+                staged_object_seal: empty_closure,
+                manifest_row_count: 0,
+                manifest_seal: empty_closure,
+                inline_body_digest: Some(digest),
+                ..begin.clone()
+            },
+            body: body.to_vec(),
+            artifact: protocol::ArtifactDescriptor {
+                logical_size: body.len() as u64,
+                body_digest: protocol::sha256_digest_uri(digest),
+                manifest_digest: protocol::sha256_digest_uri(empty_closure),
+                content_type: protocol::ContentType::new("application/json").unwrap(),
+                producer: None,
+                manifest_identity: None,
+                index_fields: Vec::new(),
+            },
+        }
+    }
+
+    fn ranged_read(
+        target: &protocol::WorkspacePath,
+        range: protocol::ByteRange,
+    ) -> protocol::WorkspaceRequest {
+        protocol::WorkspaceRequest::GetPath(protocol::GetPathRequest {
+            target: target.clone(),
+            view: protocol::WorkspaceReadView::Live,
+            expected_read_version: None,
+            range: Some(range),
+            plan_page: Some(protocol::PageRequest {
+                cursor: None,
+                limit: protocol::MAX_ARTIFACT_READ_PLAN_ROWS as u32,
+            }),
+            if_none_match: None,
+        })
+    }
+
+    #[test]
+    fn inline_publication_completes_in_one_request_and_reads_back_without_blocks() {
+        let (executor, _plan, begin) = fused_publication_fixture("inline-publish", 0x60);
+        let body = br#"{"turn":7,"role":"assistant"}"#;
+        let request =
+            inline_publication(0x62, &begin, protocol::PublishCondition::CreateOnly, body);
+        let rpc = restore_rpc(
+            0x63,
+            protocol::WorkspaceRequest::PublishInlineArtifact(request.clone()),
+        );
+        let published = executor.execute(&rpc).unwrap();
+        assert!(!published.replayed);
+        let result = executed_publication(&published);
+        assert_eq!(result.generation, 1);
+        assert_eq!(result.artifact_revision_id, begin.artifact_revision_id);
+
+        // The exact request replays its stored result.
+        let replayed = executor.execute(&rpc).unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(executed_publication(&replayed), result);
+        // Another request for the same operation observes its terminal state.
+        let retried = executor
+            .execute(&restore_rpc(
+                0x64,
+                protocol::WorkspaceRequest::PublishInlineArtifact(request.clone()),
+            ))
+            .unwrap();
+        assert_eq!(
+            executed_operation(&retried).state,
+            protocol::OperationState::Succeeded
+        );
+        // The same operation with other bytes is a different intent.
+        let forged = inline_publication(
+            0x62,
+            &begin,
+            protocol::PublishCondition::CreateOnly,
+            br#"{"turn":8,"role":"assistant"}"#,
+        );
+        let refused = executor
+            .execute(&restore_rpc(
+                0x65,
+                protocol::WorkspaceRequest::PublishInlineArtifact(forged),
+            ))
+            .unwrap_err();
+        assert_eq!(refused.code, protocol::ErrorCode::RequestReplayMismatch);
+
+        let read = executor
+            .execute(&restore_rpc(
+                0x66,
+                ranged_read(
+                    &begin.target,
+                    protocol::ByteRange {
+                        offset: 2,
+                        length: 4,
+                    },
+                ),
+            ))
+            .unwrap();
+        let protocol::WorkspaceResult::Path(read) = read.result else {
+            panic!("path read returned the wrong result variant");
+        };
+        assert!(read.blocks.is_empty());
+        assert_eq!(read.next_cursor, None);
+        assert_eq!(read.inline_body.as_deref(), Some(&body[..]));
+        assert_eq!(read.metadata.unwrap().descriptor, request.artifact);
+    }
+
+    /// Recovery-log records and logical bytes the shard appended after `lsn`.
+    fn recovery_log_since(store: &meta::MetaShard, lsn: u64) -> (usize, usize) {
+        let records = store.recovery_outbox_after(lsn, 1_000).unwrap();
+        let bytes = records
+            .iter()
+            .map(|record| record.encode().unwrap().len())
+            .sum();
+        (records.len(), bytes)
+    }
+
+    #[test]
+    fn a_small_inline_publication_logs_half_the_commands_and_fewer_bytes() {
+        let (store, executor) = ready_executor();
+        let workbench = protocol::WorkbenchName::new("inline-log").unwrap();
+        executor
+            .execute(&restore_rpc(
+                0x80,
+                protocol::WorkspaceRequest::CreateWorkspace(protocol::CreateWorkspaceRequest {
+                    workbench: workbench.clone(),
+                    workspace_incarnation_id: protocol::WorkspaceIdentity(
+                        [0x80; types::FIXED_ID_BYTES],
+                    ),
+                }),
+            ))
+            .unwrap();
+        // The mean size of a Pi harness session record.
+        let body = vec![b'j'; 1_100];
+        let target = |path: &str| protocol::WorkspacePath {
+            workbench: workbench.clone(),
+            path: protocol::RelativePath::new(path).unwrap(),
+        };
+
+        let object_revision = protocol::ArtifactRevisionIdentity([0x81; types::FIXED_ID_BYTES]);
+        let plan = OneBytePlan::single_object(object_revision, &body);
+        let begin = plan.begin(
+            protocol::OperationIdentity([0x82; types::FIXED_ID_BYTES]),
+            object_revision,
+            target("logs/object.json"),
+            protocol::PublicationAuthority::Visible,
+        );
+        let before = store.recovery_state().unwrap().applied_recovery_lsn;
+        let prepared = executor
+            .execute(&restore_rpc(
+                0x83,
+                protocol::WorkspaceRequest::PrepareArtifactPublish(
+                    protocol::PrepareArtifactPublishRequest {
+                        begin: begin.clone(),
+                        objects: plan.staged_objects.clone(),
+                    },
+                ),
+            ))
+            .unwrap();
+        executor
+            .execute(&restore_rpc(
+                0x84,
+                finish_request(&plan, executed_operation(&prepared).token),
+            ))
+            .unwrap();
+        let (object_records, object_bytes) = recovery_log_since(&store, before);
+
+        let mut inline_begin = begin;
+        inline_begin.target = target("logs/inline.json");
+        inline_begin.artifact_revision_id =
+            protocol::ArtifactRevisionIdentity([0x85; types::FIXED_ID_BYTES]);
+        let inline = inline_publication(
+            0x86,
+            &inline_begin,
+            protocol::PublishCondition::CreateOnly,
+            &body,
+        );
+        let before = store.recovery_state().unwrap().applied_recovery_lsn;
+        executor
+            .execute(&restore_rpc(
+                0x87,
+                protocol::WorkspaceRequest::PublishInlineArtifact(inline),
+            ))
+            .unwrap();
+        let (inline_records, inline_bytes) = recovery_log_since(&store, before);
+
+        // Prepare logs its claim, Begin, and the staged plan; Finish logs its
+        // claim, the upload proof, the manifest, the Finalizing transition,
+        // and the publication. The inline request logs its claim, Begin, the
+        // transition, and the publication with the body.
+        assert_eq!(object_records, 8);
+        assert_eq!(inline_records, 4);
+        assert!(
+            inline_bytes < object_bytes,
+            "inline {inline_bytes} bytes, object {object_bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn inline_replacement_conflicts_and_successor_keep_generation_rules() {
+        let (executor, _plan, begin) = fused_publication_fixture("inline-replace", 0x70);
+        let first = inline_publication(
+            0x72,
+            &begin,
+            protocol::PublishCondition::CreateOnly,
+            b"first",
+        );
+        executor
+            .execute(&restore_rpc(
+                0x73,
+                protocol::WorkspaceRequest::PublishInlineArtifact(first),
+            ))
+            .unwrap();
+        // A second create-only publication of the path conflicts and leaves
+        // the first revision current.
+        let mut duplicate = inline_publication(
+            0x74,
+            &begin,
+            protocol::PublishCondition::CreateOnly,
+            b"second",
+        );
+        duplicate.begin.artifact_revision_id =
+            protocol::ArtifactRevisionIdentity([0x75; types::FIXED_ID_BYTES]);
+        let conflict = executor
+            .execute(&restore_rpc(
+                0x76,
+                protocol::WorkspaceRequest::PublishInlineArtifact(duplicate),
+            ))
+            .unwrap_err();
+        assert_eq!(conflict.code, protocol::ErrorCode::AlreadyExists);
+        // A generation-bound replacement publishes the successor.
+        let mut replace = inline_publication(
+            0x77,
+            &begin,
+            protocol::PublishCondition::ReplaceOnly {
+                expected_generation: 1,
+            },
+            b"second",
+        );
+        replace.begin.artifact_revision_id =
+            protocol::ArtifactRevisionIdentity([0x78; types::FIXED_ID_BYTES]);
+        let replaced = executor
+            .execute(&restore_rpc(
+                0x79,
+                protocol::WorkspaceRequest::PublishInlineArtifact(replace),
+            ))
+            .unwrap();
+        assert_eq!(executed_publication(&replaced).generation, 2);
+        let read = executor
+            .execute(&restore_rpc(
+                0x7a,
+                ranged_read(
+                    &begin.target,
+                    protocol::ByteRange {
+                        offset: 0,
+                        length: 6,
+                    },
+                ),
+            ))
+            .unwrap();
+        let protocol::WorkspaceResult::Path(read) = read.result else {
+            panic!("path read returned the wrong result variant");
+        };
+        assert_eq!(read.inline_body.as_deref(), Some(&b"second"[..]));
     }
 
     #[test]
@@ -10508,6 +10887,7 @@ mod tests {
                         manifest_row_count: seals.manifest_row_count,
                         manifest_seal: seals.manifest_seal,
                         dependency_owner_revision_ids: Vec::new(),
+                        inline_body_digest: None,
                     },
                 ),
             })
@@ -11261,6 +11641,7 @@ mod tests {
                         manifest_row_count: seals.manifest_row_count,
                         manifest_seal: seals.manifest_seal,
                         dependency_owner_revision_ids: Vec::new(),
+                        inline_body_digest: None,
                     },
                 ),
             )
@@ -11392,6 +11773,7 @@ mod tests {
             manifest_row_count: seals.manifest_row_count,
             manifest_seal: seals.manifest_seal,
             dependency_owner_revision_ids: Vec::new(),
+            inline_body_digest: None,
         }
     }
 
@@ -12033,6 +12415,7 @@ mod tests {
                         manifest_row_count: seals.manifest_row_count,
                         manifest_seal: seals.manifest_seal,
                         dependency_owner_revision_ids: Vec::new(),
+                        inline_body_digest: None,
                     },
                 ),
             })
@@ -12314,6 +12697,7 @@ mod tests {
                             manifest_row_count: seals.manifest_row_count,
                             manifest_seal: seals.manifest_seal,
                             dependency_owner_revision_ids: Vec::new(),
+                            inline_body_digest: None,
                         },
                     ),
                 ))
@@ -12551,6 +12935,7 @@ mod tests {
                             manifest_row_count: seals.manifest_row_count,
                             manifest_seal: seals.manifest_seal,
                             dependency_owner_revision_ids: Vec::new(),
+                            inline_body_digest: None,
                         },
                     ),
                 ))

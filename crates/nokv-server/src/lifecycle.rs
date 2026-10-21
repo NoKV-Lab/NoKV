@@ -3137,6 +3137,7 @@ mod tests {
             dependency_count: 0,
             dependency_depth: 0,
             dependency_digest: meta::dependency_owner_digest(&[]).unwrap(),
+            inline_body_digest: None,
             cleanup_staged_object_cursor: 0,
             cleanup_manifest_cursor: 0,
             cleanup_retry_count: 0,
@@ -3449,6 +3450,7 @@ mod tests {
             dependency_count: 0,
             dependency_depth: 0,
             dependency_digest: meta::dependency_owner_digest(&[]).unwrap(),
+            inline_body_digest: None,
             cleanup_staged_object_cursor: 0,
             cleanup_manifest_cursor: 0,
             cleanup_retry_count: 0,
@@ -3737,6 +3739,7 @@ mod tests {
                 dependency_count: 0,
                 dependency_depth: 0,
                 dependency_digest: meta::dependency_owner_digest(&[]).unwrap(),
+                inline_body_digest: None,
                 cleanup_staged_object_cursor: 0,
                 cleanup_manifest_cursor: 0,
                 cleanup_retry_count: 0,
@@ -3842,6 +3845,7 @@ mod tests {
                     typed_index_projection: meta::TypedProjection::empty().encode().unwrap(),
                 },
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .expect("operation A publishes revision R");
         assert_eq!(finalized.operation.phase, PublishPhase::Published);
@@ -4036,6 +4040,7 @@ mod tests {
                 dependency_count: 0,
                 dependency_depth: 0,
                 dependency_digest: meta::dependency_owner_digest(&[]).unwrap(),
+                inline_body_digest: None,
                 cleanup_staged_object_cursor: 0,
                 cleanup_manifest_cursor: 0,
                 cleanup_retry_count: 0,
@@ -4255,6 +4260,7 @@ mod tests {
                     typed_index_projection: meta::TypedProjection::empty().encode().unwrap(),
                 },
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .expect("operation A publishes the revision");
         assert_eq!(finalized.operation.phase, PublishPhase::Published);

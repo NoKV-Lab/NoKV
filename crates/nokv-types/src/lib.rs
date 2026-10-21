@@ -18,5 +18,6 @@ pub use workspace::{
     RootActivationState, RootId, RootPlacementLifecycle, SnapshotAliasName, SnapshotId,
     SnapshotState, StagedCleanupState, StagedProviderState, TagName, UnknownDurableDiscriminant,
     WorkbenchId, WorkbenchIdError, WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState,
-    ZeroValueError, FIXED_ID_BYTES, SHA256_BYTES, TIME_ORDERED_PREFIX_BYTES,
+    ZeroValueError, FIXED_ID_BYTES, MAX_INLINE_ARTIFACT_BODY_BYTES, SHA256_BYTES,
+    TIME_ORDERED_PREFIX_BYTES,
 };

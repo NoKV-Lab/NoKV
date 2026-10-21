@@ -14,6 +14,14 @@ pub const FIXED_ID_BYTES: usize = 16;
 pub const SHA256_BYTES: usize = 32;
 /// Leading bytes of a time-ordered identity: Unix milliseconds, big-endian.
 pub const TIME_ORDERED_PREFIX_BYTES: usize = 6;
+/// Largest non-empty artifact body stored inline in shard metadata instead of
+/// immutable objects.
+///
+/// An inline revision has no staged objects and no manifest rows; its one
+/// write-once body row is created with the revision and removed only by its
+/// garbage collection. The bound keeps a body far below the metadata store's
+/// per-value ceiling and a small share of a storage page.
+pub const MAX_INLINE_ARTIFACT_BODY_BYTES: usize = 16 * 1024;
 
 /// A fixed identity ordered by when it was minted, laid out like an
 /// RFC 9562 UUIDv7: 48 bits of Unix milliseconds, then the trailing 80 bits

@@ -15,7 +15,8 @@ use crate::types::{
     WorkspacePath, WorkspaceReadView,
 };
 use crate::{
-    MAX_ARTIFACT_PUBLISH_BATCH_ROWS, MAX_ARTIFACT_PUBLISH_OBJECTS, WORKSPACE_CAPABILITY_SCHEMA,
+    inline_artifact_body_digest, sha256_digest_uri, MAX_ARTIFACT_PUBLISH_BATCH_ROWS,
+    MAX_ARTIFACT_PUBLISH_OBJECTS, MAX_INLINE_ARTIFACT_BODY_BYTES, WORKSPACE_CAPABILITY_SCHEMA,
     WORKSPACE_PREFLIGHT_SCHEMA, WORKSPACE_PROTOCOL_SCHEMA,
 };
 
@@ -85,6 +86,7 @@ pub enum WorkspaceRequest {
     CompleteArtifactPublish(CompleteArtifactPublishRequest),
     PrepareArtifactPublish(PrepareArtifactPublishRequest),
     FinishArtifactPublish(FinishArtifactPublishRequest),
+    PublishInlineArtifact(PublishInlineArtifactRequest),
     AbortArtifactPublish(AbortArtifactPublishRequest),
     ReconcileQuarantinedArtifactPublish(ReconcileQuarantinedArtifactPublishRequest),
     Commit(CommitRequest),
@@ -122,13 +124,17 @@ impl WorkspaceRequest {
             Self::ListPaths(request) => request.validate(),
             Self::RenamePath(request) => request.validate(),
             Self::RemovePath(request) => request.validate(),
-            Self::BeginArtifactPublish(request) => request.validate(),
+            Self::BeginArtifactPublish(request) => {
+                require_object_backed_begin("begin_artifact_publish", request)?;
+                request.validate()
+            }
             Self::StageArtifactObjects(request) => request.validate(),
             Self::MarkArtifactObjectsUploaded(request) => request.validate(),
             Self::StageArtifactManifest(request) => request.validate(),
             Self::CompleteArtifactPublish(request) => request.validate(),
             Self::PrepareArtifactPublish(request) => request.validate(),
             Self::FinishArtifactPublish(request) => request.validate(),
+            Self::PublishInlineArtifact(request) => request.validate(),
             Self::AbortArtifactPublish(request) => request.validate(),
             Self::ReconcileQuarantinedArtifactPublish(request) => request.validate(),
             Self::Commit(request) => request.validate(),
@@ -456,6 +462,10 @@ pub struct BeginArtifactPublishRequest {
     pub manifest_row_count: u32,
     pub manifest_seal: Digest,
     pub dependency_owner_revision_ids: Vec<ArtifactRevisionIdentity>,
+    /// SHA-256 of a body this publication stores inline instead of objects.
+    /// Only `PublishInlineArtifact` admits it, together with that body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_body_digest: Option<Digest>,
 }
 
 impl BeginArtifactPublishRequest {
@@ -567,6 +577,21 @@ impl BeginArtifactPublishRequest {
     }
 }
 
+/// Stepwise and fused object publications seal no inline body: a body only
+/// travels with the one request that also completes it.
+fn require_object_backed_begin(
+    field: &'static str,
+    begin: &BeginArtifactPublishRequest,
+) -> Result<(), ProtocolError> {
+    if begin.inline_body_digest.is_some() {
+        return Err(ProtocolError::invalid(
+            field,
+            "an inline body digest is admitted only by PublishInlineArtifact",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StageArtifactObjectsRequest {
@@ -659,6 +684,7 @@ pub struct PrepareArtifactPublishRequest {
 
 impl PrepareArtifactPublishRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
+        require_object_backed_begin("prepare_artifact_publish.begin", &self.begin)?;
         self.begin.validate()?;
         if self.objects.len() != self.begin.staged_object_count as usize {
             return Err(ProtocolError::invalid(
@@ -703,6 +729,67 @@ impl FinishArtifactPublishRequest {
             &self.dependency_owner_revision_ids,
         )?;
         self.artifact.validate()
+    }
+}
+
+/// Admit and complete a publication whose whole body travels in this request
+/// and is stored inline in shard metadata, in one write session with one
+/// durable acknowledgement.
+///
+/// No object is written, so no durable intent has to precede one: `begin`
+/// seals no staged objects and no manifest rows, and binds the body's SHA-256
+/// as its inline body digest. Each step keeps the replay, token, and recovery
+/// rules of its stepwise request; a publication found in progress is
+/// completed with this body.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublishInlineArtifactRequest {
+    pub begin: BeginArtifactPublishRequest,
+    #[serde(with = "crate::artifact_publish::wire_bytes")]
+    pub body: Vec<u8>,
+    pub artifact: ArtifactDescriptor,
+}
+
+impl PublishInlineArtifactRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.begin.validate()?;
+        self.artifact.validate()?;
+        if !matches!(self.begin.authority, PublicationAuthority::Visible) {
+            return Err(ProtocolError::invalid(
+                "publish_inline_artifact.begin.authority",
+                "inline bodies are published only under visible authority",
+            ));
+        }
+        if self.body.is_empty() || self.body.len() > MAX_INLINE_ARTIFACT_BODY_BYTES {
+            return Err(ProtocolError::invalid(
+                "publish_inline_artifact.body",
+                format!("must hold 1 to {MAX_INLINE_ARTIFACT_BODY_BYTES} bytes"),
+            ));
+        }
+        let empty_closure = Digest([0; 32]);
+        if self.begin.staged_object_count != 0
+            || self.begin.staged_object_seal != empty_closure
+            || self.begin.manifest_row_count != 0
+            || self.begin.manifest_seal != empty_closure
+            || !self.begin.dependency_owner_revision_ids.is_empty()
+        {
+            return Err(ProtocolError::invalid(
+                "publish_inline_artifact.begin",
+                "an inline publication stages no objects, manifest rows, or dependencies",
+            ));
+        }
+        let digest = inline_artifact_body_digest(&self.body);
+        if self.begin.inline_body_digest != Some(digest)
+            || self.artifact.body_digest != sha256_digest_uri(digest)
+            || self.artifact.manifest_digest != sha256_digest_uri(empty_closure)
+            || self.artifact.logical_size != self.body.len() as u64
+        {
+            return Err(ProtocolError::invalid(
+                "publish_inline_artifact",
+                "the sealed plan and descriptor must describe exactly this body",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2291,6 +2378,7 @@ mod tests {
             manifest_row_count: 1,
             manifest_seal: Digest([4; 32]),
             dependency_owner_revision_ids: Vec::new(),
+            inline_body_digest: None,
         }
     }
 

@@ -106,6 +106,112 @@ pub fn seal_artifact_publish_plan(
     })
 }
 
+/// Digest `Begin` seals for a body stored inline in shard metadata.
+///
+/// An inline publication stages no objects and no manifest rows, so its
+/// staged-object and manifest seals are the empty closures; this SHA-256 of
+/// the exact body bytes is its only content commitment and equals its body
+/// digest.
+pub fn inline_artifact_body_digest(body: &[u8]) -> Digest {
+    Digest(Sha256::digest(body).into())
+}
+
+/// Encode artifact bytes as one MessagePack `bin` value instead of an array
+/// of integers.
+pub(crate) mod wire_bytes {
+    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        deserializer.deserialize_byte_buf(BytesVisitor)
+    }
+
+    pub(crate) struct BytesVisitor;
+
+    impl<'de> Visitor<'de> for BytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a byte string")
+        }
+
+        fn visit_bytes<E: Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+            Ok(value.to_vec())
+        }
+
+        fn visit_byte_buf<E: Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, _sequence: A) -> Result<Self::Value, A::Error> {
+            Err(A::Error::custom(
+                "artifact bytes must be encoded as one byte string",
+            ))
+        }
+    }
+
+    /// The same encoding for an optional value.
+    pub mod option {
+        use serde::de::{Deserializer, Error, Visitor};
+        use serde::Serializer;
+
+        pub fn serialize<S: Serializer>(
+            bytes: &Option<Vec<u8>>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            match bytes {
+                Some(bytes) => serializer.serialize_some(&Bin(bytes)),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Vec<u8>>, D::Error> {
+            deserializer.deserialize_option(OptionVisitor)
+        }
+
+        struct Bin<'a>(&'a [u8]);
+
+        impl serde::Serialize for Bin<'_> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_bytes(self.0)
+            }
+        }
+
+        struct OptionVisitor;
+
+        impl<'de> Visitor<'de> for OptionVisitor {
+            type Value = Option<Vec<u8>>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an optional byte string")
+            }
+
+            fn visit_none<E: Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_unit<E: Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_some<D: Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                deserializer
+                    .deserialize_byte_buf(super::BytesVisitor)
+                    .map(Some)
+            }
+        }
+    }
+}
+
 pub fn sha256_digest_uri(digest: Digest) -> DigestUri {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut value = String::with_capacity(7 + digest.0.len() * 2);

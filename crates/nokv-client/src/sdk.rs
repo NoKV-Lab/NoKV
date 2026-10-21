@@ -1022,6 +1022,7 @@ mod tests {
             range: None,
             blocks: Vec::new(),
             next_cursor: None,
+            inline_body: None,
         };
         let transport = LossyRestoreReadTransport {
             requests: Mutex::new(Vec::new()),
