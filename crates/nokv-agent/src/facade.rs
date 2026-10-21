@@ -15,7 +15,8 @@ use crate::{
 };
 use base64::Engine;
 use nokv_types::{
-    ArtifactRevisionId, NormalizedRelativePath, RootId, WorkbenchId, WorkspaceIncarnationId,
+    ArtifactRevisionId, ErrorClass, NormalizedRelativePath, RootId, WorkbenchId,
+    WorkspaceIncarnationId,
 };
 use serde_json::{json, Map, Number, Value};
 use sha2::{Digest, Sha256};
@@ -665,6 +666,8 @@ pub struct BackendError {
     pub message: String,
     pub retryable: bool,
     pub details: Value,
+    /// The failure class the SDK determined for this error.
+    pub class: Option<ErrorClass>,
 }
 
 impl BackendError {
@@ -679,7 +682,13 @@ impl BackendError {
             message: message.into(),
             retryable,
             details,
+            class: None,
         }
+    }
+
+    pub fn with_class(mut self, class: ErrorClass) -> Self {
+        self.class = Some(class);
+        self
     }
 
     pub fn conflict(message: impl Into<String>) -> Self {
@@ -701,12 +710,15 @@ impl std::error::Error for BackendError {}
 
 impl From<BackendError> for AgentError {
     fn from(error: BackendError) -> Self {
-        AgentError::backend(
+        let class = error.class;
+        let mut agent = AgentError::backend(
             error.kind.code(),
             error.message,
             error.retryable,
             error.details,
-        )
+        );
+        agent.class = class;
+        agent
     }
 }
 

@@ -2575,10 +2575,15 @@ fn read_loaded_range(
 /// Whether a publication stores its body inline in shard metadata: a
 /// visible, non-empty body that would be one object no larger than the
 /// inline bound.
+/// Whether a visible, non-empty body of `body_len` bytes publishes inline in
+/// shard metadata, instead of as objects, at `block_size`.
+pub fn visible_body_publishes_inline(body_len: usize, block_size: usize) -> bool {
+    body_len > 0 && body_len <= MAX_INLINE_ARTIFACT_BODY_BYTES.min(block_size)
+}
+
 fn publishes_inline(authority: &PublicationAuthority, bytes: &[u8], block_size: usize) -> bool {
     matches!(authority, PublicationAuthority::Visible)
-        && !bytes.is_empty()
-        && bytes.len() <= MAX_INLINE_ARTIFACT_BODY_BYTES.min(block_size)
+        && visible_body_publishes_inline(bytes.len(), block_size)
 }
 
 /// An inline revision has no manifest rows, so its manifest digest is the
@@ -5313,6 +5318,120 @@ mod tests {
         let state = inspector.state();
         assert_eq!(state.abort_applies, 0);
         assert!(!state.attempts.iter().any(|(label, _)| *label == "abort"));
+    }
+
+    fn caller_identified(operation: u8) -> crate::IdempotentPublishOptions {
+        crate::IdempotentPublishOptions::new(
+            OperationIdentity([operation; 16]),
+            target(),
+            PublishCondition::CreateOnly,
+            ContentType::new("text/plain").unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_caller_identified_publication_replays_its_receipt_without_publishing_again() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        let options = caller_identified(0x41);
+        // Before any attempt, a metadata-only replay finds nothing to return.
+        assert_eq!(
+            client
+                .replay_idempotent_publish(&options, b"exact")
+                .unwrap(),
+            None
+        );
+
+        let first = client
+            .publish_idempotent(&store, &options, b"exact")
+            .unwrap();
+        assert!(!first.replayed);
+        assert_eq!(first.attempt, 0);
+        assert_eq!(first.publication.operation_id, options.operation_id);
+        assert_eq!(first.publication.generation, 1);
+
+        // A later process repeats the same intent under the same id.
+        let second = client
+            .publish_idempotent(&store, &options, b"exact")
+            .unwrap();
+        assert!(second.replayed);
+        assert_eq!(second.publication, first.publication);
+        assert_eq!(admissions(&inspector.state()), 1);
+        // The replay needs no object store.
+        let replayed = client
+            .replay_idempotent_publish(&options, b"exact")
+            .unwrap()
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.publication, first.publication);
+        assert!(matches!(
+            client.replay_idempotent_publish(&options, b"other"),
+            Err(crate::IdempotentPublishError::IdentityConflict { .. })
+        ));
+
+        let refused = client
+            .publish_idempotent(&store, &options, b"other")
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                crate::IdempotentPublishError::IdentityConflict { .. }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(refused.class(), nokv_types::ErrorClass::IdentityConflict);
+        assert_eq!(admissions(&inspector.state()), 1);
+        assert_eq!(
+            inspector
+                .state()
+                .path
+                .as_ref()
+                .and_then(|path| path.inline_body.as_deref()),
+            Some(&b"exact"[..])
+        );
+    }
+
+    #[test]
+    fn a_caller_identified_publication_whose_reply_was_lost_returns_its_own_receipt() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        inspector.lose_inline_responses();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        let options = caller_identified(0x42);
+
+        let receipt = client
+            .publish_idempotent(&store, &options, b"exact")
+            .unwrap();
+
+        assert!(receipt.replayed);
+        assert_eq!(receipt.attempt, 0);
+        assert_eq!(receipt.publication.operation_id, options.operation_id);
+        assert_eq!(inspector.state().abort_applies, 0);
+    }
+
+    #[test]
+    fn a_caller_identified_create_on_an_existing_path_fails_typed_and_admits_nothing() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_idempotent(&store, &caller_identified(0x43), b"first")
+            .unwrap();
+
+        let refused = client
+            .publish_idempotent(&store, &caller_identified(0x44), b"second")
+            .unwrap_err();
+
+        assert_eq!(refused.class(), nokv_types::ErrorClass::PreconditionFailed);
+        assert_eq!(refused.attempt(), Some(0));
+        assert_eq!(inspector.state().abort_applies, 0);
     }
 
     #[test]

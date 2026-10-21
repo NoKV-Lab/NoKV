@@ -23,7 +23,8 @@ use nokv_client::{
 use nokv_object::ArtifactObjectStore;
 use nokv_protocol as wire;
 use nokv_types::{
-    ArtifactRevisionId, NormalizedRelativePath, RootId, WorkbenchId, WorkspaceIncarnationId,
+    ArtifactRevisionId, ErrorClass, NormalizedRelativePath, RootId, WorkbenchId,
+    WorkspaceIncarnationId,
 };
 use nokv_workbench_projection::CanonicalWorkbenchProjection;
 use serde_json::{json, Value};
@@ -103,6 +104,16 @@ impl CliWorkbenchBackend {
             objects,
             max_artifact_bytes,
         }
+    }
+
+    /// Publish one whole body under a caller-chosen operation identity.
+    pub fn publish_idempotent(
+        &self,
+        options: &nokv_client::IdempotentPublishOptions,
+        body: &[u8],
+    ) -> Result<nokv_client::IdempotentPublishReceipt, nokv_client::IdempotentPublishError> {
+        self.client
+            .publish_idempotent(self.objects.as_ref(), options, body)
     }
 
     /// Execute an append after metadata-only recovery and input validation.
@@ -2781,7 +2792,8 @@ pub(crate) fn map_append_client_error(error: ClientError) -> agent::BackendError
             message,
             false,
             json!({}),
-        );
+        )
+        .with_class(ErrorClass::InvalidInput);
     }
     if matches!(&error, ClientError::Rpc(failure) if failure.code == wire::ErrorCode::InvalidArgument)
     {
@@ -2792,7 +2804,12 @@ pub(crate) fn map_append_client_error(error: ClientError) -> agent::BackendError
     map_client_error(error)
 }
 
-fn map_client_error(error: ClientError) -> agent::BackendError {
+pub(crate) fn map_client_error(error: ClientError) -> agent::BackendError {
+    let class = error.class();
+    map_client_error_shape(error).with_class(class)
+}
+
+fn map_client_error_shape(error: ClientError) -> agent::BackendError {
     if let ClientError::AppendCleanupUnresolved {
         operation_id,
         expected_token,
@@ -2964,6 +2981,7 @@ fn map_lifecycle_error(
 }
 
 fn map_rpc_failure(failure: wire::RpcFailure) -> agent::BackendError {
+    let class = nokv_client::rpc_failure_class(&failure);
     let kind = match failure.code {
         wire::ErrorCode::NotFound => agent::BackendErrorKind::NotFound,
         wire::ErrorCode::AlreadyExists => agent::BackendErrorKind::AlreadyExists,
@@ -2996,6 +3014,7 @@ fn map_rpc_failure(failure: wire::RpcFailure) -> agent::BackendError {
             "current_generation": failure.current_generation,
         }),
     )
+    .with_class(class)
 }
 
 fn error_code_name(code: wire::ErrorCode) -> &'static str {
@@ -7223,11 +7242,16 @@ mod tests {
             assert_eq!(mapped.details["code"], "NotOwner");
             assert_eq!(mapped.details["recovery_receipt"].is_null(), !known);
             assert!(!mapped.retryable);
-            let error = super::super::append_error_json(
+            let failure = super::super::with_append_details(
+                super::super::CliFailure::from_agent(
+                    &mapped.into(),
+                    nokv_types::IdempotencyScope::CallerOperation,
+                )
+                .with_next_action(nokv_types::NextAction::RetrySameCleanup),
                 operation_id,
-                super::super::agent_error(mapped.into()),
             );
-            let json: Value = serde_json::from_str(&error).unwrap();
+            let json: Value = serde_json::from_str(&failure.to_line()).unwrap();
+            assert_eq!(json["next_action"], "retry_same_cleanup");
             assert_eq!(json["details"]["next_action"], "retry_same_cleanup");
             assert_eq!(json["details"]["cause_code"], "NotOwner");
             assert_eq!(
