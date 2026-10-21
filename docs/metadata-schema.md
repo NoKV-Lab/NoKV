@@ -268,6 +268,16 @@ at API/object-manifest boundaries. `object_index` is exactly 16 lowercase
 hexadecimal characters. No UUID punctuation, variable-width
 numeric field, or process address is permitted.
 
+Request, operation, and artifact revision ids minted by the SDK and CLI are
+time-ordered: the first six bytes are big-endian Unix milliseconds and the
+remaining ten are entropy, the RFC 9562 UUIDv7 layout without its version
+bits. A metadata step's dedupe id keeps the six leading bytes of its request.
+The families keyed by these ids (command dedupe, operations, staged objects,
+artifact revisions and manifests, and their History rows) therefore receive
+inserts at one end of their key range instead of across all of it, which keeps
+the set of storage pages a checkpoint rewrites small. Uniqueness rests on the
+entropy alone; readers must not infer time or order from an id.
+
 ## Placement Authority
 
 Root placement is not a shard-local metadata family. The control plane owns:

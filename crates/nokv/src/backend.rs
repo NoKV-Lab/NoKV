@@ -340,7 +340,7 @@ impl CliWorkbenchBackend {
         for piece in pieces {
             hash_len64(&mut hasher, piece);
         }
-        digest_prefix(hasher.finalize().into())
+        nokv_types::time_ordered_identity(digest_prefix(hasher.finalize().into()))
     }
 }
 
