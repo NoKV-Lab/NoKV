@@ -110,6 +110,17 @@ pub trait ControlStore: Send + Sync {
 
     fn renew_owner(&self, lease: &LogicalShardLease) -> Result<LogicalShardRecord, ControlError>;
 
+    /// Prove at one linearizable control read that `lease` still owns its
+    /// logical shard, without extending the lease.
+    ///
+    /// A successor cannot acquire the shard while this owner's lease-attached
+    /// session exists, so a successful proof orders every write the owner made
+    /// before it ahead of any successor. Keeping the lease alive remains the
+    /// job of periodic [`Self::renew_owner`] calls. The default renews.
+    fn prove_owner(&self, lease: &LogicalShardLease) -> Result<LogicalShardRecord, ControlError> {
+        self.renew_owner(lease)
+    }
+
     /// Publish a caller-serialized recovery frontier and make the exact owner
     /// generation routable.
     fn mark_serving(
