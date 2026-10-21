@@ -407,6 +407,7 @@ class PublicTapAndWorkflowTest(unittest.TestCase):
         self.assertIn("gh pr create", workflow)
         self.assertIn("--latest", workflow)
         self.assertIn('gh release upload "$RELEASE_TAG"', workflow)
+        self.assertIn("GH_REPO: ${{ github.repository }}", workflow)
         self.assertIn("Fail closed unless the tap is public", workflow)
         self.assertIn('"$private" != "false"', workflow)
         self.assertIn('"$visibility" != "public"', workflow)
