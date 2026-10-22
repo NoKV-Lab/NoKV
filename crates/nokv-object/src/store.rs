@@ -8,7 +8,7 @@ use opendal::options::WriteOptions;
 use opendal::services::S3;
 use opendal::{ErrorKind, Operator};
 
-use crate::admission::{ProviderAdmissionReceipt, ProviderHandleIdentity};
+use crate::admission::{ProviderAdmissionError, ProviderAdmissionReceipt, ProviderHandleIdentity};
 use crate::digest::{hex, sha256};
 
 pub const DEFAULT_S3_MULTIPART_PART_SIZE: usize = 8 * 1024 * 1024;
@@ -111,6 +111,7 @@ pub enum ObjectError {
         requested: usize,
         admitted: usize,
     },
+    ProviderAdmissionFailed(ProviderAdmissionError),
     CreateAmbiguous {
         key: ObjectKey,
         detail: String,
@@ -156,6 +157,15 @@ pub trait ArtifactObjectStore: Send + Sync {
     /// Raw remote providers are unadmitted until composition records one.
     fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
         None
+    }
+
+    /// The receipt that admits an object write through this handle.
+    ///
+    /// Composition may defer admission to the first write: such a handle
+    /// proves the provider contract here and keeps only a successful receipt.
+    fn admit_object_writes(&self) -> Result<&ProviderAdmissionReceipt, ObjectError> {
+        self.provider_admission_receipt()
+            .ok_or(ObjectError::ProviderAdmissionRequired)
     }
 
     fn create_immutable(
@@ -204,6 +214,10 @@ where
 
     fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
         (**self).provider_admission_receipt()
+    }
+
+    fn admit_object_writes(&self) -> Result<&ProviderAdmissionReceipt, ObjectError> {
+        (**self).admit_object_writes()
     }
 
     fn create_immutable(
@@ -840,6 +854,7 @@ impl ObjectError {
             | Self::InvalidRange { .. }
             | Self::ProviderAdmissionBlockSizeExceeded { .. } => ErrorClass::InvalidInput,
             Self::ObjectNotFound { .. } => ErrorClass::NotFound,
+            Self::ProviderAdmissionFailed(cause) => cause.class(),
             Self::CreateAmbiguous { .. }
             | Self::DeleteAmbiguous { .. }
             | Self::SealAmbiguous { .. } => ErrorClass::OutcomeUnknown,
@@ -932,6 +947,7 @@ impl fmt::Display for ObjectError {
                 formatter,
                 "artifact block size {requested} exceeds admitted provider limit {admitted}"
             ),
+            Self::ProviderAdmissionFailed(cause) => write!(formatter, "{cause}"),
             Self::CreateAmbiguous { .. } => {
                 formatter.write_str("immutable create outcome is ambiguous")
             }

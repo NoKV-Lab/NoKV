@@ -69,6 +69,10 @@ where
         self.inner.provider_admission_receipt()
     }
 
+    fn admit_object_writes(&self) -> Result<&ProviderAdmissionReceipt, ObjectError> {
+        self.inner.admit_object_writes()
+    }
+
     fn create_immutable(
         &self,
         key: &ObjectKey,
