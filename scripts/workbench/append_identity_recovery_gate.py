@@ -980,6 +980,7 @@ except Exception as error:
         "operation_id": getattr(error, "operation_id", None), "state": getattr(error, "state", None),
         "code": getattr(error, "code", None), "cause_code": getattr(error, "cause_code", None),
         "retryable": getattr(error, "retryable", None), "expected": getattr(error, "expected", None),
+        "error_class": getattr(error, "error_class", None), "next_action": getattr(error, "next_action", None),
         "is_append_error": isinstance(error, nokv.AppendError),
         "is_incarnation_mismatch": isinstance(error, nokv.WorkspaceIncarnationMismatch),
         "identity": identity,
@@ -1085,6 +1086,8 @@ def python_interoperability(stack):
         and mismatch["operation_id"] == operation_id
         and mismatch["code"] == "AppendUnresolved"
         and mismatch["cause_code"] == "RequestReplayMismatch"
+        and mismatch["error_class"] == "identity_conflict"
+        and mismatch["next_action"] == "do_not_retry"
         and mismatch["retryable"] is False
     ), mismatch
     fence = python_call(
