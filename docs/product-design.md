@@ -53,6 +53,14 @@ reproducible outputs. Modeling unused POSIX behavior would add metadata rows,
 round trips, invalidation rules, recovery cases, and compatibility obligations
 to every hot path.
 
+## Tenant Access (Planned)
+
+Real deployments share roots among agents. NoKV will authenticate each caller
+as a principal of one tenant and authorize every request against that
+principal's roles on the named root. Several agents will then be able to work
+on one root, and one agent on several roots, in parallel. Until that ships,
+deployments are trusted; see [SECURITY.md](../SECURITY.md).
+
 ## Stable Workbench Surface
 
 A Workbench has five virtual sections:
