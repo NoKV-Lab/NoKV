@@ -38,7 +38,7 @@ use super::engine::{
 };
 use super::event_projection::change_event_projection;
 use super::keyspace::MetadataFamily;
-use super::namespace::WriteAuthority;
+use super::namespace::{NotTheInitiator, WriteAuthority};
 use super::publication_records::{
     ArtifactInlineBodyRecord, ArtifactRevisionClaimRecord, ArtifactRevisionRecord,
     GcCandidateRecord, PathEntry, PublicationRecordCodecError, RevisionRefRecord, WorkspaceRecord,
@@ -313,6 +313,9 @@ pub enum PublicationError {
     /// The durable operation row no longer matches the caller's observed
     /// predecessor. Re-observe it before diagnosing contextual authority.
     ConcurrentMutation,
+    /// Another principal began the operation; only it or an operator
+    /// continues it.
+    NotTheInitiator(NotTheInitiator),
     InitiatingOwnerEpochMismatch {
         expected: OwnerEpoch,
         actual: OwnerEpoch,
@@ -497,6 +500,7 @@ impl fmt::Display for PublicationError {
             Self::ConcurrentMutation => {
                 formatter.write_str("publication state changed concurrently")
             }
+            Self::NotTheInitiator(error) => error.fmt(formatter),
             Self::InitiatingOwnerEpochMismatch { expected, actual } => write!(
                 formatter,
                 "publish initiating owner epoch must be {}, found {}",
@@ -3973,6 +3977,11 @@ impl PublicationService<'_> {
                 {
                     return Err(PublicationError::OperationInputMismatch);
                 }
+                // A later attempt continues the append the parent records.
+                context
+                    .authority
+                    .continuation(previous.initiator)
+                    .map_err(PublicationError::NotTheInitiator)?;
                 let child_key = operation_key(
                     context.root_id,
                     OperationKind::Publish,
@@ -4174,7 +4183,12 @@ impl PublicationService<'_> {
         if current.as_deref() != Some(expected_payload.as_slice()) {
             return Err(PublicationError::ConcurrentMutation);
         }
-        Ok(())
+        // The durable record names who began it; every continuation,
+        // abort, and completion comes through here.
+        context
+            .authority
+            .continuation(expected.initiator)
+            .map_err(PublicationError::NotTheInitiator)
     }
 
     fn read_publication_record<T>(
@@ -6236,6 +6250,109 @@ mod tests {
         store
             .read_at(root(), placement(), owner(), family, key, read_version)
             .unwrap()
+    }
+
+    #[test]
+    fn only_the_initiator_or_an_operator_continues_a_publication() {
+        use crate::workspace::namespace::{NotTheInitiator, WriteAuthority};
+        use nokv_types::PrincipalId;
+
+        let mut counter = 9_000_u128;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let alice = PrincipalId::from_bytes([0xa1; FIXED_ID_BYTES]);
+        let bob = PrincipalId::from_bytes([0xb2; FIXED_ID_BYTES]);
+        let context_as = |counter: &mut u128, principal: PrincipalId, operator: bool| {
+            let mut context = publication_context(&store, counter);
+            context.authority = WriteAuthority {
+                initiator: Some(principal),
+                operator,
+            };
+            context
+        };
+        let staged = staged_rows(revision(901), 1);
+        let manifest = manifest_rows(&staged);
+        let mut operation = publish_operation(
+            operation_id(901),
+            revision(901),
+            path("outputs/owned.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        operation.initiator = Some(alice);
+        seal_publish_operation(&mut operation);
+        let begun = service
+            .begin_publish(BeginPublishRequest {
+                context: context_as(&mut counter, alice, false),
+                operation,
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(begun.initiator, Some(alice));
+        let staged_operation = stage_all(&service, &store, &mut counter, begun, &staged, &manifest);
+
+        // Bob did not begin it: refused, and the record is untouched.
+        let refused = service
+            .transition_publish(TransitionPublishRequest {
+                context: context_as(&mut counter, bob, false),
+                expected_operation: staged_operation.clone(),
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            refused,
+            PublicationError::NotTheInitiator(NotTheInitiator { initiator, principal })
+                if initiator == alice && principal == bob
+        ));
+        // An operator aborts what another principal began, against the same
+        // expected record the refusal left untouched.
+        let aborting = service
+            .transition_publish(TransitionPublishRequest {
+                context: context_as(&mut counter, bob, true),
+                expected_operation: staged_operation,
+                transition: PublishTransition::BeginAbort {
+                    terminal_error: PublishTerminalError {
+                        kind: PublishTerminalErrorKind::ActivityLeaseExpired,
+                        message: "operator cancelled".to_owned(),
+                        evidence_digest: None,
+                    },
+                },
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(aborting.phase, PublishPhase::Aborting);
+
+        // The initiator continues its own publication.
+        let staged = staged_rows(revision(902), 1);
+        let manifest = manifest_rows(&staged);
+        let mut operation = publish_operation(
+            operation_id(902),
+            revision(902),
+            path("outputs/own.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        operation.initiator = Some(alice);
+        seal_publish_operation(&mut operation);
+        let begun = service
+            .begin_publish(BeginPublishRequest {
+                context: context_as(&mut counter, alice, false),
+                operation,
+            })
+            .unwrap()
+            .operation;
+        let staged_operation = stage_all(&service, &store, &mut counter, begun, &staged, &manifest);
+        let finalizing = service
+            .transition_publish(TransitionPublishRequest {
+                context: context_as(&mut counter, alice, false),
+                expected_operation: staged_operation,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(finalizing.phase, PublishPhase::Finalizing);
     }
 
     #[test]

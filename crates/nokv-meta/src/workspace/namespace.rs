@@ -95,15 +95,56 @@ pub struct RootWriteContext {
 
 /// Who asked for a metadata write: the authenticated principal, or none on a
 /// trusted plaintext deployment and for the owner's own background work.
-/// Durable operations record it.
+/// Durable operations record it, and only the principal that began an
+/// operation continues it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WriteAuthority {
     pub initiator: Option<PrincipalId>,
+    /// The principal holds the operator role on the root, which continues
+    /// any operation.
+    pub operator: bool,
 }
 
 impl WriteAuthority {
-    /// A trusted deployment or the owner itself: nobody is recorded.
-    pub const TRUSTED: Self = Self { initiator: None };
+    /// A trusted deployment or the owner itself: nobody is recorded and
+    /// nothing is refused.
+    pub const TRUSTED: Self = Self {
+        initiator: None,
+        operator: false,
+    };
+
+    /// Whether this authority may continue, abort, or complete an operation
+    /// that `initiator` began: its own, one nobody is recorded for, or any
+    /// one as an operator. A trusted deployment continues everything.
+    pub fn continuation(self, initiator: Option<PrincipalId>) -> Result<(), NotTheInitiator> {
+        match (self.initiator, initiator) {
+            (Some(principal), Some(initiator)) if principal != initiator && !self.operator => {
+                Err(NotTheInitiator {
+                    initiator,
+                    principal,
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A principal asked to continue an operation another principal began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotTheInitiator {
+    pub initiator: PrincipalId,
+    pub principal: PrincipalId,
+}
+
+impl fmt::Display for NotTheInitiator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "principal {} did not begin this operation; principal {} did, and only it or an operator continues it",
+            super::codec::lower_hex(self.principal.as_bytes()),
+            super::codec::lower_hex(self.initiator.as_bytes())
+        )
+    }
 }
 
 impl RootWriteContext {
@@ -1119,6 +1160,44 @@ mod tests {
             incarnation(incarnation_fill),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_continuation_belongs_to_the_initiator_an_operator_or_a_trusted_owner() {
+        let alice = PrincipalId::from_bytes([0xa1; 16]);
+        let bob = PrincipalId::from_bytes([0xb2; 16]);
+        let as_alice = WriteAuthority {
+            initiator: Some(alice),
+            operator: false,
+        };
+        let as_bob = WriteAuthority {
+            initiator: Some(bob),
+            operator: false,
+        };
+        let bob_the_operator = WriteAuthority {
+            initiator: Some(bob),
+            operator: true,
+        };
+        assert_eq!(as_alice.continuation(Some(alice)), Ok(()));
+        assert_eq!(as_alice.continuation(None), Ok(()));
+        assert_eq!(bob_the_operator.continuation(Some(alice)), Ok(()));
+        assert_eq!(WriteAuthority::TRUSTED.continuation(Some(alice)), Ok(()));
+        let refused = as_bob.continuation(Some(alice)).unwrap_err();
+        assert_eq!(
+            refused,
+            NotTheInitiator {
+                initiator: alice,
+                principal: bob,
+            }
+        );
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "principal {} did not begin this operation; principal {} did, and only it or an operator continues it",
+                "b2".repeat(16),
+                "a1".repeat(16)
+            )
+        );
     }
 
     #[test]

@@ -137,9 +137,9 @@ pub use keyspace::{keyspaces, KeyspaceDef, MetadataFamily};
 pub use namespace::{
     create_visible_workspace, get_current_visible_workspace_path, get_path_at_visible_workspace,
     get_visible_path_at, get_visible_workspace_at, get_visible_workspace_path_at,
-    list_paths_at_visible_workspace, CreateVisibleWorkspaceResult, NamespaceError, RootReadContext,
-    RootWriteContext, VisiblePathChild, VisiblePathListPage, VisibleWorkspacePathRead,
-    WriteAuthority, MAX_VISIBLE_PATH_LIST_PAGE_SIZE,
+    list_paths_at_visible_workspace, CreateVisibleWorkspaceResult, NamespaceError, NotTheInitiator,
+    RootReadContext, RootWriteContext, VisiblePathChild, VisiblePathListPage,
+    VisibleWorkspacePathRead, WriteAuthority, MAX_VISIBLE_PATH_LIST_PAGE_SIZE,
 };
 pub use publication::{
     advance_manifest_rolling_digest, advance_staged_object_rolling_digest,

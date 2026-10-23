@@ -55,7 +55,7 @@ use super::generic_index_records::{
 use super::keyspace::MetadataFamily;
 use super::namespace::{
     get_visible_path_at, get_visible_workspace_at, scan_visible_paths_at, NamespaceError,
-    RootReadContext, RootWriteContext,
+    NotTheInitiator, RootReadContext, RootWriteContext,
 };
 use super::publication_records::{
     ArtifactRevisionRecord, GcCandidateRecord, PathEntry, PublicationRecordCodecError,
@@ -225,6 +225,12 @@ pub enum CommitError {
     },
     ReplayResultMismatch,
     OperationInputMismatch,
+    /// Another principal began the operation; only it or an operator
+    /// continues it.
+    NotTheInitiator(NotTheInitiator),
+    /// Another principal's identical commit is still in flight; once it is
+    /// terminal, beginning the same commit replays it.
+    OperationHeldByAnother(NotTheInitiator),
     DuplicateCommandKey {
         family: MetadataFamily,
     },
@@ -244,6 +250,11 @@ impl fmt::Display for CommitError {
             Self::GenericIndex(error) => error.fmt(formatter),
             Self::WorkspaceNotFound => formatter.write_str("visible workbench was not found"),
             Self::OperationNotFound => formatter.write_str("commit operation was not found"),
+            Self::NotTheInitiator(error) => error.fmt(formatter),
+            Self::OperationHeldByAnother(error) => write!(
+                formatter,
+                "an identical commit is still in flight for another principal: {error}"
+            ),
             Self::CommitNotFound { commit_id } => {
                 write!(
                     formatter,
@@ -425,6 +436,22 @@ impl<'a> CommitService<'a> {
                 || operation.parent_commits != request.parent_commits
             {
                 return Err(CommitError::OperationInputMismatch);
+            }
+            // The operation id derives from the content, so another
+            // principal committing the same content observes this one: its
+            // terminal outcome replays, and while it is in flight the other
+            // principal waits rather than continuing it.
+            if !matches!(
+                operation.phase,
+                BuildCommitPhase::Complete
+                    | BuildCommitPhase::Cleaned
+                    | BuildCommitPhase::Quarantined
+            ) {
+                request
+                    .context
+                    .authority
+                    .continuation(operation.initiator)
+                    .map_err(CommitError::OperationHeldByAnother)?;
             }
             return Ok(BuildCommitOutcome {
                 commit_version: CommitVersion::new(request.context.read_version.get())
@@ -2807,13 +2834,19 @@ impl<'a> CommitService<'a> {
         context: RootWriteContext,
         operation_id: OperationId,
     ) -> Result<Loaded<BuildCommitOperationRecord>, CommitError> {
-        self.read_commit_record(
-            context,
-            MetadataFamily::Operation,
-            &operation_key(context.root_id, OperationKind::BuildCommit, operation_id),
-            BuildCommitOperationRecord::decode,
-        )?
-        .ok_or(CommitError::OperationNotFound)
+        let loaded = self
+            .read_commit_record(
+                context,
+                MetadataFamily::Operation,
+                &operation_key(context.root_id, OperationKind::BuildCommit, operation_id),
+                BuildCommitOperationRecord::decode,
+            )?
+            .ok_or(CommitError::OperationNotFound)?;
+        context
+            .authority
+            .continuation(loaded.record.initiator)
+            .map_err(CommitError::NotTheInitiator)?;
+        Ok(loaded)
     }
 
     fn load_retire_operation(
@@ -4301,6 +4334,64 @@ mod tests {
                 store.current_read_version().unwrap(),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn an_identical_commit_of_another_principal_is_held_until_terminal_and_never_continued() {
+        use crate::workspace::namespace::WriteAuthority;
+        use nokv_types::PrincipalId;
+
+        let mut counter = 300_u128;
+        let store = ready_store(&mut counter);
+        seed_paths(&store, &mut counter, 3);
+        let service = CommitService::new(&store);
+        let alice = PrincipalId::from_bytes([0xa1; 16]);
+        let bob = PrincipalId::from_bytes([0xb2; 16]);
+        let context_as = |counter: &mut u128, principal: PrincipalId, operator: bool| {
+            let mut context = write_context(&store, counter);
+            context.authority = WriteAuthority {
+                initiator: Some(principal),
+                operator,
+            };
+            context
+        };
+        let operation_id = operation(1);
+        let begin =
+            |context| begin_request(context, operation_id, commit(1), revision(10_000), vec![]);
+
+        let begun = service
+            .begin_build(begin(context_as(&mut counter, alice, false)))
+            .unwrap();
+        assert_eq!(begun.operation.initiator, Some(alice));
+        // The operation id derives from the content, so Bob's identical
+        // commit meets Alice's: it waits while hers is in flight.
+        assert!(matches!(
+            service.begin_build(begin(context_as(&mut counter, bob, false))),
+            Err(CommitError::OperationHeldByAnother(mismatch))
+                if mismatch.initiator == alice && mismatch.principal == bob
+        ));
+        // Bob cannot continue it either; an operator can.
+        let step = |context| BuildCommitStepRequest {
+            context,
+            operation_id,
+            limit: 37,
+        };
+        assert!(matches!(
+            service.build_members(step(context_as(&mut counter, bob, false))),
+            Err(CommitError::NotTheInitiator(_))
+        ));
+        let by_operator = service
+            .build_members(step(context_as(&mut counter, bob, true)))
+            .unwrap();
+        assert!(!by_operator.replayed);
+        let complete = finish_build(&store, &mut counter, operation_id);
+        assert_eq!(complete.operation.phase, BuildCommitPhase::Complete);
+        // Once it is terminal, Bob's identical commit replays Alice's.
+        let replay = service
+            .begin_build(begin(context_as(&mut counter, bob, false)))
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation.initiator, Some(alice));
     }
 
     #[test]
