@@ -12,7 +12,8 @@ use crate::{
     LogSegmentRef, LogicalShardId, LogicalShardRecord, LogicalShardRecoveryState,
     LogicalShardState, NodeId, ObjectNamespaceId, OwnerEpoch, PlacementGeneration, PrincipalId,
     PrincipalRecord, RecoveryUploadIntent, Role, RoleBinding, RoleScope, RootAgentBinding, RootId,
-    RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle, RootTenantBinding, TenantId,
+    RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle, RootPresentationBinding,
+    RootTenantBinding, TenantId,
 };
 #[cfg(any(feature = "etcd", test))]
 use crate::{LogicalShardLease, TenantRecord};
@@ -46,10 +47,12 @@ const PRINCIPAL_RECORD_CODEC_VERSION: u8 = 1;
 const CREDENTIAL_BINDING_CODEC_VERSION: u8 = 1;
 const ROLE_BINDING_CODEC_VERSION: u8 = 1;
 const ROOT_TENANT_BINDING_CODEC_VERSION: u8 = 1;
+const ROOT_PRESENTATION_BINDING_CODEC_VERSION: u8 = 1;
 #[cfg(any(feature = "etcd", test))]
 const TENANT_POLICY_COUNTER_CODEC_VERSION: u8 = 1;
 #[cfg(unix)]
-const LOCAL_IDENTITY_STATE_CODEC_VERSION: u8 = 1;
+/// Version 2 added the root presentation bindings; no release wrote version 1.
+const LOCAL_IDENTITY_STATE_CODEC_VERSION: u8 = 2;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1039,6 +1042,14 @@ struct RootTenantBindingWire {
     tenant_id: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootPresentationBindingWire {
+    version: u8,
+    root_id: String,
+    workbench_root: String,
+}
+
 /// The etcd store's per-tenant revision and record counts, changed in the
 /// same transaction as every record they count.
 #[cfg(any(feature = "etcd", test))]
@@ -1070,6 +1081,7 @@ struct LocalIdentityStateWire {
     version: u8,
     tenants: Vec<LocalTenantWire>,
     root_tenants: Vec<RootTenantBindingWire>,
+    root_presentations: Vec<RootPresentationBindingWire>,
 }
 
 #[cfg(unix)]
@@ -1288,6 +1300,53 @@ pub(crate) fn decode_root_tenant_binding(bytes: &[u8]) -> Result<RootTenantBindi
     )
 }
 
+fn root_presentation_binding_wire(
+    binding: &RootPresentationBinding,
+) -> RootPresentationBindingWire {
+    RootPresentationBindingWire {
+        version: ROOT_PRESENTATION_BINDING_CODEC_VERSION,
+        root_id: encode_fixed_id(binding.root_id.as_bytes()),
+        workbench_root: binding.workbench_root.as_str().to_owned(),
+    }
+}
+
+/// A stored Workbench root must already be normalized: the canonical check
+/// of every decoder rejects one that normalization would change.
+fn root_presentation_binding_from_wire(
+    wire: RootPresentationBindingWire,
+) -> Result<RootPresentationBinding, ControlError> {
+    require_version(
+        "root presentation binding",
+        wire.version,
+        ROOT_PRESENTATION_BINDING_CODEC_VERSION,
+    )?;
+    let workbench_root = nokv_types::WorkbenchRoot::new(&wire.workbench_root)
+        .map_err(|error| ControlError::Codec(format!("root presentation binding: {error}")))?;
+    Ok(RootPresentationBinding {
+        root_id: RootId::from_bytes(decode_fixed_id(&wire.root_id, "root id")?),
+        workbench_root,
+    })
+}
+
+#[cfg(any(feature = "etcd", test))]
+pub(crate) fn encode_root_presentation_binding(
+    binding: &RootPresentationBinding,
+) -> Result<Vec<u8>, ControlError> {
+    serde_json::to_vec(&root_presentation_binding_wire(binding)).map_err(codec_error)
+}
+
+#[cfg(any(feature = "etcd", test))]
+pub(crate) fn decode_root_presentation_binding(
+    bytes: &[u8],
+) -> Result<RootPresentationBinding, ControlError> {
+    decode_canonical(
+        bytes,
+        "root presentation binding",
+        root_presentation_binding_from_wire,
+        encode_root_presentation_binding,
+    )
+}
+
 #[cfg(any(feature = "etcd", test))]
 pub(crate) fn encode_tenant_policy_counter(
     counter: &TenantPolicyCounter,
@@ -1369,10 +1428,21 @@ pub(crate) fn encode_local_identity_state(state: &IdentityState) -> Result<Vec<u
             })
         })
         .collect();
+    let root_presentations = state
+        .root_presentations
+        .iter()
+        .map(|(root_id, workbench_root)| {
+            root_presentation_binding_wire(&RootPresentationBinding {
+                root_id: *root_id,
+                workbench_root: workbench_root.clone(),
+            })
+        })
+        .collect();
     serde_json::to_vec(&LocalIdentityStateWire {
         version: LOCAL_IDENTITY_STATE_CODEC_VERSION,
         tenants,
         root_tenants,
+        root_presentations,
     })
     .map_err(codec_error)
 }
@@ -1384,6 +1454,13 @@ pub(crate) fn encode_local_identity_state(state: &IdentityState) -> Result<Vec<u
 pub(crate) fn decode_local_identity_state(bytes: &[u8]) -> Result<IdentityState, ControlError> {
     let invalid = |reason: &str| ControlError::Codec(format!("local identity state: {reason}"));
     let limits = crate::IdentityLimits::DEFAULT;
+    // An older layout is reported by its version, not by its missing fields.
+    let version: VersionWire = serde_json::from_slice(bytes).map_err(codec_error)?;
+    require_version(
+        "local identity state",
+        version.version,
+        LOCAL_IDENTITY_STATE_CODEC_VERSION,
+    )?;
     decode_canonical(
         bytes,
         "local identity state",
@@ -1399,6 +1476,12 @@ pub(crate) fn decode_local_identity_state(bytes: &[u8]) -> Result<IdentityState,
                 state
                     .root_tenants
                     .insert(binding.root_id, binding.tenant_id);
+            }
+            for binding in wire.root_presentations {
+                let binding = root_presentation_binding_from_wire(binding)?;
+                state
+                    .root_presentations
+                    .insert(binding.root_id, binding.workbench_root);
             }
             for tenant_wire in wire.tenants {
                 let tenant_id =
@@ -1945,6 +2028,10 @@ mod tests {
             root_id: root_id(1),
             tenant_id: tenant(5),
         };
+        let root_presentation = RootPresentationBinding {
+            root_id: root_id(1),
+            workbench_root: nokv_types::WorkbenchRoot::new("/agents/one/wb").unwrap(),
+        };
         let counter = TenantPolicyCounter {
             tenant_id: tenant(5),
             revision: 3,
@@ -1977,6 +2064,10 @@ mod tests {
             br#"{"version":1,"root_id":"01010101010101010101010101010101","tenant_id":"05050505050505050505050505050505"}"#
         );
         assert_eq!(
+            encode_root_presentation_binding(&root_presentation).unwrap(),
+            br#"{"version":1,"root_id":"01010101010101010101010101010101","workbench_root":"/agents/one/wb"}"#
+        );
+        assert_eq!(
             encode_tenant_policy_counter(&counter).unwrap(),
             br#"{"version":1,"tenant_id":"05050505050505050505050505050505","revision":3,"principals":1,"credentials":1,"role_bindings":1}"#
         );
@@ -2002,6 +2093,24 @@ mod tests {
             decode_root_tenant_binding(&root_tenant_bytes).unwrap(),
             root_tenant
         );
+        let root_presentation_bytes = encode_root_presentation_binding(&root_presentation).unwrap();
+        assert_eq!(
+            decode_root_presentation_binding(&root_presentation_bytes).unwrap(),
+            root_presentation
+        );
+        // A Workbench root that normalization would change is not canonical.
+        assert!(matches!(
+            decode_root_presentation_binding(
+                br#"{"version":1,"root_id":"01010101010101010101010101010101","workbench_root":"/agents/one/wb/"}"#
+            ),
+            Err(ControlError::Codec(_))
+        ));
+        assert!(matches!(
+            decode_root_presentation_binding(
+                br#"{"version":1,"root_id":"01010101010101010101010101010101","workbench_root":"agents/one/wb"}"#
+            ),
+            Err(ControlError::Codec(_))
+        ));
         let counter_bytes = encode_tenant_policy_counter(&counter).unwrap();
         assert_eq!(
             decode_tenant_policy_counter(&counter_bytes).unwrap(),
@@ -2083,13 +2192,30 @@ mod tests {
         state
             .grant_role(role(Role::Reader, RoleScope::Root(root_id(1))), limits)
             .unwrap();
+        state
+            .bind_root_presentation(RootPresentationBinding {
+                root_id: root_id(1),
+                workbench_root: nokv_types::WorkbenchRoot::new("/agents/one/wb").unwrap(),
+            })
+            .unwrap();
         let encoded = encode_local_identity_state(&state).unwrap();
         assert_eq!(decode_local_identity_state(&encoded).unwrap(), state);
         assert_eq!(
-            decode_local_identity_state(br#"{"version":1,"tenants":[],"root_tenants":[]}"#)
-                .unwrap(),
+            decode_local_identity_state(
+                br#"{"version":2,"tenants":[],"root_tenants":[],"root_presentations":[]}"#
+            )
+            .unwrap(),
             IdentityState::default()
         );
+        // The version-1 layout is named, not reported as missing fields.
+        assert!(matches!(
+            decode_local_identity_state(br#"{"version":1,"tenants":[],"root_tenants":[]}"#),
+            Err(ControlError::UnsupportedRecordVersion {
+                record: "local identity state",
+                version: 1,
+                supported: 2
+            })
+        ));
 
         let text = String::from_utf8(encoded).unwrap();
         let tampered = [
@@ -2106,6 +2232,11 @@ mod tests {
             ),
             // A zero revision: four changes so far.
             text.replace(r#""revision":4"#, r#""revision":0"#),
+            // A Workbench root that is not normalized.
+            text.replace(
+                r#""workbench_root":"/agents/one/wb""#,
+                r#""workbench_root":"/agents/one/wb/""#,
+            ),
         ];
         for tampered in tampered {
             assert_ne!(tampered, text);

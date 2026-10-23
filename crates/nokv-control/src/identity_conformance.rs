@@ -4,10 +4,12 @@
 //! local, and etcd stores cannot diverge on idempotence, tenant isolation, or
 //! revision accounting.
 
+use nokv_types::WorkbenchRoot;
+
 use crate::{
     ControlError, CredentialBinding, CredentialFingerprint, IdentityStore, PrincipalId,
-    PrincipalRecord, Role, RoleBinding, RoleScope, RootId, RootTenantBinding, TenantId,
-    TenantPolicy, TenantRecord,
+    PrincipalRecord, Role, RoleBinding, RoleScope, RootId, RootPresentationBinding,
+    RootTenantBinding, TenantId, TenantPolicy, TenantRecord,
 };
 
 fn tenant(fill: u8) -> TenantId {
@@ -241,6 +243,45 @@ pub(crate) fn tenants_never_reach_each_other(store: &dyn IdentityStore) {
     );
 }
 
+pub(crate) fn roots_present_under_one_workbench_root(store: &dyn IdentityStore) {
+    let presentation = |fill: u8, path: &str| RootPresentationBinding {
+        root_id: root(fill),
+        workbench_root: WorkbenchRoot::new(path).unwrap(),
+    };
+    // Provision binds the presentation before any tenant owns the root.
+    assert_eq!(store.get_root_presentation(&root(40)).unwrap(), None);
+    let binding = presentation(40, "/agents/one/wb");
+    for _ in 0..2 {
+        assert_eq!(
+            store.bind_root_presentation(binding.clone()).unwrap(),
+            binding
+        );
+    }
+    assert_eq!(
+        store.bind_root_presentation(presentation(40, "/agents/two/wb")),
+        Err(ControlError::RootPresentationAlreadyBound { root_id: root(40) })
+    );
+    assert_eq!(
+        store.get_root_presentation(&root(40)).unwrap(),
+        Some(binding)
+    );
+    assert_eq!(store.get_root_presentation(&root(41)).unwrap(), None);
+
+    // Presentation is root configuration, not tenant policy.
+    create_tenant(store, 1);
+    store
+        .bind_root_tenant(RootTenantBinding {
+            root_id: root(40),
+            tenant_id: tenant(1),
+        })
+        .unwrap();
+    let before = revision(store, 1);
+    store
+        .bind_root_presentation(presentation(41, "/agents/three/wb"))
+        .unwrap();
+    assert_eq!(revision(store, 1), before);
+}
+
 /// One conformance scenario.
 type Scenario = dyn Fn(&dyn IdentityStore);
 
@@ -250,4 +291,5 @@ pub(crate) fn run_all(with_fresh_store: &dyn Fn(&Scenario)) {
     with_fresh_store(&changes_advance_the_revision_once_and_replays_never);
     with_fresh_store(&records_require_their_tenant_principal_and_root);
     with_fresh_store(&tenants_never_reach_each_other);
+    with_fresh_store(&roots_present_under_one_workbench_root);
 }

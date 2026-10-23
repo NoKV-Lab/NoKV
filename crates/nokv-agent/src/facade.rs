@@ -15,7 +15,7 @@ use crate::{
 };
 use base64::Engine;
 use nokv_types::{
-    ArtifactRevisionId, ErrorClass, NormalizedRelativePath, RootId, WorkbenchId,
+    ArtifactRevisionId, ErrorClass, NormalizedRelativePath, RootId, WorkbenchId, WorkbenchRoot,
     WorkspaceIncarnationId,
 };
 use serde_json::{json, Map, Number, Value};
@@ -1727,49 +1727,11 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
     }
 }
 
+/// The normalized presentation root, or the Agent-facing refusal.
 pub fn normalize_logical_workbench_root(raw: &str) -> Result<String, AgentError> {
-    const MAX_BYTES: usize = 4096;
-    const MAX_COMPONENTS: usize = 64;
-
-    if !raw.starts_with('/') {
-        return Err(AgentError::invalid_arguments(
-            "logical Workbench root must be absolute",
-        ));
-    }
-    if raw.contains('\\') || raw.contains('\0') {
-        return Err(AgentError::invalid_arguments(
-            "logical Workbench root must not contain backslashes or NUL",
-        ));
-    }
-    let mut components = Vec::new();
-    for component in raw.split('/') {
-        if component.is_empty() {
-            continue;
-        }
-        if matches!(component, "." | "..") {
-            return Err(AgentError::invalid_arguments(
-                "logical Workbench root must not contain '.' or '..' components",
-            ));
-        }
-        components.push(component);
-    }
-    if components.is_empty() {
-        return Err(AgentError::invalid_arguments(
-            "logical Workbench root must not be /",
-        ));
-    }
-    if components.len() > MAX_COMPONENTS {
-        return Err(AgentError::invalid_arguments(format!(
-            "logical Workbench root must not exceed {MAX_COMPONENTS} components"
-        )));
-    }
-    let normalized = format!("/{}", components.join("/"));
-    if normalized.len() > MAX_BYTES {
-        return Err(AgentError::invalid_arguments(format!(
-            "logical Workbench root must not exceed {MAX_BYTES} bytes"
-        )));
-    }
-    Ok(normalized)
+    WorkbenchRoot::new(raw)
+        .map(WorkbenchRoot::into_string)
+        .map_err(|error| AgentError::invalid_arguments(error.to_string()))
 }
 
 fn parse_workbench_id(arguments: &Value) -> Result<WorkbenchId, AgentError> {

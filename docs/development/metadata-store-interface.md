@@ -586,28 +586,33 @@ before the profile can qualify.
 
 ## Tenant Identity Records
 
-Tenant identity records say which principals may use which roots. This section
-is their storage contract. No server path reads them yet: server authorization
-enforces them in a later change (#566), and until then every deployment remains
-trusted, as `SECURITY.md` states.
+Tenant identity records say which principals may use which roots, and how each
+root is presented. This section is their storage contract. An owner that serves
+RPC TLS enforces the roles; without TLS every deployment remains trusted, as
+`SECURITY.md` states.
 
 - **Records.** A tenant; its principals; credential bindings that map the
   SHA-256 fingerprint of a client certificate to one principal until an expiry
   time; role bindings (`reader`, `writer`, `operator`) scoped to the tenant or
-  to one root; and the binding of a root to the tenant that owns it.
+  to one root; the binding of a root to the tenant that owns it; and the
+  binding of a root to the Workbench root its Agents present it under, which
+  `nokv provision` writes once because canonical manifests carry paths under
+  it.
 - **Lifecycle.** Records are create-only. An exact replay succeeds and changes
   nothing; a different record under the same identity fails
-  (`CredentialAlreadyBound`, `RootTenantAlreadyBound`). Credentials and role
-  bindings can be revoked. Tenants, principals, and root bindings cannot be
-  removed, and a root is never rebound to another tenant.
+  (`CredentialAlreadyBound`, `RootTenantAlreadyBound`,
+  `RootPresentationAlreadyBound`). Credentials and role bindings can be
+  revoked. Tenants, principals, and root bindings cannot be removed, and a root
+  is never rebound to another tenant or Workbench root.
 - **Invariants.** A credential or role names a registered principal of its own
   tenant. A root-scoped role names a root already bound to the same tenant, so
   no record grants access across tenants. A fingerprint authenticates at most
   one principal in a tenant.
 - **Revision.** Every change to a tenant's principals, credentials, or roles
   advances that tenant's policy revision by exactly one. Replays and refused
-  changes leave it alone, and binding a root does not move it. A reader polls
-  the revision and reloads the policy when it moves.
+  changes leave it alone, and binding a root to its tenant or Workbench root
+  does not move it. A reader polls the revision and reloads the policy when it
+  moves.
 - **Limits.** A tenant holds at most 1,024 principals, 2,048 credentials, and
   4,096 role bindings, so one policy read stays bounded. A change beyond a
   limit fails with `TenantPolicyLimitExceeded` and needs an operator.
@@ -622,6 +627,7 @@ In etcd, under the configured key prefix:
 | `tenants/<tenant>/credentials/<fingerprint>` | A credential binding. |
 | `tenants/<tenant>/role-bindings/<principal>/<role>/<tenant or root>` | A role binding. |
 | `root-tenants/<root>` | The tenant that owns the root. |
+| `root-presentations/<root>` | The Workbench root the root's Agents present it under. |
 
 Every change writes its record and the advanced counter in one transaction
 guarded by the counter's modification revision, and retries up to 16 times
@@ -636,9 +642,9 @@ written under the same `control.lock` as `control-state.json` and with the
 same write, sync, rename, and directory-sync sequence. Its decoder checks the
 same invariants, limits, and non-zero revisions.
 
-Every value is codec version 1, encoded canonically and decoded with an
-exact-version reader that rejects unknown fields; golden tests freeze the
-bytes. The records use new etcd key families and a separate local file, so
+Every record value is codec version 1 and the local file is version 2, each
+encoded canonically and decoded with an exact-version reader that rejects
+unknown fields; golden tests freeze the bytes. The records use new etcd key families and a separate local file, so
 released owners and clients, which never read them, keep working against a
 control plane that holds them.
 
