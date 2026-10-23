@@ -69,6 +69,25 @@ not for installing the SDK.
   `expected`) with nothing written. Callers that omit the argument keep the
   0.11.0 behaviour; a server older than 0.11.1 rejects a fenced request as an
   invalid argument instead of ignoring the fence.
+- `Client.put_bytes(workbench, path, data, operation_id, ...)` is native
+  `workspace-path put`: one whole-body publication under a caller-chosen
+  operation identity (32 lowercase hex, for example a UUIDv7 without hyphens).
+  Without `expected_generation` it is create-only; with it, the path must
+  still be at that generation, and `expected_workspace_incarnation_id` fences
+  the workspace instance. Repeating the call with the same id and inputs, from
+  any process, from the CLI, or after an owner restart, returns the original
+  receipt with `replayed=True` and needs no object store; the same id with
+  other inputs fails with `identity_conflict` and changes nothing.
+  `content_type` and an explicit `block_size` are part of the intent. The
+  default `application/octet-stream` is the CLI's for `--file` and `--base64`;
+  replay a `--text` put with `content_type="text/plain; charset=utf-8"`.
+  `block_size=None` uses the SDK default, as the CLI does without
+  `--block-size`. The result matches the CLI receipt:
+  `status`, `operation=put`, the caller's `operation_id`, the publishing
+  `publication_operation_id` and its `attempt`, `state=committed`,
+  `next_action=none`, `workbench_id`, `path`, `workspace_revision`,
+  `generation`, `artifact_revision_id`, `logical_size`, `body_digest`, and the
+  call metadata `replayed` and `commit_version`.
 - `Client.append_bytes(workbench, path, data, operation_id, ...)` accepts Python
   `bytes` under a caller-owned stable logical identity. The first admission
   requires an existing workspace. An omitted `expected_workspace_incarnation_id`
@@ -90,19 +109,28 @@ not for installing the SDK.
   bound is part of the intent and must be retained across retries. The default
   block size is 4 MiB and maps to CLI `--block-size`. A retry may start a successor publication only after the
   predecessor is fenced and cleaned; the logical identity never changes.
-- `Client.operation_status(operation_id)` queries an append without resending
-  its payload or depending on a current workspace. `Client(root_id, routing)`
+- `Client.operation_status(operation_id=None, *, commit_identity=None)`
+  observes an append, publish, commit, or restore without resending its
+  payload or depending on a current workspace; `commit_identity` names a
+  commit by the `commit_id` that `commit` returns. `Client(root_id, routing)`
   needs no object-store configuration; configured object stores are initialized
   lazily on object operations, so a fresh status client works during an S3
-  outage. The result reports `state` and `next_action` from the shared Rust SDK:
-  `committed/none` with the original `receipt`, `pending/poll`,
-  `ready_to_retry/resubmit_same`, or `quarantined/retry_cleanup`. It also
-  contains the logical and publication identities, attempt number and phase,
-  activity deadline, original target and incarnation, progress, `cause_code`,
-  `failure_message`, and `attempt_failure` for a failed physical attempt. The
-  logical operation may still be `ready_to_retry` while retaining that failure.
-  A query never advances an attempt. Retain or reproduce the original delta
-  until commitment; follow `resubmit_same` using `append_bytes`.
+  outage. Every result reports `operation`, `state`, and `next_action` as native
+  `operation status` does. An append reports `committed/none` with the
+  original `receipt`, `pending/poll`, `ready_to_retry/resubmit_same`, or
+  `quarantined/retry_cleanup`. It also contains the logical and publication
+  identities, attempt number and phase, activity deadline, original target and
+  incarnation, progress, `cause_code`, `failure_message`, and `attempt_failure`
+  for a failed physical attempt. The logical operation may still be
+  `ready_to_retry` while retaining that failure. A publish, commit, or restore
+  reports `running/poll`, `aborting/poll`, `succeeded/none` with its stored
+  `receipt`, `failed/do_not_retry`, or `quarantined/operator`, with its
+  `target`, `progress`, and recorded `failure`; a receipt is the original
+  result, not a re-evaluation of current state. A query never advances an
+  operation. An absent operation raises `not_found` with `resubmit_same`:
+  absence is a point-in-time observation, and resubmitting the same call
+  admits it at most once. Retain or reproduce the original inputs until
+  commitment; follow `resubmit_same` with the same call.
 - `Client.operation_inspect(operation_id, *, cursor=None, limit=32)` returns the
   same status plus logical `operation_token`, child `publication_token`, object
   namespace, `registered_count`, `cleanup_cursor`, `remaining_count`, and a page
@@ -124,13 +152,35 @@ not for installing the SDK.
   operations. A later quarantine requires a new intentional recovery request.
   When status reaches `ready_to_retry`, redeliver the original append inputs;
   recovery does not reconstruct or publish the delta.
-- Append and status failures carry `operation_id`, observed `state`, `code`,
-  expected incarnation in `expected`, `cause_code`, and `next_action=query_same`.
+- Every exception a `Client` call raises carries `error_class` and
+  `next_action`: the class and next action a native CLI failure reports
+  ([CLI contract](../../docs/cli-contract.md)). Branch on them, never on the
+  message. The class is the one the failing layer reports; the next action
+  also depends on how the call identifies its effect. An unknown outcome is
+  `query_same` for `append_bytes`, `put_bytes`, and a `publish_bytes` or
+  `publish_file` given an `operation_id`; `resubmit_same` for `commit`,
+  `restore`, `renew_snapshot`, and `retire_snapshot`, whose repeat replays or
+  converges; and `reread_then_retry` for calls that mint a fresh identity each
+  time (`create_workspace`, `rename`, `remove`, `snapshot`, and an
+  unidentified `publish_bytes` or `publish_file`). A read never reports an
+  unknown outcome. Exception types are unchanged: `ValueError` for invalid
+  arguments, `FileNotFoundError` and `FileExistsError` for path absence and
+  existence, `AppendError`, `WorkspaceIncarnationMismatch`, and `RuntimeError`
+  otherwise. A `put_bytes` failure also carries `operation_id`, the failed
+  `attempt`, and the path's `current_generation` when the owner refused a
+  generation. `collect` publishes its files one by one under fresh
+  identities, so a failure can leave some of them published and reports
+  `outcome_unknown` with `reread_then_retry`.
+- Append and operation failures raise `AppendError` for every operation kind,
+  carrying `operation_id`, observed `state`, `code`, expected incarnation in
+  `expected`, and `cause_code`: an invalid argument is `invalid_input` with
+  `fix_input`, and an unknown outcome `outcome_unknown` with `query_same`.
   `publication_operation_id` is `None` until status supplies an observed
   publication. `AppendError` is a `RuntimeError`; incarnation conflicts retain
   the `WorkspaceIncarnationMismatch` subtype with the same recovery attributes.
-  `cause_code=RequestReplayMismatch` identifies changed inputs or another
-  lifecycle, so recover the original intent instead of blindly resubmitting.
+  `cause_code=RequestReplayMismatch` (`identity_conflict`) identifies changed
+  inputs or another lifecycle, so recover the original intent instead of
+  blindly resubmitting.
   `retryable` is false for generic retry handlers. An unknown result or a
   `NotFound` observation never authorizes a replacement logical identity.
   Cleanup errors use `code=AppendCleanupUnresolved` and

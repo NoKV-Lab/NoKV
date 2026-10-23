@@ -114,7 +114,7 @@ try:
         result = client.operation_recover(c["operation_id"], expected_state_digest=c["expected_state_digest"])
     print(json.dumps({"result":result,"native_sha256":hashlib.sha256(Path(_native.__file__).read_bytes()).hexdigest(),"object_store":None}))
 except Exception as error:
-    print(json.dumps({"result":{"status":"error","type":type(error).__name__,"message":str(error),**{field:getattr(error,field,None) for field in ("code","cause_code","operation_id","expected_state_digest","recovery_receipt","next_action","retryable")}}}))
+    print(json.dumps({"result":{"status":"error","type":type(error).__name__,"message":str(error),**{field:getattr(error,field,None) for field in ("code","cause_code","operation_id","expected_state_digest","recovery_receipt","error_class","next_action","retryable")}}}))
 """
 
 
@@ -1244,7 +1244,10 @@ def recovery_ack_loss_and_aba(stack, deadline):
             and successor_python_rejection.get("code") == "Conflict"
             and successor_python_rejection.get("cause_code") == "Conflict"
             and successor_python_rejection.get("operation_id") == operation_id
-            and successor_python_rejection.get("next_action") == "query_same"
+            # The same contract as the CLI: a changed operation state is a
+            # precondition, read again before deciding.
+            and successor_python_rejection.get("error_class") == "precondition_failed"
+            and successor_python_rejection.get("next_action") == "reread_then_retry"
             and successor_python_rejection.get("retryable") is False
             and "entries" not in successor_python_rejection,
             "Python rejects the same old attempt cursor with the exact typed conflict",
