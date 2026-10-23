@@ -43,7 +43,9 @@ The checked-in integration assets are deliberately small:
 - `object_namespace_recovery_gate.py` owns an isolated real etcd member and a
   digest-pinned RustFS container. It records deterministic PhyMat evidence,
   kills and reopens the owner, rejects a healthy wrong prefix, and proves the
-  retryable outage/recovery contract over one long-lived MCP process.
+  retryable outage/recovery contract over one long-lived MCP process. The
+  outage read targets a body above the 16 KiB inline bound, because an inline
+  body is served from shard metadata without the object store.
 - `object_namespace_recovery_gate_test.py` freezes those terminal assertions
   and the independent GitHub Actions evidence-upload contract.
 - `restore_composition_gate.py` carries the exact externally observable

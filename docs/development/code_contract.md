@@ -113,7 +113,10 @@ that owns them. Do not move domain-specific or single-use logic into a generic
 - `WorkspaceCurrent` is the visibility marker; staging must be absent from
   every query surface until marker publication.
 - Keep object bytes out of the metadata store except compact immutable
-  descriptors.
+  descriptors and the write-once inline body of a visible revision of at most
+  `MAX_INLINE_ARTIFACT_BODY_BYTES` (16 KiB). An inline revision has no staged
+  objects or manifest rows; its body row is created with the revision and
+  deleted only by the revision's garbage collection, without a History copy.
 - Publish objects first and metadata last. Metadata failure leaves no
   user-visible path.
 - Every published body has a never-reused immutable
@@ -147,6 +150,20 @@ that owns them. Do not move domain-specific or single-use logic into a generic
 - Do not introduce provider-specific RustFS metadata; RustFS uses the common
   S3-compatible boundary.
 - Prefer explicit invariants and local reasoning over manager-style wrappers.
+
+## PR Communication And DCO
+
+The [contribution guide](../../CONTRIBUTING.md#pr-description-format) owns the
+PR writing format. Use `TLDR`, `Problem`, `Consequences`, `Example`, `Solution`,
+`Gain`, `Tradeoffs`, and `Validation`, in that order, following the
+[template](../../.github/pull_request_template.md). Keep descriptions concise
+and in plain English, with minimal code details and a concrete before/after
+example. Include exact validation results and evidence for storage or
+performance claims; state relevant limits and checks not run.
+
+Every non-merge commit must carry a DCO `Signed-off-by` trailer as required by
+the [contribution guide](../../CONTRIBUTING.md#branch-and-commit-conventions)
+and [DCO](../../DCO).
 
 ## Validation
 

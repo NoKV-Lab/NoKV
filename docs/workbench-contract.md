@@ -33,6 +33,29 @@ The native CLI accepts exactly these 18 names under `nokv workbench`. It fails
 closed unless every possible destination owner supports the durable restore
 contract and the complete schema.
 
+### Persistent native CLI session
+
+`nokv workbench-session` keeps one admitted client for a sequence of tool
+calls. It takes the same root, AgentId, object-store and control-plane options
+as `nokv workbench` and reads one JSON request per line on standard input:
+
+```json
+{"id":"call-1","tool":"workbench_read","arguments":{"workbench":"run-001","section":"outputs","path":"report.md"}}
+```
+
+A line may instead name the session command `materialize` with `{"id",
+"section", "path"}` arguments, the session form of `nokv materialize`: it
+returns the whole live artifact as `base64` with its `generation`,
+`digest_uri` and `size_bytes`, because `workbench_read` pages at most 300
+lines or bytes per call. Each request is answered by one flushed JSON line
+carrying the same `id` and either `result` or `error`; a malformed line is answered with `id: null`, and a
+line over 128 MiB ends the session before dispatch. Ids are 1-128 bytes and
+only correlate responses. Every call keeps its tool's own publication,
+durability and retry boundary; the session is not a transaction. If the output
+breaks, the current mutation may already be committed, so a caller reconciles
+that tool's state and predicates before retrying it. Separate processes are
+independent concurrent clients.
+
 ## Product Boundary
 
 Workbench is a logical workspace API, not a host-filesystem API.

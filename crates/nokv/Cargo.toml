@@ -1,6 +1,6 @@
 [package]
 name = "nokv"
-version = "0.11.1"
+version = "0.12.1"
 description = "Custom CLI and MCP wiring for NoKV Agent workspaces."
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,8 @@ homepage.workspace = true
 
 [features]
 default = ["etcd"]
-etcd = ["nokv-client/etcd", "nokv-control/etcd", "nokv-server/etcd", "dep:signal-hook"]
+control = ["nokv-client/control", "dep:signal-hook"]
+etcd = ["control", "nokv-client/etcd", "nokv-control/etcd", "nokv-server/etcd"]
 
 [dependencies]
 base64.workspace = true

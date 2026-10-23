@@ -12,11 +12,13 @@ from unittest import mock
 from pathlib import Path
 
 from object_namespace_recovery_gate import (
+    INLINE_ARTIFACT_BODY_MAX_BYTES,
     PINNED_RUSTFS_IMAGE,
     Evidence,
     WorkflowFailure,
     aws_command,
     aws_environment,
+    canonical_json,
     control_args,
     execute,
     fixed_id,
@@ -363,6 +365,11 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
         evidence["outage"]["recovered"]["energy_ev"] = -1.0  # type: ignore[index]
         with self.assertRaisesRegex(WorkflowFailure, "PhyMat"):
             validate_gate_evidence(evidence)
+
+    def test_outage_read_targets_an_object_backed_body(self) -> None:
+        _, relaxation = phymat_documents()
+        body = (canonical_json(relaxation) + "\n").encode()
+        self.assertGreater(len(body), INLINE_ARTIFACT_BODY_MAX_BYTES)
 
 
 if __name__ == "__main__":

@@ -13,11 +13,12 @@ mod object_store;
 mod provision;
 mod transfer;
 mod workbench_mcp;
+mod workbench_session;
 
 use std::io::{self, BufReader};
 use std::path::Path;
 use std::process::ExitCode;
-#[cfg(feature = "etcd")]
+#[cfg(feature = "control")]
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD;
@@ -32,13 +33,13 @@ use serde_json::{json, Value};
 
 use backend::CliWorkbenchBackend;
 use cli::{AppendPayload, Command, Invocation, McpProfile, WorkspacePathCommand};
-#[cfg(feature = "etcd")]
+#[cfg(feature = "control")]
 use object_store::CliObjectStore;
 
 type CliHandler = SdkWorkbenchToolHandler<CliWorkbenchBackend>;
 type CliGenericAgentHandler = SdkGenericAgentToolHandler<CliWorkbenchBackend>;
 
-#[cfg(feature = "etcd")]
+#[cfg(feature = "control")]
 const WORKBENCH_REQUIRED_RPC_CAPABILITIES: [nokv_protocol::WorkspaceCapability; 8] = [
     nokv_protocol::WorkspaceCapability::ArtifactPublishV1,
     nokv_protocol::WorkspaceCapability::ArtifactRangeReadV1,
@@ -103,6 +104,19 @@ fn run() -> Result<(), String> {
                 .map_err(|error| format!("Workbench arguments are not valid JSON: {error}"))?;
             let result = execute_tool(&handler, tool, &arguments).map_err(agent_error)?;
             print_json(&result)
+        }
+        Command::WorkbenchSession => {
+            let backend = build_backend(&invocation)?;
+            let handler = handler_for_backend(&invocation, backend.clone())?;
+            let input = io::stdin();
+            let output = io::stdout();
+            workbench_session::serve(
+                &handler,
+                &SessionMaterializer { backend },
+                input.lock(),
+                output.lock(),
+            )
+            .map_err(|error| format!("Workbench session transport failed: {error}"))
         }
         Command::Mcp { profile } => {
             let input = io::stdin();
@@ -180,21 +194,18 @@ fn run() -> Result<(), String> {
 }
 
 #[derive(Debug)]
-struct ConfiguredAgentAdmission<'a> {
-    route: &'a cli::EtcdRoutingConfig,
+struct ConfiguredAgentAdmission {
     root_id: nokv_control::RootId,
     agent_id: nokv_types::AgentId,
 }
 
-fn configured_agent_admission(
-    invocation: &Invocation,
-) -> Result<ConfiguredAgentAdmission<'_>, String> {
-    let cli::RoutingConfig::Etcd(route) = &invocation.client.routing else {
+fn configured_agent_admission(invocation: &Invocation) -> Result<ConfiguredAgentAdmission, String> {
+    if matches!(invocation.client.routing, cli::RoutingConfig::Static(_)) {
         return Err(
-            "Agent-facing commands require durable etcd control routing; static routes cannot prove the RootId-to-AgentId binding"
+            "Agent-facing commands require durable control routing (--etcd-endpoint or --control-dir); static routes cannot prove the RootId-to-AgentId binding"
                 .to_owned(),
         );
-    };
+    }
     let root_id = nokv_control::RootId::from(
         connection::configured_root_id(&invocation.client).map_err(|error| error.to_string())?,
     );
@@ -205,11 +216,7 @@ fn configured_agent_admission(
             .ok_or_else(|| "--agent-id is required for Agent-facing commands".to_owned())?,
     )
     .map_err(|error| error.to_string())?;
-    Ok(ConfiguredAgentAdmission {
-        route,
-        root_id,
-        agent_id,
-    })
+    Ok(ConfiguredAgentAdmission { root_id, agent_id })
 }
 
 fn load_root_agent_binding(
@@ -247,29 +254,25 @@ fn after_agent_root_admission<T>(
 
 fn build_backend(invocation: &Invocation) -> Result<CliWorkbenchBackend, String> {
     let admission = configured_agent_admission(invocation)?;
-    #[cfg(feature = "etcd")]
+    #[cfg(feature = "control")]
     {
-        let control = connect_control(admission.route)?;
+        let control = open_control(invocation)?;
         after_agent_root_admission(
             control.as_ref(),
             admission.root_id,
             admission.agent_id,
             || {
-                let client =
-                    connection::connect(&invocation.client).map_err(|error| error.to_string())?;
+                let client = connection::connect(&invocation.client, Some(control.clone()))
+                    .map_err(|error| error.to_string())?;
                 build_backend_after_agent_admission(invocation, client)
             },
         )
     }
-    #[cfg(not(feature = "etcd"))]
+    #[cfg(not(feature = "control"))]
     {
-        let ConfiguredAgentAdmission {
-            route,
-            root_id,
-            agent_id,
-        } = admission;
-        let _ = (route, root_id, agent_id);
-        Err("Agent-facing commands require the nokv etcd feature".to_owned())
+        let ConfiguredAgentAdmission { root_id, agent_id } = admission;
+        let _ = (root_id, agent_id);
+        Err("Agent-facing commands require the nokv control feature".to_owned())
     }
 }
 
@@ -277,7 +280,7 @@ fn build_backend_after_agent_admission(
     invocation: &Invocation,
     client: connection::CliWorkspaceClient,
 ) -> Result<CliWorkbenchBackend, String> {
-    #[cfg(feature = "etcd")]
+    #[cfg(feature = "control")]
     {
         let preflight = client
             .preflight(WORKBENCH_REQUIRED_RPC_CAPABILITIES)
@@ -292,7 +295,7 @@ fn build_backend_after_agent_admission(
             objects
                 .validate_append_capabilities()
                 .map_err(append_provider_admission_error)?;
-        } else {
+        } else if invocation.command.creates_objects() {
             objects.validate_agent_capabilities()?;
         }
         Ok(CliWorkbenchBackend::new(
@@ -301,20 +304,27 @@ fn build_backend_after_agent_admission(
             invocation.client.max_artifact_bytes,
         ))
     }
-    #[cfg(not(feature = "etcd"))]
+    #[cfg(not(feature = "control"))]
     {
         let _ = (invocation, client);
-        Err("Agent-facing commands require the nokv etcd feature".to_owned())
+        Err("Agent-facing commands require the nokv control feature".to_owned())
     }
 }
 
 fn build_handler(invocation: &Invocation) -> Result<CliHandler, String> {
+    handler_for_backend(invocation, build_backend(invocation)?)
+}
+
+fn handler_for_backend(
+    invocation: &Invocation,
+    backend: CliWorkbenchBackend,
+) -> Result<CliHandler, String> {
     let workbench_root = invocation
         .workbench_root
         .as_deref()
         .ok_or_else(|| "--workbench-root is required for Agent-facing commands".to_owned())?;
     SdkWorkbenchToolHandler::with_limits(
-        build_backend(invocation)?,
+        backend,
         invocation.client.max_artifact_bytes,
         usize::try_from(invocation.client.max_attempts)
             .map_err(|_| "--max-attempts does not fit this platform".to_owned())?,
@@ -340,16 +350,16 @@ fn build_workspace_path_client(
     invocation: &Invocation,
 ) -> Result<connection::CliWorkspaceClient, String> {
     let admission = configured_agent_admission(invocation)?;
-    #[cfg(feature = "etcd")]
+    #[cfg(feature = "control")]
     {
-        let control = connect_control(admission.route)?;
+        let control = open_control(invocation)?;
         after_agent_root_admission(
             control.as_ref(),
             admission.root_id,
             admission.agent_id,
             || {
-                let client =
-                    connection::connect(&invocation.client).map_err(|error| error.to_string())?;
+                let client = connection::connect(&invocation.client, Some(control.clone()))
+                    .map_err(|error| error.to_string())?;
                 client
                     .preflight([nokv_protocol::WorkspaceCapability::WorkspacePathV1])
                     .map_err(|error| format!("workspace preflight failed: {error}"))?;
@@ -357,15 +367,11 @@ fn build_workspace_path_client(
             },
         )
     }
-    #[cfg(not(feature = "etcd"))]
+    #[cfg(not(feature = "control"))]
     {
-        let ConfiguredAgentAdmission {
-            route,
-            root_id,
-            agent_id,
-        } = admission;
-        let _ = (route, root_id, agent_id);
-        Err("workspace-path commands require the nokv etcd feature".to_owned())
+        let ConfiguredAgentAdmission { root_id, agent_id } = admission;
+        let _ = (root_id, agent_id);
+        Err("workspace-path commands require the nokv control feature".to_owned())
     }
 }
 
@@ -829,6 +835,54 @@ fn remove_path_json(
     }))
 }
 
+/// Session form of `materialize`: the whole live artifact inline.
+struct SessionMaterializer {
+    backend: CliWorkbenchBackend,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaterializeArguments {
+    id: String,
+    section: String,
+    path: String,
+}
+
+impl workbench_session::SessionCommands for SessionMaterializer {
+    fn materialize(&self, arguments: &Value) -> Result<Value, nokv_agent::AgentError> {
+        let arguments: MaterializeArguments =
+            serde_json::from_value(arguments.clone()).map_err(|error| {
+                nokv_agent::AgentError::invalid_arguments(format!("materialize: {error}"))
+            })?;
+        let scoped = scoped_artifact(&arguments.id, &arguments.section, &arguments.path)
+            .map_err(nokv_agent::AgentError::invalid_arguments)?;
+        let artifact = self
+            .backend
+            .read(ReadRequest {
+                path: scoped,
+                view: ReadView::Live,
+            })
+            .map_err(|error| {
+                nokv_agent::AgentError::backend("ReadFailed", error.to_string(), false, json!({}))
+            })?
+            .ok_or_else(|| {
+                nokv_agent::AgentError::backend(
+                    "NotFound",
+                    format!("{}/{} does not exist", arguments.section, arguments.path),
+                    false,
+                    json!({}),
+                )
+            })?;
+        Ok(json!({
+            "status": "success",
+            "size_bytes": artifact.bytes.len(),
+            "generation": artifact.metadata.generation,
+            "digest_uri": artifact.metadata.digest_uri,
+            "base64": STANDARD.encode(&artifact.bytes),
+        }))
+    }
+}
+
 fn materialize(
     backend: &CliWorkbenchBackend,
     workbench: &str,
@@ -962,6 +1016,7 @@ NoKV Agent-workspace CLI
 
 USAGE:
   nokv [connection/object options] workbench <tool> '<json arguments>'
+  nokv [connection/object options] workbench-session < requests.jsonl
   nokv [connection/object options] mcp [--profile workbench|agent]   (DEPRECATED)
   nokv [connection/object options] materialize <workbench> <section> <path> <destination>
   nokv [connection/object options] collect <workbench> <section> <source> <path> [--replace] [--expected-generation N] [--content-type TYPE]
@@ -971,7 +1026,7 @@ USAGE:
   nokv [route/agent options] workspace-path rename <workbench> <section> <source> <destination> --expected-generation N --request-id HEX32
   nokv [route/agent options] workspace-path remove <workbench> <section> <path> --expected-generation N --request-id HEX32
   nokv [route/agent/object options] workspace-path append <workbench> <section> <path> --operation-id HEX32 (--text TEXT | --base64 BASE64 | --file PATH) [--content-type TYPE] [--max-logical-size N] [--block-size N] [--expected-workspace-incarnation-id HEX32]
-  nokv --root-id HEX32 --agent-id HEX32 --etcd-endpoint URL provision <logical-shard-id-hex32> [adoption options]
+  nokv --root-id HEX32 --agent-id HEX32 (--etcd-endpoint URL | --control-dir PATH) provision <logical-shard-id-hex32> [adoption options]
   nokv [owner options] serve
   nokv schema
   nokv version [--json]
@@ -984,10 +1039,12 @@ AGENT CONTROL ROUTING:
   --metadata-address HOST:PORT --logical-shard-id HEX32 --object-namespace-id HEX32
     --placement-generation N --owner-epoch N
   static routing is a point-in-time pin and cannot refresh after placement changes or owner restarts
-  use --etcd-endpoint for self-refreshing routing
-  Agent-facing commands, provision, and serve require etcd routing so the RootId-to-AgentId binding can be verified;
+  use --etcd-endpoint or --control-dir for self-refreshing routing
+  Agent-facing commands, provision, and serve require control routing so the RootId-to-AgentId binding can be verified;
   a static pin is rejected there and remains a Rust SDK client option only
-  --etcd-endpoint URL [--etcd-endpoint URL ...]
+  --etcd-endpoint URL [--etcd-endpoint URL ...] for owners and clients on several hosts
+  --control-dir PATH for an owner and clients on one host: a local directory whose owner
+    session is an OS file lock released when the owner process exits; not for network filesystems
 
 AGENT PRESENTATION:
   --workbench-root /agents/AGENT_NAME/wb is required by workbench, collect, and mcp
@@ -1013,7 +1070,7 @@ OWNER:
   --adopt-legacy-agent-binding is a one-time explicit migration for a verified legacy root
   --adopt-legacy-object-namespace is a one-time explicit migration after verifying bucket/prefix
   serve validates every active root's Agent binding; it does not require or compare one shard-wide AgentId
-  --root-id HEX32 --etcd-endpoint URL --node-id ID
+  --root-id HEX32 (--etcd-endpoint URL | --control-dir PATH) --node-id ID
   --append-activity-lease-ms N: serve only, range 1000..=86400000, default 1800000; clock-skew grace is additional
   --advertise-endpoint HOST:PORT --bind HOST:PORT
   --etcd-lease-ttl-seconds N (default 10; owner keepalive runs every max(1, N/3) seconds)
@@ -1036,19 +1093,12 @@ NoKV exposes SDK and CLI operations. It does not expose FUSE or POSIX."
     );
 }
 
-#[cfg(feature = "etcd")]
-fn connect_control(
-    route: &cli::EtcdRoutingConfig,
-) -> Result<Arc<dyn nokv_control::ControlStore>, String> {
-    let options = nokv_control::EtcdControlStoreOptions::new(route.endpoints.clone())
-        .with_key_prefix(route.key_prefix.clone())
-        .with_lease_ttl_seconds(route.lease_ttl_seconds);
-    Ok(Arc::new(
-        nokv_control::EtcdControlStore::connect(options).map_err(|error| error.to_string())?,
-    ))
+#[cfg(feature = "control")]
+fn open_control(invocation: &Invocation) -> Result<Arc<dyn nokv_control::ControlStore>, String> {
+    connection::open_control(&invocation.client.routing).map_err(|error| error.to_string())
 }
 
-#[cfg(feature = "etcd")]
+#[cfg(feature = "control")]
 fn run_provision(
     invocation: &Invocation,
     logical_shard_id: &str,
@@ -1058,9 +1108,6 @@ fn run_provision(
     use nokv_control::{LogicalShardId, RootId};
     use nokv_types::RootPlacementLifecycle;
 
-    let cli::RoutingConfig::Etcd(route) = &invocation.client.routing else {
-        return Err("provision requires control-backed etcd routing".to_owned());
-    };
     let root_id = RootId::from(
         connection::configured_root_id(&invocation.client).map_err(|error| error.to_string())?,
     );
@@ -1074,7 +1121,7 @@ fn run_provision(
             .ok_or_else(|| "provision requires --agent-id".to_owned())?,
     )
     .map_err(|error| error.to_string())?;
-    let control = connect_control(route)?;
+    let control = open_control(invocation)?;
     let existing_placement =
         provision::preflight_provision(control.as_ref(), root_id, logical_shard_id)
             .map_err(|error| error.to_string())?;
@@ -1142,17 +1189,17 @@ fn run_provision(
     }))
 }
 
-#[cfg(not(feature = "etcd"))]
+#[cfg(not(feature = "control"))]
 fn run_provision(
     _invocation: &Invocation,
     _logical_shard_id: &str,
     _adopt_legacy_object_namespace: bool,
     _adopt_legacy_agent_binding: bool,
 ) -> Result<(), String> {
-    Err("provision requires the nokv etcd feature".to_owned())
+    Err("provision requires the nokv control feature".to_owned())
 }
 
-#[cfg(feature = "etcd")]
+#[cfg(feature = "control")]
 fn active_shard_placements(
     control: &dyn nokv_control::ControlStore,
     seed: &nokv_control::RootPlacement,
@@ -1176,7 +1223,7 @@ fn active_shard_placements(
     Ok(placements)
 }
 
-#[cfg(feature = "etcd")]
+#[cfg(feature = "control")]
 fn validate_served_root_agent_bindings(
     control: &dyn nokv_control::ControlStore,
     placements: &[nokv_control::RootPlacement],
@@ -1187,7 +1234,7 @@ fn validate_served_root_agent_bindings(
     Ok(())
 }
 
-#[cfg(feature = "etcd")]
+#[cfg(feature = "control")]
 fn join_lifecycle_workers(
     workers: Vec<std::thread::JoinHandle<Result<(), nokv_server::LifecycleError>>>,
     failures: &mut Vec<String>,
@@ -1201,7 +1248,7 @@ fn join_lifecycle_workers(
     }
 }
 
-#[cfg(feature = "etcd")]
+#[cfg(feature = "control")]
 fn run_server(invocation: &Invocation) -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1216,6 +1263,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     use sha2::{Digest, Sha256};
 
     static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    const NON_EXPIRING_SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
     fn install_shutdown_signal() -> Result<Arc<AtomicBool>, String> {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1254,9 +1302,6 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     }
 
     let shutdown = install_shutdown_signal()?;
-    let cli::RoutingConfig::Etcd(route) = &invocation.client.routing else {
-        return Err("serve requires control-backed etcd routing".to_owned());
-    };
     let metadata = match invocation.server.metadata_store.clone().ok_or_else(|| {
         "serve requires --metadata-create, --metadata-reopen, or --metadata-recover-log".to_owned()
     })? {
@@ -1280,7 +1325,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     let root_id = RootId::from(
         connection::configured_root_id(&invocation.client).map_err(|error| error.to_string())?,
     );
-    let control = connect_control(route)?;
+    let control = open_control(invocation)?;
     let placement = control
         .get_root_placement(&root_id)
         .map_err(|error| error.to_string())?
@@ -1379,9 +1424,13 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
 
-    let lease_renew_interval = owner.owner_lease_renew_interval().ok_or_else(|| {
-        "etcd-backed workspace server requires an expiring owner-lease renewal policy".to_owned()
-    })?;
+    // An expiring owner lease is renewed on the store's cadence. A session
+    // that ends only with its process is still checked on a fixed cadence, so
+    // a lost lock or a durable record changed outside it fails the owner
+    // closed.
+    let lease_renew_interval = owner
+        .owner_lease_renew_interval()
+        .unwrap_or(NON_EXPIRING_SESSION_CHECK_INTERVAL);
 
     let meta = Arc::clone(owner.meta());
     let recovery = Arc::clone(owner.recovery_publisher());
@@ -1475,9 +1524,9 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     }
 }
 
-#[cfg(not(feature = "etcd"))]
+#[cfg(not(feature = "control"))]
 fn run_server(_invocation: &Invocation) -> Result<(), String> {
-    Err("serve requires the nokv etcd feature".to_owned())
+    Err("serve requires the nokv control feature".to_owned())
 }
 
 #[cfg(test)]
@@ -1947,11 +1996,11 @@ mod tests {
         );
 
         let error = configured_agent_admission(&invocation).unwrap_err();
-        assert!(error.contains("durable etcd control"));
+        assert!(error.contains("durable control routing"));
         assert!(!error.contains("logical-shard-id"));
     }
 
-    #[cfg(feature = "etcd")]
+    #[cfg(feature = "control")]
     #[test]
     fn shard_startup_selects_every_active_root_and_no_other_placement() {
         use nokv_control::{ControlStore, InMemoryControlStore, RootAgentBinding, RootPlacement};

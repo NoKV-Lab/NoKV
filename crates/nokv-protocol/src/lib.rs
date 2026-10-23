@@ -29,9 +29,9 @@ pub use append::{
     InspectAppendCleanupRequest, RetryAppendCleanupRequest,
 };
 pub use artifact_publish::{
-    parse_sha256_digest_uri, seal_artifact_publish_plan, sha256_digest_uri,
-    ArtifactPublishPlanSeal, MAX_ARTIFACT_PUBLISH_BATCH_ROWS, MAX_ARTIFACT_PUBLISH_OBJECTS,
-    MAX_ARTIFACT_READ_PLAN_ROWS,
+    inline_artifact_body_digest, parse_sha256_digest_uri, seal_artifact_publish_plan,
+    sha256_digest_uri, ArtifactPublishPlanSeal, MAX_ARTIFACT_PUBLISH_BATCH_ROWS,
+    MAX_ARTIFACT_PUBLISH_OBJECTS, MAX_ARTIFACT_READ_PLAN_ROWS,
 };
 pub use codec::{
     decode_request, decode_response, encode_request, encode_response, MAX_FRAME_BYTES,
@@ -44,18 +44,20 @@ pub use handshake::{
     WorkspaceHandshake, HANDSHAKE_FRAME_BYTES, HANDSHAKE_PAYLOAD_BYTES, HANDSHAKE_SCHEMA_BYTES,
     WORKSPACE_HANDSHAKE_MAGIC,
 };
+pub use nokv_types::MAX_INLINE_ARTIFACT_BODY_BYTES;
 pub use request::{
     AbortArtifactPublishRequest, AbortGenericIndexRegistrationRequest, AggregateFunction,
     AggregateRequest, AggregateSpec, AppendGenericIndexRowsRequest, BeginArtifactPublishRequest,
     BeginGenericIndexRegistrationRequest, BindRestoreDestinationRequest, CatalogPathMatch,
     CatalogRequest, ChangePageRequest, CommitRequest, CompleteArtifactPublishRequest,
     CreateWorkspaceRequest, FinalizeGenericIndexRegistrationRequest, FinalizeRestoreRequest,
-    FindWorkspacesRequest, GenericIndexFieldCapability, GenericIndexFieldValues, GenericIndexRow,
-    GetGenericIndexRegistrationRequest, GetOperationRequest, GetPathRequest, GetSnapshotRequest,
-    GetWorkspaceRequest, ListPathsRequest, ListSnapshotsRequest,
-    MarkArtifactObjectsUploadedRequest, MintSnapshotRequest, ObjectUploadProof,
-    PrepareRestoreRequest, QuarantineResolution, QueryOperand, QueryOperator, QueryPredicate,
-    QueryProfile, QueryScope, ReadRestoreSourceRunManifestRequest,
+    FindWorkspacesRequest, FinishArtifactPublishRequest, GenericIndexFieldCapability,
+    GenericIndexFieldValues, GenericIndexRow, GetGenericIndexRegistrationRequest,
+    GetOperationRequest, GetPathRequest, GetSnapshotRequest, GetWorkspaceRequest, ListPathsRequest,
+    ListSnapshotsRequest, MarkArtifactObjectsUploadedRequest, MintSnapshotRequest,
+    ObjectUploadProof, PrepareArtifactPublishRequest, PrepareRestoreRequest,
+    PublishInlineArtifactRequest, QuarantineResolution, QueryOperand, QueryOperator,
+    QueryPredicate, QueryProfile, QueryScope, ReadRestoreSourceRunManifestRequest,
     ReconcileQuarantinedArtifactPublishRequest, RemovePathRequest, RenamePathRequest,
     RenewSnapshotRequest, RestoreManifestDescriptor, RestoreManifestIdentity, RestoreSource,
     RetireSnapshotRequest, SearchRequest, SortDirection, SortField, StageArtifactManifestRequest,

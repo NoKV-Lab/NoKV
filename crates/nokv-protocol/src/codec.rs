@@ -10,7 +10,7 @@ use crate::request::WorkspaceRpcRequest;
 use crate::response::WorkspaceRpcResponse;
 
 /// The exact and only accepted wire schema.
-pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v12";
+pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v14";
 /// Exact schema for the versioned workspace RPC preflight exchange.
 pub const WORKSPACE_PREFLIGHT_SCHEMA: &str = "nokv.workspace.rpc_preflight.v1";
 /// Exact schema for the advertised workspace RPC capability set.
@@ -254,6 +254,7 @@ mod tests {
                 manifest_row_count: 1,
                 manifest_seal: Digest([4; 32]),
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body_digest: None,
             }),
         };
         let without = begin(None);
@@ -271,9 +272,182 @@ mod tests {
         assert_eq!(decode_request(&encoded).unwrap(), with);
     }
 
+    fn inline_publication_request(body: &[u8]) -> crate::PublishInlineArtifactRequest {
+        let digest = crate::inline_artifact_body_digest(body);
+        let empty = Digest([0; 32]);
+        crate::PublishInlineArtifactRequest {
+            begin: crate::BeginArtifactPublishRequest {
+                append_attempt: None,
+                append_intent_digest: None,
+                operation_id: OperationIdentity([1; 16]),
+                artifact_revision_id: crate::ArtifactRevisionIdentity([2; 16]),
+                target: crate::WorkspacePath {
+                    workbench: WorkbenchName::new("run-42").unwrap(),
+                    path: crate::RelativePath::new("logs/0001.json").unwrap(),
+                },
+                authority: crate::PublicationAuthority::Visible,
+                condition: crate::PublishCondition::CreateOnly,
+                expected_workspace_incarnation_id: None,
+                staged_object_count: 0,
+                staged_object_seal: empty,
+                manifest_row_count: 0,
+                manifest_seal: empty,
+                dependency_owner_revision_ids: Vec::new(),
+                inline_body_digest: Some(digest),
+            },
+            body: body.to_vec(),
+            artifact: crate::ArtifactDescriptor {
+                logical_size: body.len() as u64,
+                body_digest: crate::sha256_digest_uri(digest),
+                manifest_digest: crate::sha256_digest_uri(empty),
+                content_type: crate::ContentType::new("application/json").unwrap(),
+                producer: None,
+                manifest_identity: None,
+                index_fields: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn inline_publication_carries_its_body_as_one_byte_string() {
+        let body = b"{\"turn\":1}\x00\x80\xff".to_vec();
+        let rpc = |operation| WorkspaceRpcRequest {
+            route: route(),
+            request_id: RequestIdentity([0x61; 16]),
+            operation,
+        };
+        let request = rpc(WorkspaceRequest::PublishInlineArtifact(
+            inline_publication_request(&body),
+        ));
+        let encoded = encode_request(&request).unwrap();
+        assert_eq!(decode_request(&encoded).unwrap(), request);
+        // One MessagePack bin8 value holds the exact body bytes.
+        let mut bin = vec![0xc4, u8::try_from(body.len()).unwrap()];
+        bin.extend_from_slice(&body);
+        assert!(encoded.windows(bin.len()).any(|window| window == bin));
+
+        let refused = |mutate: &dyn Fn(&mut crate::PublishInlineArtifactRequest)| {
+            let mut inline = inline_publication_request(&body);
+            mutate(&mut inline);
+            encode_request(&rpc(WorkspaceRequest::PublishInlineArtifact(inline))).is_err()
+        };
+        assert!(refused(&|inline| inline.body[0] = b'['));
+        assert!(refused(&|inline| inline.artifact.logical_size += 1));
+        assert!(refused(
+            &|inline| inline.begin.manifest_seal = Digest([4; 32])
+        ));
+        assert!(refused(&|inline| inline.begin.inline_body_digest = None));
+        assert!(refused(&|inline| {
+            inline.begin.authority = crate::PublicationAuthority::CommitStaging {
+                commit_operation_id: OperationIdentity([9; 16]),
+            };
+        }));
+        assert!(refused(&|inline| {
+            *inline =
+                inline_publication_request(&vec![b'x'; crate::MAX_INLINE_ARTIFACT_BODY_BYTES + 1]);
+        }));
+        assert!(refused(&|inline| *inline = inline_publication_request(b"")));
+        // A body digest is only ever admitted together with its body.
+        let begin = inline_publication_request(&body).begin;
+        assert!(encode_request(&rpc(WorkspaceRequest::BeginArtifactPublish(begin))).is_err());
+    }
+
+    #[test]
+    fn fused_publication_requests_have_one_exact_v14_encoding() {
+        let digest = crate::sha256_digest_uri(Digest([5; 32]));
+        let object = || crate::ObjectIdentity::new("objects/0").unwrap();
+        let prepare = WorkspaceRpcRequest {
+            route: route(),
+            request_id: RequestIdentity([0x51; 16]),
+            operation: WorkspaceRequest::PrepareArtifactPublish(
+                crate::PrepareArtifactPublishRequest {
+                    begin: crate::BeginArtifactPublishRequest {
+                        append_attempt: None,
+                        append_intent_digest: None,
+                        operation_id: OperationIdentity([1; 16]),
+                        artifact_revision_id: crate::ArtifactRevisionIdentity([2; 16]),
+                        target: crate::WorkspacePath {
+                            workbench: WorkbenchName::new("run-42").unwrap(),
+                            path: crate::RelativePath::new("outputs/result.bin").unwrap(),
+                        },
+                        authority: crate::PublicationAuthority::Visible,
+                        condition: crate::PublishCondition::CreateOnly,
+                        expected_workspace_incarnation_id: None,
+                        staged_object_count: 1,
+                        staged_object_seal: Digest([3; 32]),
+                        manifest_row_count: 1,
+                        manifest_seal: Digest([4; 32]),
+                        dependency_owner_revision_ids: Vec::new(),
+                        inline_body_digest: None,
+                    },
+                    objects: vec![crate::StagedObject {
+                        sequence: 0,
+                        object_identity: object(),
+                        expected_length: 1,
+                        expected_digest: digest.clone(),
+                        multipart_token: None,
+                    }],
+                },
+            ),
+        };
+        let finish = WorkspaceRpcRequest {
+            route: route(),
+            request_id: RequestIdentity([0x52; 16]),
+            operation: WorkspaceRequest::FinishArtifactPublish(
+                crate::FinishArtifactPublishRequest {
+                    token: crate::OperationToken {
+                        operation_id: OperationIdentity([1; 16]),
+                        state_digest: Digest([6; 32]),
+                    },
+                    uploaded_objects: vec![crate::ObjectUploadProof {
+                        sequence: 0,
+                        observed_length: 1,
+                        observed_digest: digest.clone(),
+                    }],
+                    manifest_rows: vec![crate::ArtifactManifestRow {
+                        object_index: 0,
+                        physical_object_index: 0,
+                        logical_offset: 0,
+                        physical_owner_revision_id: crate::ArtifactRevisionIdentity([2; 16]),
+                        object_identity: object(),
+                        object_offset: 0,
+                        length: 1,
+                        digest: digest.clone(),
+                        append_segment: None,
+                    }],
+                    dependency_owner_revision_ids: Vec::new(),
+                    artifact: crate::ArtifactDescriptor {
+                        logical_size: 1,
+                        body_digest: digest,
+                        manifest_digest: crate::sha256_digest_uri(Digest([4; 32])),
+                        content_type: crate::ContentType::new("application/octet-stream").unwrap(),
+                        producer: None,
+                        manifest_identity: None,
+                        index_fields: Vec::new(),
+                    },
+                },
+            ),
+        };
+        let mut golden = Sha256::new();
+        for request in [&prepare, &finish] {
+            let encoded = encode_request(request).unwrap();
+            assert_eq!(&decode_request(&encoded).unwrap(), request);
+            golden.update((encoded.len() as u64).to_be_bytes());
+            golden.update(encoded);
+        }
+        assert_eq!(
+            <[u8; 32]>::from(golden.finalize()),
+            [
+                9, 128, 233, 212, 239, 34, 122, 9, 113, 226, 178, 202, 131, 110, 80, 62, 62, 156,
+                15, 122, 15, 30, 236, 121, 190, 110, 51, 136, 141, 39, 248, 212
+            ],
+            "update only for an intentional fused publication v14 wire change"
+        );
+    }
+
     #[test]
     fn request_round_trips_with_exact_schema() {
-        assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v12");
+        assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v14");
         let expected = request();
         let encoded = encode_request(&expected).unwrap();
         assert!(encoded
@@ -283,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn get_path_read_version_fence_has_one_exact_v12_encoding() {
+    fn get_path_read_version_fence_has_one_exact_v14_encoding() {
         let expected = WorkspaceRpcRequest {
             route: route(),
             request_id: RequestIdentity([0x41; 16]),
@@ -305,15 +479,15 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(&encoded)),
             [
-                179, 220, 36, 137, 57, 170, 16, 113, 127, 121, 12, 54, 66, 112, 180, 80, 1, 16, 34,
-                48, 206, 193, 195, 10, 114, 163, 6, 16, 114, 126, 230, 28
+                233, 25, 246, 249, 134, 128, 133, 157, 77, 246, 24, 228, 130, 116, 219, 246, 45,
+                58, 119, 41, 22, 114, 64, 224, 6, 53, 80, 99, 98, 230, 167, 148
             ],
-            "update only for an intentional GetPath v12 wire change"
+            "update only for an intentional GetPath v14 wire change"
         );
     }
 
     #[test]
-    fn artifact_v1_query_and_catalog_keep_one_exact_v12_encoding() {
+    fn artifact_v1_query_and_catalog_keep_one_exact_v14_encoding() {
         let search = WorkspaceRpcRequest {
             route: route(),
             request_id: RequestIdentity([0x3a; 16]),
@@ -431,10 +605,10 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(golden.finalize()),
             [
-                48, 253, 178, 231, 50, 193, 139, 175, 49, 139, 216, 226, 90, 13, 27, 136, 102, 252,
-                27, 175, 160, 165, 77, 14, 209, 86, 251, 151, 56, 101, 21, 136
+                192, 107, 49, 111, 14, 154, 100, 60, 11, 62, 172, 83, 158, 137, 67, 170, 240, 179,
+                95, 245, 231, 101, 122, 19, 17, 168, 35, 183, 45, 16, 29, 44
             ],
-            "update only for an intentional ArtifactV1 v12 wire change"
+            "update only for an intentional ArtifactV1 v14 wire change"
         );
         assert_eq!(decode_request(&encoded_search).unwrap(), search);
         assert_eq!(
@@ -448,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_exact_catalog_path_match_has_one_exact_v12_encoding() {
+    fn generic_exact_catalog_path_match_has_one_exact_v14_encoding() {
         let expected = WorkspaceRpcRequest {
             route: route(),
             request_id: RequestIdentity([0x42; 16]),
@@ -475,15 +649,15 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(&encoded)),
             [
-                202, 3, 155, 179, 204, 51, 168, 138, 4, 124, 170, 103, 61, 71, 150, 159, 227, 65,
-                149, 73, 201, 142, 66, 149, 59, 115, 150, 253, 238, 154, 39, 33
+                41, 89, 72, 85, 178, 20, 23, 221, 127, 208, 178, 203, 43, 4, 49, 225, 30, 145, 157,
+                163, 101, 120, 167, 111, 25, 40, 77, 215, 57, 0, 71, 154
             ],
-            "update only for an intentional Catalog Exact v12 wire change"
+            "update only for an intentional Catalog Exact v14 wire change"
         );
     }
 
     #[test]
-    fn generic_registration_surface_has_one_exact_v12_encoding() {
+    fn generic_registration_surface_has_one_exact_v14_encoding() {
         let begin = generic_begin_request();
         let append = generic_append_request();
         let finalize = WorkspaceRpcRequest {
@@ -593,10 +767,10 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(golden.finalize()),
             [
-                76, 148, 117, 180, 52, 151, 228, 127, 234, 140, 75, 192, 248, 29, 46, 94, 196, 4,
-                57, 122, 242, 12, 110, 16, 48, 93, 115, 120, 236, 102, 84, 128
+                155, 205, 114, 179, 131, 107, 85, 23, 10, 144, 111, 199, 67, 120, 166, 186, 227,
+                214, 255, 180, 125, 87, 233, 165, 31, 151, 21, 65, 147, 99, 193, 154
             ],
-            "update only for an intentional Generic registration v12 wire change"
+            "update only for an intentional Generic registration v14 wire change"
         );
         for request in [&begin, &append, &finalize, &abort, &get] {
             assert_eq!(
@@ -1003,8 +1177,8 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(&encoded_prepare)),
             [
-                19, 184, 126, 255, 221, 167, 62, 204, 167, 139, 10, 50, 60, 97, 62, 227, 184, 120,
-                216, 104, 208, 37, 254, 45, 160, 157, 145, 121, 149, 84, 66, 80
+                117, 48, 191, 86, 84, 213, 30, 178, 73, 125, 229, 100, 139, 3, 199, 127, 209, 35,
+                78, 34, 41, 156, 68, 241, 225, 151, 237, 92, 190, 209, 154, 22
             ],
             "update only for an intentional restore-v12 wire change"
         );
@@ -1109,6 +1283,7 @@ mod tests {
                     range: None,
                     blocks: Vec::new(),
                     next_cursor: None,
+                    inline_body: None,
                 }),
             )),
         };
@@ -1132,8 +1307,8 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(complete_v12_golden.finalize()),
             [
-                67, 211, 249, 84, 52, 53, 130, 176, 253, 198, 101, 67, 121, 119, 167, 220, 59, 152,
-                156, 165, 126, 213, 114, 37, 229, 198, 254, 20, 94, 148, 15, 3
+                252, 206, 230, 107, 242, 228, 52, 109, 134, 105, 29, 232, 242, 72, 85, 20, 104,
+                201, 163, 99, 161, 130, 130, 230, 96, 116, 240, 61, 218, 43, 178, 12
             ],
             "update only for an intentional restore-v12 wire change"
         );
@@ -1254,7 +1429,7 @@ mod tests {
 
     #[test]
     fn schema_mismatch_fails_closed() {
-        for previous in ["nokv.workspace.rpc.v8", "nokv.workspace.rpc.v11"] {
+        for previous in ["nokv.workspace.rpc.v8", "nokv.workspace.rpc.v13"] {
             let encoded = rmp_serde::to_vec_named(&Frame {
                 schema: previous.to_owned(),
                 payload: request(),
@@ -1264,7 +1439,7 @@ mod tests {
                 decode_request(&encoded),
                 Err(ProtocolError::SchemaMismatch {
                     actual: previous.to_owned(),
-                    expected: "nokv.workspace.rpc.v12",
+                    expected: "nokv.workspace.rpc.v14",
                 })
             );
         }
@@ -1318,7 +1493,7 @@ mod tests {
             decode_request(&actual_v4),
             Err(ProtocolError::SchemaMismatch {
                 actual: "nokv.workspace.rpc.v4".to_owned(),
-                expected: "nokv.workspace.rpc.v12",
+                expected: "nokv.workspace.rpc.v14",
             })
         );
 
@@ -1346,7 +1521,7 @@ mod tests {
             decode_response(&encoded),
             Err(ProtocolError::SchemaMismatch {
                 actual: "nokv.workspace.rpc.v4".to_owned(),
-                expected: "nokv.workspace.rpc.v12",
+                expected: "nokv.workspace.rpc.v14",
             })
         );
     }
@@ -1460,8 +1635,8 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(encode_request(&expected).unwrap())),
             [
-                136, 147, 125, 201, 247, 93, 58, 26, 17, 129, 123, 181, 179, 183, 26, 230, 10, 178,
-                187, 91, 218, 24, 107, 190, 100, 8, 47, 131, 64, 28, 68, 16
+                123, 152, 195, 246, 92, 191, 54, 42, 101, 7, 216, 78, 213, 165, 141, 245, 53, 129,
+                88, 17, 116, 129, 116, 141, 108, 235, 149, 44, 230, 71, 236, 37
             ],
             "update only for an intentional capability-v2 wire change"
         );

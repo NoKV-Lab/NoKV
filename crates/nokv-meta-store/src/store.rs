@@ -3,13 +3,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::{Commit, ReadBatch, ReadSnapshot, StoreError, StoreProfile, WriteTxn};
+use crate::{
+    Commit, PendingCommit, ReadBatch, ReadSnapshot, StoreError, StoreProfile, Submission, WriteTxn,
+};
 
 /// Synchronous ordered transaction store for one logical metadata shard.
 ///
 /// Every read batch is linearizable and observes one consistent snapshot. A
 /// read includes every commit that this instance reported as [`Commit::Applied`]
-/// before the read began. Separate `read` calls do not share a snapshot.
+/// before the read began. Separate `read` calls do not share a snapshot. A read
+/// may also observe a [`Self::submit`] transaction whose acknowledgement is
+/// still pending; a caller must not expose such state outside the store until
+/// that transaction or a later [`Self::durability_barrier`] is acknowledged.
 ///
 /// Every write transaction evaluates its checks and mutations atomically at
 /// the store's configured acknowledgement boundary. A false check returns
@@ -31,6 +36,29 @@ pub trait TxnStore: Send + Sync {
 
     /// Evaluate all checks and mutations in one serializable transaction.
     fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError>;
+
+    /// Evaluate and apply one transaction like [`Self::commit`] without
+    /// waiting for its acknowledgement boundary.
+    ///
+    /// An applied submission is ordered after every earlier submission and
+    /// visible to later reads and submissions on this instance. It counts as
+    /// committed only after its [`PendingCommit::acknowledge`] succeeds, which
+    /// also acknowledges every earlier submission. Waiting outside a caller
+    /// lock lets serialized writers share one acknowledgement. The default
+    /// acknowledges before it returns.
+    fn submit(&self, txn: WriteTxn) -> Result<Submission, StoreError> {
+        Ok(match self.commit(txn)? {
+            Commit::Applied => Submission::Applied(PendingCommit::acknowledged()),
+            Commit::Conflict => Submission::Conflict,
+        })
+    }
+
+    /// Block until every transaction submitted before this call reaches the
+    /// acknowledgement boundary. A failure poisons the store like an unknown
+    /// commit outcome.
+    fn durability_barrier(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
 
     /// Report whether this instance can safely accept reads and commits.
     fn ready(&self) -> Result<(), StoreError>;

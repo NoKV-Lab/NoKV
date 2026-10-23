@@ -318,7 +318,7 @@ fn serve_socket_loop(
                     .map_err(ServerError::Connection)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                sleep_until_runtime_event(next_renewal);
+                wait_for_connection(&listener, next_renewal);
             }
             Err(error) => return Err(ServerError::Connection(error)),
         }
@@ -352,7 +352,37 @@ fn require_owner_retained(owner_loss: &OwnerLossSignal) -> Result<(), ServerErro
 
 fn sleep_until_runtime_event(next_renewal: Instant) {
     let until_renewal = next_renewal.saturating_duration_since(Instant::now());
-    thread::sleep(until_renewal.min(Duration::from_millis(10)));
+    thread::sleep(until_renewal.min(RUNTIME_EVENT_POLL));
+}
+
+/// Shutdown and owner-loss checks run at least this often while idle.
+const RUNTIME_EVENT_POLL: Duration = Duration::from_millis(10);
+
+/// Block until the listener has a pending connection, the next renewal is
+/// due, or the runtime poll interval elapses. A pending connection wakes the
+/// loop at once instead of waiting out a fixed sleep.
+#[cfg(unix)]
+fn wait_for_connection(listener: &TcpListener, next_renewal: Instant) {
+    use std::os::fd::AsRawFd;
+
+    let until_renewal = next_renewal.saturating_duration_since(Instant::now());
+    let timeout = until_renewal.min(RUNTIME_EVENT_POLL);
+    let mut descriptor = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: `descriptor` is one valid pollfd for a listener this function
+    // borrows for the whole call; poll writes only its `revents` field.
+    unsafe {
+        libc::poll(&mut descriptor, 1, timeout_ms);
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_for_connection(_listener: &TcpListener, next_renewal: Instant) {
+    sleep_until_runtime_event(next_renewal);
 }
 
 fn validate_ownership(
@@ -460,6 +490,10 @@ fn serve_connection(
     registry: Arc<RootOwnerRegistry>,
     options: ServerOptions,
 ) -> Result<(), ServerError> {
+    // A response must not wait for the client's delayed ACK of an earlier
+    // segment. This runs per connection, not in the accept loop, so a failure
+    // closes only this connection.
+    stream.set_nodelay(true).map_err(ServerError::Connection)?;
     if !admit_current_protocol(&mut stream, options.handshake_timeout)? {
         return Ok(());
     }
@@ -575,10 +609,8 @@ fn write_legacy_rejection_until(
     let Some(response) = legacy_rejection_response(first_frame) else {
         return Ok(());
     };
-    let length = u32::try_from(response.len())
-        .map_err(|_| ServerError::InvalidOptions("frame length exceeds u32".to_owned()))?;
-    write_all_until(stream, &length.to_be_bytes(), deadline).map_err(ServerError::Connection)?;
-    write_all_until(stream, &response, deadline).map_err(ServerError::Connection)
+    write_all_until(stream, &length_prefixed_frame(&response)?, deadline)
+        .map_err(ServerError::Connection)
 }
 
 fn read_exact_until(
@@ -669,19 +701,29 @@ fn read_frame(reader: &mut impl Read) -> Result<Option<Vec<u8>>, ServerError> {
 }
 
 fn write_frame(writer: &mut impl Write, frame: &[u8]) -> Result<(), ServerError> {
-    if frame.len() > MAX_FRAME_BYTES {
+    writer
+        .write_all(&length_prefixed_frame(frame)?)
+        .map_err(ServerError::Connection)?;
+    writer.flush().map_err(ServerError::Connection)
+}
+
+/// Builds one complete frame, the four-byte big-endian length followed by the
+/// payload, so it leaves in a single write. Writing the prefix on its own lets
+/// Nagle's algorithm hold the payload until the client acknowledges the prefix,
+/// and delayed ACK postpones that acknowledgement by tens of milliseconds.
+fn length_prefixed_frame(payload: &[u8]) -> Result<Vec<u8>, ServerError> {
+    if payload.len() > MAX_FRAME_BYTES {
         return Err(ServerError::FrameTooLarge {
-            bytes: frame.len(),
+            bytes: payload.len(),
             max: MAX_FRAME_BYTES,
         });
     }
-    let length = u32::try_from(frame.len())
+    let length = u32::try_from(payload.len())
         .map_err(|_| ServerError::InvalidOptions("frame length exceeds u32".to_owned()))?;
-    writer
-        .write_all(&length.to_be_bytes())
-        .map_err(ServerError::Connection)?;
-    writer.write_all(frame).map_err(ServerError::Connection)?;
-    writer.flush().map_err(ServerError::Connection)
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(payload);
+    Ok(frame)
 }
 
 #[cfg(test)]
@@ -839,6 +881,70 @@ mod tests {
         let mut cursor = Cursor::new(encoded);
         assert_eq!(read_frame(&mut cursor).unwrap(), Some(expected.to_vec()));
         assert_eq!(read_frame(&mut cursor).unwrap(), None);
+    }
+
+    /// Writer that keeps every `write` call as a separate entry.
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.writes.push(buffer.to_vec());
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn response_frame_leaves_in_one_write() {
+        let response = b"workspace response";
+        let mut writer = RecordingWriter::default();
+        write_frame(&mut writer, response).unwrap();
+
+        let mut expected = (response.len() as u32).to_be_bytes().to_vec();
+        expected.extend_from_slice(response);
+        assert_eq!(writer.writes, vec![expected]);
+    }
+
+    #[test]
+    fn oversized_outbound_frame_is_rejected_before_writing() {
+        let mut writer = RecordingWriter::default();
+        assert!(matches!(
+            write_frame(&mut writer, &vec![0_u8; MAX_FRAME_BYTES + 1]),
+            Err(ServerError::FrameTooLarge { .. })
+        ));
+        assert!(writer.writes.is_empty());
+    }
+
+    #[test]
+    fn accepted_connection_disables_nagle() {
+        let (mut client, server) = streams();
+        let accepted = server.try_clone().unwrap();
+        assert!(!accepted.nodelay().unwrap());
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || serve_connection(server, registry, options()));
+
+        let hello =
+            WorkspaceHandshake::new(HandshakeKind::ClientHello, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
+        client
+            .write_all(&encode_handshake_frame(&hello).unwrap())
+            .unwrap();
+        let mut reply = [0_u8; HANDSHAKE_FRAME_BYTES];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(
+            decode_handshake_frame(&reply).unwrap().kind(),
+            HandshakeKind::Accepted
+        );
+        assert!(accepted.nodelay().unwrap());
+
+        client.shutdown(Shutdown::Write).unwrap();
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
     }
 
     #[test]

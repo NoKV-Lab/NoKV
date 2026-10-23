@@ -36,6 +36,7 @@ pub struct ClientConfig {
 pub enum RoutingConfig {
     Static(StaticRoutingConfig),
     Etcd(EtcdRoutingConfig),
+    Local(LocalRoutingConfig),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +53,12 @@ pub struct EtcdRoutingConfig {
     pub endpoints: Vec<String>,
     pub key_prefix: String,
     pub lease_ttl_seconds: i64,
+}
+
+/// Single-host control directory shared by the owner and its clients.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalRoutingConfig {
+    pub directory: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +126,8 @@ pub enum Command {
         tool: String,
         arguments: String,
     },
+    /// Sequential Workbench calls, one JSON line each, over one client.
+    WorkbenchSession,
     Mcp {
         profile: McpProfile,
     },
@@ -161,6 +170,33 @@ pub enum Command {
         json: bool,
     },
     Help,
+}
+
+impl Command {
+    /// Whether this invocation may create artifact objects.
+    ///
+    /// Provider admission proves create semantics with several block-sized
+    /// probe writes. A command that only reads objects skips it: every block
+    /// it reads is verified against its digest, and a command misclassified
+    /// here still cannot write, because publication requires the receipt.
+    pub fn creates_objects(&self) -> bool {
+        match self {
+            Self::Workbench { tool, .. } => !matches!(
+                tool.as_str(),
+                "workbench_aggregate"
+                    | "workbench_catalog"
+                    | "workbench_find"
+                    | "workbench_grep"
+                    | "workbench_list"
+                    | "workbench_read"
+                    | "workbench_search"
+                    | "workbench_snapshot_list"
+                    | "workbench_stat"
+            ),
+            Self::Materialize { .. } => false,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -264,7 +300,7 @@ impl fmt::Display for CliError {
             ),
             Self::OperationInput { message, .. } => formatter.write_str(message),
             Self::MixedRoutingOptions => formatter.write_str(
-                "static metadata routing options and etcd routing options cannot be combined",
+                "static metadata routing, etcd routing, and --control-dir cannot be combined",
             ),
             Self::MixedMetadataStoreOptions => formatter
                 .write_str("--metadata-create, --metadata-reopen, and --metadata-recover-log are mutually exclusive"),
@@ -360,6 +396,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     let mut append_activity_lease_explicit = false;
     let mut static_routing = StaticRoutingConfig::default();
     let mut etcd_routing = EtcdRoutingConfig::default();
+    let mut control_directory = None;
     let mut routing_kind = None;
     let mut agent_id = None;
     let mut workbench_root = None;
@@ -412,6 +449,10 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             "--etcd-key-prefix" => {
                 select_routing(&mut routing_kind, RoutingKind::Etcd)?;
                 etcd_routing.key_prefix = next_value(&mut arguments, &argument)?;
+            }
+            "--control-dir" => {
+                select_routing(&mut routing_kind, RoutingKind::Local)?;
+                control_directory = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
             }
             "--etcd-lease-ttl-seconds" => {
                 select_routing(&mut routing_kind, RoutingKind::Etcd)?;
@@ -560,6 +601,9 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     client.routing = match routing_kind.unwrap_or(RoutingKind::Static) {
         RoutingKind::Static => RoutingConfig::Static(static_routing),
         RoutingKind::Etcd => RoutingConfig::Etcd(etcd_routing),
+        RoutingKind::Local => RoutingConfig::Local(LocalRoutingConfig {
+            directory: control_directory.ok_or(CliError::MissingOption("--control-dir"))?,
+        }),
     };
     if let Some(argument) = arguments.next() {
         return Err(CliError::UnexpectedArgument(argument));
@@ -571,7 +615,10 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     }
     if matches!(
         &command,
-        Command::Workbench { .. } | Command::Mcp { .. } | Command::Collect { .. }
+        Command::Workbench { .. }
+            | Command::WorkbenchSession
+            | Command::Mcp { .. }
+            | Command::Collect { .. }
     ) && workbench_root.is_none()
     {
         return Err(CliError::MissingOption("--workbench-root"));
@@ -579,6 +626,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     if matches!(
         &command,
         Command::Workbench { .. }
+            | Command::WorkbenchSession
             | Command::Mcp { .. }
             | Command::Materialize { .. }
             | Command::Collect { .. }
@@ -604,6 +652,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
 enum RoutingKind {
     Static,
     Etcd,
+    Local,
 }
 
 fn select_routing(
@@ -642,6 +691,7 @@ fn parse_command(
                 .ok_or(CliError::MissingArgument("Workbench tool name"))?,
             arguments: arguments.next().unwrap_or_else(|| "{}".to_owned()),
         }),
+        "workbench-session" => Ok(Command::WorkbenchSession),
         "mcp" => parse_mcp(arguments),
         "materialize" => Ok(Command::Materialize {
             workbench: arguments
@@ -1081,10 +1131,78 @@ fn hex_nibble(byte: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_commands_that_read_objects_skip_provider_admission() {
+        let tool = |name: &str| Command::Workbench {
+            tool: name.to_owned(),
+            arguments: "{}".to_owned(),
+        };
+        for name in [
+            "workbench_aggregate",
+            "workbench_catalog",
+            "workbench_find",
+            "workbench_grep",
+            "workbench_list",
+            "workbench_read",
+            "workbench_search",
+            "workbench_snapshot_list",
+            "workbench_stat",
+        ] {
+            assert!(!tool(name).creates_objects(), "{name}");
+        }
+        for name in [
+            "workbench_append",
+            "workbench_commit",
+            "workbench_create",
+            "workbench_edit",
+            "workbench_put_file",
+            "workbench_restore",
+            "workbench_snapshot",
+            "workbench_snapshot_renew",
+            "workbench_snapshot_retire",
+            "workbench_unknown",
+        ] {
+            assert!(tool(name).creates_objects(), "{name}");
+        }
+        assert!(!Command::Materialize {
+            workbench: "w".to_owned(),
+            section: "outputs".to_owned(),
+            path: "a.txt".to_owned(),
+            destination: PathBuf::from("a.txt"),
+        }
+        .creates_objects());
+        assert!(Command::WorkbenchSession.creates_objects());
+    }
+
     use super::*;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn workbench_session_requires_the_same_identity_and_presentation_root() {
+        assert_eq!(
+            parse(args(&["workbench-session"])),
+            Err(CliError::MissingOption("--workbench-root"))
+        );
+        assert_eq!(
+            parse(args(&[
+                "--workbench-root",
+                "/agents/test/wb",
+                "workbench-session"
+            ])),
+            Err(CliError::MissingOption("--agent-id"))
+        );
+        let parsed = parse(args(&[
+            "--workbench-root",
+            "/agents/test/wb",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "workbench-session",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.command, Command::WorkbenchSession);
     }
 
     #[test]
@@ -1677,6 +1795,42 @@ mod tests {
             ])),
             Err(CliError::MixedRoutingOptions)
         );
+    }
+
+    #[test]
+    fn local_control_routing_names_one_directory_and_mixes_with_nothing() {
+        let parsed = parse(args(&[
+            "--root-id",
+            "11",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--control-dir",
+            "/var/lib/nokv/control",
+            "provision",
+            "22222222222222222222222222222222",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.client.routing,
+            RoutingConfig::Local(LocalRoutingConfig {
+                directory: PathBuf::from("/var/lib/nokv/control"),
+            })
+        );
+        for other in [
+            ["--etcd-endpoint", "http://127.0.0.1:2379"],
+            ["--metadata-address", "127.0.0.1:7750"],
+        ] {
+            assert_eq!(
+                parse(args(&[
+                    "--control-dir",
+                    "/var/lib/nokv/control",
+                    other[0],
+                    other[1],
+                    "serve",
+                ])),
+                Err(CliError::MixedRoutingOptions)
+            );
+        }
     }
 
     #[test]

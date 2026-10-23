@@ -43,19 +43,38 @@ def require(condition, message, evidence=None):
 
 
 class PublicationProxy(base.EvidenceDropProxy):
-    """Metadata proxy with an exact pre-Begin rendezvous and observed ACK loss."""
+    """Metadata proxy with an exact pre-admission rendezvous and observed ACK loss."""
 
     def __init__(self, port, timeout, stack):
         super().__init__(port, timeout, stack)
         self.rendezvous = None
-        self.rendezvous_operation = "begin_artifact_publish"
+        self.rendezvous_operation = "prepare_artifact_publish"
         self.rendezvous_entries = []
 
-    def begin_rendezvous(self, count, *, operation_name="begin_artifact_publish"):
+    def begin_rendezvous(self, count, *, operation_name="prepare_artifact_publish"):
         require(self.rendezvous is None, "only one admission rendezvous")
+        self.track_operations()
         self.rendezvous = threading.Barrier(count)
         self.rendezvous_operation = operation_name
         self.rendezvous_entries = []
+
+    def track_operations(self):
+        """Start a new run of sent operations, as arming a fault does."""
+        with self._lock:
+            self.operations_since_arm = []
+
+    def require_shapes(self, expected, label):
+        """Fail as a shape mismatch, not as a missed fault or a timeout, when
+        the commands since the last arm or track used another publication."""
+        with self._lock:
+            sent = list(self.operations_since_arm)
+        shapes = base.publication_shapes(sent)
+        if shapes != list(expected):
+            raise base.infra.WorkflowFailure(
+                f"publication shape mismatch at {label}: expected {list(expected)}, "
+                f"but it sent {sent} ({shapes or 'no publication'})"
+            )
+        return shapes
 
     def _forward(self, client):
         operation = None
@@ -77,6 +96,7 @@ class PublicationProxy(base.EvidenceDropProxy):
                         operation = req["payload"]["operation"]["operation"]
                         barrier = None
                         with self._lock:
+                            self.operations_since_arm.append(operation)
                             if (
                                 operation == self.rendezvous_operation
                                 and self.rendezvous is not None
@@ -548,6 +568,12 @@ class ProductStack(base.IsolatedStack):
             self.object_proxy.close()
 
 
+def above_inline_bound(unit):
+    """`unit` repeated past the inline bound. At the default block size the
+    body is one object, published by the fused Prepare/Finish pair."""
+    return unit * (base.MAX_INLINE_BODY_BYTES // len(unit) + 1)
+
+
 def append(
     stack,
     workbench,
@@ -894,7 +920,10 @@ def caller_boundary_completion(stack, deadline, operation):
     )
     workbench = "product-caller-" + suffix.replace("_", "-")
     operation_id = hashlib.sha256(workbench.encode()).hexdigest()[:32]
+    shape = base.PUBLICATION_SHAPES[operation]
     text = "caller-recovery-event\n"
+    if shape != "inline":
+        text = above_inline_bound(text)
     label = "caller-kill-" + suffix
     stack.cli("workbench_create", {"id": workbench})
     owner_pid = stack.owner.pid
@@ -903,6 +932,7 @@ def caller_boundary_completion(stack, deadline, operation):
         stack, workbench, operation_id, text, label=label, max_size=1024 * 1024
     )
     stack.proxy.wait_dropped()
+    stack.proxy.require_shapes([shape], label)
     require(first.get("status") == "caller_killed", "caller was actually killed", first)
     require(
         stack.owner.pid == owner_pid and stack.owner.poll() is None,
@@ -967,14 +997,24 @@ def caller_boundary_completion(stack, deadline, operation):
     )
 
 
-def deterministic_same_identity(stack, deadline):
-    workbench, operation_id, text = (
-        "product-admission-race",
-        "c2" * 16,
-        "one-concurrent-event\n",
-    )
+# The one request that admits a publication of each shape; racers are held
+# before it. The original object-backed fixtures race Prepare.
+ADMISSION_OPERATIONS = {
+    "fused": "prepare_artifact_publish",
+    "inline": "publish_inline_artifact",
+}
+
+
+def deterministic_same_identity(stack, deadline, shape="fused"):
+    inline = shape == "inline"
+    tag = "inline-" if inline else ""
+    workbench = f"product-{tag}admission-race"
+    operation_id = ("c6" if inline else "c2") * 16
+    text = "one-concurrent-event\n"
+    if not inline:
+        text = above_inline_bound(text)
     stack.cli("workbench_create", {"id": workbench})
-    stack.proxy.begin_rendezvous(2)
+    stack.proxy.begin_rendezvous(2, operation_name=ADMISSION_OPERATIONS[shape])
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             futures = [
@@ -984,12 +1024,13 @@ def deterministic_same_identity(stack, deadline):
                     workbench,
                     operation_id,
                     text,
-                    label=f"admission-racer-{index}",
+                    label=f"{tag}admission-racer-{index}",
                     max_size=1024 * 1024,
                 )
                 for index in range(2)
             ]
             first = [future.result() for future in futures]
+        stack.proxy.require_shapes([shape], tag + "admission-racers")
         entries = stack.proxy.rendezvous_entries
         require(
             len(entries) == 2,
@@ -1003,7 +1044,7 @@ def deterministic_same_identity(stack, deadline):
         workbench,
         operation_id,
         text,
-        label="admission-reconcile",
+        label=tag + "admission-reconcile",
         deadline=deadline,
     )
     require(recovered is not None, "concurrent same identity completes", outcomes)
@@ -1024,20 +1065,21 @@ def deterministic_same_identity(stack, deadline):
     require(
         recovered["generation"] == 1, "exactly one publication generation", recovered
     )
-    exact_body(stack, workbench, text.encode(), "admission-exact-body")
+    exact_body(stack, workbench, text.encode(), tag + "admission-exact-body")
     replay = replay_unchanged(
         stack,
         workbench,
         operation_id,
         text,
         recovered,
-        "admission-replay",
+        tag + "admission-replay",
         max_size=1024 * 1024,
     )
-    intent_race = different_intent_admission(stack)
+    intent_race = different_intent_admission(stack, shape)
     return case_result(
         safety="PASS",
         completion="PASS",
+        publication_shape=shape,
         requests_held_before_forward=2,
         initial_results=first,
         retry_outcomes=outcomes,
@@ -1046,11 +1088,16 @@ def deterministic_same_identity(stack, deadline):
     )
 
 
-def different_intent_admission(stack):
-    workbench, operation_id = "product-admission-intent-race", "cf" * 16
+def different_intent_admission(stack, shape):
+    inline = shape == "inline"
+    tag = "inline-" if inline else ""
+    workbench = f"product-{tag}admission-intent-race"
+    operation_id = ("ce" if inline else "cf") * 16
     payloads = (b"intent-A\n", b"intent-B\n")
+    if not inline:
+        payloads = tuple(map(above_inline_bound, payloads))
     stack.cli("workbench_create", {"id": workbench})
-    stack.proxy.begin_rendezvous(2)
+    stack.proxy.begin_rendezvous(2, operation_name=ADMISSION_OPERATIONS[shape])
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             futures = [
@@ -1060,11 +1107,12 @@ def different_intent_admission(stack):
                     workbench,
                     operation_id,
                     payload,
-                    label=f"intent-racer-{index}",
+                    label=f"{tag}intent-racer-{index}",
                 )
                 for index, payload in enumerate(payloads)
             ]
             results = [future.result() for future in futures]
+        stack.proxy.require_shapes([shape], tag + "intent-racers")
         require(
             len(stack.proxy.rendezvous_entries) == 2,
             "two distinct intents reached Begin before either was forwarded",
@@ -1090,14 +1138,16 @@ def different_intent_admission(stack):
         "losing intent has a precise replay-mismatch error",
         loser,
     )
-    exact_body(stack, workbench, payloads[winner_index], "intent-race-exact-winner")
+    exact_body(
+        stack, workbench, payloads[winner_index], tag + "intent-race-exact-winner"
+    )
     replay = replay_unchanged(
         stack,
         workbench,
         operation_id,
         payloads[winner_index],
         winner,
-        "intent-race-winner-replay",
+        tag + "intent-race-winner-replay",
     )
     return {
         "initial_results": results,
@@ -1108,13 +1158,15 @@ def different_intent_admission(stack):
 
 
 def object_put_response_loss(stack, deadline):
+    # Only an object-backed body sends the artifact PUT this fault targets.
     workbench, operation_id, payload = (
         "product-object-put-loss",
         "c3" * 16,
-        "provider-persisted-event\n",
+        above_inline_bound("provider-persisted-event\n"),
     )
     stack.cli("workbench_create", {"id": workbench})
     before = stack.object_proxy.arm("PUT", "drop_success")
+    stack.proxy.track_operations()
     first = append(
         stack,
         workbench,
@@ -1123,6 +1175,7 @@ def object_put_response_loss(stack, deadline):
         label="put-loss-first",
         max_size=1024 * 1024,
     )
+    stack.proxy.require_shapes(["fused"], "put-loss-first")
     fault = stack.object_proxy.verify_fault(before)
     recovered, outcomes = recover_same_identity(
         stack,
@@ -1165,9 +1218,14 @@ def object_put_response_loss(stack, deadline):
 
 def object_read_integrity(stack, deadline):
     workbench, seed_id, append_id = "product-object-read-fault", "c4" * 16, "c5" * 16
+    # The fault corrupts the provider read of the append base, so the base is
+    # object-backed; an inline base is read from shard metadata instead.
+    seed_text = above_inline_bound("seed\n")
     stack.cli("workbench_create", {"id": workbench})
-    seed = append(stack, workbench, seed_id, "seed\n", label="read-fault-seed")
+    stack.proxy.track_operations()
+    seed = append(stack, workbench, seed_id, seed_text, label="read-fault-seed")
     require(seed.get("status") == "success", "read-fault seed", seed)
+    stack.proxy.require_shapes(["fused"], "read-fault-seed")
     before_live = live_path(stack, workbench, "read-fault-live-before")
     before = stack.object_proxy.arm("GET", "corrupt_body")
     result = append(
@@ -1201,7 +1259,7 @@ def object_read_integrity(stack, deadline):
         "same identity works after a pre-admission read fault clears",
         outcomes,
     )
-    exact_body(stack, workbench, b"seed\ntail\n", "read-fault-final")
+    exact_body(stack, workbench, (seed_text + "tail\n").encode(), "read-fault-final")
     return case_result(
         safety="PASS",
         completion="PASS",
@@ -1211,14 +1269,20 @@ def object_read_integrity(stack, deadline):
     )
 
 
-def distinct_identity_exact_bytes(stack, deadline):
-    workbench, count = "product-distinct-race", 4
+def distinct_identity_exact_bytes(stack, deadline, shape="fused"):
+    tag = "distinct-" if shape == "fused" else "distinct-inline-"
+    workbench, count = f"product-{tag}race", 4
     stack.cli("workbench_create", {"id": workbench})
     ids = [
-        hashlib.sha256(f"distinct-{index}".encode()).hexdigest()[:32]
+        hashlib.sha256(f"{tag}{index}".encode()).hexdigest()[:32]
         for index in range(count)
     ]
     payloads = [f"event-{index:02d}\n" for index in range(count)]
+    if shape == "fused":
+        # An object-backed delta stays admitted until Finish, so a racer can
+        # lose the generation CAS after admission and then complete through
+        # child cleanup and a same-ID successor.
+        payloads = [above_inline_bound(payload) for payload in payloads]
     barrier = threading.Barrier(count)
     workload_started = time.monotonic()
 
@@ -1229,12 +1293,14 @@ def distinct_identity_exact_bytes(stack, deadline):
             workbench,
             ids[index],
             payloads[index],
-            label=f"distinct-initial-{index}",
+            label=f"{tag}initial-{index}",
             max_size=1024 * 1024,
         )
 
+    stack.proxy.track_operations()
     with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
         initial = list(pool.map(call, range(count)))
+    stack.proxy.require_shapes([shape], tag + "initial")
     receipts = []
     attempt_indexes = {}
     for index in range(count):
@@ -1243,7 +1309,7 @@ def distinct_identity_exact_bytes(stack, deadline):
             workbench,
             ids[index],
             payloads[index],
-            label=f"distinct-reconcile-{index}",
+            label=f"{tag}reconcile-{index}",
             deadline=deadline,
         )
         require(
@@ -1256,9 +1322,7 @@ def distinct_identity_exact_bytes(stack, deadline):
                 (initial[index], result),
             )
         receipts.append(result)
-        status = operation_status(
-            stack, ids[index], f"distinct-terminal-attempt-{index}"
-        )
+        status = operation_status(stack, ids[index], f"{tag}terminal-attempt-{index}")
         validate_parent_child_mapping(stack, ids[index], status, result)
         attempt_indexes[ids[index]] = status["attempt"]
     workload_seconds = time.monotonic() - workload_started
@@ -1270,15 +1334,15 @@ def distinct_identity_exact_bytes(stack, deadline):
     )
     ordered = sorted(zip(receipts, payloads), key=lambda pair: pair[0]["generation"])
     expected = "".join(payload for _, payload in ordered).encode()
-    exact_body(stack, workbench, expected, "distinct-complete-byte-oracle")
-    live_before = live_path(stack, workbench, "distinct-live-before-replay")
+    exact_body(stack, workbench, expected, tag + "complete-byte-oracle")
+    live_before = live_path(stack, workbench, tag + "live-before-replay")
     for index in range(count):
         result = append(
             stack,
             workbench,
             ids[index],
             payloads[index],
-            label=f"distinct-history-{index}",
+            label=f"{tag}history-{index}",
             max_size=1024 * 1024,
         )
         require(
@@ -1287,15 +1351,15 @@ def distinct_identity_exact_bytes(stack, deadline):
             result,
         )
     require(
-        live_path(stack, workbench, "distinct-live-after-replay") == live_before,
+        live_path(stack, workbench, tag + "live-after-replay") == live_before,
         "historical replays preserve final live generation",
     )
     stack.restart()
-    exact_body(stack, workbench, expected, "distinct-reopened-byte-oracle")
+    exact_body(stack, workbench, expected, tag + "reopened-byte-oracle")
     timings = [
         value
         for value in stack.append_timings
-        if value["label"].startswith(("distinct-initial-", "distinct-reconcile-"))
+        if value["label"].startswith((tag + "initial-", tag + "reconcile-"))
     ]
     ordered_latencies = sorted(value["wall_seconds"] for value in timings)
 
@@ -1332,6 +1396,7 @@ def distinct_identity_exact_bytes(stack, deadline):
     return case_result(
         safety="PASS",
         completion="PASS",
+        publication_shape=shape,
         initial_results=initial,
         receipts=receipts,
         exact_expected_utf8=expected.decode(),
@@ -1401,13 +1466,18 @@ def cross_root_identity(stack):
 
 def boundary_and_capacity(stack):
     block = 4 * 1024 * 1024
+    inline = base.MAX_INLINE_BODY_BYTES
     outcomes = []
-    for index, size in enumerate((0, 1, block - 1, block, block + 1)):
+    sizes = (0, 1, inline, inline + 1, block - 1, block, block + 1)
+    for index, size in enumerate(sizes):
         workbench = f"product-size-{size}"
         operation_id = hashlib.sha256(workbench.encode()).hexdigest()[:32]
         stack.cli("workbench_create", {"id": workbench})
         payload = (b"\0\xffboundary\n" * (size // 11 + 1))[:size]
         require(len(payload) == size, "boundary fixture exact size")
+        # Only a non-empty body within the inline bound publishes inline.
+        shape = "inline" if 0 < size <= inline else "fused"
+        stack.proxy.track_operations()
         result = append(
             stack,
             workbench,
@@ -1424,6 +1494,7 @@ def boundary_and_capacity(stack):
             "zero/block-boundary append",
             result,
         )
+        stack.proxy.require_shapes([shape], f"size-{size}")
         exact_body(stack, workbench, payload, f"size-{size}-body")
         replay = replay_unchanged(
             stack,
@@ -1571,6 +1642,7 @@ def publication_batch_boundaries(stack):
         payload = b"".join(
             index.to_bytes(4, "big") * (block_size // 4) for index in range(blocks)
         )
+        stack.proxy.track_operations()
         result = append(
             stack,
             workbench,
@@ -1585,6 +1657,11 @@ def publication_batch_boundaries(stack):
             and result.get("logical_size") == blocks * block_size,
             "bounded batch-spanning append succeeds",
             result,
+        )
+        # One batch holds 192 objects: a plan that fits it publishes through
+        # the fused Prepare/Finish pair, a larger one through stepwise batches.
+        stack.proxy.require_shapes(
+            ["fused" if blocks <= 192 else "stepwise"], f"batch-{blocks}-original"
         )
         exact_body(stack, workbench, payload, f"batch-{blocks}-readback")
         replay = replay_unchanged(
@@ -1664,15 +1741,17 @@ def completed_replay_provider_unavailable(stack):
 
 
 def late_put_after_cleanup(stack, deadline):
+    # Only an object-backed body sends the artifact PUT this scenario holds.
     workbench, operation_id, payload = (
         "product-late-put",
         "fc" * 16,
-        b"one-late-provider-event\n",
+        above_inline_bound(b"one-late-provider-event\n"),
     )
     label = "late-put-caller"
     stack.cli("workbench_create", {"id": workbench})
     owner_pid = stack.owner.pid
     stack.object_proxy.hold_next_put()
+    stack.proxy.track_operations()
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(
@@ -1684,8 +1763,16 @@ def late_put_after_cleanup(stack, deadline):
                 label=label,
                 max_size=1024 * 1024,
             )
+            held_by = time.monotonic() + stack.timeout
+            while not (stack.object_proxy.held.wait(0.1) or future.done()):
+                require(
+                    time.monotonic() < held_by,
+                    "actual complete artifact PUT received before forwarding",
+                )
+            # A caller that exits without sending a PUT used another shape.
+            stack.proxy.require_shapes(["fused"], label)
             require(
-                stack.object_proxy.held.wait(stack.timeout),
+                stack.object_proxy.held.is_set(),
                 "actual complete artifact PUT received before forwarding",
             )
             held = stack.object_proxy.held_request
@@ -2733,11 +2820,15 @@ def recover_same_identity(
 
 
 def owner_begin_completion(stack, deadline):
-    """Committed Begin, lost response, real owner SIGKILL, same-ID completion."""
+    """Committed Prepare, lost response, real owner SIGKILL, same-ID completion."""
     workbench = "product-owner-begin-completion"
-    operation_id, text = "b1" * 16, "one-recoverable-event\n"
+    # Only an object-backed body is admitted (Prepare) before it completes;
+    # an inline publication admits and completes in one request
+    # (docs/metadata-schema.md, PublishInlineArtifact).
+    operation_id = "b1" * 16
+    text = above_inline_bound("one-recoverable-event\n")
     stack.cli("workbench_create", {"id": workbench})
-    stack.proxy.arm("begin_artifact_publish", lambda: stack.owner.kill())
+    stack.proxy.arm("prepare_artifact_publish", lambda: stack.owner.kill())
     first = base.native_append(
         stack,
         workbench,
@@ -2747,6 +2838,7 @@ def owner_begin_completion(stack, deadline):
         check=False,
     )
     stack.proxy.wait_dropped()
+    stack.proxy.require_shapes(["fused"], "owner-begin-first")
     dropped = stack.proxy.last_drop
     require(dropped is not None, "successful Begin fault must actually fire")
     require(first.get("status") == "error", "first caller observed no success", first)
@@ -2802,19 +2894,29 @@ def main():
                     stack, args.completion_timeout_seconds, operation
                 )
             )
+            # A one-batch append has two durable publication boundaries:
+            # Prepare (admission and staged objects) and Finish. A body
+            # within the inline bound has one: PublishInlineArtifact.
             for operation in (
-                "begin_artifact_publish",
-                "stage_artifact_objects",
-                "mark_artifact_objects_uploaded",
-                "stage_artifact_manifest",
-                "complete_artifact_publish",
+                "prepare_artifact_publish",
+                "finish_artifact_publish",
+                "publish_inline_artifact",
             )
         },
+        # The original race fixtures are object-backed; *_inline races small ones.
         "deterministic_same_identity": lambda stack, args: deterministic_same_identity(
             stack, args.completion_timeout_seconds
         ),
+        "deterministic_same_identity_inline": lambda stack,
+        args: deterministic_same_identity(
+            stack, args.completion_timeout_seconds, "inline"
+        ),
         "distinct_identity_exact_bytes": lambda stack,
         args: distinct_identity_exact_bytes(stack, args.completion_timeout_seconds),
+        "distinct_identity_exact_bytes_inline": lambda stack,
+        args: distinct_identity_exact_bytes(
+            stack, args.completion_timeout_seconds, "inline"
+        ),
         "object_put_response_loss": lambda stack, args: object_put_response_loss(
             stack, args.completion_timeout_seconds
         ),

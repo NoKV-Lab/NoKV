@@ -21,5 +21,11 @@ etcd = ["dep:etcd-client", "dep:tokio"]
 etcd-client = { workspace = true, optional = true }
 nokv-types.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 tokio = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

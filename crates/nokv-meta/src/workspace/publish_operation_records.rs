@@ -20,6 +20,9 @@ use nokv_types::{
 
 /// Durable value format for publication-owned payloads.
 pub const PUBLISH_VALUE_FORMAT_VERSION: u8 = 7;
+/// Durable value format for the publish operation record. Version 8 adds the
+/// sealed digest of a body published inline.
+pub const PUBLISH_OPERATION_VALUE_FORMAT_VERSION: u8 = 8;
 
 /// Hard safety bound for one publish operation's staged-object ledger.
 pub const MAX_STAGED_OBJECTS: u32 = 1_048_576;
@@ -184,6 +187,10 @@ pub struct PublishOperationRecord {
     pub dependency_count: u8,
     pub dependency_depth: u8,
     pub dependency_digest: [u8; SHA256_BYTES],
+    /// SHA-256 of the exact body a publication stores inline instead of
+    /// objects; such a publication seals no staged objects, manifest rows, or
+    /// dependencies.
+    pub inline_body_digest: Option<[u8; SHA256_BYTES]>,
 
     /// Number of staged-object and manifest rows durably removed by cleanup.
     pub cleanup_staged_object_cursor: u32,
@@ -595,6 +602,18 @@ impl PublishOperationRecord {
                 field: "activity_deadline_ms",
             });
         }
+        if self.inline_body_digest.is_some()
+            && (!matches!(self.authority, PublishAuthority::Visible)
+                || self.staged_object_count != 0
+                || self.manifest_row_count != 0
+                || self.dependency_count != 0)
+        {
+            return Err(PublishRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason:
+                    "an inline body is a visible publication without objects, rows, or dependencies",
+            });
+        }
         if self.staged_object_count > MAX_STAGED_OBJECTS {
             return Err(PublishRecordError::CountOutOfRange {
                 field: "staged_object_count",
@@ -840,7 +859,7 @@ impl PublishOperationRecord {
         self.validate()?;
         let path = self.path.as_str().as_bytes();
         let mut encoded = Vec::with_capacity(256 + path.len());
-        encoded.push(PUBLISH_VALUE_FORMAT_VERSION);
+        encoded.push(PUBLISH_OPERATION_VALUE_FORMAT_VERSION);
         encoded.extend_from_slice(self.operation_id.as_bytes());
         encoded.extend_from_slice(&self.identity_digest);
         encoded.extend_from_slice(&self.initialization_digest);
@@ -896,6 +915,7 @@ impl PublishOperationRecord {
         encoded.push(self.dependency_count);
         encoded.push(self.dependency_depth);
         encoded.extend_from_slice(&self.dependency_digest);
+        push_optional_fixed(&mut encoded, &self.inline_body_digest);
         encoded.extend_from_slice(&self.cleanup_staged_object_cursor.to_be_bytes());
         encoded.extend_from_slice(&self.cleanup_manifest_cursor.to_be_bytes());
         encoded.extend_from_slice(&self.cleanup_retry_count.to_be_bytes());
@@ -917,7 +937,7 @@ impl PublishOperationRecord {
             MAX_PUBLISH_OPERATION_RECORD_BYTES,
         )?;
         let mut decoder = Decoder::new(encoded);
-        decoder.require_value_version()?;
+        decoder.require_version(PUBLISH_OPERATION_VALUE_FORMAT_VERSION)?;
         let operation_id = OperationId::from_bytes(decoder.fixed("operation_id")?);
         let identity_digest = decoder.fixed("identity_digest")?;
         let initialization_digest = decoder.fixed("initialization_digest")?;
@@ -1010,6 +1030,7 @@ impl PublishOperationRecord {
         let dependency_count = decoder.u8("dependency_count")?;
         let dependency_depth = decoder.u8("dependency_depth")?;
         let dependency_digest = decoder.fixed("dependency_digest")?;
+        let inline_body_digest = decoder.optional_fixed("inline_body_digest")?;
         let cleanup_staged_object_cursor = decoder.u32("cleanup_staged_object_cursor")?;
         let cleanup_manifest_cursor = decoder.u32("cleanup_manifest_cursor")?;
         let cleanup_retry_count = decoder.u64("cleanup_retry_count")?;
@@ -1047,6 +1068,7 @@ impl PublishOperationRecord {
             dependency_count,
             dependency_depth,
             dependency_digest,
+            inline_body_digest,
             cleanup_staged_object_cursor,
             cleanup_manifest_cursor,
             cleanup_retry_count,
@@ -1869,14 +1891,15 @@ impl<'a> Decoder<'a> {
     }
 
     fn require_value_version(&mut self) -> Result<(), PublishRecordError> {
+        self.require_version(PUBLISH_VALUE_FORMAT_VERSION)
+    }
+
+    fn require_version(&mut self, expected: u8) -> Result<(), PublishRecordError> {
         let actual = self.u8("value_format_version")?;
-        if actual == PUBLISH_VALUE_FORMAT_VERSION {
+        if actual == expected {
             Ok(())
         } else {
-            Err(PublishRecordError::UnsupportedValueVersion {
-                actual,
-                expected: PUBLISH_VALUE_FORMAT_VERSION,
-            })
+            Err(PublishRecordError::UnsupportedValueVersion { actual, expected })
         }
     }
 
@@ -2103,6 +2126,7 @@ mod tests {
             dependency_count: 1,
             dependency_depth: 1,
             dependency_digest: [0x18; SHA256_BYTES],
+            inline_body_digest: None,
             cleanup_staged_object_cursor: 0,
             cleanup_manifest_cursor: 0,
             cleanup_retry_count: 0,
@@ -2158,7 +2182,7 @@ mod tests {
         record.result = Some(result());
 
         let expected = [
-            &[PUBLISH_VALUE_FORMAT_VERSION][..],
+            &[PUBLISH_OPERATION_VALUE_FORMAT_VERSION][..],
             &[0x10; 16],
             &[0x11; SHA256_BYTES],
             &[0x12; SHA256_BYTES],
@@ -2191,6 +2215,7 @@ mod tests {
             &11_u64.to_be_bytes(),
             &[1, 1],
             &[0x18; SHA256_BYTES],
+            &[0],
             &0_u32.to_be_bytes(),
             &0_u32.to_be_bytes(),
             &0_u64.to_be_bytes(),
@@ -2660,15 +2685,20 @@ mod tests {
 
     #[test]
     fn every_codec_rejects_unknown_versions_and_enums() {
-        let mut operation = uploading_operation().encode().unwrap();
-        operation[0] = PUBLISH_VALUE_FORMAT_VERSION + 1;
-        assert_eq!(
-            PublishOperationRecord::decode(&operation).unwrap_err(),
-            PublishRecordError::UnsupportedValueVersion {
-                actual: PUBLISH_VALUE_FORMAT_VERSION + 1,
-                expected: PUBLISH_VALUE_FORMAT_VERSION,
-            }
-        );
+        for version in [
+            PUBLISH_OPERATION_VALUE_FORMAT_VERSION - 1,
+            PUBLISH_OPERATION_VALUE_FORMAT_VERSION + 1,
+        ] {
+            let mut operation = uploading_operation().encode().unwrap();
+            operation[0] = version;
+            assert_eq!(
+                PublishOperationRecord::decode(&operation).unwrap_err(),
+                PublishRecordError::UnsupportedValueVersion {
+                    actual: version,
+                    expected: PUBLISH_OPERATION_VALUE_FORMAT_VERSION,
+                }
+            );
+        }
 
         let mut operation = uploading_operation().encode().unwrap();
         let phase_offset = 1

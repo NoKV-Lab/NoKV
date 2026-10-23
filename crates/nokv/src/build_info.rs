@@ -35,10 +35,10 @@ mod tests {
 
     #[test]
     fn compiled_identity_is_complete() {
-        assert_eq!(VERSION, "0.11.1");
+        assert_eq!(VERSION, "0.12.1");
         assert!(GIT_COMMIT == "unknown" || GIT_COMMIT.len() == 40);
         assert_eq!(CARGO_LOCK_SHA256.len(), 64);
-        assert_eq!(HOLT_VERSION, "0.8.6");
+        assert_eq!(HOLT_VERSION, "0.8.7");
         assert_eq!(
             HOLT_SOURCE,
             "registry+https://github.com/rust-lang/crates.io-index"

@@ -265,10 +265,10 @@ round after the underlying problem is corrected.
 | Failure | Durable observation | Recovery |
 | --- | --- | --- |
 | Worker dies before admission. | No parent. | Replacement submits the same ID; attempt zero is admitted once. |
-| Begin succeeds but its response is lost; worker or owner dies. | Parent and child already exist. | Wait for fenced cleanup, then submit the same ID to create the next child atomically. |
+| Prepare (admission and object staging) succeeds but its response is lost; worker or owner dies. | Parent and child already exist. | Wait for fenced cleanup, then submit the same ID to create the next child atomically. |
 | An object PUT succeeds but the client loses its response. | The child may be pending; publication is not inferred. | Query and wait for a safe child outcome. Unknown upload results never authorize an unfenced successor. |
 | A different action wins a generation CAS. | Losing child is safely aborted and cleaned. | The same logical append replans against the new head and completes once. |
-| Complete commits but its response is lost. | Parent contains the committed receipt. | Replacement returns that receipt; it uploads and appends nothing. |
+| Finish (upload proofs, manifest, and completion) commits but its response is lost. | Parent contains the committed receipt. | Replacement returns that receipt; it uploads and appends nothing. |
 | File is later appended, removed, or replaced. | Parent retains its original success. | Status and replay still return the historical result without changing the new live head. |
 | Workspace name is deleted and recreated. | Parent retains the original incarnation. | Old success remains queryable; an unfinished old intent cannot write into the new instance. |
 
@@ -351,8 +351,8 @@ functional demand, not a benchmark target or a promised commercial SLA.
 
 ## Version and deployment boundary
 
-The workspace RPC schema is `nokv.workspace.rpc.v12`, the system format is 13,
-and the publication value format is 7. A parent row is a new operation kind;
+The workspace RPC schema is `nokv.workspace.rpc.v14`, the system format is 14,
+the publication value format is 7, and the publish operation value format is 8. A parent row is a new operation kind;
 the child includes the monotonic cleanup retry counter. These version gates
 also reject the preceding unreleased append candidate's v11/system-12 layout.
 Older stores and protocol clients are rejected explicitly. Existing Holt stores

@@ -6,7 +6,8 @@
 //! Epoch-fenced artifact-revision garbage collection.
 //!
 //! Authoritative manifest rows drive physical deletion. Object-provider
-//! listing is deliberately absent from this service.
+//! listing is deliberately absent from this service. An inline revision owns
+//! no manifest rows; its completion deletes its write-once body row.
 
 use std::fmt;
 
@@ -18,15 +19,15 @@ use nokv_types::{
 use sha2::{Digest, Sha256};
 
 use super::codec::{
-    artifact_manifest_key, artifact_manifest_prefix, artifact_revision_key,
-    decode_artifact_manifest_key, decode_gc_candidate_key, decode_generic_index_append_receipt_key,
-    decode_generic_index_generation_key, decode_generic_index_row_key,
-    decode_revision_dependency_ref_key, gc_candidate_key, gc_candidate_prefix,
-    gc_history_barrier_key, generic_index_append_receipt_key, generic_index_append_receipt_prefix,
-    generic_index_generation_key, generic_index_generation_prefix,
-    generic_index_generation_ref_prefix, generic_index_row_key, generic_index_row_prefix,
-    history_hold_prefix, object_block_key, operation_key, revision_dependency_ref_prefix,
-    SCHEMA_ID,
+    artifact_inline_body_key, artifact_manifest_key, artifact_manifest_prefix,
+    artifact_revision_key, decode_artifact_manifest_key, decode_gc_candidate_key,
+    decode_generic_index_append_receipt_key, decode_generic_index_generation_key,
+    decode_generic_index_row_key, decode_revision_dependency_ref_key, gc_candidate_key,
+    gc_candidate_prefix, gc_history_barrier_key, generic_index_append_receipt_key,
+    generic_index_append_receipt_prefix, generic_index_generation_key,
+    generic_index_generation_prefix, generic_index_generation_ref_prefix, generic_index_row_key,
+    generic_index_row_prefix, history_hold_prefix, object_block_key, operation_key,
+    revision_dependency_ref_prefix, SCHEMA_ID,
 };
 use super::engine::{
     CommandMutation, CommandPredicate, HistoryProjection, MetaError, MetaShard, MetadataCommand,
@@ -44,8 +45,9 @@ use super::generic_index_records::{
 use super::keyspace::MetadataFamily;
 use super::namespace::{RootReadContext, RootWriteContext};
 use super::publication_records::{
-    ArtifactRevisionRecord, GcCandidateRecord, PublicationRecordCodecError, RevisionRefRecord,
-    MAX_DEPENDENCY_COUNT, MAX_QUARANTINE_EVIDENCE_BYTES,
+    ArtifactInlineBodyRecord, ArtifactRevisionRecord, GcCandidateRecord,
+    PublicationRecordCodecError, RevisionRefRecord, MAX_DEPENDENCY_COUNT,
+    MAX_QUARANTINE_EVIDENCE_BYTES,
 };
 use super::publish_operation_records::{ArtifactManifestRow, ManifestPosition, PublishRecordError};
 use super::snapshot_records::{HistoryHoldRecord, SnapshotRecordError};
@@ -834,6 +836,12 @@ impl<'a> GcService<'a> {
                 floor: safe_history_floor.get(),
             });
         }
+        load_inline_body(
+            self.store,
+            request.context,
+            request.artifact_revision_id,
+            &revision,
+        )?;
         let expected_manifest_digest = parse_sha256_digest_uri(&revision.manifest_digest_uri)?;
         let operation_id = gc_operation_id(
             request.context.root_id,
@@ -1095,6 +1103,12 @@ impl<'a> GcService<'a> {
             &request.expected_operation,
             &triple.revision,
         )?;
+        let inline_body = load_inline_body(
+            self.store,
+            request.context,
+            request.expected_operation.artifact_revision_id,
+            &triple.revision,
+        )?;
         let dependency_updates = load_dependency_updates(
             self.store,
             request.context,
@@ -1135,6 +1149,14 @@ impl<'a> GcService<'a> {
             triple.operation_payload,
             next_operation.encode()?,
         );
+        if let Some(inline_body) = inline_body {
+            delete_write_once(
+                &mut command,
+                MetadataFamily::ArtifactInlineBody,
+                inline_body.key,
+                inline_body.payload,
+            );
+        }
         for update in dependency_updates {
             delete_exact(
                 &mut command,
@@ -2116,6 +2138,44 @@ fn load_manifest_rows(
         .collect()
 }
 
+/// Whether a revision keeps its body in one inline row instead of objects.
+fn is_inline_revision(revision: &ArtifactRevisionRecord) -> bool {
+    revision.block_count == 0 && revision.logical_size != 0
+}
+
+struct LoadedInlineBody {
+    key: Vec<u8>,
+    payload: Vec<u8>,
+}
+
+/// Load and verify the inline body of an inline revision; object-backed and
+/// empty revisions have none.
+fn load_inline_body(
+    store: &MetaShard,
+    context: RootWriteContext,
+    revision_id: ArtifactRevisionId,
+    revision: &ArtifactRevisionRecord,
+) -> Result<Option<LoadedInlineBody>, GcError> {
+    if !is_inline_revision(revision) {
+        return Ok(None);
+    }
+    let key = artifact_inline_body_key(context.root_id, revision_id);
+    let payload = read_current(store, context, MetadataFamily::ArtifactInlineBody, &key)?
+        .ok_or_else(|| GcError::ManifestClosureMismatch {
+            reason: "inline revision has no inline body row".to_owned(),
+        })?;
+    let record = ArtifactInlineBodyRecord::decode(&payload)?;
+    let digest: [u8; SHA256_BYTES] = Sha256::digest(&record.body).into();
+    if u64::try_from(record.body.len()).ok() != Some(revision.logical_size)
+        || parse_sha256_digest_uri(&revision.body_digest_uri)? != digest
+    {
+        return Err(GcError::ManifestClosureMismatch {
+            reason: "inline body does not match its sealed revision".to_owned(),
+        });
+    }
+    Ok(Some(LoadedInlineBody { key, payload }))
+}
+
 fn validate_complete_manifest(
     store: &MetaShard,
     context: RootWriteContext,
@@ -2418,6 +2478,23 @@ fn delete_exact(
     command
         .history_projection
         .push(HistoryProjection { family, key });
+}
+
+/// Delete a write-once row. Its reclamation keeps no History copy.
+fn delete_write_once(
+    command: &mut MetadataCommand,
+    family: MetadataFamily,
+    key: Vec<u8>,
+    expected: Vec<u8>,
+) {
+    command.predicates.push(CommandPredicate::Value {
+        family,
+        key: key.clone(),
+        expected: Some(expected),
+    });
+    command
+        .mutations
+        .push(CommandMutation::Delete { family, key });
 }
 
 fn execute_operation_command(

@@ -4,7 +4,7 @@
  */
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nokv_protocol::{
@@ -25,6 +25,7 @@ use nokv_protocol::{
 };
 use sha2::{Digest as _, Sha256};
 
+use crate::body_digest::BodyDigestCache;
 use crate::{ClientError, ResolvedRoute, RouteRefreshMode, RouteResolver, RpcTransport};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +77,8 @@ pub struct WorkspaceClient<Transport, Resolver> {
     options: ClientOptions,
     request_seed: [u8; 16],
     request_sequence: Arc<AtomicU64>,
+    /// Resumable body digests of revisions this client published or read.
+    body_digests: Arc<Mutex<BodyDigestCache>>,
 }
 
 impl<Transport, Resolver> Clone for WorkspaceClient<Transport, Resolver>
@@ -91,6 +94,7 @@ where
             options: self.options,
             request_seed: self.request_seed,
             request_sequence: Arc::clone(&self.request_sequence),
+            body_digests: Arc::clone(&self.body_digests),
         }
     }
 }
@@ -126,7 +130,16 @@ where
             options,
             request_seed,
             request_sequence: Arc::new(AtomicU64::new(0)),
+            body_digests: Arc::new(Mutex::new(BodyDigestCache::default())),
         })
+    }
+
+    pub(crate) fn body_digests(&self) -> std::sync::MutexGuard<'_, BodyDigestCache> {
+        // The cache holds only derived digests; a panic while holding it
+        // cannot leave a digest that disagrees with its revision.
+        self.body_digests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub const fn root_id(&self) -> RootIdentity {
@@ -138,6 +151,9 @@ where
     }
 
     /// Allocates a process-local unique request id suitable for exact replay.
+    ///
+    /// The id is time-ordered, so the metadata rows keyed by it, and by the
+    /// operation and revision ids minted the same way, land near each other.
     pub fn new_request_id(&self) -> RequestIdentity {
         let sequence = self.request_sequence.fetch_add(1, Ordering::Relaxed);
         let mut hasher = Sha256::new();
@@ -145,9 +161,9 @@ where
         hasher.update(self.request_seed);
         hasher.update(sequence.to_be_bytes());
         let digest = hasher.finalize();
-        let mut request_id = [0_u8; 16];
-        request_id.copy_from_slice(&digest[..16]);
-        RequestIdentity(request_id)
+        let mut entropy = [0_u8; 16];
+        entropy.copy_from_slice(&digest[..16]);
+        RequestIdentity(nokv_types::time_ordered_identity(entropy))
     }
 
     /// Executes one operation. All retries reuse `request_id` exactly.
@@ -1006,6 +1022,7 @@ mod tests {
             range: None,
             blocks: Vec::new(),
             next_cursor: None,
+            inline_body: None,
         };
         let transport = LossyRestoreReadTransport {
             requests: Mutex::new(Vec::new()),

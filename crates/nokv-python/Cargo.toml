@@ -2,7 +2,7 @@
 name = "nokv-python"
 # Wheel version. Keep equal to the crates/nokv package version; the release
 # gate (scripts/release/python_sdk_release.py) refuses a tag otherwise.
-version = "0.11.1"
+version = "0.12.1"
 publish = false
 description = "Python SDK for NoKV Agent workspaces and immutable artifacts."
 edition.workspace = true
@@ -27,7 +27,7 @@ nokv-workbench-projection.workspace = true
 nokv-object.workspace = true
 nokv-protocol.workspace = true
 nokv-types.workspace = true
-pyo3 = { version = "0.29.0", features = ["abi3-py39"] }
+pyo3 = { version = "0.30.1", features = ["abi3-py39"] }
 serde_json.workspace = true
 
 [dev-dependencies]

@@ -40,6 +40,11 @@ PINNED_RUSTFS_IMAGE = (
     "e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
 )
 MARKER_MAGIC = b"nokv.object-namespace\0"
+# A visible body of at most this many bytes is stored in shard metadata
+# (`nokv_types::MAX_INLINE_ARTIFACT_BODY_BYTES`) and stays readable while the
+# object store is down.
+INLINE_ARTIFACT_BODY_MAX_BYTES = 16 * 1024
+RELAXATION_IONIC_STEPS = 256
 SECRET_FLAGS = {"--object-secret-access-key", "--secret-key"}
 PHYSICAL_ERROR_TOKENS = (
     "http://",
@@ -139,7 +144,12 @@ def fixed_id(seed: str, label: str) -> str:
 
 
 def phymat_documents() -> tuple[dict[str, Any], dict[str, Any]]:
-    """Return deterministic, simulated PhyMat campaign evidence."""
+    """Return deterministic, simulated PhyMat campaign evidence.
+
+    The relaxation evidence carries its ionic steps, which keeps its body above
+    the inline bound: the outage scenario reads it and must reach the object
+    store.
+    """
     structure = {
         "schema": "phymat.structure.v1",
         "material_id": "mp-19017",
@@ -161,6 +171,14 @@ def phymat_documents() -> tuple[dict[str, Any], dict[str, Any]]:
             "converged": True,
             "energy_ev": -203.417,
             "max_force_ev_per_angstrom": 0.014,
+            "ionic_steps": [
+                {
+                    "step": step,
+                    "energy_ev": round(-203.417 + 0.5 / (step + 1), 6),
+                    "max_force_ev_per_angstrom": round(0.014 + 0.166 / (step + 1), 6),
+                }
+                for step in range(RELAXATION_IONIC_STEPS)
+            ],
         },
         "thermodynamics": {
             "temperature_k": 300,
@@ -1265,6 +1283,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             evidence=evidence,
             label="stop-rustfs",
         )
+        # The relaxation body is above the inline bound, so this read needs RustFS.
         outage_error = mcp.call("workbench_read", read_arguments)
         failed_request_digest = mcp.last_call_digest
         run(

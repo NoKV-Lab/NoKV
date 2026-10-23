@@ -92,6 +92,47 @@ def unpack(data):
     return value
 
 
+# A body of at most this many bytes that fits one block publishes inline in
+# one PublishInlineArtifact request; anything larger uploads objects through
+# the fused Prepare/Finish pair, or the stepwise requests past one batch.
+# Mirrors MAX_INLINE_ARTIFACT_BODY_BYTES in crates/nokv-types.
+MAX_INLINE_BODY_BYTES = 16 * 1024
+
+PUBLICATION_SHAPES = {
+    "publish_inline_artifact": "inline",
+    "prepare_artifact_publish": "fused",
+    "finish_artifact_publish": "fused",
+    "begin_artifact_publish": "stepwise",
+    "stage_artifact_objects": "stepwise",
+    "mark_artifact_objects_uploaded": "stepwise",
+    "stage_artifact_manifest": "stepwise",
+    "complete_artifact_publish": "stepwise",
+}
+
+
+def publication_shapes(operations):
+    """The publication shapes, in first-seen order, of a run of RPC operations."""
+    shapes = []
+    for operation in operations:
+        shape = PUBLICATION_SHAPES.get(operation)
+        if shape is not None and shape not in shapes:
+            shapes.append(shape)
+    return shapes
+
+
+def locked_package_version(source, package):
+    """The version Cargo.lock in `source` pins for `package`."""
+    name = None
+    for line in (Path(source) / "Cargo.lock").read_text().splitlines():
+        if line == "[[package]]":
+            name = None
+        elif line.startswith("name = "):
+            name = line.split('"')[1]
+        elif line.startswith("version = ") and name == package:
+            return line.split('"')[1]
+    raise infra.WorkflowFailure(f"Cargo.lock does not pin {package}")
+
+
 class EvidenceDropProxy(ResponseDropProxy):
     def __init__(self, port, timeout, stack):
         super().__init__(port, timeout)
@@ -101,13 +142,23 @@ class EvidenceDropProxy(ResponseDropProxy):
         self.handshake_request = None
         self.wire_schema = None
         self.latest_route = None
+        self.operations_since_arm = []
+
+    def arm(self, operation, on_drop):
+        with self._lock:
+            self.operations_since_arm = []
+        super().arm(operation, on_drop)
 
     def wait_dropped(self):
         # Called after the only faulted CLI process has exited. At that point
         # no future RPC can reach this barrier; allow only thread handoff time.
         if not self._dropped.wait(1):
+            with self._lock:
+                armed = self._drop_operation
+                sent = list(self.operations_since_arm)
             raise infra.WorkflowFailure(
-                f"append exited before the armed successful {self._drop_operation} response; "
+                f"publication shape mismatch: armed a successful {armed} response, but the "
+                f"faulted command sent {sent} ({publication_shapes(sent) or 'no publication'}); "
                 "inspect native-append-transcript.jsonl and publication-rpc-trace.jsonl"
             )
         self.raise_if_failed()
@@ -137,10 +188,11 @@ class EvidenceDropProxy(ResponseDropProxy):
                     else:
                         req = unpack(request)
                         rsp = unpack(response)
+                        operation = req["payload"]["operation"]["operation"]
                         with self._lock:
                             self.wire_schema = req["schema"]
                             self.latest_route = req["payload"]["route"]
-                        operation = req["payload"]["operation"]["operation"]
+                            self.operations_since_arm.append(operation)
                         if self.capture_rpc:
                             self.stack.record(
                                 "publication-rpc-trace.jsonl",
@@ -192,6 +244,22 @@ def materialize(s, wb, section, path, label):
     return target.read_bytes()
 
 
+def beyond_inline(line):
+    """Repeat `line` past the inline bound so its body publishes through objects."""
+    return line * (MAX_INLINE_BODY_BYTES // len(line.encode()) + 1)
+
+
+def require_shape(stack, expected, label, start=0):
+    """Fail unless RPCs sent since the arm, from `start`, published as `expected`."""
+    with stack.proxy._lock:
+        sent = stack.proxy.operations_since_arm[start:]
+    if publication_shapes(sent) != [expected]:
+        raise infra.WorkflowFailure(
+            f"publication shape mismatch: {label} should publish {expected}, but sent "
+            f"{sent} ({publication_shapes(sent) or 'no publication'})"
+        )
+
+
 def append_loss(s):
     wb = "append-response-loss"
     marker = "effect-0001\n"
@@ -204,9 +272,11 @@ def append_loss(s):
     }
     # Admit the workbench first so the one-shot targets only the append publication.
     s.cli("workbench_create", {"id": wb})
-    s.proxy.arm("complete_artifact_publish", lambda: s.owner.kill())
+    # A small append commits in its one inline request; lose that success response.
+    s.proxy.arm("publish_inline_artifact", lambda: s.owner.kill())
     failed = s.cli("workbench_append", args, label="append-first-ack-lost", check=False)
     s.proxy.wait_dropped()
+    require_shape(s, "inline", "append-first-ack-lost")
     assert failed.get("status") != "success", failed
     s.owner.wait(timeout=10)
     s.restart()
@@ -250,6 +320,7 @@ def native_append(
     max_size=1024 * 1024,
     incarnation=None,
     payload_form="text",
+    shape=None,
     check=True,
 ):
     command = [
@@ -278,6 +349,8 @@ def native_append(
         raise ValueError(f"unsupported test payload form: {payload_form}")
     if incarnation is not None:
         command += ["--expected-workspace-incarnation-id", incarnation]
+    with stack.proxy._lock:
+        start = len(stack.proxy.operations_since_arm)
     process = stack.run(command, label=label, check=False)
     raw = (
         process.stdout
@@ -303,6 +376,8 @@ def native_append(
             "result": result,
         },
     )
+    if shape is not None:
+        require_shape(stack, shape, label, start)
     if check:
         assert process.returncode == 0 and result.get("status") == "success", result
     else:
@@ -333,14 +408,16 @@ def assert_rejected(result, operation_id):
     ), result
 
 
-def assert_dropped_receipt(result, dropped):
+def assert_dropped_receipt(result, dropped, operation_id):
     observed = dropped["response"]["payload"]["outcome"]["body"]
     assert observed["result"] == "published", observed
     published = observed["value"]
-    assert result["operation_id"] == bytes(published["operation_id"]).hex(), (
-        result,
-        published,
-    )
+    # A receipt names the caller's logical append and, separately, the attempt's
+    # child publication that committed it (append-product-spec.md:70-74).
+    assert result["operation_id"] == operation_id, (result, published)
+    assert (
+        result["publication_operation_id"] == bytes(published["operation_id"]).hex()
+    ), (result, published)
     assert result["path"] == published["target"]["path"], (result, published)
     assert result["workbench_id"] == published["target"]["workbench"], (
         result,
@@ -354,38 +431,74 @@ def assert_dropped_receipt(result, dropped):
 
 
 def terminal_response_loss(stack):
-    wb, operation_id, text = "stable-response-loss", "11" * 16, "logical-event-1\n"
-    stack.cli("workbench_create", {"id": wb})
-    stack.proxy.arm("complete_artifact_publish", lambda: stack.owner.kill())
-    failed = native_append(
-        stack, wb, operation_id, text, label="terminal-ack-lost", check=False
-    )
-    stack.proxy.wait_dropped()
-    dropped = stack.proxy.last_drop
-    assert failed.get("status") == "error", failed
-    stack.owner.wait(timeout=10)
-    stack.restart()
-    before = materialize(stack, wb, "logs", "effects.log", "terminal-after-reopen")
-    assert before == text.encode(), before
-    replay = native_append(
-        stack, wb, operation_id, text, label="terminal-new-process-replay"
-    )
-    assert replay["replayed"] is True, replay
-    assert_dropped_receipt(replay, dropped)
-    again = native_append(stack, wb, operation_id, text, label="terminal-second-replay")
-    assert again["replayed"] is True and receipt(again) == receipt(replay), (
-        again,
-        replay,
-    )
-    after = materialize(stack, wb, "logs", "effects.log", "terminal-after-replays")
-    assert after == before, after
+    # A committed publication whose response is lost replays its receipt
+    # (append-product-spec.md:271). A small append commits in its one inline
+    # request; a body past the inline bound commits in Finish.
+    small, variants = "logical-event-1\n", {}
+    for shape, operation, operation_id, text, form in (
+        ("inline", "publish_inline_artifact", "11" * 16, small, "text"),
+        ("fused", "finish_artifact_publish", "12" * 16, beyond_inline(small), "file"),
+    ):
+        wb = "stable-response-loss-" + shape
+        stack.cli("workbench_create", {"id": wb})
+        stack.proxy.arm(operation, lambda: stack.owner.kill())
+        failed = native_append(
+            stack,
+            wb,
+            operation_id,
+            text,
+            label=f"terminal-{shape}-ack-lost",
+            payload_form=form,
+            shape=shape,
+            check=False,
+        )
+        stack.proxy.wait_dropped()
+        dropped = stack.proxy.last_drop
+        assert failed.get("status") == "error", failed
+        stack.owner.wait(timeout=10)
+        stack.restart()
+        before = materialize(
+            stack, wb, "logs", "effects.log", f"terminal-{shape}-after-reopen"
+        )
+        assert before == text.encode(), before
+        replay = native_append(
+            stack,
+            wb,
+            operation_id,
+            text,
+            label=f"terminal-{shape}-new-process-replay",
+            payload_form=form,
+        )
+        assert replay["replayed"] is True, replay
+        assert_dropped_receipt(replay, dropped, operation_id)
+        again = native_append(
+            stack,
+            wb,
+            operation_id,
+            text,
+            label=f"terminal-{shape}-second-replay",
+            payload_form=form,
+        )
+        assert again["replayed"] is True and receipt(again) == receipt(replay), (
+            again,
+            replay,
+        )
+        after = materialize(
+            stack, wb, "logs", "effects.log", f"terminal-{shape}-after-replays"
+        )
+        assert after == before, after
+        variants[shape] = {
+            "dropped_operation": operation,
+            "first_call": failed,
+            "replay": replay,
+            "actual_effects": 1,
+            "body_bytes": len(after),
+            "body_sha256": hashlib.sha256(after).hexdigest(),
+        }
     return {
         "status": "PASS",
-        "first_call": failed,
-        "replay": replay,
+        "variants": variants,
         "expected_effects": 1,
-        "actual_effects": 1,
-        "exact_bytes": after.decode(),
         "original_rpc_receipt_verified": True,
         "owner_sigkill_reopen": True,
     }
@@ -607,17 +720,32 @@ def concurrent_same_identity(stack):
 
 def begin_response_loss(stack, *, change_live):
     suffix = "with-drift" if change_live else "without-drift"
+    # An inline append admits and commits in one request, so only an object
+    # publication has an admission (Prepare) response to lose.
     wb, operation_id, text = (
         "begin-loss-" + suffix,
         ("44" if change_live else "45") * 16,
-        "uncertain-event\n",
+        beyond_inline("uncertain-event\n"),
     )
     stack.cli("workbench_create", {"id": wb})
-    stack.proxy.arm("begin_artifact_publish", lambda: stack.owner.kill())
+    stack.proxy.arm("prepare_artifact_publish", lambda: stack.owner.kill())
     failed = native_append(
-        stack, wb, operation_id, text, label="begin-ack-lost-" + suffix, check=False
+        stack,
+        wb,
+        operation_id,
+        text,
+        label="begin-ack-lost-" + suffix,
+        payload_form="file",
+        shape="fused",
+        check=False,
     )
     stack.proxy.wait_dropped()
+    prepare = stack.proxy.last_drop["request"]["payload"]["operation"]["request"]
+    admitted = prepare["begin"]
+    assert admitted["append_attempt"] == {
+        "operation_id": list(bytes.fromhex(operation_id)),
+        "attempt": 0,
+    }, admitted
     assert failed.get("status") == "error", failed
     stack.owner.wait(timeout=10)
     stack.restart()
@@ -632,6 +760,7 @@ def begin_response_loss(stack, *, change_live):
             operation_id,
             text,
             label=f"begin-retry-{suffix}-{index}",
+            payload_form="file",
             check=False,
         )
         for index in range(2)
@@ -640,10 +769,10 @@ def begin_response_loss(stack, *, change_live):
         if result.get("status") != "success":
             assert_rejected(result, operation_id)
             assert result.get("details", {}).get("state"), result
+    successful = [result for result in outcomes if result.get("status") == "success"]
     if change_live:
-        assert all(result.get("status") == "error" for result in outcomes), outcomes
         body = materialize(stack, wb, "logs", "effects.log", "begin-drift-final")
-        assert body == b"independent\n", body
+        assert body == b"independent\n" + (text.encode() if successful else b""), body
     else:
         stat = stack.cli(
             "workbench_stat",
@@ -657,12 +786,21 @@ def begin_response_loss(stack, *, change_live):
         else:
             assert stat.get("code") == "NotFound", stat
             body = b""
-    successful = [result for result in outcomes if result.get("status") == "success"]
     if successful:
-        assert not change_live and body == text.encode(), (body, successful)
-        assert all(
-            receipt(result) == receipt(successful[0]) for result in successful
-        ), successful
+        # Once cleanup proves the lost admission cannot publish, the same logical
+        # id admits its next attempt atomically and completes once on the current
+        # head, a later writer's included (append-product-spec.md:83-88, 111-115,
+        # 268-270).
+        first = successful[0]
+        assert body == (b"independent\n" if change_live else b"") + text.encode(), body
+        assert all(receipt(result) == receipt(first) for result in successful), (
+            successful
+        )
+        assert first["operation_id"] == operation_id, first
+        assert first["generation"] == (2 if change_live else 1), first
+        assert first["publication_operation_id"] != bytes(
+            admitted["operation_id"]
+        ).hex(), (first, admitted)
     stack.restart()
     if body:
         assert (
@@ -684,7 +822,7 @@ def begin_response_loss(stack, *, change_live):
         "uncertain_append_effects": body.count(text.encode()),
         "completion_qualified": bool(successful),
         "safety_qualified": True,
-        "oracle": "A pending operation may remain explicitly unresolved; it must not switch identity or rebase onto a later writer.",
+        "oracle": "A pending operation may remain explicitly unresolved; a completed retry is the next attempt of the same logical id, applied once to the current head.",
     }
 
 
@@ -765,6 +903,7 @@ def multiblock_replay(stack):
         label="multiblock-original",
         payload_form="file",
         max_size=16 * 1024 * 1024,
+        shape="fused",
     )
     assert original["generation"] == 1 and original["logical_size"] == size, original
     tail = "after-multiblock\n"
@@ -1097,9 +1236,10 @@ def cross_kind_identity_collision(stack):
         "request": {"operation_id": list(bytes.fromhex(operation_id))},
     }
     before = raw_rpc(stack, query, "cross-kind-operation-before")
+    # A logical append is its own operation kind (append-product-spec.md:355-356).
     assert (
         before["status"] == "success"
-        and before["body"]["value"]["kind"] == "artifact_publish"
+        and before["body"]["value"]["kind"] == "artifact_append"
     ), before
     collision = raw_rpc(
         stack,
@@ -1134,7 +1274,7 @@ def cross_kind_identity_collision(stack):
     assert after["status"] == "success", after
     before_value, after_value = before["body"]["value"], after["body"]["value"]
     assert (
-        after_value["kind"] == "artifact_publish"
+        after_value["kind"] == "artifact_append"
         and after_value["state"] == "succeeded"
     ), after
     assert after_value["result"] == before_value["result"], (before, after)
@@ -1615,7 +1755,8 @@ class IsolatedStack:
                     [self.binary, "version", "--json"], label="binary-identity"
                 ).stdout
             )
-            assert identity["holt"]["version"] == "0.8.6", identity
+            holt = locked_package_version(self.source, "holt")
+            assert identity["holt"]["version"] == holt, (holt, identity)
             self.json(
                 "environment.json",
                 {

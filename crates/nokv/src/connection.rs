@@ -9,18 +9,19 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-#[cfg(feature = "etcd")]
+#[cfg(feature = "control")]
 use nokv_client::ControlRouteResolver;
-#[cfg(feature = "etcd")]
-use nokv_client::EtcdRouteOptions;
 use nokv_client::{
     ClientError, ClientOptions, FramedTcpOptions, FramedTcpTransport, RouteResolver,
     StaticRouteResolver, TransportError, WorkspaceClient,
 };
+use nokv_control::ControlStore;
 use nokv_protocol::{LogicalShardIdentity, ObjectNamespaceIdentity, RootIdentity, RootRoute};
 use nokv_types::AgentId;
 
-use super::cli::{ClientConfig, EtcdRoutingConfig, RoutingConfig, StaticRoutingConfig};
+use super::cli::{
+    ClientConfig, EtcdRoutingConfig, LocalRoutingConfig, RoutingConfig, StaticRoutingConfig,
+};
 
 const FIXED_ID_BYTES: usize = 16;
 const FIXED_ID_HEX_BYTES: usize = FIXED_ID_BYTES * 2;
@@ -41,6 +42,8 @@ pub enum ConnectionError {
         routing: &'static str,
         feature: &'static str,
     },
+    StaticControl,
+    Control(nokv_control::ControlError),
     Transport(TransportError),
     Client(ClientError),
 }
@@ -58,6 +61,10 @@ impl fmt::Display for ConnectionError {
                 formatter,
                 "{routing} routing requires the nokv `{feature}` feature; rebuild with --features {feature}"
             ),
+            Self::StaticControl => formatter.write_str(
+                "static routes have no durable control store; use --etcd-endpoint or --control-dir",
+            ),
+            Self::Control(error) => write!(formatter, "cannot open control store: {error}"),
             Self::Transport(error) => write!(formatter, "cannot configure RPC transport: {error}"),
             Self::Client(error) => write!(formatter, "cannot configure workspace client: {error}"),
         }
@@ -67,9 +74,10 @@ impl fmt::Display for ConnectionError {
 impl Error for ConnectionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Control(error) => Some(error),
             Self::Transport(error) => Some(error),
             Self::Client(error) => Some(error),
-            Self::MissingOption(_) | Self::InvalidIdentity { .. } => None,
+            Self::MissingOption(_) | Self::InvalidIdentity { .. } | Self::StaticControl => None,
             #[cfg(not(feature = "etcd"))]
             Self::FeatureDisabled { .. } => None,
         }
@@ -89,9 +97,36 @@ impl From<ClientError> for ConnectionError {
 }
 
 /// Build the real transport and route resolver from the parsed CLI options.
-pub fn connect(config: &ClientConfig) -> Result<CliWorkspaceClient, ConnectionError> {
+///
+/// Control-backed routing resolves through `control` when the command has
+/// already opened it for admission, so one command opens one control store.
+pub fn connect(
+    config: &ClientConfig,
+    control: Option<Arc<dyn ControlStore>>,
+) -> Result<CliWorkspaceClient, ConnectionError> {
     let root_id = configured_root_id(config)?;
-    let routes = route_resolver(root_id, &config.routing)?;
+    let routes = match (&config.routing, control) {
+        (RoutingConfig::Static(routing), _) => static_route_resolver(root_id, routing)?,
+        (_, Some(control)) => control_route_resolver(control)?,
+        (routing, None) => control_route_resolver(open_control(routing)?)?,
+    };
+    workspace_client(config, root_id, routes)
+}
+
+/// Open the durable control store that control-backed routing names.
+pub fn open_control(routing: &RoutingConfig) -> Result<Arc<dyn ControlStore>, ConnectionError> {
+    match routing {
+        RoutingConfig::Static(_) => Err(ConnectionError::StaticControl),
+        RoutingConfig::Etcd(config) => etcd_control(config),
+        RoutingConfig::Local(config) => local_control(config),
+    }
+}
+
+fn workspace_client(
+    config: &ClientConfig,
+    root_id: RootIdentity,
+    routes: Arc<dyn RouteResolver>,
+) -> Result<CliWorkspaceClient, ConnectionError> {
     let transport = FramedTcpTransport::new(FramedTcpOptions::default())?;
     WorkspaceClient::new(
         root_id,
@@ -132,14 +167,21 @@ pub fn parse_agent_id(value: &str) -> Result<AgentId, ConnectionError> {
     )?))
 }
 
-fn route_resolver(
-    root_id: RootIdentity,
-    routing: &RoutingConfig,
+#[cfg(feature = "control")]
+fn control_route_resolver(
+    control: Arc<dyn ControlStore>,
 ) -> Result<Arc<dyn RouteResolver>, ConnectionError> {
-    match routing {
-        RoutingConfig::Static(config) => static_route_resolver(root_id, config),
-        RoutingConfig::Etcd(config) => etcd_route_resolver(config),
-    }
+    Ok(Arc::new(ControlRouteResolver::new(control)))
+}
+
+#[cfg(not(feature = "control"))]
+fn control_route_resolver(
+    _control: Arc<dyn ControlStore>,
+) -> Result<Arc<dyn RouteResolver>, ConnectionError> {
+    Err(ConnectionError::FeatureDisabled {
+        routing: "control-backed",
+        feature: "control",
+    })
 }
 
 fn static_route_resolver(
@@ -174,17 +216,16 @@ fn static_route_resolver(
 }
 
 #[cfg(feature = "etcd")]
-fn etcd_route_resolver(
-    config: &EtcdRoutingConfig,
-) -> Result<Arc<dyn RouteResolver>, ConnectionError> {
-    let resolver = ControlRouteResolver::connect_etcd(etcd_options(config))?;
-    Ok(Arc::new(resolver))
+fn etcd_control(config: &EtcdRoutingConfig) -> Result<Arc<dyn ControlStore>, ConnectionError> {
+    let options = etcd_options(config);
+    options.validate().map_err(ConnectionError::Control)?;
+    Ok(Arc::new(
+        nokv_control::EtcdControlStore::connect(options).map_err(ConnectionError::Control)?,
+    ))
 }
 
 #[cfg(not(feature = "etcd"))]
-fn etcd_route_resolver(
-    _config: &EtcdRoutingConfig,
-) -> Result<Arc<dyn RouteResolver>, ConnectionError> {
+fn etcd_control(_config: &EtcdRoutingConfig) -> Result<Arc<dyn ControlStore>, ConnectionError> {
     Err(ConnectionError::FeatureDisabled {
         routing: "etcd",
         feature: "etcd",
@@ -192,10 +233,25 @@ fn etcd_route_resolver(
 }
 
 #[cfg(feature = "etcd")]
-fn etcd_options(config: &EtcdRoutingConfig) -> EtcdRouteOptions {
-    EtcdRouteOptions::new(config.endpoints.clone())
+fn etcd_options(config: &EtcdRoutingConfig) -> nokv_control::EtcdControlStoreOptions {
+    nokv_control::EtcdControlStoreOptions::new(config.endpoints.clone())
         .with_key_prefix(config.key_prefix.clone())
         .with_lease_ttl_seconds(config.lease_ttl_seconds)
+}
+
+#[cfg(unix)]
+fn local_control(config: &LocalRoutingConfig) -> Result<Arc<dyn ControlStore>, ConnectionError> {
+    Ok(Arc::new(
+        nokv_control::LocalControlStore::open(&config.directory)
+            .map_err(ConnectionError::Control)?,
+    ))
+}
+
+#[cfg(not(unix))]
+fn local_control(_config: &LocalRoutingConfig) -> Result<Arc<dyn ControlStore>, ConnectionError> {
+    Err(ConnectionError::Control(
+        nokv_control::ControlError::InvalidOptions("--control-dir requires a Unix host".to_owned()),
+    ))
 }
 
 fn required_fixed_identity(
@@ -265,7 +321,10 @@ mod tests {
     fn builds_exact_static_root_route_and_workspace_client() {
         let config = static_config();
         let root_id = RootIdentity([0x11; FIXED_ID_BYTES]);
-        let resolver = route_resolver(root_id, &config.routing).unwrap();
+        let RoutingConfig::Static(routing) = &config.routing else {
+            panic!("static route expected");
+        };
+        let resolver = static_route_resolver(root_id, routing).unwrap();
         let resolved = resolver.resolve(root_id, false).unwrap();
         assert_eq!(resolved.route.root_id, root_id);
         assert_eq!(
@@ -285,7 +344,7 @@ mod tests {
                 .expect("test address is valid")
         );
 
-        let client = connect(&config).unwrap();
+        let client = connect(&config, None).unwrap();
         assert_eq!(client.root_id(), root_id);
     }
 
@@ -294,7 +353,7 @@ mod tests {
         let mut config = static_config();
         config.root_id = None;
         assert!(matches!(
-            connect(&config),
+            connect(&config, None),
             Err(ConnectionError::MissingOption("--root-id"))
         ));
 
@@ -304,7 +363,7 @@ mod tests {
         };
         route.logical_shard_id = None;
         assert!(matches!(
-            connect(&config),
+            connect(&config, None),
             Err(ConnectionError::MissingOption("--logical-shard-id"))
         ));
     }
@@ -347,11 +406,11 @@ mod tests {
         };
 
         assert!(matches!(
-            connect(&parse(&["--owner-epoch", "1"])),
+            connect(&parse(&["--owner-epoch", "1"]), None),
             Err(ConnectionError::MissingOption("--placement-generation"))
         ));
         assert!(matches!(
-            connect(&parse(&["--placement-generation", "2"])),
+            connect(&parse(&["--placement-generation", "2"]), None),
             Err(ConnectionError::MissingOption("--owner-epoch"))
         ));
     }
@@ -366,7 +425,7 @@ mod tests {
             let mut config = static_config();
             config.root_id = Some(invalid);
             assert!(matches!(
-                connect(&config),
+                connect(&config, None),
                 Err(ConnectionError::InvalidIdentity {
                     option: "--root-id",
                     ..
@@ -380,7 +439,7 @@ mod tests {
         };
         route.logical_shard_id = Some("AA".repeat(FIXED_ID_BYTES));
         assert!(matches!(
-            connect(&config),
+            connect(&config, None),
             Err(ConnectionError::InvalidIdentity {
                 option: "--logical-shard-id",
                 ..
@@ -436,7 +495,7 @@ mod tests {
             key_prefix: "/nokv/control".to_owned(),
             lease_ttl_seconds: 10,
         });
-        let error = match connect(&config) {
+        let error = match connect(&config, None) {
             Ok(_) => panic!("etcd routing must not fall back without its feature"),
             Err(error) => error,
         };
@@ -459,6 +518,11 @@ mod tests {
             key_prefix: "/nokv/control".to_owned(),
             lease_ttl_seconds: 10,
         });
-        assert!(matches!(connect(&config), Err(ConnectionError::Client(_))));
+        assert!(matches!(
+            connect(&config, None),
+            Err(ConnectionError::Control(
+                nokv_control::ControlError::InvalidOptions(_)
+            ))
+        ));
     }
 }

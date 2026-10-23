@@ -15,7 +15,8 @@ use crate::types::{
     WorkspacePath, WorkspaceReadView,
 };
 use crate::{
-    MAX_ARTIFACT_PUBLISH_BATCH_ROWS, MAX_ARTIFACT_PUBLISH_OBJECTS, WORKSPACE_CAPABILITY_SCHEMA,
+    inline_artifact_body_digest, sha256_digest_uri, MAX_ARTIFACT_PUBLISH_BATCH_ROWS,
+    MAX_ARTIFACT_PUBLISH_OBJECTS, MAX_INLINE_ARTIFACT_BODY_BYTES, WORKSPACE_CAPABILITY_SCHEMA,
     WORKSPACE_PREFLIGHT_SCHEMA, WORKSPACE_PROTOCOL_SCHEMA,
 };
 
@@ -83,6 +84,9 @@ pub enum WorkspaceRequest {
     MarkArtifactObjectsUploaded(MarkArtifactObjectsUploadedRequest),
     StageArtifactManifest(StageArtifactManifestRequest),
     CompleteArtifactPublish(CompleteArtifactPublishRequest),
+    PrepareArtifactPublish(PrepareArtifactPublishRequest),
+    FinishArtifactPublish(FinishArtifactPublishRequest),
+    PublishInlineArtifact(PublishInlineArtifactRequest),
     AbortArtifactPublish(AbortArtifactPublishRequest),
     ReconcileQuarantinedArtifactPublish(ReconcileQuarantinedArtifactPublishRequest),
     Commit(CommitRequest),
@@ -120,11 +124,17 @@ impl WorkspaceRequest {
             Self::ListPaths(request) => request.validate(),
             Self::RenamePath(request) => request.validate(),
             Self::RemovePath(request) => request.validate(),
-            Self::BeginArtifactPublish(request) => request.validate(),
+            Self::BeginArtifactPublish(request) => {
+                require_object_backed_begin("begin_artifact_publish", request)?;
+                request.validate()
+            }
             Self::StageArtifactObjects(request) => request.validate(),
             Self::MarkArtifactObjectsUploaded(request) => request.validate(),
             Self::StageArtifactManifest(request) => request.validate(),
             Self::CompleteArtifactPublish(request) => request.validate(),
+            Self::PrepareArtifactPublish(request) => request.validate(),
+            Self::FinishArtifactPublish(request) => request.validate(),
+            Self::PublishInlineArtifact(request) => request.validate(),
             Self::AbortArtifactPublish(request) => request.validate(),
             Self::ReconcileQuarantinedArtifactPublish(request) => request.validate(),
             Self::Commit(request) => request.validate(),
@@ -452,6 +462,10 @@ pub struct BeginArtifactPublishRequest {
     pub manifest_row_count: u32,
     pub manifest_seal: Digest,
     pub dependency_owner_revision_ids: Vec<ArtifactRevisionIdentity>,
+    /// SHA-256 of a body this publication stores inline instead of objects.
+    /// Only `PublishInlineArtifact` admits it, together with that body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_body_digest: Option<Digest>,
 }
 
 impl BeginArtifactPublishRequest {
@@ -545,25 +559,10 @@ impl BeginArtifactPublishRequest {
                 format!("exceeds {MAX_ARTIFACT_PUBLISH_OBJECTS}"),
             ));
         }
-        if self.dependency_owner_revision_ids.len()
-            > usize::try_from(crate::MAX_ARTIFACT_DEPENDENCY_OWNERS)
-                .expect("artifact dependency owner limit fits usize")
-        {
-            return Err(ProtocolError::invalid(
-                "begin_artifact_publish.dependency_owner_revision_ids",
-                format!("exceeds {}", crate::MAX_ARTIFACT_DEPENDENCY_OWNERS),
-            ));
-        }
-        if !self
-            .dependency_owner_revision_ids
-            .windows(2)
-            .all(|pair| pair[0] < pair[1])
-        {
-            return Err(ProtocolError::invalid(
-                "begin_artifact_publish.dependency_owner_revision_ids",
-                "must be sorted and unique",
-            ));
-        }
+        validate_dependency_owners(
+            "begin_artifact_publish.dependency_owner_revision_ids",
+            &self.dependency_owner_revision_ids,
+        )?;
         if self
             .dependency_owner_revision_ids
             .binary_search(&self.artifact_revision_id)
@@ -578,6 +577,21 @@ impl BeginArtifactPublishRequest {
     }
 }
 
+/// Stepwise and fused object publications seal no inline body: a body only
+/// travels with the one request that also completes it.
+fn require_object_backed_begin(
+    field: &'static str,
+    begin: &BeginArtifactPublishRequest,
+) -> Result<(), ProtocolError> {
+    if begin.inline_body_digest.is_some() {
+        return Err(ProtocolError::invalid(
+            field,
+            "an inline body digest is admitted only by PublishInlineArtifact",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StageArtifactObjectsRequest {
@@ -587,14 +601,7 @@ pub struct StageArtifactObjectsRequest {
 
 impl StageArtifactObjectsRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        validate_artifact_batch("stage_artifact_objects.objects", &self.objects)?;
-        for object in &self.objects {
-            object.validate()?;
-        }
-        require_strict_sequences(
-            "stage_artifact_objects.objects",
-            self.objects.iter().map(|object| u64::from(object.sequence)),
-        )
+        validate_staged_objects("stage_artifact_objects.objects", &self.objects)
     }
 }
 
@@ -627,14 +634,7 @@ pub struct MarkArtifactObjectsUploadedRequest {
 
 impl MarkArtifactObjectsUploadedRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        validate_artifact_batch("mark_artifact_objects_uploaded.objects", &self.objects)?;
-        for object in &self.objects {
-            object.validate()?;
-        }
-        require_strict_sequences(
-            "mark_artifact_objects_uploaded.objects",
-            self.objects.iter().map(|object| u64::from(object.sequence)),
-        )
+        validate_upload_proofs("mark_artifact_objects_uploaded.objects", &self.objects)
     }
 }
 
@@ -648,40 +648,11 @@ pub struct StageArtifactManifestRequest {
 
 impl StageArtifactManifestRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        validate_artifact_batch("stage_artifact_manifest.rows", &self.rows)?;
-        for row in &self.rows {
-            row.validate()?;
-        }
-        let mut previous = None;
-        for row in &self.rows {
-            if previous.is_some_and(|previous| previous >= row.object_index) {
-                return Err(ProtocolError::invalid(
-                    "stage_artifact_manifest.rows",
-                    "object indexes must be strictly increasing",
-                ));
-            }
-            previous = Some(row.object_index);
-        }
-        if self.dependency_owner_revision_ids.len()
-            > usize::try_from(crate::MAX_ARTIFACT_DEPENDENCY_OWNERS)
-                .expect("artifact dependency owner limit fits usize")
-        {
-            return Err(ProtocolError::invalid(
-                "stage_artifact_manifest.dependency_owner_revision_ids",
-                format!("exceeds {}", crate::MAX_ARTIFACT_DEPENDENCY_OWNERS),
-            ));
-        }
-        if !self
-            .dependency_owner_revision_ids
-            .windows(2)
-            .all(|pair| pair[0] < pair[1])
-        {
-            return Err(ProtocolError::invalid(
-                "stage_artifact_manifest.dependency_owner_revision_ids",
-                "must be sorted and unique",
-            ));
-        }
-        Ok(())
+        validate_manifest_rows("stage_artifact_manifest.rows", &self.rows)?;
+        validate_dependency_owners(
+            "stage_artifact_manifest.dependency_owner_revision_ids",
+            &self.dependency_owner_revision_ids,
+        )
     }
 }
 
@@ -695,6 +666,130 @@ pub struct CompleteArtifactPublishRequest {
 impl CompleteArtifactPublishRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
         self.artifact.validate()
+    }
+}
+
+/// `BeginArtifactPublish` and, for a fresh publication, staging its complete
+/// object plan in the same write session, so the publication is durable before
+/// any provider write after one acknowledgement. A publication that already
+/// made progress answers with its `Begin` status unchanged and the caller
+/// resumes it step by step.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareArtifactPublishRequest {
+    pub begin: BeginArtifactPublishRequest,
+    /// The complete staged-object plan sealed by `begin`.
+    pub objects: Vec<StagedObject>,
+}
+
+impl PrepareArtifactPublishRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        require_object_backed_begin("prepare_artifact_publish.begin", &self.begin)?;
+        self.begin.validate()?;
+        if self.objects.len() != self.begin.staged_object_count as usize {
+            return Err(ProtocolError::invalid(
+                "prepare_artifact_publish.objects",
+                "must carry the complete staged-object plan",
+            ));
+        }
+        if self.objects.is_empty() {
+            return Ok(());
+        }
+        validate_staged_objects("prepare_artifact_publish.objects", &self.objects)
+    }
+}
+
+/// Recording the remaining uploaded objects, staging the remaining manifest
+/// rows, and completing the publication in one write session, with one
+/// acknowledgement after the provider writes. Each step keeps the replay,
+/// heartbeat, and token rules of its stepwise request.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FinishArtifactPublishRequest {
+    pub token: OperationToken,
+    pub uploaded_objects: Vec<ObjectUploadProof>,
+    pub manifest_rows: Vec<ArtifactManifestRow>,
+    pub dependency_owner_revision_ids: Vec<ArtifactRevisionIdentity>,
+    pub artifact: ArtifactDescriptor,
+}
+
+impl FinishArtifactPublishRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if !self.uploaded_objects.is_empty() {
+            validate_upload_proofs(
+                "finish_artifact_publish.uploaded_objects",
+                &self.uploaded_objects,
+            )?;
+        }
+        if !self.manifest_rows.is_empty() {
+            validate_manifest_rows("finish_artifact_publish.manifest_rows", &self.manifest_rows)?;
+        }
+        validate_dependency_owners(
+            "finish_artifact_publish.dependency_owner_revision_ids",
+            &self.dependency_owner_revision_ids,
+        )?;
+        self.artifact.validate()
+    }
+}
+
+/// Admit and complete a publication whose whole body travels in this request
+/// and is stored inline in shard metadata, in one write session with one
+/// durable acknowledgement.
+///
+/// No object is written, so no durable intent has to precede one: `begin`
+/// seals no staged objects and no manifest rows, and binds the body's SHA-256
+/// as its inline body digest. Each step keeps the replay, token, and recovery
+/// rules of its stepwise request; a publication found in progress is
+/// completed with this body.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublishInlineArtifactRequest {
+    pub begin: BeginArtifactPublishRequest,
+    #[serde(with = "crate::artifact_publish::wire_bytes")]
+    pub body: Vec<u8>,
+    pub artifact: ArtifactDescriptor,
+}
+
+impl PublishInlineArtifactRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.begin.validate()?;
+        self.artifact.validate()?;
+        if !matches!(self.begin.authority, PublicationAuthority::Visible) {
+            return Err(ProtocolError::invalid(
+                "publish_inline_artifact.begin.authority",
+                "inline bodies are published only under visible authority",
+            ));
+        }
+        if self.body.is_empty() || self.body.len() > MAX_INLINE_ARTIFACT_BODY_BYTES {
+            return Err(ProtocolError::invalid(
+                "publish_inline_artifact.body",
+                format!("must hold 1 to {MAX_INLINE_ARTIFACT_BODY_BYTES} bytes"),
+            ));
+        }
+        let empty_closure = Digest([0; 32]);
+        if self.begin.staged_object_count != 0
+            || self.begin.staged_object_seal != empty_closure
+            || self.begin.manifest_row_count != 0
+            || self.begin.manifest_seal != empty_closure
+            || !self.begin.dependency_owner_revision_ids.is_empty()
+        {
+            return Err(ProtocolError::invalid(
+                "publish_inline_artifact.begin",
+                "an inline publication stages no objects, manifest rows, or dependencies",
+            ));
+        }
+        let digest = inline_artifact_body_digest(&self.body);
+        if self.begin.inline_body_digest != Some(digest)
+            || self.artifact.body_digest != sha256_digest_uri(digest)
+            || self.artifact.manifest_digest != sha256_digest_uri(empty_closure)
+            || self.artifact.logical_size != self.body.len() as u64
+        {
+            return Err(ProtocolError::invalid(
+                "publish_inline_artifact",
+                "the sealed plan and descriptor must describe exactly this body",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1782,6 +1877,71 @@ fn validate_artifact_batch<T>(field: &'static str, rows: &[T]) -> Result<(), Pro
     Ok(())
 }
 
+fn validate_staged_objects(
+    field: &'static str,
+    objects: &[StagedObject],
+) -> Result<(), ProtocolError> {
+    validate_artifact_batch(field, objects)?;
+    for object in objects {
+        object.validate()?;
+    }
+    require_strict_sequences(
+        field,
+        objects.iter().map(|object| u64::from(object.sequence)),
+    )
+}
+
+fn validate_upload_proofs(
+    field: &'static str,
+    proofs: &[ObjectUploadProof],
+) -> Result<(), ProtocolError> {
+    validate_artifact_batch(field, proofs)?;
+    for proof in proofs {
+        proof.validate()?;
+    }
+    require_strict_sequences(field, proofs.iter().map(|proof| u64::from(proof.sequence)))
+}
+
+fn validate_manifest_rows(
+    field: &'static str,
+    rows: &[ArtifactManifestRow],
+) -> Result<(), ProtocolError> {
+    validate_artifact_batch(field, rows)?;
+    for row in rows {
+        row.validate()?;
+    }
+    let mut previous = None;
+    for row in rows {
+        if previous.is_some_and(|previous| previous >= row.object_index) {
+            return Err(ProtocolError::invalid(
+                field,
+                "object indexes must be strictly increasing",
+            ));
+        }
+        previous = Some(row.object_index);
+    }
+    Ok(())
+}
+
+fn validate_dependency_owners(
+    field: &'static str,
+    owners: &[ArtifactRevisionIdentity],
+) -> Result<(), ProtocolError> {
+    if owners.len()
+        > usize::try_from(crate::MAX_ARTIFACT_DEPENDENCY_OWNERS)
+            .expect("artifact dependency owner limit fits usize")
+    {
+        return Err(ProtocolError::invalid(
+            field,
+            format!("exceeds {}", crate::MAX_ARTIFACT_DEPENDENCY_OWNERS),
+        ));
+    }
+    if !owners.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(ProtocolError::invalid(field, "must be sorted and unique"));
+    }
+    Ok(())
+}
+
 fn require_strict_sequences(
     field: &'static str,
     sequences: impl Iterator<Item = u64>,
@@ -2218,7 +2378,152 @@ mod tests {
             manifest_row_count: 1,
             manifest_seal: Digest([4; 32]),
             dependency_owner_revision_ids: Vec::new(),
+            inline_body_digest: None,
         }
+    }
+
+    fn staged_object(sequence: u32) -> StagedObject {
+        StagedObject {
+            sequence,
+            object_identity: crate::ObjectIdentity::new(format!("objects/{sequence}")).unwrap(),
+            expected_length: 1,
+            expected_digest: crate::sha256_digest_uri(Digest([5; 32])),
+            multipart_token: None,
+        }
+    }
+
+    fn upload_proof(sequence: u32) -> ObjectUploadProof {
+        ObjectUploadProof {
+            sequence,
+            observed_length: 1,
+            observed_digest: crate::sha256_digest_uri(Digest([5; 32])),
+        }
+    }
+
+    fn finish_request() -> FinishArtifactPublishRequest {
+        FinishArtifactPublishRequest {
+            token: OperationToken {
+                operation_id: OperationIdentity([1; 16]),
+                state_digest: Digest([6; 32]),
+            },
+            uploaded_objects: vec![upload_proof(0)],
+            manifest_rows: vec![ArtifactManifestRow {
+                object_index: 0,
+                physical_object_index: 0,
+                logical_offset: 0,
+                physical_owner_revision_id: ArtifactRevisionIdentity([2; 16]),
+                object_identity: crate::ObjectIdentity::new("objects/0").unwrap(),
+                object_offset: 0,
+                length: 1,
+                digest: crate::sha256_digest_uri(Digest([5; 32])),
+                append_segment: None,
+            }],
+            dependency_owner_revision_ids: Vec::new(),
+            artifact: ArtifactDescriptor {
+                logical_size: 1,
+                body_digest: crate::sha256_digest_uri(Digest([5; 32])),
+                manifest_digest: crate::sha256_digest_uri(Digest([4; 32])),
+                content_type: crate::ContentType::new("application/octet-stream").unwrap(),
+                producer: None,
+                manifest_identity: None,
+                index_fields: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn prepare_carries_exactly_the_sealed_object_plan() {
+        let begin = begin_manifest_publish(
+            "outputs/result.bin",
+            PublicationAuthority::Visible,
+            PublishCondition::CreateOnly,
+        );
+        PrepareArtifactPublishRequest {
+            begin: begin.clone(),
+            objects: vec![staged_object(0)],
+        }
+        .validate()
+        .unwrap();
+        for objects in [Vec::new(), vec![staged_object(0), staged_object(1)]] {
+            assert!(matches!(
+                PrepareArtifactPublishRequest {
+                    begin: begin.clone(),
+                    objects,
+                }
+                .validate(),
+                Err(ProtocolError::InvalidField {
+                    field: "prepare_artifact_publish.objects",
+                    ..
+                })
+            ));
+        }
+        let mut empty_plan = begin.clone();
+        empty_plan.staged_object_count = 0;
+        PrepareArtifactPublishRequest {
+            begin: empty_plan,
+            objects: Vec::new(),
+        }
+        .validate()
+        .unwrap();
+
+        // The Begin half keeps every Begin rule.
+        let mut staging = begin;
+        staging.authority = PublicationAuthority::CommitStaging {
+            commit_operation_id: OperationIdentity([5; 16]),
+        };
+        assert!(matches!(
+            PrepareArtifactPublishRequest {
+                begin: staging,
+                objects: vec![staged_object(0)],
+            }
+            .validate(),
+            Err(ProtocolError::InvalidField {
+                field: "begin_artifact_publish.authority",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn finish_validates_each_step_it_carries() {
+        finish_request().validate().unwrap();
+        let mut complete_only = finish_request();
+        complete_only.uploaded_objects.clear();
+        complete_only.manifest_rows.clear();
+        complete_only.validate().unwrap();
+
+        let mut unordered = finish_request();
+        unordered.uploaded_objects = vec![upload_proof(1), upload_proof(0)];
+        assert!(matches!(
+            unordered.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "finish_artifact_publish.uploaded_objects",
+                ..
+            })
+        ));
+        let mut repeated_row = finish_request();
+        repeated_row
+            .manifest_rows
+            .push(repeated_row.manifest_rows[0].clone());
+        assert!(matches!(
+            repeated_row.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "finish_artifact_publish.manifest_rows",
+                ..
+            })
+        ));
+        let mut unsorted_owners = finish_request();
+        unsorted_owners.dependency_owner_revision_ids = vec![
+            ArtifactRevisionIdentity([8; 16]),
+            ArtifactRevisionIdentity([7; 16]),
+        ];
+        assert!(matches!(
+            unsorted_owners.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "finish_artifact_publish.dependency_owner_revision_ids",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "metadata-read-stats")]
 use std::marker::PhantomData;
@@ -5,13 +6,14 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 #[cfg(feature = "metadata-read-stats")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::thread;
 use std::time::Duration;
 
 use nokv_meta_store::{
-    Check, Commit, Key, Keyspace, LimitKind, Mutation, ReadBatch, ReadOp, ReadResult, ReadSnapshot,
-    Scan, ScanItem, ScanPage, StoreError, StoreLimits, TxnStore, WriteTxn,
+    Check, Commit, Key, Keyspace, LimitKind, Mutation, PendingCommit, ReadBatch, ReadOp,
+    ReadResult, ReadSnapshot, Scan, ScanItem, ScanPage, StoreError, StoreLimits, Submission,
+    TxnStore, WriteTxn,
 };
 use nokv_types::{
     CommandDigest, CommitVersion, LogicalShardId, ObjectNamespaceId, OwnerEpoch,
@@ -473,10 +475,56 @@ impl std::fmt::Display for MetaError {
 
 impl std::error::Error for MetaError {}
 
+/// The metadata write session held by the current thread, if any.
+struct WriteSessionState {
+    gate: usize,
+    // The latest unacknowledged submission. Acknowledging it also
+    // acknowledges every earlier submission of the session.
+    pending: Option<PendingCommit>,
+}
+
+thread_local! {
+    static WRITE_SESSION: RefCell<Option<WriteSessionState>> = const { RefCell::new(None) };
+}
+
+/// Clears the thread's write session when its work returns or unwinds.
+struct WriteSessionScope;
+
+impl WriteSessionScope {
+    fn begin(gate: usize) -> Self {
+        WRITE_SESSION.with(|session| {
+            *session.borrow_mut() = Some(WriteSessionState {
+                gate,
+                pending: None,
+            });
+        });
+        Self
+    }
+
+    fn finish(self) -> Option<PendingCommit> {
+        let pending = WRITE_SESSION.with(|session| {
+            session
+                .borrow_mut()
+                .as_mut()
+                .and_then(|state| state.pending.take())
+        });
+        drop(self);
+        pending
+    }
+}
+
+impl Drop for WriteSessionScope {
+    fn drop(&mut self) {
+        WRITE_SESSION.with(|session| session.borrow_mut().take());
+    }
+}
+
 #[derive(Clone)]
 pub struct MetaShard {
     store: Arc<dyn TxnStore>,
     logical_shard_id: LogicalShardId,
+    // Exclusive for one write session; shared for fenced reads. A thread that
+    // holds a write session reenters it instead of locking again.
     command_gate: Arc<RwLock<()>>,
     #[cfg(feature = "metadata-read-stats")]
     read_stats_identity: Arc<ReadStatsIdentity>,
@@ -667,6 +715,121 @@ impl MetaShard {
         Ok(self)
     }
 
+    /// Run `work` as one sequenced write session on this shard.
+    ///
+    /// The command gate is held exclusively for the whole closure. Commands
+    /// planned inside it read the latest applied state, so their read version
+    /// equals the commit clock by construction and an unrelated writer cannot
+    /// invalidate them. Each command is applied without waiting for the store's
+    /// acknowledgement boundary; after the gate is released the session
+    /// acknowledges its last submission, which covers every earlier one, and
+    /// only then returns `work`'s result. A session that submitted nothing waits
+    /// on a durability barrier instead, because its reads may have observed
+    /// another session's unacknowledged commands. A nested call on the same
+    /// shard runs inside the outer session.
+    ///
+    /// `work` must stay limited to metadata reads, commands, and local
+    /// computation: no external side effect may depend on a command being
+    /// durable before the session returns, and it must not wait for another
+    /// session.
+    pub fn write_session<R>(&self, work: impl FnOnce() -> R) -> Result<R, MetaError> {
+        if self.write_session_active() {
+            return Ok(work());
+        }
+        if WRITE_SESSION.with(|session| session.borrow().is_some()) {
+            return Err(MetaError::Internal {
+                operation: "begin write session",
+                message: "the thread already holds a write session on another metadata shard"
+                    .to_owned(),
+            });
+        }
+        // The gate guards no data. A session that panicked left only complete
+        // store transactions behind, like an owner crash between commands, so
+        // a later session may proceed.
+        let gate = self
+            .command_gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scope = WriteSessionScope::begin(self.gate_id());
+        let result = work();
+        let pending = scope.finish();
+        drop(gate);
+        match pending {
+            Some(pending) => pending
+                .acknowledge()
+                .map_err(|source| store_error("acknowledge write session", source))?,
+            None => self
+                .store
+                .durability_barrier()
+                .map_err(|source| store_error("write session durability barrier", source))?,
+        }
+        Ok(result)
+    }
+
+    /// Wait until every metadata command applied before this call reaches the
+    /// store's acknowledgement boundary.
+    ///
+    /// Read-only callers use it before exposing results that may include
+    /// another session's not yet acknowledged commands.
+    pub fn durability_barrier(&self) -> Result<(), MetaError> {
+        self.store
+            .durability_barrier()
+            .map_err(|source| store_error("metadata durability barrier", source))
+    }
+
+    fn gate_id(&self) -> usize {
+        Arc::as_ptr(&self.command_gate) as *const () as usize
+    }
+
+    fn write_session_active(&self) -> bool {
+        let gate = self.gate_id();
+        WRITE_SESSION.with(|session| {
+            session
+                .borrow()
+                .as_ref()
+                .is_some_and(|state| state.gate == gate)
+        })
+    }
+
+    /// Shared gate for fenced reads, or nothing inside this shard's session,
+    /// which already excludes every other writer.
+    fn read_gate(&self) -> Result<Option<RwLockReadGuard<'_, ()>>, MetaError> {
+        if self.write_session_active() {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.command_gate
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ))
+    }
+
+    /// Hand an applied submission to the active session, or acknowledge it
+    /// before returning when no session of this shard is active.
+    fn acknowledge_or_defer(
+        &self,
+        operation: &'static str,
+        pending: PendingCommit,
+    ) -> Result<(), MetaError> {
+        let gate = self.gate_id();
+        let undeferred = WRITE_SESSION.with(|session| {
+            let mut session = session.borrow_mut();
+            match session.as_mut() {
+                Some(state) if state.gate == gate => {
+                    state.pending = Some(pending);
+                    None
+                }
+                _ => Some(pending),
+            }
+        });
+        match undeferred {
+            None => Ok(()),
+            Some(pending) => pending
+                .acknowledge()
+                .map_err(|source| store_error(operation, source)),
+        }
+    }
+
     pub fn current_read_version(&self) -> Result<ReadVersion, MetaError> {
         let value =
             self.required_value(SYSTEM.id, SYSTEM_COMMIT_CLOCK_KEY, "System(commit_clock)")?;
@@ -730,10 +893,7 @@ impl MetaShard {
     ///
     /// Ordinary reads and writes must still use the fenced context APIs.
     pub fn root_fence(&self, root_id: RootId) -> Result<Option<RootFence>, MetaError> {
-        let _read_guard = self
-            .command_gate
-            .read()
-            .map_err(|error| internal("lock read gate", error))?;
+        let _read_guard = self.read_gate()?;
         self.read_value(
             ROOT_FENCE.id,
             root_id.as_bytes(),
@@ -756,10 +916,7 @@ impl MetaShard {
 
     /// Return the durable recovery tail atomically serialized with writes.
     pub fn recovery_state(&self) -> Result<RecoveryState, MetaError> {
-        let _read_guard = self
-            .command_gate
-            .read()
-            .map_err(|error| internal("lock read gate", error))?;
+        let _read_guard = self.read_gate()?;
         self.recovery_state_unlocked()
     }
 
@@ -778,25 +935,23 @@ impl MetaShard {
         recovery_lsn: u64,
         replacement: Option<Vec<u8>>,
     ) -> Result<(), MetaError> {
-        let _command_guard = self
-            .command_gate
-            .write()
-            .map_err(|error| internal("lock command gate", error))?;
-        let key = Key::new(RECOVERY_OUTBOX.id, recovery_outbox_key(recovery_lsn));
-        let mutation = match replacement {
-            Some(value) => Mutation::Put { key, value },
-            None => Mutation::Delete { key },
-        };
-        match self.commit(
-            "inject RecoveryOutbox test fault",
-            WriteTxn {
-                checks: Vec::new(),
-                mutations: vec![mutation],
-            },
-        )? {
-            Commit::Applied => Ok(()),
-            Commit::Conflict => Err(MetaError::WriteConflict),
-        }
+        self.write_session(|| {
+            let key = Key::new(RECOVERY_OUTBOX.id, recovery_outbox_key(recovery_lsn));
+            let mutation = match replacement {
+                Some(value) => Mutation::Put { key, value },
+                None => Mutation::Delete { key },
+            };
+            match self.commit(
+                "inject RecoveryOutbox test fault",
+                WriteTxn {
+                    checks: Vec::new(),
+                    mutations: vec![mutation],
+                },
+            )? {
+                Commit::Applied => Ok(()),
+                Commit::Conflict => Err(MetaError::WriteConflict),
+            }
+        })?
     }
 
     fn recovery_outbox_after_with_byte_budget(
@@ -811,10 +966,7 @@ impl MetaShard {
                 "recovery outbox limit must be in 1..={MAX_RECOVERY_PAGE_ROWS}"
             )));
         }
-        let _read_guard = self
-            .command_gate
-            .read()
-            .map_err(|error| internal("lock read gate", error))?;
+        let _read_guard = self.read_gate()?;
         self.recovery_outbox_after_unlocked(start_after_lsn, limit, max_encoded_bytes)
     }
 
@@ -885,10 +1037,7 @@ impl MetaShard {
 
     /// Verify every durable recovery row and the `System` tail.
     pub fn verify_recovery_chain(&self) -> Result<RecoveryState, MetaError> {
-        let _read_guard = self
-            .command_gate
-            .read()
-            .map_err(|error| internal("lock read gate", error))?;
+        let _read_guard = self.read_gate()?;
         self.verify_recovery_chain_unlocked()
     }
 
@@ -903,10 +1052,7 @@ impl MetaShard {
                 "recovery segment limit must be in 1..={MAX_RECOVERY_SEGMENT_RECORDS}"
             )));
         }
-        let _read_guard = self
-            .command_gate
-            .read()
-            .map_err(|error| internal("lock read gate", error))?;
+        let _read_guard = self.read_gate()?;
         let current = self.recovery_state_unlocked()?;
         if boundary.applied_recovery_lsn > current.applied_recovery_lsn {
             return Err(corrupt(
@@ -969,11 +1115,7 @@ impl MetaShard {
                 ));
             }
         }
-        let _command_guard = self
-            .command_gate
-            .write()
-            .map_err(|error| internal("lock command gate", error))?;
-        self.replay_recovery_record_unlocked(record)
+        self.write_session(|| self.replay_recovery_record_unlocked(record))?
     }
 
     /// Replay one fully validated segment after checking its entire overlap
@@ -991,55 +1133,50 @@ impl MetaShard {
                 "segment targets a different logical shard",
             ));
         }
-        let _command_guard = self
-            .command_gate
-            .write()
-            .map_err(|error| internal("lock command gate", error))?;
-        let before = self.recovery_state_unlocked()?;
-        if before.applied_recovery_lsn < segment.first_lsn {
-            segment
-                .verify_follows(before)
-                .map_err(|error| corrupt("RecoveryOutbox replay", error))?;
-        } else {
-            for record in segment
-                .records
-                .iter()
-                .take_while(|record| record.recovery_lsn <= before.applied_recovery_lsn)
-            {
-                let local = self.recovery_record_at_unlocked(record.recovery_lsn)?;
-                if &local != record {
-                    return Err(corrupt(
-                        "RecoveryOutbox replay",
-                        format!("target diverges at overlapping LSN {}", record.recovery_lsn),
-                    ));
+        self.write_session(|| {
+            let before = self.recovery_state_unlocked()?;
+            if before.applied_recovery_lsn < segment.first_lsn {
+                segment
+                    .verify_follows(before)
+                    .map_err(|error| corrupt("RecoveryOutbox replay", error))?;
+            } else {
+                for record in segment
+                    .records
+                    .iter()
+                    .take_while(|record| record.recovery_lsn <= before.applied_recovery_lsn)
+                {
+                    let local = self.recovery_record_at_unlocked(record.recovery_lsn)?;
+                    if &local != record {
+                        return Err(corrupt(
+                            "RecoveryOutbox replay",
+                            format!("target diverges at overlapping LSN {}", record.recovery_lsn),
+                        ));
+                    }
+                }
+                if before.applied_recovery_lsn < segment.last_lsn {
+                    let overlap = self.recovery_record_at_unlocked(before.applied_recovery_lsn)?;
+                    if overlap.chain_digest != before.chain_digest {
+                        return Err(corrupt(
+                            "RecoveryOutbox replay",
+                            "target tail digest disagrees with its overlapping row",
+                        ));
+                    }
                 }
             }
-            if before.applied_recovery_lsn < segment.last_lsn {
-                let overlap = self.recovery_record_at_unlocked(before.applied_recovery_lsn)?;
-                if overlap.chain_digest != before.chain_digest {
-                    return Err(corrupt(
-                        "RecoveryOutbox replay",
-                        "target tail digest disagrees with its overlapping row",
-                    ));
+            for record in &segment.records {
+                if record.recovery_lsn > before.applied_recovery_lsn {
+                    self.replay_recovery_record_unlocked(record)?;
                 }
             }
-        }
-        for record in &segment.records {
-            if record.recovery_lsn > before.applied_recovery_lsn {
-                self.replay_recovery_record_unlocked(record)?;
-            }
-        }
-        self.recovery_state_unlocked()
+            self.recovery_state_unlocked()
+        })?
     }
 
     /// Verify the full recovery head/chain and the bidirectional binding
     /// between every metadata-command row and its exact dedupe result. This is
     /// diagnostic only and never repairs, skips, or guesses a missing row.
     pub fn fsck_recovery(&self) -> Result<RecoveryFsckReport, MetaError> {
-        let _read_guard = self
-            .command_gate
-            .read()
-            .map_err(|error| internal("lock read gate", error))?;
+        let _read_guard = self.read_gate()?;
         self.with_stable_recovery_scan(|state| self.fsck_recovery_at_state_unlocked(state))
     }
 
@@ -1281,11 +1418,14 @@ impl MetaShard {
         owner_epoch: OwnerEpoch,
         observed_ms: u64,
     ) -> Result<u64, MetaError> {
-        let _command_guard = self
-            .command_gate
-            .write()
-            .map_err(|error| internal("lock command gate", error))?;
-        self.observe_lease_clock_unlocked(root_id, placement_generation, owner_epoch, observed_ms)
+        self.write_session(|| {
+            self.observe_lease_clock_unlocked(
+                root_id,
+                placement_generation,
+                owner_epoch,
+                observed_ms,
+            )
+        })?
     }
 
     fn observe_lease_clock_unlocked(
@@ -1386,11 +1526,7 @@ impl MetaShard {
         expected: Option<OwnerEpoch>,
         next: OwnerEpoch,
     ) -> Result<(), MetaError> {
-        let _command_guard = self
-            .command_gate
-            .write()
-            .map_err(|error| internal("lock command gate", error))?;
-        self.advance_owner_epoch_unlocked(expected, next)
+        self.write_session(|| self.advance_owner_epoch_unlocked(expected, next))?
     }
 
     fn advance_owner_epoch_unlocked(
@@ -1549,11 +1685,9 @@ impl MetaShard {
         if command.command_digest != command.canonical_digest() {
             return Err(MetaError::CommandDigestMismatch);
         }
-        let _command_guard = self
-            .command_gate
-            .write()
-            .map_err(|error| internal("lock command gate", error))?;
-        self.execute_with_lease_deadline_unlocked(command, lease_deadline_ms)
+        self.write_session(|| {
+            self.execute_with_lease_deadline_unlocked(command, lease_deadline_ms)
+        })?
     }
 
     fn execute_with_lease_deadline_unlocked(
@@ -1673,10 +1807,7 @@ impl MetaShard {
         key: &[u8],
         version: ReadVersion,
     ) -> Result<Option<Vec<u8>>, MetaError> {
-        let _read_guard = self
-            .command_gate
-            .read()
-            .map_err(|error| internal("lock read gate", error))?;
+        let _read_guard = self.read_gate()?;
         validate_root_scoped_bytes(root_id, key, "read key")?;
         self.read_at_fence(
             family,
@@ -1709,10 +1840,7 @@ impl MetaShard {
     where
         E: From<MetaError>,
     {
-        let _read_guard = self
-            .command_gate
-            .read()
-            .map_err(|error| E::from(internal("lock read gate", error)))?;
+        let _read_guard = self.read_gate().map_err(E::from)?;
         let current_version = self
             .validate_read_context(root_id, placement_generation, owner_epoch)
             .map_err(E::from)?;
@@ -1748,10 +1876,7 @@ impl MetaShard {
         owner_epoch: OwnerEpoch,
         request_id: RequestId,
     ) -> Result<Option<CommandDedupeRecord>, MetaError> {
-        let _read_guard = self
-            .command_gate
-            .read()
-            .map_err(|error| internal("lock read gate", error))?;
+        let _read_guard = self.read_gate()?;
         let key = command_dedupe_key(root_id, request_id);
         let (_, value) = self.read_value_at_fence(
             COMMAND_DEDUPE.id,
@@ -1787,10 +1912,7 @@ impl MetaShard {
         else {
             return Ok(None);
         };
-        let _read_guard = self
-            .command_gate
-            .read()
-            .map_err(|error| internal("lock read gate", error))?;
+        let _read_guard = self.read_gate()?;
         let key = command_dedupe_key(root_id, request_id);
         let recovery = self.validate_dedupe_recovery_binding(&key, &dedupe)?;
         Ok(Some(MetadataCommandResult {
@@ -2180,10 +2302,7 @@ impl MetaShard {
         key: &[u8],
         version: ReadVersion,
     ) -> Result<Option<Vec<u8>>, MetaError> {
-        let _read_guard = self
-            .command_gate
-            .read()
-            .map_err(|error| internal("lock read gate", error))?;
+        let _read_guard = self.read_gate()?;
         validate_root_scoped_bytes(root_id, key, "change-event key")?;
         let (current_version, record) = self.read_value_at_fence(
             CHANGE_EVENT.id,
@@ -2227,10 +2346,7 @@ impl MetaShard {
         start_after: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<MetadataScanItem>, MetaError> {
-        let _read_guard = self
-            .command_gate
-            .read()
-            .map_err(|error| internal("lock read gate", error))?;
+        let _read_guard = self.read_gate()?;
         let mut expected_clock =
             self.validate_read_fence(root_id, placement_generation, owner_epoch, prefix, version)?;
         let effective_limit = if limit == 0 {
@@ -2718,9 +2834,13 @@ impl MetaShard {
         if requested.len() != command.history_projection.len() {
             return Err(invalid("duplicate history projection"));
         }
+        // A write-once inline body is deleted only after its revision's
+        // garbage-collection floor proves no retained read version can reach
+        // it, so its deletion keeps no History copy of the body.
         let expected = command
             .mutations
             .iter()
+            .filter(|mutation| mutation.family() != MetadataFamily::ArtifactInlineBody)
             .filter_map(|mutation| {
                 let planned = plan
                     .exact
@@ -3188,9 +3308,17 @@ impl MetaShard {
     fn commit(&self, operation: &'static str, txn: WriteTxn) -> Result<Commit, MetaError> {
         txn.validate(&store_limits())
             .map_err(|source| store_error(operation, source))?;
-        self.store
-            .commit(txn)
-            .map_err(|source| store_error(operation, source))
+        match self
+            .store
+            .submit(txn)
+            .map_err(|source| store_error(operation, source))?
+        {
+            Submission::Conflict => Ok(Commit::Conflict),
+            Submission::Applied(pending) => {
+                self.acknowledge_or_defer(operation, pending)?;
+                Ok(Commit::Applied)
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3453,6 +3581,12 @@ fn validate_predicate_plan(
             return Err(invalid(
                 "workspace incarnation claims are append-only and permanent",
             ));
+        }
+        if mutation.family() == MetadataFamily::ArtifactInlineBody
+            && matches!(mutation, CommandMutation::Put { .. })
+            && predicate.current.is_some()
+        {
+            return Err(invalid("artifact inline bodies are write-once"));
         }
         if matches!(mutation, CommandMutation::Delete { .. }) && predicate.current.is_none() {
             return Err(invalid("delete mutation requires an existing value"));
@@ -4315,6 +4449,71 @@ mod tests {
         }
     }
 
+    /// Records submissions, acknowledgements, and barriers in order.
+    struct DeferredAckStore {
+        inner: Arc<dyn TxnStore>,
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl DeferredAckStore {
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().unwrap().clone()
+        }
+
+        fn clear(&self) {
+            self.events.lock().unwrap().clear();
+        }
+    }
+
+    impl TxnStore for DeferredAckStore {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            self.inner.read(batch)
+        }
+
+        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            self.inner.commit(txn)
+        }
+
+        fn submit(&self, txn: WriteTxn) -> Result<Submission, StoreError> {
+            let outcome = self.inner.commit(txn)?;
+            self.events.lock().unwrap().push("submit");
+            Ok(match outcome {
+                Commit::Applied => {
+                    let events = Arc::clone(&self.events);
+                    Submission::Applied(PendingCommit::new(move || {
+                        events.lock().unwrap().push("ack");
+                        Ok(())
+                    }))
+                }
+                Commit::Conflict => Submission::Conflict,
+            })
+        }
+
+        fn durability_barrier(&self) -> Result<(), StoreError> {
+            self.events.lock().unwrap().push("barrier");
+            Ok(())
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
+
+    fn deferred_ack_shard() -> (MetaShard, Arc<DeferredAckStore>) {
+        let controller = ready_store();
+        let wrapper = Arc::new(DeferredAckStore {
+            inner: Arc::clone(&controller.store),
+            events: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let shard = MetaShard::open(wrapper.clone(), shard(1)).unwrap();
+        wrapper.clear();
+        (shard, wrapper)
+    }
+
     struct ProfileOnlyStore {
         limits: StoreLimits,
     }
@@ -4578,7 +4777,7 @@ mod tests {
     #[test]
     fn fresh_store_freezes_schema_shard_and_bootstrap_version() {
         let store = crate::workspace::test_support::memory(shard(1)).unwrap();
-        assert_eq!(keyspaces().len(), 29);
+        assert_eq!(keyspaces().len(), 30);
         assert_eq!(store.current_read_version().unwrap().get(), 1);
         assert_eq!(
             store.advance_owner_epoch(Some(epoch(1)), epoch(2)),
@@ -6636,5 +6835,115 @@ mod tests {
             ),
             "continuous cross-instance tail movement must remain a typed retryable condition"
         );
+    }
+
+    #[test]
+    fn write_session_acknowledges_its_last_submission_after_releasing_the_gate() {
+        let (store, recorder) = deferred_ack_shard();
+        let (first, second) = store
+            .write_session(|| {
+                let first = store
+                    .execute(&create_command(
+                        &store,
+                        request(40),
+                        scoped_key(root(2), b"session/a"),
+                        b"a",
+                    ))
+                    .unwrap();
+                let second = store
+                    .execute(&create_command(
+                        &store,
+                        request(41),
+                        scoped_key(root(2), b"session/b"),
+                        b"b",
+                    ))
+                    .unwrap();
+                assert_eq!(recorder.events(), vec!["submit", "submit"]);
+                (first, second)
+            })
+            .unwrap();
+        assert_eq!(second.commit_version.get(), first.commit_version.get() + 1);
+        assert_eq!(recorder.events(), vec!["submit", "submit", "ack"]);
+    }
+
+    #[test]
+    fn write_session_without_submissions_waits_on_a_barrier() {
+        let (store, recorder) = deferred_ack_shard();
+        let version = store
+            .write_session(|| store.current_read_version().unwrap())
+            .unwrap();
+        assert_eq!(version, store.current_read_version().unwrap());
+        assert_eq!(recorder.events(), vec!["barrier"]);
+    }
+
+    #[test]
+    fn execute_outside_a_session_acknowledges_before_returning() {
+        let (store, recorder) = deferred_ack_shard();
+        store
+            .execute(&create_command(
+                &store,
+                request(42),
+                scoped_key(root(2), b"single"),
+                b"v",
+            ))
+            .unwrap();
+        assert_eq!(recorder.events(), vec!["submit", "ack"]);
+    }
+
+    #[test]
+    fn nested_write_session_joins_the_outer_session() {
+        let (store, recorder) = deferred_ack_shard();
+        store
+            .write_session(|| {
+                store
+                    .write_session(|| {
+                        store
+                            .execute(&create_command(
+                                &store,
+                                request(43),
+                                scoped_key(root(2), b"nested"),
+                                b"v",
+                            ))
+                            .unwrap();
+                    })
+                    .unwrap();
+                assert_eq!(recorder.events(), vec!["submit"]);
+            })
+            .unwrap();
+        assert_eq!(recorder.events(), vec!["submit", "ack"]);
+    }
+
+    #[test]
+    fn concurrent_write_sessions_never_plan_against_a_stale_clock() {
+        let store = Arc::new(ready_store());
+        let start = Arc::new(Barrier::new(8));
+        let workers = (0..8_u8)
+            .map(|worker| {
+                let store = Arc::clone(&store);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    for step in 0..16_u8 {
+                        let fill = 64 + worker * 16 + step;
+                        let key = scoped_key(root(2), format!("race/{worker}/{step}").as_bytes());
+                        // Planning reads the clock inside the session, so no
+                        // other writer can advance it before execute.
+                        store
+                            .write_session(|| {
+                                store.execute(&create_command(&store, request(fill), key, b"v"))
+                            })
+                            .unwrap()
+                            .unwrap_or_else(|error| {
+                                panic!("sequenced command {worker}/{step} failed: {error}")
+                            });
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        // Three setup commands plus 128 sequenced ones, without gaps.
+        assert_eq!(store.current_read_version().unwrap().get(), 3 + 128);
     }
 }

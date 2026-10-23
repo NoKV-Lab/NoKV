@@ -19,16 +19,16 @@ Every logical-shard store has one authoritative marker:
 System("schema")
   -> value_format_version = 1
      schema_id = "nokv_workspace"
-     format_version = 13
+     format_version = 14
 ```
 
 Startup is fail-closed:
 
 - an empty store is initialized with the exact supported marker and logical
   keyspace catalog;
-- format-12 and older stores are rejected without writes; there is no marker-only
-  upgrade because format 13 adds the monotonic append cleanup retry counter and
-  changes the durable publication operation codec;
+- format-13 and older stores are rejected without writes; there is no marker-only
+  upgrade because format 14 adds the `ArtifactInlineBody` family and changes
+  the durable publish operation codec;
 - a nonempty current store opens only when its marker, value format, and
   configured adapter catalog match this contract;
 - a missing, malformed, unknown-version, or inconsistent store is rejected.
@@ -106,7 +106,9 @@ float, timestamp, bytes, and string values.
 
 ## Durable Format Registry
 
-`System.format_version` is `13`. Version 13 adds the monotonic append cleanup
+`System.format_version` is `14`. Version 14 adds the write-once
+`ArtifactInlineBody` family and the sealed inline body digest of a publish
+operation. Version 13 added the monotonic append cleanup
 retry counter and durable exact-token retry receipts in CommandDedupe.
 Version 12 introduced logical append parents,
 publication-attempt bindings, and the active-publication recovery index in the
@@ -114,13 +116,14 @@ existing Operation family. It retains the format-11 full SHA-256 append intent,
 format-10 Generic index families, and format-9 RecoveryOutbox fixed-width decimal
 LSN keys. Existing logical recovery and object formats are unchanged.
 
-Ordinary open does not migrate a format-12 or older marker. A marker-only
+Ordinary open does not migrate a format-13 or older marker. A marker-only
 upgrade would reinterpret publication records without their required codec and
 omit the active index. Migration remains not qualified; every older or unknown
 marker is fail-closed and unchanged.
 
 Durable codecs are independently versioned:
-publish operation, staged-object, and manifest-row records use value version
+the publish operation record uses value version `8` and rejects version `7`;
+staged-object and manifest-row records use value version
 `7` and reject version `6`; an append publication binds both the full 256-bit
 intent and logical parent/attempt, with a cleanup retry counter that prevents
 repeated quarantine from recreating an earlier state token. `AppendOperationRecord` uses value version
@@ -185,6 +188,7 @@ and name. Store adapters map this catalog to their physical layout.
 | `generic_index_current` | `0x0219` | `0x19` |
 | `generic_index_generation` | `0x021a` | `0x1a` |
 | `commit_generic_index_member` | `0x021b` | `0x1b` |
+| `artifact_inline_body` | `0x021c` | `0x1c` |
 
 System keyspaces use IDs `0x0101` through `0x0106`. Domain keyspaces use
 `0x0200 | format_tag`. The `MetadataFamily` format tags remain one byte and keep
@@ -268,6 +272,16 @@ at API/object-manifest boundaries. `object_index` is exactly 16 lowercase
 hexadecimal characters. No UUID punctuation, variable-width
 numeric field, or process address is permitted.
 
+Request, operation, and artifact revision ids minted by the SDK and CLI are
+time-ordered: the first six bytes are big-endian Unix milliseconds and the
+remaining ten are entropy, the RFC 9562 UUIDv7 layout without its version
+bits. A metadata step's dedupe id keeps the six leading bytes of its request.
+The families keyed by these ids (command dedupe, operations, staged objects,
+artifact revisions and manifests, and their History rows) therefore receive
+inserts at one end of their key range instead of across all of it, which keeps
+the set of storage pages a checkpoint rewrites small. Uniqueness rests on the
+entropy alone; readers must not infer time or order from an id.
+
 ## Placement Authority
 
 Root placement is not a shard-local metadata family. The control plane owns:
@@ -328,7 +342,7 @@ WorkspaceIncarnationClaim
   key: root_id | workspace_incarnation_id
   val: stable workbench_id
 
-Publish fence: `BeginArtifactPublish` may carry `expected_workspace_incarnation_id`.
+Publish fence: `BeginArtifactPublish`, alone or inside `PrepareArtifactPublish`, may carry `expected_workspace_incarnation_id`.
 The owner compares it with the `WorkspaceCurrent` incarnation on the same read
 version as the path-generation claim and refuses the publish with
 `ConflictKind::WorkspaceIncarnation` before writing the operation row, the
@@ -376,6 +390,18 @@ ArtifactRevisionClaim (reserved key inside the artifact_revision tree)
 RevisionRef
   key: root_id | reference_kind | reference_owner_id | artifact_revision_id
   val: reference_epoch_at_add, created_version
+
+ArtifactInlineBody
+  key: root_id | artifact_revision_id
+  val: the complete body of an inline revision, 1 to 16 KiB
+
+  Write-once: the command that creates an inline revision as `Available`
+  inserts it, nothing replaces it, and only the command that completes the
+  revision's garbage collection deletes it. Because that deletion happens only
+  after the history floor proves no retained read version can resolve the
+  revision, it writes no History copy of the body. An inline revision has no
+  staged objects and no manifest rows, `block_count` 0, the empty-closure
+  manifest digest, and a body digest equal to the SHA-256 of this value.
 
 ArtifactManifest
   key: root_id | artifact_revision_id | object_index
@@ -660,6 +686,25 @@ caller must rebuild the command. An exact request-id replay is checked before
 that fence and returns the stored result. Reusing a request id with different
 inputs is an error. A failed predicate applies no mutation.
 
+A mutating RPC first claims its request id with an empty command whose
+deterministic result is the request fingerprint:
+
+```text
+SHA-256("nokv.server.request-fingerprint.v1\0"
+        || principal            (0x00; 0x01 || agent_id is reserved)
+        || root_id || logical_shard_id || object_namespace_id
+        || request_id || u64be(len(operation)) || operation)
+```
+
+`operation` is the MessagePack encoding of the request's operation. The owner
+epoch, the placement generation and the protocol schema are not part of it, so
+a same-id retry of the same operation replays after an owner restart; reads
+and commits fence ownership and placement instead. The claim binds the
+operation, not its result: a step that failed records nothing, and a same-id
+retry evaluates it again. The fingerprint and the step identities derived from
+a request id are part of the metadata format. A store whose claim rows hold an
+earlier fingerprint refuses those request ids as reused.
+
 Ordinary put/replace/remove has a fixed upper bound on predicates and mutations
 apart from bounded manifest and index rows. It performs no namespace prefix
 scan.
@@ -763,6 +808,21 @@ The final metadata command creates the `ArtifactRevision` as `Available`, its
 manifest, the first path reference, `PathCurrent`, workspace revision, indexes,
 event, and dedupe result. A failed upload is invisible. A response-loss retry
 returns the stored result without allocating another revision.
+
+A visible body of at most 16 KiB that would be a single object is published
+inline instead: `PublishInlineArtifact` carries the body, its `Begin` seals no
+staged objects or manifest rows and binds the body's SHA-256 as the
+operation's inline body digest, and the same final command that creates the
+revision inserts its `ArtifactInlineBody` row. No object is written, so no
+durable intent has to precede one; the request runs `Begin`, the
+`Finalizing` transition, and finalization in one write session with one
+durable acknowledgement, and every replay, takeover, and cleanup rule of the
+stepwise publication applies unchanged. A ranged read of an inline revision
+returns its complete body, which the reader verifies against the body digest
+before slicing. An append whose base is inline rematerializes the complete
+result under the new revision: inline while it stays within the bound,
+otherwise as dependency-free objects. Commit- and restore-staging manifests
+remain object-backed.
 
 Append stores immutable segments in the new revision manifest and atomically
 advances the path generation. A manifest row names the revision that physically
@@ -1077,7 +1137,9 @@ race past that claim.
 
 After all manifest objects are confirmed absent, the revision becomes
 `Deleted` and its manifest/candidate rows may be pruned according to audit
-retention. An ambiguous provider result changes it to `Quarantined`; neither
+retention. An inline revision owns no manifest objects: the command
+that makes it `Deleted` also deletes its `ArtifactInlineBody` row, after
+verifying the row against the revision's size and body digest. An ambiguous provider result changes it to `Quarantined`; neither
 reference addition nor metadata deletion is allowed until reconciliation
 proves all objects present or absent and performs an explicit state transition.
 

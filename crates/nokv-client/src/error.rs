@@ -46,10 +46,16 @@ impl std::error::Error for TransportError {}
 pub enum ArtifactPublishStage {
     Begin,
     StageObjects,
+    /// `Begin` and staging of a whole one-batch object plan in one request.
+    Prepare,
     UploadObjects,
     MarkObjectsUploaded,
     StageManifest,
     Complete,
+    /// Marking uploads, staging the manifest, and `Complete` in one request.
+    Finish,
+    /// `Begin` and `Complete` of a body stored inline, in one request.
+    PublishInline,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -225,10 +231,13 @@ impl fmt::Display for ArtifactPublishStage {
         formatter.write_str(match self {
             Self::Begin => "begin",
             Self::StageObjects => "stage objects",
+            Self::Prepare => "prepare",
             Self::UploadObjects => "upload objects",
             Self::MarkObjectsUploaded => "mark objects uploaded",
             Self::StageManifest => "stage manifest",
             Self::Complete => "complete",
+            Self::Finish => "finish",
+            Self::PublishInline => "publish inline",
         })
     }
 }

@@ -27,6 +27,11 @@ base = product.base
 require = product.require
 BLOCK_SIZE = 4096
 BODY_LIMIT = 4 * 1024 * 1024
+# Cleanup seals objects, so fixtures need an object-backed publication: a
+# one-block body publishes inline, a plan of at most one staging batch fused
+# (Prepare, uploads, Finish), a larger plan stepwise.
+# Mirrors MAX_ARTIFACT_PUBLISH_BATCH_ROWS in crates/nokv-protocol.
+PUBLISH_BATCH_OBJECTS = 192
 
 
 def operation(
@@ -173,10 +178,61 @@ def fixture_body(count):
     )
 
 
+def kill_caller_mid_upload(stack, workbench, operation_id, payload, label):
+    """Kill a fused caller after Prepare while its first object PUT is held.
+
+    A fused publication sends no metadata request between its uploads and the
+    committing Finish. The dead caller's held PUT then persists before the
+    activity lease admits cleanup, which must seal that uploaded object.
+    """
+    proxy = stack.object_proxy
+    proxy.hold_next_put()
+    stack.proxy.track_operations()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                product.append,
+                stack,
+                workbench,
+                operation_id,
+                payload,
+                label=label,
+                max_size=BODY_LIMIT,
+                block_size=BLOCK_SIZE,
+            )
+            while not proxy.held.wait(0.05) and not future.done():
+                pass
+            if proxy.held.is_set():
+                stack.kill_caller(label)
+            first = future.result(timeout=stack.timeout)
+        stack.proxy.require_shapes(["fused"], label)
+        held = proxy.held_request
+        proxy.release.set()
+        require(
+            held is not None and proxy.released_response.wait(stack.timeout),
+            "the dead caller's held object PUT reached the real provider",
+            held,
+        )
+    finally:
+        with proxy.lock:
+            proxy.hold_put = False
+        proxy.release.set()
+    require(
+        held["path"].endswith("/blocks/0000000000000000")
+        and held["if_none_match"] == "*"
+        and held["request_bytes"] == BLOCK_SIZE
+        and 200 <= held["released_upstream_response"]["upstream_status"] < 300,
+        "the dead caller's first object upload persisted before cleanup",
+        held,
+    )
+    return first, held
+
+
 def create_quarantine(stack, *, label, count, fault_sequence, deadline):
     workbench = "operations-" + label
     operation_id = hashlib.sha256(workbench.encode()).hexdigest()[:32]
     payload = fixture_body(count)
+    shape = "stepwise" if count > PUBLISH_BATCH_OBJECTS else "fused"
     stack.cli("workbench_create", {"id": workbench})
     owner_pid = stack.owner.pid
     with stack.object_proxy.lock:
@@ -188,17 +244,31 @@ def create_quarantine(stack, *, label, count, fault_sequence, deadline):
             "path_suffix": f"/blocks/{fault_sequence:016x}",
         }
     caller_label = label + "-uploaded-caller"
-    stack.proxy.arm("stage_artifact_manifest", lambda: stack.kill_caller(caller_label))
-    first = product.append(
-        stack,
-        workbench,
-        operation_id,
-        payload,
-        label=caller_label,
-        max_size=BODY_LIMIT,
-        block_size=BLOCK_SIZE,
-    )
-    stack.proxy.wait_dropped()
+    held_upload = None
+    if shape == "fused":
+        first, held_upload = kill_caller_mid_upload(
+            stack, workbench, operation_id, payload, caller_label
+        )
+    else:
+        # Stepwise manifest staging follows every upload: the caller dies with
+        # all objects uploaded and its publication incomplete.
+        stack.proxy.arm(
+            "stage_artifact_manifest", lambda: stack.kill_caller(caller_label)
+        )
+        first = product.append(
+            stack,
+            workbench,
+            operation_id,
+            payload,
+            label=caller_label,
+            max_size=BODY_LIMIT,
+            block_size=BLOCK_SIZE,
+        )
+        stack.proxy.require_shapes([shape], caller_label)
+        stack.proxy.wait_dropped()
+    sent = [
+        op for op in stack.proxy.operations_since_arm if op in base.PUBLICATION_SHAPES
+    ]
     require(
         first.get("status") == "caller_killed",
         "the real uploaded caller was killed",
@@ -258,6 +328,7 @@ def create_quarantine(stack, *, label, count, fault_sequence, deadline):
         "quarantine": status,
         "fault": faults[0],
         "active_noop": active_noop,
+        "publication_shape": {"shape": shape, "requests": sent, "held": held_upload},
     }
 
 
@@ -569,12 +640,53 @@ def finish_append(stack, fixture, label):
     return {"receipt": result, "replay": replay}
 
 
+def inline_committed_noop(stack, label):
+    """A one-block append commits inline in one request and stages nothing."""
+    workbench = "operations-" + label
+    operation_id = hashlib.sha256(workbench.encode()).hexdigest()[:32]
+    stack.cli("workbench_create", {"id": workbench})
+    stack.proxy.track_operations()
+    receipt = product.append(
+        stack,
+        workbench,
+        operation_id,
+        fixture_body(1),
+        label=label + "-append",
+        max_size=BODY_LIMIT,
+        block_size=BLOCK_SIZE,
+    )
+    require(receipt.get("status") == "success", "inline append commits", receipt)
+    stack.proxy.require_shapes(["inline"], label)
+    inspected = operation(stack, "inspect", operation_id, label + "-inspect")
+    require(
+        inspected.get("status") == "success"
+        and inspected.get("state") == "committed"
+        and inspected.get("registered_count") == inspected.get("remaining_count") == 0
+        and inspected.get("entries") == []
+        and inspected.get("next_cursor") is None,
+        "a committed inline append retains no cleanup ledger",
+        inspected,
+    )
+    no_op = operation(stack, "recover", operation_id, label + "-recover")
+    require(
+        no_op.get("status") == "success"
+        and no_op.get("requested") is False
+        and no_op.get("recovery_receipt") is None
+        and no_op.get("state") == "committed"
+        and product.canonical_receipt(no_op["receipt"])
+        == product.canonical_receipt(receipt),
+        "recover of a committed inline append is a metadata-only no-op",
+        no_op,
+    )
+    return {"receipt": receipt, "inspection": inspected, "committed_noop": no_op}
+
+
 def public_quarantine_recovery(
     stack,
     deadline,
     *,
     label="public-quarantine",
-    count=1,
+    count=2,  # one block would publish inline, with no object to seal
     fault_sequence=0,
     python_pages=False,
 ):
@@ -720,6 +832,7 @@ def public_quarantine_recovery(
         return product.case_result(
             safety="PASS",
             completion="PASS",
+            publication_shape=fixture["publication_shape"],
             fault=fixture["fault"],
             initial_quarantine=fixture["quarantine"],
             inspection=inspected,
@@ -850,6 +963,7 @@ def paginated_prefix_recovery(stack, deadline):
         return product.case_result(
             safety="PASS",
             completion="PASS",
+            publication_shape=fixture["publication_shape"],
             fault=fixture["fault"],
             cleaned_prefix=32,
             registered_count=257,
@@ -1166,9 +1280,11 @@ def recovery_ack_loss_and_aba(stack, deadline):
             "recover of committed append is a metadata-only no-op",
             no_op,
         )
+        inline = inline_committed_noop(stack, label + "-inline")
         return product.case_result(
             safety="PASS",
             completion="PASS",
+            publication_shape=fixture["publication_shape"],
             initial_fault=fixture["fault"],
             lost_recovery=lost,
             original_cleanup_receipt=original_receipt,
@@ -1180,6 +1296,7 @@ def recovery_ack_loss_and_aba(stack, deadline):
             ready=ready,
             historical_first_receipt=historical,
             committed_noop=no_op,
+            inline_committed_noop=inline,
             stale_cursor_rejected=stale,
             successor_cursor_rejections={
                 "cursor": first_cursor,
@@ -1196,8 +1313,14 @@ def recovery_ack_loss_and_aba(stack, deadline):
 
 def owner_during_cleanup_seal(stack, deadline):
     label = "public-owner-mid-seal"
+    # The recovery round holds an If-Match seal of block 1, so block 1 must
+    # be uploaded too: only a stepwise caller dies after every upload.
     fixture = create_quarantine(
-        stack, label=label, count=3, fault_sequence=0, deadline=deadline
+        stack,
+        label=label,
+        count=PUBLISH_BATCH_OBJECTS + 1,
+        fault_sequence=0,
+        deadline=deadline,
     )
     operation_id = fixture["operation_id"]
     try:
@@ -1316,6 +1439,7 @@ def owner_during_cleanup_seal(stack, deadline):
         return product.case_result(
             safety="PASS",
             completion="PASS",
+            publication_shape=fixture["publication_shape"],
             inspected=inspected,
             killed_owner_pid=owner_pid,
             reopened_owner_pid=stack.owner.pid,

@@ -15,6 +15,7 @@ etcd = ["nokv-control/etcd"]
 restore-crash-test-support = []
 
 [dependencies]
+libc.workspace = true
 nokv-control.workspace = true
 nokv-meta.workspace = true
 nokv-meta-holt.workspace = true

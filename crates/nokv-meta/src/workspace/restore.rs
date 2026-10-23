@@ -10797,6 +10797,7 @@ mod tests {
             dependency_count: 0,
             dependency_depth: 0,
             dependency_digest: dependency_owner_digest(&[]).unwrap(),
+            inline_body_digest: None,
             cleanup_staged_object_cursor: 0,
             cleanup_manifest_cursor: 0,
             cleanup_retry_count: 0,
@@ -10882,6 +10883,7 @@ mod tests {
                 artifact,
                 expected_operation: operation,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .unwrap()
     }
@@ -14048,6 +14050,7 @@ mod tests {
                 },
                 expected_operation: operation_record,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .expect("commit-staging publication returns before the visible-path projection read");
 

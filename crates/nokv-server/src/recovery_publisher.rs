@@ -4,11 +4,11 @@
  */
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use nokv_control::{
-    ControlError, ControlStore, LogRef, LogSegmentRef, LogicalShardLease, LogicalShardRecord,
-    RecoveryPublication, RecoveryUploadIntent, MAX_RECOVERY_LOG_SEGMENTS,
+    CheckpointRef, ControlError, ControlStore, LogRef, LogSegmentRef, LogicalShardLease,
+    LogicalShardRecord, RecoveryPublication, RecoveryUploadIntent, MAX_RECOVERY_LOG_SEGMENTS,
 };
 use nokv_meta::workspace::{
     MetaError, MetaShard, RecoveryOutboxSegment, RecoveryState, MAX_RECOVERY_SEGMENT_RECORDS,
@@ -52,7 +52,98 @@ pub struct RecoveryPublisher {
     objects: Arc<dyn ArtifactObjectStore>,
     object_namespace_id: nokv_types::ObjectNamespaceId,
     mode: RecoveryPublicationMode,
-    serialized: Mutex<()>,
+    rounds: CoveringRounds<LogicalShardRecord>,
+    /// Control frontier a local-only round already validated against the
+    /// local recovery state. Only shared publication advances the control
+    /// frontier and the local LSN never moves backwards, so an unchanged
+    /// frontier stays valid without reading local state again.
+    validated_local_only_frontier: Mutex<Option<ControlFrontier>>,
+}
+
+/// The recovery frontier fields of one control record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ControlFrontier {
+    durable_lsn: u64,
+    checkpoint: Option<CheckpointRef>,
+    log: Option<LogRef>,
+}
+
+impl ControlFrontier {
+    fn of(record: &LogicalShardRecord) -> Self {
+        Self {
+            durable_lsn: record.durable_lsn,
+            checkpoint: record.checkpoint.clone(),
+            log: record.log.clone(),
+        }
+    }
+}
+
+/// Rounds of one idempotent proof that run one at a time.
+///
+/// Only a round that starts after a caller arrives covers that caller: for
+/// publication, such a round proves owner liveness after every write the
+/// caller made before it arrived. Concurrent callers therefore share one round
+/// instead of queueing one control-plane proof each. A caller whose covering
+/// round failed requires a newer round, so it never reports another caller's
+/// failure as success.
+struct CoveringRounds<T> {
+    state: Mutex<RoundState<T>>,
+    finished: Condvar,
+}
+
+struct RoundState<T> {
+    started: u64,
+    completed: u64,
+    running: bool,
+    succeeded: Option<(u64, T)>,
+}
+
+impl<T: Clone> CoveringRounds<T> {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RoundState {
+                started: 0,
+                completed: 0,
+                running: false,
+                succeeded: None,
+            }),
+            finished: Condvar::new(),
+        }
+    }
+
+    fn run<E>(&self, round: impl Fn() -> Result<T, E>, poisoned: impl Fn() -> E) -> Result<T, E> {
+        let mut state = self.state.lock().map_err(|_| poisoned())?;
+        let mut needed = state.started + 1;
+        loop {
+            if let Some((covered, value)) = &state.succeeded {
+                if *covered >= needed {
+                    return Ok(value.clone());
+                }
+            }
+            if state.completed >= needed {
+                needed = state.started + 1;
+            }
+            if !state.running {
+                state.running = true;
+                state.started += 1;
+                let current = state.started;
+                drop(state);
+                let outcome = round();
+                state = self.state.lock().map_err(|_| poisoned())?;
+                state.running = false;
+                state.completed = current;
+                if let Ok(value) = &outcome {
+                    state.succeeded = Some((current, value.clone()));
+                }
+                self.finished.notify_all();
+                if current >= needed {
+                    return outcome;
+                }
+                continue;
+            }
+            state = self.finished.wait(state).map_err(|_| poisoned())?;
+        }
+    }
 }
 
 /// Fail-closed recovery publication error.
@@ -66,8 +157,9 @@ pub enum RecoveryPublisherError {
     Poisoned,
 }
 
-/// Executor adapter that repairs an earlier pending upload before dispatch and
-/// publishes every local write before returning its response.
+/// Executor adapter that, in `Shared` mode, repairs an earlier pending upload
+/// before dispatch, and in every mode publishes (or proves owner liveness for)
+/// every local write before returning its response.
 pub struct RecoveryPublishingExecutor {
     inner: Arc<dyn WorkspaceRequestExecutor>,
     publisher: Arc<RecoveryPublisher>,
@@ -113,7 +205,8 @@ impl RecoveryPublisher {
             objects,
             object_namespace_id,
             mode,
-            serialized: Mutex::new(()),
+            rounds: CoveringRounds::new(),
+            validated_local_only_frontier: Mutex::new(None),
         })
     }
 
@@ -121,15 +214,24 @@ impl RecoveryPublisher {
         self.mode
     }
 
+    /// Prove owner liveness, and in `Shared` mode publish the local outbox
+    /// tail, for every metadata write made before this call. Concurrent
+    /// callers share covering rounds.
     pub fn publish_current(&self) -> Result<LogicalShardRecord, RecoveryPublisherError> {
-        let _guard = self
-            .serialized
-            .lock()
-            .map_err(|_| RecoveryPublisherError::Poisoned)?;
-        let required = self.meta.recovery_state()?;
+        self.rounds
+            .run(|| self.publish_round(), || RecoveryPublisherError::Poisoned)
+    }
+
+    fn publish_round(&self) -> Result<LogicalShardRecord, RecoveryPublisherError> {
         match self.mode {
-            RecoveryPublicationMode::Shared => self.publish_required(required),
-            RecoveryPublicationMode::LocalOnly => self.confirm_local_only(required),
+            RecoveryPublicationMode::Shared => {
+                // Upload only outbox rows that already reached the local
+                // acknowledgement boundary.
+                self.meta.durability_barrier()?;
+                let required = self.meta.recovery_state()?;
+                self.publish_required(required)
+            }
+            RecoveryPublicationMode::LocalOnly => self.confirm_local_only(),
         }
     }
 
@@ -137,12 +239,19 @@ impl RecoveryPublisher {
     /// the local store has not fallen behind a frontier some earlier shared
     /// owner already published, without uploading segments or touching the
     /// control frontier.
-    fn confirm_local_only(
-        &self,
-        required: RecoveryState,
-    ) -> Result<LogicalShardRecord, RecoveryPublisherError> {
-        let record = self.control.renew_owner(&self.lease)?;
-        self.validate_control_frontier(&record, required)?;
+    fn confirm_local_only(&self) -> Result<LogicalShardRecord, RecoveryPublisherError> {
+        let record = self.control.prove_owner(&self.lease)?;
+        let frontier = ControlFrontier::of(&record);
+        let mut validated = self
+            .validated_local_only_frontier
+            .lock()
+            .map_err(|_| RecoveryPublisherError::Poisoned)?;
+        if validated.as_ref() != Some(&frontier) {
+            let required = self.meta.recovery_state()?;
+            self.validate_control_frontier(&record, required)?;
+            *validated = Some(frontier);
+        }
+        drop(validated);
         if record.pending_recovery_upload.is_some() {
             return Err(RecoveryPublisherError::InvalidState(
                 "logical shard has a pending shared recovery upload; reopen with shared recovery publication to finish or abort it before serving local-only".to_owned(),
@@ -160,7 +269,7 @@ impl RecoveryPublisher {
             // local and durable frontiers already match, prove that this exact
             // owner session is still live before allowing a response to leave
             // the shard.
-            let mut record = self.control.renew_owner(&self.lease)?;
+            let mut record = self.control.prove_owner(&self.lease)?;
             self.validate_control_frontier(&record, required)?;
             if record.pending_recovery_upload.is_none()
                 && record.durable_lsn == required.applied_recovery_lsn
@@ -409,9 +518,16 @@ impl RecoveryPublishingExecutor {
 
 impl WorkspaceRequestExecutor for RecoveryPublishingExecutor {
     fn execute(&self, request: &WorkspaceRpcRequest) -> Result<ExecutedRequest, RpcFailure> {
-        self.publisher
-            .publish_current()
-            .map_err(RecoveryPublisherError::rpc_failure)?;
+        // Shared publication first repairs an earlier interrupted upload. A
+        // local-only owner has nothing to repair, and the barrier below proves
+        // liveness after everything this request observed or wrote, so a
+        // second proof before dispatch would add a control round trip without
+        // fencing anything more.
+        if self.publisher.mode() == RecoveryPublicationMode::Shared {
+            self.publisher
+                .publish_current()
+                .map_err(RecoveryPublisherError::rpc_failure)?;
+        }
         let outcome = self.inner.execute(request);
         self.publisher
             .publish_current()
@@ -693,6 +809,81 @@ mod tests {
         let (segment, _, _, intent) = publisher.plan_next_segment(&record, sampled).unwrap();
         assert_eq!(segment.last_lsn, sampled.applied_recovery_lsn);
         assert_eq!(intent.last_lsn, sampled.applied_recovery_lsn);
+    }
+
+    #[test]
+    fn callers_arriving_during_a_round_share_the_next_round() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::mpsc;
+
+        let rounds = Arc::new(CoveringRounds::<u64>::new());
+        let executed = Arc::new(AtomicU64::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+
+        let run = |rounds: Arc<CoveringRounds<u64>>,
+                   executed: Arc<AtomicU64>,
+                   entered: mpsc::Sender<u64>,
+                   release: Arc<Mutex<mpsc::Receiver<()>>>| {
+            std::thread::spawn(move || {
+                rounds.run(
+                    || {
+                        let round = executed.fetch_add(1, Ordering::AcqRel) + 1;
+                        entered.send(round).unwrap();
+                        release.lock().unwrap().recv().unwrap();
+                        Ok::<u64, ()>(round)
+                    },
+                    || (),
+                )
+            })
+        };
+        let first = run(
+            Arc::clone(&rounds),
+            Arc::clone(&executed),
+            entered_tx.clone(),
+            Arc::clone(&release_rx),
+        );
+        assert_eq!(entered_rx.recv().unwrap(), 1);
+        // Both arrive while round 1 runs, so round 1 cannot cover them.
+        let waiters = (0..2)
+            .map(|_| {
+                run(
+                    Arc::clone(&rounds),
+                    Arc::clone(&executed),
+                    entered_tx.clone(),
+                    Arc::clone(&release_rx),
+                )
+            })
+            .collect::<Vec<_>>();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), Ok(1));
+        assert_eq!(entered_rx.recv().unwrap(), 2);
+        release_tx.send(()).unwrap();
+        for waiter in waiters {
+            assert_eq!(waiter.join().unwrap(), Ok(2));
+        }
+        assert_eq!(executed.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn a_failed_covering_round_is_never_reported_as_success() {
+        let rounds = CoveringRounds::<u64>::new();
+        let attempts = std::cell::Cell::new(0_u64);
+        assert_eq!(
+            rounds.run(
+                || {
+                    attempts.set(attempts.get() + 1);
+                    Err::<u64, &str>("owner lost")
+                },
+                || "poisoned",
+            ),
+            Err("owner lost")
+        );
+        // A later caller needs a newer round and does not reuse the failure.
+        assert_eq!(rounds.run(|| Ok::<u64, &str>(7), || "poisoned"), Ok(7));
+        assert_eq!(attempts.get(), 1);
     }
 
     #[test]

@@ -15,7 +15,8 @@ use nokv_types::{
     ArtifactRevisionId, BuildCommitPhase, CommandDigest, CommitVersion, GcClaimState, Generation,
     LogicalShardId, ObjectNamespaceId, OperationId, OperationKind, OwnerEpoch, PlacementGeneration,
     PublishPhase, ReadVersion, ReferenceEpoch, RequestId, RestorePhase, RevisionState, RootId,
-    StagedCleanupState, StagedProviderState, WorkspaceRevision, WorkspaceState, SHA256_BYTES,
+    StagedCleanupState, StagedProviderState, WorkspaceRevision, WorkspaceState,
+    MAX_INLINE_ARTIFACT_BODY_BYTES, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
 
@@ -24,10 +25,11 @@ use super::build_commit_records::{
     CommitOperationRecordError,
 };
 use super::codec::{
-    artifact_manifest_key, artifact_manifest_prefix, artifact_revision_claim_key,
-    artifact_revision_key, commit_revision_ref_key, gc_candidate_key, object_block_key,
-    operation_key, path_current_key, path_revision_ref_key, revision_dependency_ref_key,
-    staged_object_key, staged_object_prefix, workspace_current_key, SCHEMA_ID,
+    artifact_inline_body_key, artifact_manifest_key, artifact_manifest_prefix,
+    artifact_revision_claim_key, artifact_revision_key, commit_revision_ref_key, gc_candidate_key,
+    object_block_key, operation_key, path_current_key, path_revision_ref_key,
+    revision_dependency_ref_key, staged_object_key, staged_object_prefix, workspace_current_key,
+    SCHEMA_ID,
 };
 use super::commit::RUN_MANIFEST_PATH;
 use super::engine::{
@@ -37,8 +39,8 @@ use super::engine::{
 use super::event_projection::change_event_projection;
 use super::keyspace::MetadataFamily;
 use super::publication_records::{
-    ArtifactRevisionClaimRecord, ArtifactRevisionRecord, GcCandidateRecord, PathEntry,
-    PublicationRecordCodecError, RevisionRefRecord, WorkspaceRecord,
+    ArtifactInlineBodyRecord, ArtifactRevisionClaimRecord, ArtifactRevisionRecord,
+    GcCandidateRecord, PathEntry, PublicationRecordCodecError, RevisionRefRecord, WorkspaceRecord,
 };
 use super::publish_operation_records::{
     AppendCleanupRetryReceipt, AppendOperationRecord, ArtifactManifestRow, ManifestPosition,
@@ -267,6 +269,10 @@ pub struct FinalizePublishRequest {
     pub artifact: PublishedArtifact,
     /// Strictly increasing, distinct physical owner revision ids.
     pub dependency_owner_revision_ids: Vec<ArtifactRevisionId>,
+    /// The complete body of a revision published without objects. Its
+    /// operation sealed no staged objects, no manifest rows, and the body's
+    /// SHA-256 as its manifest seal.
+    pub inline_body: Option<Vec<u8>>,
 }
 
 /// Decoded durable result of begin or transition.
@@ -379,6 +385,9 @@ pub enum PublicationError {
         actual: u64,
     },
     ManifestDigestMismatch,
+    InlineBodyMismatch {
+        reason: &'static str,
+    },
     ManifestPhysicalOwnerMissing {
         owner: ArtifactRevisionId,
     },
@@ -592,6 +601,9 @@ impl fmt::Display for PublicationError {
             ),
             Self::ManifestDigestMismatch => {
                 formatter.write_str("manifest-row digest does not match operation seal")
+            }
+            Self::InlineBodyMismatch { reason } => {
+                write!(formatter, "inline artifact body {reason}")
             }
             Self::ManifestPhysicalOwnerMissing { owner } => write!(
                 formatter,
@@ -1131,6 +1143,38 @@ fn validate_dependency_seal(
     Ok(())
 }
 
+/// An inline body replaces the object plan of an ordinary visible
+/// publication: its operation sealed no objects, no manifest rows, and no
+/// dependencies, and bound the SHA-256 of the exact body.
+fn validate_inline_publication(
+    operation: &PublishOperationRecord,
+    artifact: &PublishedArtifact,
+    body: &[u8],
+) -> Result<(), PublicationError> {
+    let Some(sealed_digest) = operation.inline_body_digest else {
+        return Err(PublicationError::InlineBodyMismatch {
+            reason: "was not sealed by this publication",
+        });
+    };
+    if body.is_empty() || body.len() > MAX_INLINE_ARTIFACT_BODY_BYTES {
+        return Err(PublicationError::InlineBodyMismatch {
+            reason: "length is outside the inline bound",
+        });
+    }
+    let digest: [u8; SHA256_BYTES] = Sha256::digest(body).into();
+    if digest != sealed_digest {
+        return Err(PublicationError::InlineBodyMismatch {
+            reason: "does not match the sealed publication",
+        });
+    }
+    if artifact.body_digest_uri != sha256_digest_uri(digest) {
+        return Err(PublicationError::InlineBodyMismatch {
+            reason: "does not match the declared body digest",
+        });
+    }
+    Ok(())
+}
+
 fn validate_dependency_order(owners: &[ArtifactRevisionId]) -> Result<(), PublicationError> {
     if owners.len() > usize::from(MAX_DEPENDENCY_COUNT) {
         return Err(PublicationError::DependencyCountMismatch {
@@ -1229,6 +1273,18 @@ fn validate_path_claim(
     claim: &PublishClaim,
     current: Option<&Loaded<PathEntry>>,
 ) -> Result<Generation, PublicationError> {
+    validate_publish_claim(claim, current.map(|loaded| &loaded.record))
+}
+
+/// The generation a publication claim gives its path if it completed against
+/// `current`, or the conflict that completion would report.
+///
+/// Completion applies it to the live path; admission applies the same rule
+/// earlier so a claim that already fails refuses before any object upload.
+pub fn validate_publish_claim(
+    claim: &PublishClaim,
+    current: Option<&PathEntry>,
+) -> Result<Generation, PublicationError> {
     match (claim, current) {
         (PublishClaim::CreateOnly, None) => {
             Generation::new(1).map_err(|_| PublicationError::PathGenerationOverflow)
@@ -1242,7 +1298,7 @@ fn validate_path_claim(
                 expected_generation,
             },
             Some(current),
-        ) => next_generation(*expected_generation, &current.record),
+        ) => next_generation(*expected_generation, current),
         (
             PublishClaim::Append {
                 expected_generation,
@@ -1251,8 +1307,8 @@ fn validate_path_claim(
             },
             Some(current),
         ) => {
-            let generation = next_generation(*expected_generation, &current.record)?;
-            if current.record.artifact_revision_id != *base_revision_id {
+            let generation = next_generation(*expected_generation, current)?;
+            if current.artifact_revision_id != *base_revision_id {
                 return Err(PublicationError::AppendBaseRevisionMismatch);
             }
             Ok(generation)
@@ -1353,7 +1409,7 @@ fn publish_identity_digest(operation: &PublishOperationRecord) -> [u8; SHA256_BY
 
 fn publish_initialization_digest(operation: &PublishOperationRecord) -> [u8; SHA256_BYTES] {
     let mut hasher = Sha256::new();
-    hasher.update(b"nokv.publish.operation.initialization.v5\0");
+    hasher.update(b"nokv.publish.operation.initialization.v6\0");
     match operation.append_intent_digest {
         Some(digest) => {
             hasher.update([1]);
@@ -1397,6 +1453,13 @@ fn publish_initialization_digest(operation: &PublishOperationRecord) -> [u8; SHA
     hasher.update(operation.manifest_seal);
     hasher.update([operation.dependency_count, operation.dependency_depth]);
     hasher.update(operation.dependency_digest);
+    match operation.inline_body_digest {
+        None => hasher.update([0]),
+        Some(digest) => {
+            hasher.update([1]);
+            hasher.update(digest);
+        }
+    }
     hasher.finalize().into()
 }
 
@@ -4157,24 +4220,30 @@ impl PublicationService<'_> {
         if request.artifact.manifest_digest_uri != expected_manifest_uri {
             return Err(PublicationError::ManifestDigestMismatch);
         }
-        let sealed_logical_size =
-            if let Some(last) = request.expected_operation.manifest_last_position {
-                let key = artifact_manifest_key(
-                    request.context.root_id,
-                    request.expected_operation.artifact_revision_id,
-                    last.object_index,
-                );
-                let payload = self
-                    .read_payload(request.context, MetadataFamily::ArtifactManifest, &key)?
-                    .ok_or(PublicationError::ManifestPositionMismatch)?;
-                let last_row = ArtifactManifestRow::decode(&payload)?;
-                last_row
-                    .logical_offset
-                    .checked_add(last_row.length)
-                    .expect("validated manifest logical range cannot overflow")
-            } else {
-                0
-            };
+        let sealed_logical_size = if let Some(body) = &request.inline_body {
+            validate_inline_publication(&request.expected_operation, &request.artifact, body)?;
+            u64::try_from(body.len()).expect("bounded inline body length fits u64")
+        } else if request.expected_operation.inline_body_digest.is_some() {
+            return Err(PublicationError::InlineBodyMismatch {
+                reason: "is required by its sealed publication",
+            });
+        } else if let Some(last) = request.expected_operation.manifest_last_position {
+            let key = artifact_manifest_key(
+                request.context.root_id,
+                request.expected_operation.artifact_revision_id,
+                last.object_index,
+            );
+            let payload = self
+                .read_payload(request.context, MetadataFamily::ArtifactManifest, &key)?
+                .ok_or(PublicationError::ManifestPositionMismatch)?;
+            let last_row = ArtifactManifestRow::decode(&payload)?;
+            last_row
+                .logical_offset
+                .checked_add(last_row.length)
+                .expect("validated manifest logical range cannot overflow")
+        } else {
+            0
+        };
         if request.artifact.logical_size != sealed_logical_size {
             return Err(PublicationError::ManifestLogicalOffsetMismatch {
                 expected: sealed_logical_size,
@@ -4560,6 +4629,16 @@ impl PublicationService<'_> {
             revision_key,
             new_revision.encode()?,
         )?;
+        if let Some(body) = request.inline_body {
+            plan.put_absent(
+                MetadataFamily::ArtifactInlineBody,
+                artifact_inline_body_key(
+                    request.context.root_id,
+                    request.expected_operation.artifact_revision_id,
+                ),
+                ArtifactInlineBodyRecord { body }.encode()?,
+            )?;
+        }
         self.release_revision_claim(
             request.context,
             request.expected_operation.artifact_revision_id,
@@ -5295,6 +5374,7 @@ mod tests {
             dependency_count: 0,
             dependency_depth: 0,
             dependency_digest: dependency_owner_digest(&dependencies).unwrap(),
+            inline_body_digest: None,
             cleanup_staged_object_cursor: 0,
             cleanup_manifest_cursor: 0,
             cleanup_retry_count: 0,
@@ -5768,6 +5848,7 @@ mod tests {
                     typed_index_projection: TypedProjection::empty().encode().unwrap(),
                 },
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .unwrap();
         (initial, outcome)
@@ -5983,6 +6064,7 @@ mod tests {
                 artifact,
                 expected_operation: operation,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .unwrap()
     }
@@ -6049,6 +6131,7 @@ mod tests {
                 artifact,
                 expected_operation: operation,
                 dependency_owner_revision_ids: dependencies.to_vec(),
+                inline_body: None,
             })
             .unwrap()
     }
@@ -6938,6 +7021,7 @@ mod tests {
                 artifact: published_artifact(&child),
                 expected_operation: child,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .unwrap();
         let parent = read_append_parent(&service, &store, &mut counter);
@@ -7000,6 +7084,7 @@ mod tests {
                 artifact: published_artifact(&child),
                 expected_operation: child,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .is_err());
         assert!(read_append_parent(&service, &store, &mut counter)
@@ -7092,6 +7177,7 @@ mod tests {
                 expected_operation: successor,
                 artifact,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .unwrap();
         let receipt = read_append_parent(&service, &store, &mut counter);
@@ -7166,6 +7252,7 @@ mod tests {
                 artifact: published_artifact(&finalizing),
                 expected_operation: finalizing,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .is_err());
     }
@@ -7488,6 +7575,7 @@ mod tests {
                 expected_operation: finalizing,
                 artifact,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .unwrap();
         assert_eq!(outcome.operation.phase, PublishPhase::Published);
@@ -8062,6 +8150,7 @@ mod tests {
                 artifact: staged_manifest,
                 expected_operation: operation,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .unwrap();
         assert_eq!(staged_outcome.operation.phase, PublishPhase::Published);
@@ -8376,6 +8465,7 @@ mod tests {
                 artifact: published_artifact(&operation),
                 expected_operation: operation,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .unwrap();
         assert_eq!(finalized.operation.phase, PublishPhase::Published);
@@ -8393,6 +8483,370 @@ mod tests {
         .unwrap();
         assert_eq!(visible.artifact_revision_id, revision_id);
         assert_eq!(visible.logical_size, TEST_BATCH_ROWS as u64);
+    }
+
+    fn inline_operation(
+        operation_id: OperationId,
+        artifact_revision_id: ArtifactRevisionId,
+        path: NormalizedRelativePath,
+        claim: PublishClaim,
+        body: &[u8],
+    ) -> PublishOperationRecord {
+        let mut operation =
+            publish_operation(operation_id, artifact_revision_id, path, claim, &[], &[]);
+        operation.inline_body_digest = Some(Sha256::digest(body).into());
+        seal_publish_operation(&mut operation);
+        operation
+    }
+
+    fn inline_artifact(body: &[u8]) -> PublishedArtifact {
+        PublishedArtifact {
+            logical_size: body.len() as u64,
+            body_digest_uri: sha256_digest_uri(Sha256::digest(body).into()),
+            manifest_digest_uri: sha256_digest_uri([0; SHA256_BYTES]),
+            content_type: "application/json".to_owned(),
+            producer: None,
+            manifest_id: None,
+            typed_index_projection: TypedProjection::empty().encode().unwrap(),
+        }
+    }
+
+    fn finalizing_inline_operation(
+        service: &PublicationService<'_>,
+        store: &MetaShard,
+        counter: &mut u128,
+        operation: PublishOperationRecord,
+    ) -> PublishOperationRecord {
+        let begun = begin_operation(service, store, counter, operation);
+        service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(store, counter),
+                expected_operation: begun,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_inline(
+        service: &PublicationService<'_>,
+        store: &MetaShard,
+        counter: &mut u128,
+        operation_id: OperationId,
+        artifact_revision_id: ArtifactRevisionId,
+        path: NormalizedRelativePath,
+        claim: PublishClaim,
+        body: &[u8],
+    ) -> FinalizePublishOutcome {
+        let finalizing = finalizing_inline_operation(
+            service,
+            store,
+            counter,
+            inline_operation(operation_id, artifact_revision_id, path, claim, body),
+        );
+        service
+            .finalize_publish(FinalizePublishRequest {
+                context: publication_context(store, counter),
+                expected_operation: finalizing,
+                artifact: inline_artifact(body),
+                dependency_owner_revision_ids: Vec::new(),
+                inline_body: Some(body.to_vec()),
+            })
+            .unwrap()
+    }
+
+    fn inline_body_at(
+        store: &MetaShard,
+        artifact_revision_id: ArtifactRevisionId,
+        read_version: ReadVersion,
+    ) -> Option<Vec<u8>> {
+        payload_at(
+            store,
+            MetadataFamily::ArtifactInlineBody,
+            &artifact_inline_body_key(root(), artifact_revision_id),
+            read_version,
+        )
+        .map(|payload| ArtifactInlineBodyRecord::decode(&payload).unwrap().body)
+    }
+
+    #[test]
+    fn inline_publication_stores_one_write_once_body_without_objects_or_manifest() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let body = br#"{"turn":1,"text":"inline"}"#;
+        let revision_id = revision(300);
+        let artifact_path = path("logs/session/0000000001.json");
+        let published = publish_inline(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(300),
+            revision_id,
+            artifact_path.clone(),
+            PublishClaim::CreateOnly,
+            body,
+        );
+        assert_eq!(published.operation.phase, PublishPhase::Published);
+        assert_eq!(published.result.logical_size, body.len() as u64);
+
+        let version = store.current_read_version().unwrap();
+        let revision_row = ArtifactRevisionRecord::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::ArtifactRevision,
+                &artifact_revision_key(root(), revision_id),
+                version,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(revision_row.block_count, 0);
+        assert_eq!(revision_row.logical_size, body.len() as u64);
+        assert_eq!(
+            revision_row.manifest_digest_uri,
+            sha256_digest_uri([0; SHA256_BYTES])
+        );
+        assert_eq!(
+            inline_body_at(&store, revision_id, version).as_deref(),
+            Some(&body[..])
+        );
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::ArtifactManifest,
+                &artifact_manifest_prefix(root(), revision_id),
+            ),
+            0
+        );
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::StagedObject,
+                &staged_object_prefix(root(), operation_id(300)),
+            ),
+            0
+        );
+        let visible = get_visible_path_at(
+            &store,
+            RootReadContext::current(&store, root(), placement(), owner()).unwrap(),
+            &workbench(),
+            &artifact_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(visible.artifact_revision_id, revision_id);
+
+        // The body row is write-once: replacing it is refused by the engine.
+        let key = artifact_inline_body_key(root(), revision_id);
+        let current =
+            payload_at(&store, MetadataFamily::ArtifactInlineBody, &key, version).unwrap();
+        let mut replace = fence_command(
+            &store,
+            next_request(&mut counter),
+            RootFenceAction::RequireActive,
+        );
+        replace.predicates.push(CommandPredicate::Value {
+            family: MetadataFamily::ArtifactInlineBody,
+            key: key.clone(),
+            expected: Some(current),
+        });
+        replace.mutations.push(CommandMutation::Put {
+            family: MetadataFamily::ArtifactInlineBody,
+            key: key.clone(),
+            value: ArtifactInlineBodyRecord {
+                body: b"rewritten".to_vec(),
+            }
+            .encode()
+            .unwrap(),
+        });
+        replace.history_projection.push(HistoryProjection {
+            family: MetadataFamily::ArtifactInlineBody,
+            key,
+        });
+        assert!(store.execute(&replace.seal()).is_err());
+        assert_eq!(
+            inline_body_at(&store, revision_id, store.current_read_version().unwrap()).as_deref(),
+            Some(&body[..])
+        );
+    }
+
+    #[test]
+    fn inline_publication_rejects_any_body_its_operation_did_not_seal() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let body = br#"{"turn":2}"#;
+        let finalizing = finalizing_inline_operation(
+            &service,
+            &store,
+            &mut counter,
+            inline_operation(
+                operation_id(310),
+                revision(310),
+                path("logs/session/0000000002.json"),
+                PublishClaim::CreateOnly,
+                body,
+            ),
+        );
+        let finalize = |artifact: PublishedArtifact, inline_body: Vec<u8>, counter: &mut u128| {
+            service.finalize_publish(FinalizePublishRequest {
+                context: publication_context(&store, counter),
+                expected_operation: finalizing.clone(),
+                artifact,
+                dependency_owner_revision_ids: Vec::new(),
+                inline_body: Some(inline_body),
+            })
+        };
+        // Same length, different bytes: the operation sealed another body.
+        let mut forged = body.to_vec();
+        forged[0] = b'[';
+        assert!(matches!(
+            finalize(inline_artifact(body), forged, &mut counter),
+            Err(PublicationError::InlineBodyMismatch { .. })
+        ));
+        // The sealed bytes under a descriptor that names another body.
+        let mut wrong_digest = inline_artifact(body);
+        wrong_digest.body_digest_uri = canonical_digest_uri(0x11);
+        assert!(matches!(
+            finalize(wrong_digest, body.to_vec(), &mut counter),
+            Err(PublicationError::InlineBodyMismatch { .. })
+        ));
+        assert!(matches!(
+            finalize(inline_artifact(&[]), Vec::new(), &mut counter),
+            Err(PublicationError::InlineBodyMismatch { .. })
+        ));
+        // A publication sealed for an inline body cannot complete without it.
+        assert!(matches!(
+            service.finalize_publish(FinalizePublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: finalizing.clone(),
+                artifact: inline_artifact(body),
+                dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
+            }),
+            Err(PublicationError::InlineBodyMismatch { .. })
+        ));
+        // Nothing was published; the exact sealed body still completes.
+        let published = finalize(inline_artifact(body), body.to_vec(), &mut counter).unwrap();
+        assert_eq!(published.operation.phase, PublishPhase::Published);
+
+        // A publication that sealed no inline body cannot publish one.
+        let unsealed = finalizing_inline_operation(
+            &service,
+            &store,
+            &mut counter,
+            publish_operation(
+                operation_id(311),
+                revision(311),
+                path("logs/session/0000000003.json"),
+                PublishClaim::CreateOnly,
+                &[],
+                &[],
+            ),
+        );
+        assert!(matches!(
+            service.finalize_publish(FinalizePublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: unsealed,
+                artifact: inline_artifact(body),
+                dependency_owner_revision_ids: Vec::new(),
+                inline_body: Some(body.to_vec()),
+            }),
+            Err(PublicationError::InlineBodyMismatch { .. })
+        ));
+        let version = store.current_read_version().unwrap();
+        assert_eq!(inline_body_at(&store, revision(311), version), None);
+    }
+
+    #[test]
+    fn inline_revision_gc_deletes_its_body_row_without_a_history_copy() {
+        use super::super::gc::{
+            BeginGcDeletionRequest, ClaimGcRequest, CompleteGcRequest, GcService,
+        };
+
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let artifact_path = path("outputs/notes.json");
+        let first = br#"{"v":1}"#;
+        let old_revision = revision(320);
+        publish_inline(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(320),
+            old_revision,
+            artifact_path.clone(),
+            PublishClaim::CreateOnly,
+            first,
+        );
+        publish_inline(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(321),
+            revision(321),
+            artifact_path,
+            PublishClaim::ReplaceOnly {
+                expected_generation: Generation::new(1).unwrap(),
+            },
+            br#"{"v":2}"#,
+        );
+        let gc = GcService::new(&store);
+        // A later commit moves the quiet root's history floor past the
+        // replacement that released the old revision.
+        gc.advance_history_barrier(commit_context(&store, &mut counter))
+            .unwrap();
+        let claimed = gc
+            .claim(ClaimGcRequest {
+                context: commit_context(&store, &mut counter),
+                artifact_revision_id: old_revision,
+                reference_epoch: ReferenceEpoch::new(2),
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(claimed.expected_manifest_row_count, 0);
+        let deleting = gc
+            .begin_deletion(BeginGcDeletionRequest {
+                context: commit_context(&store, &mut counter),
+                expected_operation: claimed,
+            })
+            .unwrap()
+            .operation;
+        let before_complete = store.current_read_version().unwrap();
+        assert_eq!(
+            inline_body_at(&store, old_revision, before_complete).as_deref(),
+            Some(&first[..])
+        );
+        let completed = gc
+            .complete(CompleteGcRequest {
+                context: commit_context(&store, &mut counter),
+                expected_operation: deleting,
+            })
+            .unwrap();
+        assert_eq!(completed.operation.phase, nokv_types::GcPhase::Deleted);
+        let after = store.current_read_version().unwrap();
+        assert_eq!(inline_body_at(&store, old_revision, after), None);
+        // No History copy keeps the reclaimed body readable at an older
+        // version, unlike every historied row.
+        assert_eq!(inline_body_at(&store, old_revision, before_complete), None);
+        let revision_row = ArtifactRevisionRecord::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::ArtifactRevision,
+                &artifact_revision_key(root(), old_revision),
+                after,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(revision_row.state, RevisionState::Deleted);
+        assert_eq!(
+            inline_body_at(&store, revision(321), after).as_deref(),
+            Some(&br#"{"v":2}"#[..])
+        );
     }
 
     #[test]
@@ -8625,7 +9079,7 @@ mod tests {
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
         // The 8-byte retry epoch occurs in the operation check, mutation,
         // history value and dedupe result, plus their recovery-command copies.
-        assert_eq!(replace_bytes, 11_799_847);
+        assert_eq!(replace_bytes, 11_799_855);
         assert!(replace_bytes < super::super::store_limits().max_transaction_bytes);
 
         let removed = remove_path(
@@ -8887,7 +9341,7 @@ mod tests {
 
         assert_eq!(
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes),
-            9_861_120
+            9_861_128
         );
     }
 
@@ -8937,6 +9391,7 @@ mod tests {
                 expected_operation: operation,
                 artifact,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .unwrap();
 
@@ -9024,6 +9479,7 @@ mod tests {
                 expected_operation: operation.clone(),
                 artifact,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .expect_err("maximum valid projection union must be rejected before commit");
         assert!(matches!(
@@ -9258,6 +9714,7 @@ mod tests {
                 artifact: published_artifact(&operation),
                 expected_operation: operation,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             }),
             Err(PublicationError::AppendBaseRevisionMismatch)
         );
@@ -9305,6 +9762,7 @@ mod tests {
                     artifact: published_artifact(&operation),
                     expected_operation: operation.clone(),
                     dependency_owner_revision_ids: Vec::new(),
+                    inline_body: None,
                 })
                 .unwrap();
             assert_eq!(finalized.operation.phase, PublishPhase::Published);
@@ -9412,6 +9870,7 @@ mod tests {
                 artifact: published_artifact(&operation),
                 expected_operation: operation,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             });
             assert!(matches!(
                 finalize_loser,
@@ -9552,6 +10011,7 @@ mod tests {
                 artifact: artifact.clone(),
                 expected_operation: finalizing.clone(),
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .unwrap();
         assert_eq!(winner.operation.phase, PublishPhase::Published);
@@ -9562,6 +10022,7 @@ mod tests {
                 artifact,
                 expected_operation: finalizing,
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             }),
             Err(PublicationError::ConcurrentMutation)
         );
@@ -10830,6 +11291,7 @@ mod tests {
                     typed_index_projection: TypedProjection::empty().encode().unwrap(),
                 },
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             })
             .unwrap();
         assert_eq!(outcome.result.logical_size, 160);
@@ -11028,6 +11490,7 @@ mod tests {
                     typed_index_projection: TypedProjection::empty().encode().unwrap(),
                 },
                 dependency_owner_revision_ids: Vec::new(),
+                inline_body: None,
             }),
             Err(PublicationError::RestoreManifestClosureMismatch),
         );
@@ -11733,6 +12196,7 @@ mod tests {
                             typed_index_projection: TypedProjection::empty().encode().unwrap(),
                         },
                         dependency_owner_revision_ids: Vec::new(),
+                        inline_body: None,
                     })
                     .map(|_| ()),
                 _ => unreachable!("forward step is bounded"),

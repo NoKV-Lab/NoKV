@@ -4,6 +4,7 @@
  */
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use nokv_client::{
@@ -25,10 +26,11 @@ enum ConfiguredRouting {
         owner_epoch: u64,
     },
     Etcd(EtcdRouteOptions),
+    Local(PathBuf),
 }
 
 /// Explicit route discovery configuration for one Agent root.
-#[pyclass(name = "RoutingConfig", frozen, skip_from_py_object)]
+#[pyclass(name = "RoutingConfig", frozen)]
 #[derive(Clone, Debug)]
 pub(crate) struct PythonRoutingConfig {
     routing: ConfiguredRouting,
@@ -89,6 +91,20 @@ impl PythonRoutingConfig {
             routing: ConfiguredRouting::Etcd(options),
         })
     }
+
+    /// Discover placement and ownership from the single-host control
+    /// directory that the owner serves from.
+    #[staticmethod]
+    fn local(directory: PathBuf) -> PyResult<Self> {
+        if directory.as_os_str().is_empty() {
+            return Err(PyValueError::new_err(
+                "local control directory must not be empty",
+            ));
+        }
+        Ok(Self {
+            routing: ConfiguredRouting::Local(directory),
+        })
+    }
 }
 
 impl PythonRoutingConfig {
@@ -115,6 +131,9 @@ impl PythonRoutingConfig {
             )?)),
             ConfiguredRouting::Etcd(options) => Ok(Arc::new(ControlRouteResolver::connect_etcd(
                 options.clone(),
+            )?)),
+            ConfiguredRouting::Local(directory) => Ok(Arc::new(ControlRouteResolver::open_local(
+                directory.clone(),
             )?)),
         }
     }
@@ -167,6 +186,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("placement_generation"));
+    }
+
+    #[test]
+    fn local_configuration_resolves_through_its_control_directory() {
+        Python::initialize();
+        assert!(PythonRoutingConfig::local(PathBuf::new()).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let root_id = RootIdentity([0x11; 16]);
+        let resolver = PythonRoutingConfig::local(directory.path().join("control"))
+            .unwrap()
+            .build(root_id)
+            .unwrap();
+        let error = resolver.resolve(root_id, true).unwrap_err();
+        assert!(error.to_string().contains("root placement does not exist"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ in-process API. Agent frameworks should normally expose skills over the CLI.
 This package exposes API version `1` for path-native Workbenches and immutable
 artifacts. The version is available as `nokv.API_VERSION`; the stable package
 exports are listed by `nokv.__all__`. `nokv.__version__` is the NoKV release
-line the installed wheel was built from (for example `0.11.0`); it is not the
+line the installed wheel was built from (for example `0.12.1`); it is not the
 API version and it changes with every release.
 
 ## Install
@@ -29,7 +29,7 @@ release you pinned by pointing `pip` at that release's assets, and verify the
 download against the published checksum:
 
 ```shell
-version=0.11.0
+version=0.12.1
 pip install "nokv==$version" \
   --find-links "https://github.com/NoKV-Lab/NoKV/releases/expanded_assets/v$version"
 python -c 'import nokv; print(nokv.__version__, nokv.API_VERSION)'
@@ -44,6 +44,13 @@ The wheel version, the `crates/nokv` package version, and the release tag are
 one identity; the release workflow refuses to publish otherwise. A wheel built
 from an unreleased commit reports that commit's declared version, so pin by
 release tag, not by version string alone, when qualifying a deployment.
+
+Upgrade the SDK, the CLI, and the metadata owner together. The 0.12 releases
+speak `nokv.workspace.rpc.v14`, and their handshake refuses a 0.11.x or older
+client or owner. They also store metadata in System format 14 and refuse to
+open a format-13 store written by 0.11.x, so an owner upgraded from 0.11.x
+starts from a new metadata store. 0.12.0 and 0.12.1 share the protocol and
+the format.
 
 Building from source (`maturin build --release` in `crates/nokv-python`)
 requires a Rust toolchain and a `protoc` binary; that path is for development,
