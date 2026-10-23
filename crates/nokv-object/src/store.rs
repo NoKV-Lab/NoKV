@@ -8,7 +8,7 @@ use opendal::options::WriteOptions;
 use opendal::services::S3;
 use opendal::{ErrorKind, Operator};
 
-use crate::admission::{ProviderAdmissionReceipt, ProviderHandleIdentity};
+use crate::admission::{ProviderAdmissionError, ProviderAdmissionReceipt, ProviderHandleIdentity};
 use crate::digest::{hex, sha256};
 
 pub const DEFAULT_S3_MULTIPART_PART_SIZE: usize = 8 * 1024 * 1024;
@@ -111,6 +111,7 @@ pub enum ObjectError {
         requested: usize,
         admitted: usize,
     },
+    ProviderAdmissionFailed(ProviderAdmissionError),
     CreateAmbiguous {
         key: ObjectKey,
         detail: String,
@@ -156,6 +157,15 @@ pub trait ArtifactObjectStore: Send + Sync {
     /// Raw remote providers are unadmitted until composition records one.
     fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
         None
+    }
+
+    /// The receipt that admits an object write through this handle.
+    ///
+    /// Composition may defer admission to the first write: such a handle
+    /// proves the provider contract here and keeps only a successful receipt.
+    fn admit_object_writes(&self) -> Result<&ProviderAdmissionReceipt, ObjectError> {
+        self.provider_admission_receipt()
+            .ok_or(ObjectError::ProviderAdmissionRequired)
     }
 
     fn create_immutable(
@@ -204,6 +214,10 @@ where
 
     fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
         (**self).provider_admission_receipt()
+    }
+
+    fn admit_object_writes(&self) -> Result<&ProviderAdmissionReceipt, ObjectError> {
+        (**self).admit_object_writes()
     }
 
     fn create_immutable(
@@ -517,32 +531,12 @@ pub struct S3ArtifactStore {
 impl S3ArtifactStore {
     pub fn new(options: S3ArtifactStoreOptions) -> Result<Self, ObjectError> {
         options.validate()?;
-        let mut builder = S3::default()
-            .bucket(&options.bucket)
-            .root(&options.root)
-            .region(&options.region);
-        if let Some(endpoint) = &options.endpoint {
-            builder = builder.endpoint(endpoint);
-        }
-        if let Some(access_key_id) = &options.access_key_id {
-            builder = builder.access_key_id(access_key_id);
-        }
-        if let Some(secret_access_key) = &options.secret_access_key {
-            builder = builder.secret_access_key(secret_access_key);
-        }
-        if let Some(session_token) = &options.session_token {
-            builder = builder.session_token(session_token);
-        }
-        if options.virtual_host_style {
-            builder = builder.enable_virtual_host_style();
-        }
-        if options.skip_signature {
-            builder = builder.skip_signature();
-        }
-
-        let operator = Operator::new(builder)
-            .map_err(ObjectError::opendal_backend)?
-            .finish();
+        // The facade installs its reqwest transport only through
+        // `auto-register-services`, which `default-features = false` disables.
+        // Without it every request fails with "default HTTP transport is not
+        // installed". Installation is idempotent and first-installed-wins.
+        opendal::install_default();
+        let operator = Operator::new(s3_builder(&options)).map_err(ObjectError::opendal_backend)?;
         let _runtime_guard = OPENDAL_RUNTIME.enter();
         let operator = BlockingOperator::new(operator).map_err(ObjectError::opendal_backend)?;
         Ok(Self {
@@ -603,16 +597,12 @@ impl ArtifactObjectStore for S3ArtifactStore {
         if let Err(error) = writer.write(bytes.to_vec()) {
             return self.read_existing_for_replay(key, bytes, error);
         }
+        // Every failure reconciles against the key's current bytes rather than
+        // the error kind: a failed precondition (`ConditionNotMatch`), a
+        // service-reported conflict (`Conflict`), and a lost response all
+        // leave the stored object as the only authority.
         match writer.close() {
             Ok(_) => Ok(ImmutableCreateOutcome::Created),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
-                ) =>
-            {
-                self.read_existing_for_replay(key, bytes, error)
-            }
             Err(error) => self.read_existing_for_replay(key, bytes, error),
         }
     }
@@ -660,7 +650,7 @@ impl ArtifactObjectStore for S3ArtifactStore {
     }
 
     fn seal_immutable(&self, key: &ObjectKey) -> Result<ObjectSealOutcome, ObjectError> {
-        let capabilities = self.operator.info().full_capability();
+        let capabilities = self.operator.info().capability();
         if !capabilities.write_with_if_match || !capabilities.write_with_if_not_exists {
             return Err(ObjectError::ImmutableSealingUnsupported);
         }
@@ -695,10 +685,15 @@ impl ArtifactObjectStore for S3ArtifactStore {
                 .write_options(key.as_str(), Vec::<u8>::new(), options)
             {
                 Ok(_) => return Ok(ObjectSealOutcome::Sealed),
+                // The conditional PUT was not applied: its precondition failed,
+                // or the service rejected it for a concurrent conflicting
+                // write. Reobserve and retry within the budget.
                 Err(error)
                     if matches!(
                         error.kind(),
-                        ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
+                        ErrorKind::AlreadyExists
+                            | ErrorKind::ConditionNotMatch
+                            | ErrorKind::Conflict
                     ) => {}
                 Err(error) => {
                     // A lost response is success only after observing the
@@ -743,6 +738,32 @@ impl ArtifactObjectStore for S3ArtifactStore {
             }),
         }
     }
+}
+
+fn s3_builder(options: &S3ArtifactStoreOptions) -> S3 {
+    let mut builder = S3::default()
+        .bucket(&options.bucket)
+        .root(&options.root)
+        .region(&options.region);
+    if let Some(endpoint) = &options.endpoint {
+        builder = builder.endpoint(endpoint);
+    }
+    if let Some(access_key_id) = &options.access_key_id {
+        builder = builder.access_key_id(access_key_id);
+    }
+    if let Some(secret_access_key) = &options.secret_access_key {
+        builder = builder.secret_access_key(secret_access_key);
+    }
+    if let Some(session_token) = &options.session_token {
+        builder = builder.session_token(session_token);
+    }
+    if options.virtual_host_style {
+        builder = builder.enable_virtual_host_style();
+    }
+    if options.skip_signature {
+        builder = builder.skip_signature();
+    }
+    builder
 }
 
 fn validate_key(raw: &str) -> Result<(), ObjectError> {
@@ -833,6 +854,7 @@ impl ObjectError {
             | Self::InvalidRange { .. }
             | Self::ProviderAdmissionBlockSizeExceeded { .. } => ErrorClass::InvalidInput,
             Self::ObjectNotFound { .. } => ErrorClass::NotFound,
+            Self::ProviderAdmissionFailed(cause) => cause.class(),
             Self::CreateAmbiguous { .. }
             | Self::DeleteAmbiguous { .. }
             | Self::SealAmbiguous { .. } => ErrorClass::OutcomeUnknown,
@@ -925,6 +947,7 @@ impl fmt::Display for ObjectError {
                 formatter,
                 "artifact block size {requested} exceeds admitted provider limit {admitted}"
             ),
+            Self::ProviderAdmissionFailed(cause) => write!(formatter, "{cause}"),
             Self::CreateAmbiguous { .. } => {
                 formatter.write_str("immutable create outcome is ambiguous")
             }
@@ -947,3 +970,7 @@ impl fmt::Debug for ObjectError {
 }
 
 impl std::error::Error for ObjectError {}
+
+#[cfg(test)]
+#[path = "s3_store_test.rs"]
+mod s3_store_test;

@@ -86,12 +86,15 @@ Those local sandbox paths are not NoKV namespace identities.
 
 ## Jail And Logical Paths
 
-The deployment root is `/agents/{agent_id}/wb` and must not be `/`.
+The deployment root is an absolute presentation path other than `/`,
+conventionally `/agents/{agent_name}/wb`.
 
 This root is durable presentation configuration. It shapes returned paths and
 the presentation-path fields in canonical run/restore manifest v1 envelopes,
 so a deployment must retain the same value across restarts
-and exact operation replay. It is not a namespace, routing, Holt-key,
+and exact operation replay. Every client of one root must use the same
+deployment root, because canonical manifests and the operations derived from
+them carry it. It is not a namespace, routing, Holt-key,
 object-key, or sharding identity; `RootId` remains the storage and routing
 authority.
 

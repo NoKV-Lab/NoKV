@@ -29,11 +29,11 @@ pub use append_operations::{
     MAX_APPEND_INSPECTION_LIMIT,
 };
 pub use artifact::{
-    visible_body_publishes_inline, ArtifactAppendOptions, ArtifactAppendOutcome,
-    ArtifactPublishOptions, ArtifactPublishOutcome, ArtifactRangeBatchItem,
-    ArtifactRangeBatchOutcome, ArtifactRangeBatchRequest, ArtifactReadAuthority,
-    ArtifactReadOutcome, MAX_ARTIFACT_RANGE_BATCH_OUTPUT_BYTES, MAX_ARTIFACT_RANGE_BATCH_RANGES,
-    MAX_ARTIFACT_RANGE_BATCH_READ_BYTES, MAX_ARTIFACT_RANGE_BATCH_REQUESTS,
+    ArtifactAppendOptions, ArtifactAppendOutcome, ArtifactPublishOptions, ArtifactPublishOutcome,
+    ArtifactRangeBatchItem, ArtifactRangeBatchOutcome, ArtifactRangeBatchRequest,
+    ArtifactReadAuthority, ArtifactReadOutcome, MAX_ARTIFACT_RANGE_BATCH_OUTPUT_BYTES,
+    MAX_ARTIFACT_RANGE_BATCH_RANGES, MAX_ARTIFACT_RANGE_BATCH_READ_BYTES,
+    MAX_ARTIFACT_RANGE_BATCH_REQUESTS,
 };
 pub use error::{rpc_failure_class, ArtifactPublishStage, ClientError, TransportError};
 pub use generic_index::{

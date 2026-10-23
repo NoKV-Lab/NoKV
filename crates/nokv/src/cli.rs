@@ -279,41 +279,6 @@ impl Command {
             | Self::Help => false,
         }
     }
-
-    /// Whether this invocation may create artifact objects.
-    ///
-    /// Provider admission proves create semantics with several block-sized
-    /// probe writes. A command that only reads objects skips it: every block
-    /// it reads is verified against its digest, and a command misclassified
-    /// here still cannot write, because publication requires the receipt.
-    pub fn creates_objects(&self) -> bool {
-        match self {
-            Self::Workbench { tool, .. } => !matches!(
-                tool.as_str(),
-                "workbench_aggregate"
-                    | "workbench_catalog"
-                    | "workbench_find"
-                    | "workbench_grep"
-                    | "workbench_list"
-                    | "workbench_read"
-                    | "workbench_search"
-                    | "workbench_snapshot_list"
-                    | "workbench_stat"
-            ),
-            Self::Materialize { .. } => false,
-            // A caller-identified publication admits the object provider only
-            // when its body does not publish inline.
-            Self::WorkspacePath(
-                WorkspacePathCommand::Put { .. } | WorkspacePathCommand::Stat { .. },
-            )
-            | Self::Collect {
-                operation_id: Some(_),
-                ..
-            } => false,
-            Self::Identity(_) => false,
-            _ => true,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1685,49 +1650,6 @@ fn hex_nibble(byte: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn only_commands_that_read_objects_skip_provider_admission() {
-        let tool = |name: &str| Command::Workbench {
-            tool: name.to_owned(),
-            arguments: "{}".to_owned(),
-        };
-        for name in [
-            "workbench_aggregate",
-            "workbench_catalog",
-            "workbench_find",
-            "workbench_grep",
-            "workbench_list",
-            "workbench_read",
-            "workbench_search",
-            "workbench_snapshot_list",
-            "workbench_stat",
-        ] {
-            assert!(!tool(name).creates_objects(), "{name}");
-        }
-        for name in [
-            "workbench_append",
-            "workbench_commit",
-            "workbench_create",
-            "workbench_edit",
-            "workbench_put_file",
-            "workbench_restore",
-            "workbench_snapshot",
-            "workbench_snapshot_renew",
-            "workbench_snapshot_retire",
-            "workbench_unknown",
-        ] {
-            assert!(tool(name).creates_objects(), "{name}");
-        }
-        assert!(!Command::Materialize {
-            workbench: "w".to_owned(),
-            section: "outputs".to_owned(),
-            path: "a.txt".to_owned(),
-            destination: PathBuf::from("a.txt"),
-        }
-        .creates_objects());
-        assert!(Command::WorkbenchSession.creates_objects());
-    }
-
     use super::*;
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -2640,7 +2562,6 @@ mod tests {
             identity(&["show", &tenant]),
             Ok(Command::Identity(IdentityCommand::Show { tenant_id }))
         );
-        assert!(!Command::Identity(IdentityCommand::Show { tenant_id }).creates_objects());
     }
 
     #[test]
