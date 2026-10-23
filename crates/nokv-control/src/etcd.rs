@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::future::Future;
 
 use etcd_client::{
-    Client, Compare, CompareOp, GetOptions, GetResponse, KeyValue, PutOptions, Txn, TxnOp,
-    TxnOpResponse,
+    Client, Compare, CompareOp, ConnectOptions, GetOptions, GetResponse, KeyValue, PutOptions, Txn,
+    TxnOp, TxnOpResponse,
 };
 use tokio::runtime::{Builder, Runtime};
 
@@ -117,8 +117,13 @@ impl EtcdControlStore {
             .map_err(|error| {
                 ControlError::Backend(format!("etcd runtime initialization failed: {error}"))
             })?;
+        // Every call is bounded, so a partitioned etcd fails an owner's
+        // renewal or a policy refresh instead of stalling it.
+        let connect_options = ConnectOptions::new()
+            .with_connect_timeout(options.connect_timeout())
+            .with_timeout(options.request_timeout());
         let client = runtime
-            .block_on(Client::connect(options.endpoints(), None))
+            .block_on(Client::connect(options.endpoints(), Some(connect_options)))
             .map_err(etcd_backend)?;
         Ok(Self {
             options,
