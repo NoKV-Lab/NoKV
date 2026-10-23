@@ -1881,10 +1881,9 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
 
     use nokv_control::{NodeId, RecoveryPublication, RootId};
     use nokv_server::{
-        bootstrap_shard, ArtifactLifecycleCleaner, CredentialAuthenticator, LeaseMode,
-        LifecycleObjectCleaner, LifecycleRunner, LifecycleRunnerOptions, OpenMode,
-        RecoveryPublicationMode, RootAttach, RootOwnerRegistry, RpcServerTls, ServerOptions,
-        ShardBoot, WorkspaceServer,
+        bootstrap_shard, ArtifactLifecycleCleaner, LeaseMode, LifecycleObjectCleaner,
+        LifecycleRunner, LifecycleRunnerOptions, OpenMode, RecoveryPublicationMode, RootAttach,
+        RootOwnerRegistry, RpcServerTls, ServerOptions, ShardBoot, TenantAccess, WorkspaceServer,
     };
     use nokv_types::RequestId;
     use sha2::{Digest, Sha256};
@@ -2017,15 +2016,10 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
             let identity = connection::open_identity(&invocation.client.routing)
                 .map_err(|error| error.to_string())?;
             let tenant_id = served_tenant(identity.as_ref(), &placements)?;
+            let access =
+                TenantAccess::load(identity, tenant_id).map_err(|error| error.to_string())?;
             let (chain, key) = rpc_tls::server_identity(tls)?;
-            Some(
-                RpcServerTls::new(
-                    chain,
-                    key,
-                    CredentialAuthenticator::new(identity, tenant_id),
-                )
-                .map_err(|error| error.to_string())?,
-            )
+            Some(RpcServerTls::new(chain, key, access).map_err(|error| error.to_string())?)
         }
     };
     let objects = Arc::new(

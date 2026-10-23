@@ -9,6 +9,7 @@
 //! workspace protocol, and delegates domain execution. Metadata semantics stay
 //! in `nokv-meta`.
 
+mod access;
 mod bootstrap;
 mod error;
 mod executor;
@@ -24,6 +25,7 @@ mod service;
 #[cfg(test)]
 mod test_support;
 
+pub use access::{AccessDenial, TenantAccess, MAX_POLICY_AGE, POLICY_REFRESH_INTERVAL};
 pub use bootstrap::{bootstrap_shard, LeaseMode, OpenMode, RootAttach, ShardBoot, ShardOwner};
 pub use error::ServerError;
 pub use executor::{MetadataWorkspaceRequestExecutor, MAX_APPEND_ACTIVITY_LEASE_MS};
@@ -48,6 +50,6 @@ pub use recovery_publisher::{
     RecoveryPublicationMode, RecoveryPublisher, RecoveryPublisherError, RecoveryPublishingExecutor,
 };
 pub use registry::RootOwnerRegistry;
-pub use rpc_tls::{AuthenticationError, CredentialAuthenticator, RpcServerTls};
+pub use rpc_tls::RpcServerTls;
 pub use server::{OwnerLossSignal, ServerHealth, ServerOptions, WorkspaceServer};
 pub use service::{ExecutedRequest, WorkspaceRequestExecutor};

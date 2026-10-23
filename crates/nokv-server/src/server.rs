@@ -14,14 +14,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use nokv_protocol::{
     decode_handshake_frame, decode_handshake_payload, decode_request, encode_handshake_frame,
     encode_response, has_handshake_magic, ErrorCode, HandshakeKind, ProtocolError, RpcFailure,
-    WorkspaceHandshake, WorkspaceRpcOutcome, WorkspaceRpcResponse, HANDSHAKE_FRAME_BYTES,
-    HANDSHAKE_PAYLOAD_BYTES, MAX_FRAME_BYTES, WORKSPACE_PROTOCOL_SCHEMA,
+    WorkspaceHandshake, WorkspaceRpcOutcome, WorkspaceRpcRequest, WorkspaceRpcResponse,
+    HANDSHAKE_FRAME_BYTES, HANDSHAKE_PAYLOAD_BYTES, MAX_FRAME_BYTES, WORKSPACE_PROTOCOL_SCHEMA,
 };
 
+use crate::access::{AccessDenial, ConnectionPrincipal, MAX_POLICY_AGE, POLICY_REFRESH_INTERVAL};
 use crate::legacy_rejection::{legacy_rejection_response, MAX_LEGACY_FIRST_FRAME_BYTES};
 use crate::rpc_tls::{
-    accept_tls, drain_tls_record, opens_tls_record, AuthenticationError, DeadlineSocket,
-    RpcServerTls, RpcStream,
+    accept_tls, drain_tls_record, opens_tls_record, DeadlineSocket, RpcServerTls, RpcStream,
 };
 use crate::{RootOwnerRegistry, ServerError, ShardOwner};
 
@@ -306,6 +306,7 @@ fn serve_socket_loop(
         .set_nonblocking(true)
         .map_err(ServerError::Connection)?;
     let mut next_renewal = Instant::now();
+    let mut policy = tls.as_deref().map(PolicyRefresh::new);
     let connections = Arc::new(
         ConnectionLimiter::new(options.max_inflight_connections)
             .expect("validated connection maximum is nonzero"),
@@ -319,6 +320,9 @@ fn serve_socket_loop(
         if now >= next_renewal {
             renew_ownership()?;
             next_renewal = Instant::now() + options.lease_renew_interval;
+        }
+        if let Some(policy) = &mut policy {
+            policy.refresh_when_due(now);
         }
         match listener.accept() {
             Ok((stream, _)) => {
@@ -358,9 +362,54 @@ fn serve_socket_loop(
             renew_ownership()?;
             next_renewal = Instant::now() + options.lease_renew_interval;
         }
+        if let Some(policy) = &mut policy {
+            policy.refresh_when_due(now);
+        }
         sleep_until_runtime_event(next_renewal);
     }
     require_owner_retained(&owner_loss)
+}
+
+/// Refreshes the tenant policy of a TLS listener on its interval. A failure
+/// is reported once and again when it clears; meanwhile the last copy serves
+/// until it is `MAX_POLICY_AGE` old.
+struct PolicyRefresh<'a> {
+    tls: &'a RpcServerTls,
+    next: Instant,
+    failing: bool,
+}
+
+impl<'a> PolicyRefresh<'a> {
+    fn new(tls: &'a RpcServerTls) -> Self {
+        Self {
+            tls,
+            next: Instant::now() + POLICY_REFRESH_INTERVAL,
+            failing: false,
+        }
+    }
+
+    fn refresh_when_due(&mut self, now: Instant) {
+        if now < self.next {
+            return;
+        }
+        match self.tls.access.refresh() {
+            Ok(()) if self.failing => {
+                eprintln!("nokv-server: the tenant policy refreshes again");
+                self.failing = false;
+            }
+            Ok(()) => {}
+            Err(error) if !self.failing => {
+                eprintln!(
+                    "nokv-server: cannot refresh the tenant policy: {error}; requests are refused \
+                     once the last copy is {} s old",
+                    MAX_POLICY_AGE.as_secs()
+                );
+                self.failing = true;
+            }
+            Err(_) => {}
+        }
+        self.next = Instant::now() + POLICY_REFRESH_INTERVAL;
+    }
 }
 
 fn require_owner_retained(owner_loss: &OwnerLossSignal) -> Result<(), ServerError> {
@@ -522,7 +571,7 @@ fn serve_connection(
     // segment. This runs per connection, not in the accept loop, so a failure
     // closes only this connection.
     stream.set_nodelay(true).map_err(ServerError::Connection)?;
-    let Some(mut stream) = admit(stream, options.handshake_timeout, tls)? else {
+    let Some((mut stream, principal)) = admit(stream, options.handshake_timeout, tls)? else {
         return Ok(());
     };
     stream
@@ -530,6 +579,23 @@ fn serve_connection(
         .map_err(ServerError::Connection)?;
     while let Some(request) = read_frame(&mut stream)? {
         let request = decode_request(&request)?;
+        // Authorization comes before any route lookup, so a denied caller
+        // learns nothing about the root.
+        if let Some(tls) = tls {
+            let Some(principal) = &principal else {
+                return Ok(());
+            };
+            if let Err(denial) = tls.access.authorize(principal, &request, unix_now()) {
+                write_frame(
+                    &mut stream,
+                    &encode_response(&denied_response(&request, denial))?,
+                )?;
+                if denial == AccessDenial::NotACurrentCredential {
+                    return Ok(());
+                }
+                continue;
+            }
+        }
         let response = registry.dispatch_guarded(request)?;
         let encoded = encode_response_or_internal_failure(response.response())?;
         write_frame(&mut stream, &encoded)?;
@@ -537,6 +603,43 @@ fn serve_connection(
         require_owner_retained(&registry.owner_loss_signal())?;
     }
     Ok(())
+}
+
+/// The failure for a request the connection's principal may not make. It
+/// carries no route hint, generation, or commit version.
+fn denied_response(request: &WorkspaceRpcRequest, denial: AccessDenial) -> WorkspaceRpcResponse {
+    let (code, message, retryable) = match denial {
+        AccessDenial::NotACurrentCredential => (
+            ErrorCode::Unauthenticated,
+            "the connection's certificate is no longer a current credential of the owner's tenant"
+                .to_owned(),
+            false,
+        ),
+        AccessDenial::PermissionDenied { required } => (
+            ErrorCode::PermissionDenied,
+            format!("the principal holds no role on this root that includes {required:?}"),
+            false,
+        ),
+        AccessDenial::PolicyStale => (
+            ErrorCode::Unauthenticated,
+            "the owner cannot refresh its tenant policy; retry later".to_owned(),
+            true,
+        ),
+    };
+    WorkspaceRpcResponse {
+        route: request.route,
+        request_id: request.request_id,
+        commit_version: None,
+        replayed: false,
+        outcome: WorkspaceRpcOutcome::Failure(RpcFailure {
+            code,
+            message,
+            retryable,
+            conflict: None,
+            current_generation: None,
+            route_hint: None,
+        }),
+    }
 }
 
 /// Encodes one response frame. A success projection that fails wire
@@ -582,7 +685,7 @@ fn admit(
     stream: TcpStream,
     timeout: Duration,
     tls: Option<&RpcServerTls>,
-) -> Result<Option<RpcStream>, ServerError> {
+) -> Result<Option<(RpcStream, Option<ConnectionPrincipal>)>, ServerError> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| ServerError::InvalidOptions("handshake deadline overflows".to_owned()))?;
@@ -601,9 +704,8 @@ fn admit(
             write_handshake(&mut socket, HandshakeKind::TlsUnavailable)?;
             Ok(None)
         }
-        (tls, false) => {
-            Ok(admit_plaintext(&mut socket, tls.is_some())?.then_some(RpcStream::Plain(socket)))
-        }
+        (tls, false) => Ok(admit_plaintext(&mut socket, tls.is_some())?
+            .then_some((RpcStream::Plain(socket), None))),
     }
 }
 
@@ -663,7 +765,10 @@ fn admit_plaintext(socket: &mut DeadlineSocket, tls_required: bool) -> Result<bo
 /// a client whose certificate is not a current credential of the tenant gets
 /// `Unauthenticated`. A failure to read the tenant's records closes the
 /// connection unanswered, and the client retries it.
-fn admit_tls(socket: DeadlineSocket, tls: &RpcServerTls) -> Result<Option<RpcStream>, ServerError> {
+fn admit_tls(
+    socket: DeadlineSocket,
+    tls: &RpcServerTls,
+) -> Result<Option<(RpcStream, Option<ConnectionPrincipal>)>, ServerError> {
     let (mut stream, certificate) = accept_tls(socket, tls)?;
     let mut hello = [0_u8; HANDSHAKE_FRAME_BYTES];
     stream
@@ -673,15 +778,18 @@ fn admit_tls(socket: DeadlineSocket, tls: &RpcServerTls) -> Result<Option<RpcStr
     if hello.kind() != HandshakeKind::ClientHello {
         return Ok(None);
     }
+    let mut principal = None;
     let verdict = if hello.operation_schema() != WORKSPACE_PROTOCOL_SCHEMA {
         HandshakeKind::Incompatible
     } else {
-        match tls.authenticator.authenticate(&certificate, unix_now()) {
-            Ok(_) => HandshakeKind::Accepted,
-            Err(AuthenticationError::NotACurrentCredential) => HandshakeKind::Unauthenticated,
-            Err(AuthenticationError::Unavailable(error)) => {
-                return Err(ServerError::Control(error))
+        match tls.access.authenticate(&certificate, unix_now()) {
+            Ok(authenticated) => {
+                principal = Some(authenticated);
+                HandshakeKind::Accepted
             }
+            // Unanswered, so the client retries once the policy refreshes.
+            Err(AccessDenial::PolicyStale) => return Ok(None),
+            Err(_) => HandshakeKind::Unauthenticated,
         }
     };
     write_handshake(&mut stream, verdict)?;
@@ -690,7 +798,7 @@ fn admit_tls(socket: DeadlineSocket, tls: &RpcServerTls) -> Result<Option<RpcStr
         stream.flush().map_err(ServerError::Connection)?;
         return Ok(None);
     }
-    Ok(Some(RpcStream::Tls(Box::new(stream))))
+    Ok(Some((RpcStream::Tls(Box::new(stream)), principal)))
 }
 
 /// Seconds since the Unix epoch; a clock before it expires every credential.
@@ -1451,6 +1559,168 @@ mod tests {
         client.shutdown(Shutdown::Write).unwrap();
         serving.join().unwrap().unwrap();
         assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// Send `request` on an admitted TLS stream and decode the answer.
+    fn tls_exchange(
+        stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+        request: &WorkspaceRpcRequest,
+    ) -> WorkspaceRpcResponse {
+        write_frame(stream, &encode_request(request).unwrap()).unwrap();
+        decode_response(&read_frame(stream).unwrap().unwrap()).unwrap()
+    }
+
+    fn failure_of(response: &WorkspaceRpcResponse) -> &RpcFailure {
+        let WorkspaceRpcOutcome::Failure(failure) = &response.outcome else {
+            panic!("expected a failure, got {:?}", response.outcome);
+        };
+        failure
+    }
+
+    #[test]
+    fn a_reader_is_refused_a_write_without_a_route_hint_and_keeps_its_connection() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (client, server) = streams();
+        let (registry, executor) = registry();
+        let serving =
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)));
+
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.reader)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        for _ in 0..2 {
+            let response = tls_exchange(&mut stream, &request());
+            let failure = failure_of(&response);
+            assert_eq!(failure.code, ErrorCode::PermissionDenied);
+            assert!(!failure.retryable);
+            assert_eq!(failure.route_hint, None);
+            assert_eq!(response.route, request().route);
+            assert_eq!(response.commit_version, None);
+        }
+        stream.conn.send_close_notify();
+        stream.flush().unwrap();
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_credential_revoked_mid_connection_is_refused_once_and_the_connection_closes() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let (tls, store) = pki.server_tls_with_store();
+        let tls = Arc::new(tls);
+        let serving_tls = Arc::clone(&tls);
+        let (client, server) = streams();
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || {
+            serve_connection(server, registry, tls_options(), Some(&serving_tls))
+        });
+
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.registered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        assert!(matches!(
+            tls_exchange(&mut stream, &request()).outcome,
+            WorkspaceRpcOutcome::Success(_)
+        ));
+
+        use nokv_control::IdentityStore as _;
+        store
+            .revoke_credential(
+                &crate::rpc_tls::test_pki::TENANT,
+                &pki.registered.fingerprint(),
+            )
+            .unwrap();
+        tls.access.refresh().unwrap();
+        let response = tls_exchange(&mut stream, &request());
+        assert_eq!(failure_of(&response).code, ErrorCode::Unauthenticated);
+        assert!(!failure_of(&response).retryable);
+        let mut rest = Vec::new();
+        assert_eq!(stream.read_to_end(&mut rest).unwrap_or(0), 0);
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_stale_policy_refuses_requests_with_a_retryable_failure() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = Arc::new(pki.server_tls());
+        let serving_tls = Arc::clone(&tls);
+        let (client, server) = streams();
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || {
+            serve_connection(server, registry, tls_options(), Some(&serving_tls))
+        });
+
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.registered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        tls.access
+            .age_for_test(MAX_POLICY_AGE + Duration::from_secs(1));
+        let response = tls_exchange(&mut stream, &request());
+        assert_eq!(failure_of(&response).code, ErrorCode::Unauthenticated);
+        assert!(failure_of(&response).retryable);
+        stream.conn.send_close_notify();
+        stream.flush().unwrap();
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_serving_loop_applies_a_revoked_role_within_its_refresh_interval() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let (tls, store) = pki.server_tls_with_store();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let (registry, executor) = registry();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let serving_shutdown = Arc::clone(&shutdown);
+        let serving = thread::spawn(move || {
+            serve_socket_loop(
+                listener,
+                tls_options(),
+                registry,
+                Some(Arc::new(tls)),
+                OwnerLossSignal::default(),
+                serving_shutdown.as_ref(),
+                || Ok(()),
+            )
+        });
+
+        let client = TcpStream::connect(endpoint).unwrap();
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.registered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        assert!(matches!(
+            tls_exchange(&mut stream, &request()).outcome,
+            WorkspaceRpcOutcome::Success(_)
+        ));
+
+        use nokv_control::IdentityStore as _;
+        store
+            .revoke_role(&nokv_control::RoleBinding {
+                tenant_id: crate::rpc_tls::test_pki::TENANT,
+                principal_id: nokv_types::PrincipalId::from_bytes([6; 16]),
+                role: nokv_types::Role::Writer,
+                scope: nokv_types::RoleScope::Tenant,
+            })
+            .unwrap();
+        let revoked = Instant::now();
+        let mut refused = None;
+        while revoked.elapsed() < POLICY_REFRESH_INTERVAL * 3 {
+            let response = tls_exchange(&mut stream, &request());
+            if let WorkspaceRpcOutcome::Failure(failure) = &response.outcome {
+                assert_eq!(failure.code, ErrorCode::PermissionDenied);
+                refused = Some(revoked.elapsed());
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let refused = refused.expect("the revoked role was never applied");
+        assert!(refused <= POLICY_REFRESH_INTERVAL * 2, "{refused:?}");
+
+        stream.conn.send_close_notify();
+        stream.flush().unwrap();
+        drop(stream);
+        shutdown.store(true, AtomicOrdering::Release);
+        serving.join().unwrap().unwrap();
+        assert!(executor.calls.load(AtomicOrdering::SeqCst) >= 1);
     }
 
     #[test]

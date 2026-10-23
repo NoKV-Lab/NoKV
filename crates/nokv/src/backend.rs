@@ -3033,6 +3033,8 @@ fn error_code_name(code: wire::ErrorCode) -> &'static str {
         wire::ErrorCode::ObjectUnavailable => "ObjectUnavailable",
         wire::ErrorCode::Quarantined => "Quarantined",
         wire::ErrorCode::ResourceExhausted => "ResourceExhausted",
+        wire::ErrorCode::Unauthenticated => "Unauthenticated",
+        wire::ErrorCode::PermissionDenied => "PermissionDenied",
         wire::ErrorCode::Internal => "Internal",
     }
 }
