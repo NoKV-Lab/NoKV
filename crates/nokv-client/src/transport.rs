@@ -4,7 +4,8 @@
  */
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::fmt;
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,6 +14,8 @@ use nokv_protocol::{
     decode_handshake_frame, encode_handshake_frame, HandshakeKind, WorkspaceHandshake,
     HANDSHAKE_FRAME_BYTES, MAX_FRAME_BYTES, WORKSPACE_PROTOCOL_SCHEMA,
 };
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 use crate::TransportError;
 
@@ -49,6 +52,65 @@ impl Default for FramedTcpOptions {
     }
 }
 
+/// TLS 1.3 settings for workspace RPC: the owner name and roots this client
+/// trusts, and the certificate that authenticates its principal.
+///
+/// The server name is fixed here and never taken from a route. Routes name
+/// socket addresses, and whoever can change routing must not be able to
+/// change which certificate the client accepts.
+#[derive(Clone)]
+pub struct RpcClientTls {
+    config: Arc<ClientConfig>,
+    server_name: ServerName<'static>,
+}
+
+impl fmt::Debug for RpcClientTls {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RpcClientTls")
+            .field("server_name", &self.server_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RpcClientTls {
+    pub fn new(
+        server_name: ServerName<'static>,
+        server_roots: Vec<CertificateDer<'static>>,
+        client_chain: Vec<CertificateDer<'static>>,
+        client_key: PrivateKeyDer<'static>,
+    ) -> Result<Self, TransportError> {
+        let mut roots = RootCertStore::empty();
+        for root in server_roots {
+            roots.add(root).map_err(tls_configuration_error)?;
+        }
+        if roots.is_empty() || client_chain.is_empty() {
+            return Err(TransportError::security(
+                "RPC TLS needs a trusted server root and a client certificate",
+            ));
+        }
+        let mut config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .map_err(tls_configuration_error)?
+                .with_root_certificates(roots)
+                .with_client_auth_cert(client_chain, client_key)
+                .map_err(tls_configuration_error)?;
+        // Every connection presents the certificate again, so the owner
+        // authenticates each one: no resumption and no early data.
+        config.resumption = rustls::client::Resumption::disabled();
+        config.enable_early_data = false;
+        Ok(Self {
+            config: Arc::new(config),
+            server_name,
+        })
+    }
+}
+
+fn tls_configuration_error(error: rustls::Error) -> TransportError {
+    TransportError::security(format!("invalid RPC TLS configuration: {error}"))
+}
+
 /// Idle admitted connections kept for reuse per endpoint.
 const MAX_IDLE_CONNECTIONS_PER_ENDPOINT: usize = 8;
 /// Reuse a connection only while it is well inside the server's idle read
@@ -64,15 +126,20 @@ const MAX_IDLE_CONNECTION_AGE: Duration = Duration::from_secs(10);
 /// arrives was closed by its peer; the request is resent once on a fresh
 /// connection. Workspace requests carry their own request identity, so that
 /// resend has the same replay semantics as any client retry.
+///
+/// A transport authenticates as one principal. Its TLS settings are fixed when
+/// it is built and its clones share its pool, so a pooled connection is never
+/// reused under another identity.
 #[derive(Clone, Debug)]
 pub struct FramedTcpTransport {
     options: FramedTcpOptions,
+    tls: Option<RpcClientTls>,
     idle: Arc<Mutex<HashMap<SocketAddr, Vec<IdleConnection>>>>,
 }
 
 #[derive(Debug)]
 struct IdleConnection {
-    stream: TcpStream,
+    stream: RpcStream,
     idle_since: Instant,
 }
 
@@ -97,34 +164,55 @@ impl FramedTcpTransport {
         }
         Ok(Self {
             options,
+            tls: None,
             idle: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    /// Opens one connection and completes the exact-schema handshake. Nagle's
-    /// algorithm is disabled before the first byte is written, so no frame
-    /// waits for the server's delayed ACK of an earlier segment.
-    fn connect(&self, endpoint: SocketAddr) -> Result<TcpStream, TransportError> {
-        let mut stream = TcpStream::connect_timeout(&endpoint, self.options.connect_timeout)
+    /// Require TLS on every connection, with no plaintext fallback. The
+    /// transport starts a new pool, so no connection admitted under other
+    /// settings is reused.
+    pub fn with_tls(self, tls: RpcClientTls) -> Self {
+        Self {
+            options: self.options,
+            tls: Some(tls),
+            idle: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Opens one connection and completes the TLS and exact-schema
+    /// handshakes under one deadline. Nagle's algorithm is disabled before the
+    /// first byte is written, so no frame waits for the server's delayed ACK
+    /// of an earlier segment.
+    fn connect(&self, endpoint: SocketAddr) -> Result<RpcStream, TransportError> {
+        let socket = TcpStream::connect_timeout(&endpoint, self.options.connect_timeout)
             .map_err(io_error)?;
-        stream.set_nodelay(true).map_err(io_error)?;
-        perform_handshake(&mut stream, self.options.handshake_timeout)?;
+        socket.set_nodelay(true).map_err(io_error)?;
+        let deadline = Instant::now()
+            .checked_add(self.options.handshake_timeout)
+            .ok_or_else(|| TransportError::new("TCP handshake deadline overflows", false))?;
+        let socket = DeadlineSocket {
+            socket,
+            deadline: Some(deadline),
+        };
+        let mut stream = match &self.tls {
+            Some(tls) => RpcStream::Tls(Box::new(start_tls(socket, tls)?)),
+            None => RpcStream::Plain(socket),
+        };
+        perform_handshake(&mut stream)?;
         stream
-            .set_read_timeout(Some(self.options.read_timeout))
-            .map_err(io_error)?;
-        stream
-            .set_write_timeout(Some(self.options.write_timeout))
+            .finish_admission(self.options.read_timeout, self.options.write_timeout)
             .map_err(io_error)?;
         Ok(stream)
     }
 
     /// Take the most recently returned live connection for `endpoint`.
-    fn take_idle(&self, endpoint: SocketAddr) -> Option<TcpStream> {
+    fn take_idle(&self, endpoint: SocketAddr) -> Option<RpcStream> {
         let mut idle = self.idle.lock().ok()?;
         let connections = idle.get_mut(&endpoint)?;
-        while let Some(connection) = connections.pop() {
+        while let Some(mut connection) = connections.pop() {
             if connection.idle_since.elapsed() < MAX_IDLE_CONNECTION_AGE
-                && connection_is_quiet(&connection.stream)
+                && connection.stream.is_quiet()
             {
                 return Some(connection.stream);
             }
@@ -132,7 +220,7 @@ impl FramedTcpTransport {
         None
     }
 
-    fn return_idle(&self, endpoint: SocketAddr, stream: TcpStream) {
+    fn return_idle(&self, endpoint: SocketAddr, stream: RpcStream) {
         if let Ok(mut idle) = self.idle.lock() {
             let connections = idle.entry(endpoint).or_default();
             if connections.len() < MAX_IDLE_CONNECTIONS_PER_ENDPOINT {
@@ -150,20 +238,6 @@ impl FramedTcpTransport {
             idle.remove(&endpoint);
         }
     }
-}
-
-/// A reusable connection has nothing to read: unread bytes or end of stream
-/// mean the peer closed or desynchronized it.
-fn connection_is_quiet(stream: &TcpStream) -> bool {
-    if stream.set_nonblocking(true).is_err() {
-        return false;
-    }
-    let mut probe = [0_u8; 1];
-    let quiet = matches!(
-        stream.peek(&mut probe),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-    );
-    stream.set_nonblocking(false).is_ok() && quiet
 }
 
 impl RpcTransport for FramedTcpTransport {
@@ -191,6 +265,180 @@ impl RpcTransport for FramedTcpTransport {
             }
         }
     }
+}
+
+/// One admitted connection: plaintext, or TLS over the same socket.
+#[derive(Debug)]
+enum RpcStream {
+    Plain(DeadlineSocket),
+    Tls(Box<StreamOwned<ClientConnection, DeadlineSocket>>),
+}
+
+impl RpcStream {
+    fn socket(&mut self) -> &mut DeadlineSocket {
+        match self {
+            Self::Plain(socket) => socket,
+            Self::Tls(tls) => &mut tls.sock,
+        }
+    }
+
+    /// End the handshake deadline; later reads and writes are bounded by the
+    /// per-call socket timeouts instead.
+    fn finish_admission(
+        &mut self,
+        read_timeout: Duration,
+        write_timeout: Duration,
+    ) -> io::Result<()> {
+        let socket = self.socket();
+        socket.deadline = None;
+        socket.socket.set_read_timeout(Some(read_timeout))?;
+        socket.socket.set_write_timeout(Some(write_timeout))
+    }
+
+    /// A reusable connection has nothing to read: unread bytes, end of stream,
+    /// or buffered TLS data mean the peer closed or desynchronized it. An
+    /// owner sends nothing between exchanges, not even TLS session tickets.
+    fn is_quiet(&mut self) -> bool {
+        if let Self::Tls(tls) = self {
+            match tls.conn.process_new_packets() {
+                Ok(state) if state.plaintext_bytes_to_read() == 0 && !state.peer_has_closed() => {}
+                _ => return false,
+            }
+        }
+        socket_is_quiet(&self.socket().socket)
+    }
+}
+
+fn socket_is_quiet(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut probe = [0_u8; 1];
+    let quiet = matches!(
+        stream.peek(&mut probe),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    );
+    stream.set_nonblocking(false).is_ok() && quiet
+}
+
+impl Read for RpcStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(socket) => socket.read(buffer),
+            Self::Tls(tls) => tls.read(buffer),
+        }
+    }
+}
+
+impl Write for RpcStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(socket) => socket.write(buffer),
+            Self::Tls(tls) => tls.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(socket) => socket.flush(),
+            Self::Tls(tls) => tls.flush(),
+        }
+    }
+}
+
+/// A socket whose reads and writes share one absolute deadline while it is
+/// set. The deadline lives below rustls: one TLS read can make several socket
+/// reads, and a timeout per read would let a peer that trickles bytes extend
+/// the handshake indefinitely.
+#[derive(Debug)]
+struct DeadlineSocket {
+    socket: TcpStream,
+    deadline: Option<Instant>,
+}
+
+impl Read for DeadlineSocket {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            self.socket.set_read_timeout(Some(remaining(deadline)?))?;
+        }
+        self.socket.read(buffer)
+    }
+}
+
+impl Write for DeadlineSocket {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            self.socket.set_write_timeout(Some(remaining(deadline)?))?;
+        }
+        self.socket.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.socket.flush()
+    }
+}
+
+/// Run the TLS handshake. An owner without TLS answers the TLS client hello
+/// with a plaintext handshake frame, which is read here before rustls would
+/// reject it as a malformed record.
+fn start_tls(
+    mut socket: DeadlineSocket,
+    tls: &RpcClientTls,
+) -> Result<StreamOwned<ClientConnection, DeadlineSocket>, TransportError> {
+    let mut connection = ClientConnection::new(Arc::clone(&tls.config), tls.server_name.clone())
+        .map_err(tls_configuration_error)?;
+    while connection.wants_write() {
+        connection.write_tls(&mut socket).map_err(io_error)?;
+    }
+    if !answer_is_tls(&mut socket)? {
+        return Err(plaintext_answer(&mut socket));
+    }
+    while connection.is_handshaking() {
+        connection.complete_io(&mut socket).map_err(stream_error)?;
+    }
+    Ok(StreamOwned::new(connection, socket))
+}
+
+/// Wait for the owner's first byte. A TLS record starts with a content type
+/// in 20..=23; a plaintext frame starts with the high byte of its length,
+/// which is zero for every frame this protocol allows.
+fn answer_is_tls(socket: &mut DeadlineSocket) -> Result<bool, TransportError> {
+    let mut first = [0_u8; 1];
+    loop {
+        if let Some(deadline) = socket.deadline {
+            socket
+                .socket
+                .set_read_timeout(Some(remaining(deadline).map_err(io_error)?))
+                .map_err(io_error)?;
+        }
+        match socket.socket.peek(&mut first) {
+            Ok(0) => {
+                return Err(io_error(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the owner closed the connection during the TLS handshake; an owner \
+                     without TLS that predates this client does so",
+                )));
+            }
+            Ok(_) => return Ok((20..=23).contains(&first[0])),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(io_error(error)),
+        }
+    }
+}
+
+fn plaintext_answer(socket: &mut DeadlineSocket) -> TransportError {
+    let mut frame = [0_u8; HANDSHAKE_FRAME_BYTES];
+    if socket.read_exact(&mut frame).is_ok() {
+        if let Ok(answer) = decode_handshake_frame(&frame) {
+            if answer.kind() == HandshakeKind::TlsUnavailable {
+                return TransportError::security(
+                    "the owner does not use TLS; configure this client without RPC TLS or \
+                     enable TLS on the owner",
+                );
+            }
+        }
+    }
+    TransportError::security("the owner answered the TLS client hello in plaintext")
 }
 
 /// Builds one complete request frame, the four-byte big-endian length followed
@@ -232,15 +480,13 @@ fn exchange_frame(
     let first = loop {
         match stream.read(&mut response_length[..1]) {
             Ok(0) => {
-                return Err(ExchangeError::BeforeResponse(io_error(
-                    std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "workspace RPC connection closed before a response",
-                    ),
-                )));
+                return Err(ExchangeError::BeforeResponse(io_error(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "workspace RPC connection closed before a response",
+                ))));
             }
             Ok(read) => break read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(ExchangeError::BeforeResponse(io_error(error))),
         }
     };
@@ -267,18 +513,21 @@ fn exchange_frame(
     Ok(response)
 }
 
-fn perform_handshake(stream: &mut TcpStream, timeout: Duration) -> Result<(), TransportError> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| TransportError::new("TCP handshake deadline overflows", false))?;
+/// Offer the exact schema and read the owner's verdict. Both frames travel
+/// inside TLS when it is configured, under the connection's handshake
+/// deadline.
+fn perform_handshake(stream: &mut RpcStream) -> Result<(), TransportError> {
     let hello = WorkspaceHandshake::new(HandshakeKind::ClientHello, WORKSPACE_PROTOCOL_SCHEMA)
         .expect("the compiled workspace protocol schema fits the handshake");
     let encoded = encode_handshake_frame(&hello)
         .expect("the compiled workspace protocol schema has one canonical handshake encoding");
-    write_all_until(stream, &encoded, deadline).map_err(io_error)?;
+    stream
+        .write_all(&encoded)
+        .and_then(|()| stream.flush())
+        .map_err(stream_error)?;
 
     let mut response = [0_u8; HANDSHAKE_FRAME_BYTES];
-    read_exact_until(stream, &mut response, deadline).map_err(io_error)?;
+    stream.read_exact(&mut response).map_err(stream_error)?;
     let response = decode_handshake_frame(&response).map_err(|error| {
         TransportError::incompatible(format!("invalid workspace RPC handshake: {error}"))
     })?;
@@ -295,82 +544,57 @@ fn perform_handshake(stream: &mut TcpStream, timeout: Duration) -> Result<(), Tr
             "workspace RPC handshake accepted a different operation schema: {}",
             response.operation_schema()
         ))),
-        HandshakeKind::ClientHello => Err(TransportError::new(
-            "workspace RPC server returned a client hello",
+        HandshakeKind::TlsRequired => Err(TransportError::security(
+            "the owner requires TLS; configure RPC TLS for this client",
+        )),
+        HandshakeKind::Unauthenticated => Err(TransportError::security(
+            "the owner did not accept this client's certificate: it is not a current \
+             credential of the owner's tenant",
+        )),
+        HandshakeKind::ClientHello | HandshakeKind::TlsUnavailable => Err(TransportError::new(
+            format!(
+                "workspace RPC server answered the handshake with {:?}",
+                response.kind()
+            ),
             false,
         )),
     }
 }
 
-fn read_exact_until(
-    stream: &mut TcpStream,
-    mut buffer: &mut [u8],
-    deadline: Instant,
-) -> std::io::Result<()> {
-    while !buffer.is_empty() {
-        let remaining = remaining(deadline)?;
-        stream.set_read_timeout(Some(remaining))?;
-        match stream.read(buffer) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "workspace RPC handshake ended early",
-                ));
-            }
-            Ok(read) => buffer = &mut buffer[read..],
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    remaining(deadline).map(|_| ())
-}
-
-fn write_all_until(
-    stream: &mut TcpStream,
-    mut buffer: &[u8],
-    deadline: Instant,
-) -> std::io::Result<()> {
-    while !buffer.is_empty() {
-        let remaining = remaining(deadline)?;
-        stream.set_write_timeout(Some(remaining))?;
-        match stream.write(buffer) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "workspace RPC handshake write made no progress",
-                ));
-            }
-            Ok(written) => buffer = &buffer[written..],
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    remaining(deadline).map(|_| ())
-}
-
-fn remaining(deadline: Instant) -> std::io::Result<Duration> {
+fn remaining(deadline: Instant) -> io::Result<Duration> {
     deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
         .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
+            io::Error::new(
+                io::ErrorKind::TimedOut,
                 "workspace RPC handshake deadline expired",
             )
         })
 }
 
-fn io_error(error: std::io::Error) -> TransportError {
+/// A TLS protocol failure surfaces as invalid data: a rejected certificate,
+/// an alert from the owner, or a malformed record. None of them changes on
+/// retry.
+fn stream_error(error: io::Error) -> TransportError {
+    if error.kind() == io::ErrorKind::InvalidData {
+        TransportError::security(format!("RPC TLS failed: {error}"))
+    } else {
+        io_error(error)
+    }
+}
+
+fn io_error(error: io::Error) -> TransportError {
     let retryable = matches!(
         error.kind(),
-        std::io::ErrorKind::TimedOut
-            | std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::Interrupted
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::ConnectionRefused
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::NotConnected
-            | std::io::ErrorKind::UnexpectedEof
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
     );
     TransportError::new(error.to_string(), retryable)
 }
@@ -385,17 +609,25 @@ mod tests {
         decode_handshake_frame, encode_handshake_frame, HandshakeKind, WorkspaceHandshake,
         HANDSHAKE_FRAME_BYTES, WORKSPACE_PROTOCOL_SCHEMA,
     };
+    use nokv_types::ErrorClass;
+    use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+    use rustls::server::WebPkiClientVerifier;
+    use rustls::{ServerConfig, ServerConnection};
 
     use super::*;
 
-    fn transport() -> FramedTcpTransport {
-        FramedTcpTransport::new(FramedTcpOptions {
+    fn options() -> FramedTcpOptions {
+        FramedTcpOptions {
             connect_timeout: Duration::from_secs(1),
             handshake_timeout: Duration::from_secs(1),
             read_timeout: Duration::from_secs(1),
             write_timeout: Duration::from_secs(1),
-        })
-        .unwrap()
+        }
+    }
+
+    fn transport() -> FramedTcpTransport {
+        FramedTcpTransport::new(options()).unwrap()
     }
 
     /// In-memory stream that keeps every `write` call as a separate entry.
@@ -466,13 +698,13 @@ mod tests {
         let endpoint = listener.local_addr().unwrap();
         let server = thread::spawn(move || accept_one_handshake(listener));
 
-        let stream = transport().connect(endpoint).unwrap();
-        assert!(stream.nodelay().unwrap());
+        let mut stream = transport().connect(endpoint).unwrap();
+        assert!(stream.socket().socket.nodelay().unwrap());
         server.join().unwrap();
     }
 
     #[test]
-    fn sends_an_exact_v9_hello_before_the_operation_frame() {
+    fn sends_an_exact_hello_before_the_operation_frame() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = listener.local_addr().unwrap();
         let expected_request = [7_u8; 48];
@@ -509,24 +741,29 @@ mod tests {
         server.join().unwrap();
     }
 
-    fn accept_hello(stream: &mut TcpStream) {
+    fn accept_hello(stream: &mut (impl Read + Write)) {
+        answer_hello(stream, HandshakeKind::Accepted);
+    }
+
+    fn answer_hello(stream: &mut (impl Read + Write), kind: HandshakeKind) {
         let mut hello = [0_u8; HANDSHAKE_FRAME_BYTES];
         stream.read_exact(&mut hello).unwrap();
         decode_handshake_frame(&hello).unwrap();
-        let accepted =
-            WorkspaceHandshake::new(HandshakeKind::Accepted, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
+        let answer = WorkspaceHandshake::new(kind, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
         stream
-            .write_all(&encode_handshake_frame(&accepted).unwrap())
+            .write_all(&encode_handshake_frame(&answer).unwrap())
             .unwrap();
+        stream.flush().unwrap();
     }
 
-    fn echo_one(stream: &mut TcpStream) {
+    fn echo_one(stream: &mut (impl Read + Write)) {
         let mut length = [0_u8; 4];
         stream.read_exact(&mut length).unwrap();
         let mut request = vec![0_u8; u32::from_be_bytes(length) as usize];
         stream.read_exact(&mut request).unwrap();
         stream.write_all(&length).unwrap();
         stream.write_all(&request).unwrap();
+        stream.flush().unwrap();
     }
 
     #[test]
@@ -580,15 +817,7 @@ mod tests {
         let endpoint = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut hello = [0_u8; HANDSHAKE_FRAME_BYTES];
-            stream.read_exact(&mut hello).unwrap();
-            decode_handshake_frame(&hello).unwrap();
-            let incompatible =
-                WorkspaceHandshake::new(HandshakeKind::Incompatible, WORKSPACE_PROTOCOL_SCHEMA)
-                    .unwrap();
-            stream
-                .write_all(&encode_handshake_frame(&incompatible).unwrap())
-                .unwrap();
+            answer_hello(&mut stream, HandshakeKind::Incompatible);
             stream
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
@@ -602,5 +831,293 @@ mod tests {
         assert!(!error.retryable());
         assert!(error.message().contains("incompatible"));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn an_owner_requiring_tls_refuses_a_plaintext_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            answer_hello(&mut stream, HandshakeKind::TlsRequired);
+        });
+
+        let error = transport().round_trip(endpoint, b"plain").unwrap_err();
+        assert!(!error.retryable());
+        assert_eq!(error.refusal_class(), Some(ErrorClass::OperatorRequired));
+        assert!(error.message().contains("requires TLS"));
+        server.join().unwrap();
+    }
+
+    /// A test CA and the owner (`owner.test`) and client certificates it
+    /// signs.
+    struct Pki {
+        ca: CertifiedIssuer<'static, KeyPair>,
+        server_chain: Vec<CertificateDer<'static>>,
+        server_key: PrivateKeyDer<'static>,
+        client_chain: Vec<CertificateDer<'static>>,
+        client_key: PrivateKeyDer<'static>,
+    }
+
+    impl Pki {
+        fn new() -> Self {
+            let mut params = CertificateParams::default();
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+            let server_key = KeyPair::generate().unwrap();
+            let server = CertificateParams::new(vec!["owner.test".to_owned()])
+                .unwrap()
+                .signed_by(&server_key, &ca)
+                .unwrap();
+            let client_key = KeyPair::generate().unwrap();
+            let client = CertificateParams::new(vec!["agent".to_owned()])
+                .unwrap()
+                .signed_by(&client_key, &ca)
+                .unwrap();
+            Self {
+                server_chain: vec![server.der().clone()],
+                server_key: PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+                client_chain: vec![client.der().clone()],
+                client_key: PrivatePkcs8KeyDer::from(client_key.serialize_der()).into(),
+                ca,
+            }
+        }
+
+        fn client_tls(&self, server_name: &str) -> RpcClientTls {
+            RpcClientTls::new(
+                ServerName::try_from(server_name.to_owned()).unwrap(),
+                vec![self.ca.der().clone()],
+                self.client_chain.clone(),
+                self.client_key.clone_key(),
+            )
+            .unwrap()
+        }
+
+        fn tls_transport(&self, server_name: &str) -> FramedTcpTransport {
+            transport().with_tls(self.client_tls(server_name))
+        }
+
+        /// An owner that requires a client certificate signed by the test CA.
+        fn server_config(&self) -> Arc<ServerConfig> {
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let mut roots = RootCertStore::empty();
+            roots.add(self.ca.der().clone()).unwrap();
+            let verifier =
+                WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
+                    .build()
+                    .unwrap();
+            let mut config = ServerConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(self.server_chain.clone(), self.server_key.clone_key())
+                .unwrap();
+            config.send_tls13_tickets = 0;
+            Arc::new(config)
+        }
+    }
+
+    fn accept_tls(
+        listener: &TcpListener,
+        config: &Arc<ServerConfig>,
+    ) -> StreamOwned<ServerConnection, TcpStream> {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut connection = ServerConnection::new(Arc::clone(config)).unwrap();
+        while connection.is_handshaking() {
+            connection.complete_io(&mut socket).unwrap();
+        }
+        StreamOwned::new(connection, socket)
+    }
+
+    #[test]
+    fn tls_exchanges_reuse_one_authenticated_connection() {
+        let pki = Pki::new();
+        let config = pki.server_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut stream = accept_tls(&listener, &config);
+            accept_hello(&mut stream);
+            echo_one(&mut stream);
+            echo_one(&mut stream);
+            listener.set_nonblocking(true).unwrap();
+            assert!(listener.accept().is_err(), "a second connection was opened");
+        });
+
+        let transport = pki.tls_transport("owner.test");
+        assert_eq!(transport.round_trip(endpoint, b"first").unwrap(), b"first");
+        assert_eq!(
+            transport.round_trip(endpoint, b"second").unwrap(),
+            b"second"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_pooled_tls_connection_the_owner_closed_is_replaced() {
+        let pki = Pki::new();
+        let config = pki.server_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut first = accept_tls(&listener, &config);
+            accept_hello(&mut first);
+            echo_one(&mut first);
+            first.conn.send_close_notify();
+            first.flush().unwrap();
+            drop(first);
+            closed_tx.send(()).unwrap();
+            let mut second = accept_tls(&listener, &config);
+            accept_hello(&mut second);
+            echo_one(&mut second);
+        });
+
+        let transport = pki.tls_transport("owner.test");
+        assert_eq!(transport.round_trip(endpoint, b"one").unwrap(), b"one");
+        closed_rx.recv().unwrap();
+        assert_eq!(transport.round_trip(endpoint, b"two").unwrap(), b"two");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_owner_certificate_for_another_name_is_a_security_refusal() {
+        let pki = Pki::new();
+        let config = pki.server_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut connection = ServerConnection::new(config).unwrap();
+            // The client aborts the handshake; nothing reaches the protocol.
+            while connection.is_handshaking() {
+                if connection.complete_io(&mut socket).is_err() {
+                    return;
+                }
+            }
+            panic!("the handshake completed for a mismatched server name");
+        });
+
+        let error = pki
+            .tls_transport("other.test")
+            .round_trip(endpoint, b"never")
+            .unwrap_err();
+        assert!(!error.retryable());
+        assert_eq!(error.refusal_class(), Some(ErrorClass::OperatorRequired));
+        assert!(error.message().contains("RPC TLS failed"), "{error}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_owner_without_tls_answers_a_tls_hello_in_plaintext() {
+        let pki = Pki::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read the whole client hello record first: closing over unread
+            // bytes resets the connection before the client reads the answer.
+            let mut header = [0_u8; 5];
+            stream.read_exact(&mut header).unwrap();
+            assert_eq!(
+                header[0], 22,
+                "the client opened with a TLS handshake record"
+            );
+            let mut record = vec![0_u8; usize::from(u16::from_be_bytes([header[3], header[4]]))];
+            stream.read_exact(&mut record).unwrap();
+            let answer =
+                WorkspaceHandshake::new(HandshakeKind::TlsUnavailable, WORKSPACE_PROTOCOL_SCHEMA)
+                    .unwrap();
+            stream
+                .write_all(&encode_handshake_frame(&answer).unwrap())
+                .unwrap();
+            let mut rest = Vec::new();
+            let _ = stream.read_to_end(&mut rest);
+        });
+
+        let error = pki
+            .tls_transport("owner.test")
+            .round_trip(endpoint, b"never")
+            .unwrap_err();
+        assert!(!error.retryable());
+        assert_eq!(error.refusal_class(), Some(ErrorClass::OperatorRequired));
+        assert!(error.message().contains("does not use TLS"), "{error}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_unauthenticated_answer_is_a_security_refusal() {
+        let pki = Pki::new();
+        let config = pki.server_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut stream = accept_tls(&listener, &config);
+            answer_hello(&mut stream, HandshakeKind::Unauthenticated);
+        });
+
+        let error = pki
+            .tls_transport("owner.test")
+            .round_trip(endpoint, b"never")
+            .unwrap_err();
+        assert!(!error.retryable());
+        assert_eq!(error.refusal_class(), Some(ErrorClass::OperatorRequired));
+        assert!(
+            error.message().contains("not a current credential"),
+            "{error}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_trickling_owner_cannot_extend_the_tls_handshake() {
+        let pki = Pki::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // A TLS record header that promises a long record, then one byte
+            // every 50 ms: each read makes progress, the whole never ends.
+            stream.write_all(&[22, 3, 3, 0x40, 0x00]).unwrap();
+            for _ in 0..60 {
+                thread::sleep(Duration::from_millis(50));
+                if stream.write_all(&[0]).is_err() {
+                    break;
+                }
+            }
+        });
+        let transport = FramedTcpTransport::new(FramedTcpOptions {
+            handshake_timeout: Duration::from_millis(300),
+            ..options()
+        })
+        .unwrap()
+        .with_tls(pki.client_tls("owner.test"));
+
+        let started = Instant::now();
+        let error = transport.round_trip(endpoint, b"never").unwrap_err();
+        assert!(error.retryable(), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tls_settings_never_reuse_a_plaintext_pool() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            accept_hello(&mut stream);
+            echo_one(&mut stream);
+            stream
+        });
+        let plaintext = transport();
+        assert_eq!(plaintext.round_trip(endpoint, b"plain").unwrap(), b"plain");
+        let _held = server.join().unwrap();
+
+        let secured = plaintext.with_tls(Pki::new().client_tls("owner.test"));
+        assert!(secured.take_idle(endpoint).is_none());
     }
 }

@@ -24,9 +24,11 @@ nokv-object.workspace = true
 nokv-protocol.workspace = true
 nokv-types.workspace = true
 rmp-serde.workspace = true
+rustls.workspace = true
 serde.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
 nokv-meta-holt = { workspace = true, features = ["test-support"] }
+rcgen.workspace = true
 tempfile.workspace = true

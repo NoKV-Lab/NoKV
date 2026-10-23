@@ -16,7 +16,8 @@ use nokv_types::ErrorClass;
 pub struct TransportError {
     message: String,
     retryable: bool,
-    incompatible: bool,
+    /// The class of a refusal that came before any request was sent.
+    refusal: Option<ErrorClass>,
 }
 
 impl TransportError {
@@ -24,7 +25,7 @@ impl TransportError {
         Self {
             message: message.into(),
             retryable,
-            incompatible: false,
+            refusal: None,
         }
     }
 
@@ -34,12 +35,30 @@ impl TransportError {
         Self {
             message: message.into(),
             retryable: false,
-            incompatible: true,
+            refusal: Some(ErrorClass::Incompatible),
         }
     }
 
-    pub const fn is_incompatible(&self) -> bool {
-        self.incompatible
+    /// Transport security failed before any request was sent: the two sides
+    /// disagree on TLS, a certificate was rejected, or the owner did not
+    /// accept the client's credential. Repeating it cannot succeed until an
+    /// operator fixes the credential or the settings.
+    pub fn security(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+            refusal: Some(ErrorClass::OperatorRequired),
+        }
+    }
+
+    pub fn is_incompatible(&self) -> bool {
+        self.refusal == Some(ErrorClass::Incompatible)
+    }
+
+    /// The class of a refusal that came before any request was sent; `None`
+    /// for a failure that may follow delivery.
+    pub const fn refusal_class(&self) -> Option<ErrorClass> {
+        self.refusal
     }
 
     pub fn message(&self) -> &str {
@@ -167,10 +186,8 @@ impl ClientError {
             Self::InvalidOptions(_) => ErrorClass::InvalidInput,
             // An unresolvable route sends nothing.
             Self::InvalidRoute(_) => ErrorClass::Transient,
-            Self::Transport(error) if error.is_incompatible() => ErrorClass::Incompatible,
-            Self::Transport(_) | Self::Protocol(_) | Self::ResponseMismatch(_) => {
-                ErrorClass::OutcomeUnknown
-            }
+            Self::Transport(error) => error.refusal_class().unwrap_or(ErrorClass::OutcomeUnknown),
+            Self::Protocol(_) | Self::ResponseMismatch(_) => ErrorClass::OutcomeUnknown,
             Self::Rpc(failure) => rpc_failure_class(failure),
             Self::MissingCapabilities(_) => ErrorClass::Incompatible,
             Self::ArtifactIntegrity(_) => ErrorClass::OperatorRequired,

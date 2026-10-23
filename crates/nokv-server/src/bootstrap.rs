@@ -2598,6 +2598,29 @@ mod tests {
     }
 
     #[test]
+    fn a_tls_server_refuses_direct_dispatch_without_a_client_identity() {
+        let temporary = TempDir::new().unwrap();
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let registry = Arc::new(RootOwnerRegistry::new());
+        let owner = bootstrap_shard(
+            as_control(&control),
+            Arc::clone(&registry),
+            acquire_boot(temporary.path().join("metadata"), &[root_id]),
+        )
+        .unwrap();
+
+        let server = WorkspaceServer::new(options(), Arc::clone(&registry), vec![owner])
+            .unwrap()
+            .with_rpc_tls(crate::rpc_tls::test_pki::TestPki::new().server_tls());
+        assert!(matches!(
+            server.dispatch_frame(&[]),
+            Err(ServerError::InvalidOptions(message)) if message.contains("TLS")
+        ));
+        server.release_ownership().unwrap();
+    }
+
+    #[test]
     fn exact_current_owner_reopens_without_reinstalling_the_active_fence() {
         let temporary = TempDir::new().unwrap();
         let database = temporary.path().join("metadata");

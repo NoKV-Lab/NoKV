@@ -13,6 +13,7 @@ mod failure_envelope;
 mod identity_admin;
 mod object_store;
 mod provision;
+mod rpc_tls;
 mod transfer;
 mod workbench_mcp;
 mod workbench_session;
@@ -1616,6 +1617,15 @@ OWNER:
     before a response leaves the shard; without checkpoint compaction the chain is bounded by the
     control record size, and a shard that reaches that bound stops accepting writes
 
+RPC TLS:
+  --rpc-tls-cert PEM --rpc-tls-key PEM: with serve, the owner's certificate chain and key. The owner then
+    accepts only TLS 1.3 clients whose certificate is a current credential of the tenant bound to its roots
+  --rpc-tls-ca PEM --rpc-tls-cert PEM --rpc-tls-key PEM --rpc-tls-server-name NAME: with a command that
+    connects to an owner, the roots that sign the owner's certificate, this client's certificate and key,
+    and the name the owner's certificate must carry; there is no fallback to plaintext
+  a refused credential or a TLS mismatch fails with class operator_required before any request is sent
+  an authenticated principal is not yet limited by its roles
+
 TENANT IDENTITY:
   identity tenant create <tenant-id-hex32>
   identity principal create <tenant-id-hex32> <principal-id-hex32>
@@ -1789,6 +1799,40 @@ fn validate_served_root_agent_bindings(
     Ok(())
 }
 
+/// The one tenant that owns every served root. An owner serving over TLS
+/// authenticates clients against that tenant's credentials.
+#[cfg(feature = "control")]
+fn served_tenant(
+    identity: &dyn nokv_control::IdentityStore,
+    placements: &[nokv_control::RootPlacement],
+) -> Result<nokv_types::TenantId, String> {
+    let mut tenant = None;
+    for placement in placements {
+        let binding = identity
+            .get_root_tenant(&placement.root_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "root {} is not bound to a tenant; run `nokv identity root bind` before \
+                     serving with --rpc-tls-cert",
+                    encode_lowercase_hex(placement.root_id.as_bytes())
+                )
+            })?;
+        match tenant {
+            None => tenant = Some(binding.tenant_id),
+            Some(owner_tenant) if owner_tenant != binding.tenant_id => {
+                return Err(
+                    "one owner serves one tenant, but the roots of this shard are bound to \
+                     different tenants"
+                        .to_owned(),
+                );
+            }
+            Some(_) => {}
+        }
+    }
+    tenant.ok_or_else(|| "serving over TLS requires at least one root".to_owned())
+}
+
 #[cfg(feature = "control")]
 fn join_lifecycle_workers(
     workers: Vec<std::thread::JoinHandle<Result<(), nokv_server::LifecycleError>>>,
@@ -1810,9 +1854,10 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
 
     use nokv_control::{NodeId, RecoveryPublication, RootId};
     use nokv_server::{
-        bootstrap_shard, ArtifactLifecycleCleaner, LeaseMode, LifecycleObjectCleaner,
-        LifecycleRunner, LifecycleRunnerOptions, OpenMode, RecoveryPublicationMode, RootAttach,
-        RootOwnerRegistry, ServerOptions, ShardBoot, WorkspaceServer,
+        bootstrap_shard, ArtifactLifecycleCleaner, CredentialAuthenticator, LeaseMode,
+        LifecycleObjectCleaner, LifecycleRunner, LifecycleRunnerOptions, OpenMode,
+        RecoveryPublicationMode, RootAttach, RootOwnerRegistry, RpcServerTls, ServerOptions,
+        ShardBoot, WorkspaceServer,
     };
     use nokv_types::RequestId;
     use sha2::{Digest, Sha256};
@@ -1938,6 +1983,24 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
             "one shard owner cannot serve roots bound to different object namespaces".to_owned(),
         );
     }
+    // TLS is loaded and checked before metadata open or ownership acquisition.
+    let rpc_tls = match &invocation.server.tls {
+        None => None,
+        Some(tls) => {
+            let identity = connection::open_identity(&invocation.client.routing)
+                .map_err(|error| error.to_string())?;
+            let tenant_id = served_tenant(identity.as_ref(), &placements)?;
+            let (chain, key) = rpc_tls::server_identity(tls)?;
+            Some(
+                RpcServerTls::new(
+                    chain,
+                    key,
+                    CredentialAuthenticator::new(identity, tenant_id),
+                )
+                .map_err(|error| error.to_string())?,
+            )
+        }
+    };
     let objects = Arc::new(
         CliObjectStore::build(&invocation.client.object)?
             .bind(expected_namespace)
@@ -2006,6 +2069,10 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         vec![owner],
     )
     .map_err(|error| error.to_string())?;
+    let server = match rpc_tls {
+        Some(tls) => server.with_rpc_tls(tls),
+        None => server,
+    };
     let owner_loss = server.owner_loss_signal();
     let lifecycle_objects: Arc<dyn LifecycleObjectCleaner> =
         Arc::new(ArtifactLifecycleCleaner::new(objects));

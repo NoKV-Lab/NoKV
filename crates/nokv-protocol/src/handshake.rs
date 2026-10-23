@@ -29,6 +29,15 @@ pub enum HandshakeKind {
     Accepted = 2,
     /// The server rejects the offer and advertises its own exact schema.
     Incompatible = 3,
+    /// The server requires TLS and refuses this plaintext offer; nothing is
+    /// dispatched on the connection.
+    TlsRequired = 4,
+    /// The server has no TLS and answers a TLS client hello with this
+    /// plaintext frame.
+    TlsUnavailable = 5,
+    /// The server accepts the schema but not the client certificate as a
+    /// credential of its tenant; nothing is dispatched on the connection.
+    Unauthenticated = 6,
 }
 
 impl HandshakeKind {
@@ -37,6 +46,9 @@ impl HandshakeKind {
             1 => Ok(Self::ClientHello),
             2 => Ok(Self::Accepted),
             3 => Ok(Self::Incompatible),
+            4 => Ok(Self::TlsRequired),
+            5 => Ok(Self::TlsUnavailable),
+            6 => Ok(Self::Unauthenticated),
             other => Err(HandshakeError::InvalidKind(other)),
         }
     }
@@ -247,6 +259,9 @@ mod tests {
             HandshakeKind::ClientHello,
             HandshakeKind::Accepted,
             HandshakeKind::Incompatible,
+            HandshakeKind::TlsRequired,
+            HandshakeKind::TlsUnavailable,
+            HandshakeKind::Unauthenticated,
         ] {
             let expected = WorkspaceHandshake::new(kind, V10).unwrap();
             let encoded = encode_handshake_payload(&expected).unwrap();
@@ -268,12 +283,14 @@ mod tests {
             Err(HandshakeError::InvalidMagic)
         );
 
-        let mut wrong_kind = canonical;
-        wrong_kind[8] = 0;
-        assert_eq!(
-            decode_handshake_payload(&wrong_kind),
-            Err(HandshakeError::InvalidKind(0))
-        );
+        for kind in [0_u8, 7] {
+            let mut wrong_kind = canonical;
+            wrong_kind[8] = kind;
+            assert_eq!(
+                decode_handshake_payload(&wrong_kind),
+                Err(HandshakeError::InvalidKind(kind))
+            );
+        }
 
         for length in [0_u8, 33] {
             let mut wrong_length = canonical;

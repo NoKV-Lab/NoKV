@@ -31,6 +31,7 @@ pub enum ServerError {
     },
     Protocol(nokv_protocol::ProtocolError),
     Handshake(nokv_protocol::HandshakeError),
+    TlsConfiguration(String),
     Bind(std::io::Error),
     Connection(std::io::Error),
     FrameTooLarge {
@@ -99,6 +100,7 @@ impl fmt::Display for ServerError {
             ),
             Self::Protocol(error) => write!(formatter, "workspace protocol failed: {error}"),
             Self::Handshake(error) => write!(formatter, "workspace handshake failed: {error}"),
+            Self::TlsConfiguration(message) => write!(formatter, "RPC TLS failed: {message}"),
             Self::Bind(error) => write!(formatter, "server bind failed: {error}"),
             Self::Connection(error) => write!(formatter, "server connection failed: {error}"),
             Self::FrameTooLarge { bytes, max } => {
