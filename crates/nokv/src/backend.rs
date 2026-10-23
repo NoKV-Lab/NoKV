@@ -2858,6 +2858,16 @@ fn map_client_error_shape(error: ClientError) -> agent::BackendError {
         }
         return mapped;
     }
+    if let Some(cause) = provider_admission_cause(&error) {
+        // Admission failed before the first object write; the command
+        // reports it as an admission at its start would have.
+        return agent::BackendError::new(
+            agent::BackendErrorKind::Other("ProviderAdmissionFailed".to_owned()),
+            cause.to_string(),
+            false,
+            json!({"code": cause.code()}),
+        );
+    }
     let is_object_failure = object_failure(&error);
     let is_artifact_integrity_failure = artifact_integrity_failure(&error);
     let kind = if is_object_failure {
@@ -2904,6 +2914,17 @@ fn map_client_error_shape(error: ClientError) -> agent::BackendError {
         }
     }
     mapped
+}
+
+fn provider_admission_cause(error: &ClientError) -> Option<nokv_object::ProviderAdmissionError> {
+    match error {
+        ClientError::Object(nokv_object::ObjectError::ProviderAdmissionFailed(cause)) => {
+            Some(*cause)
+        }
+        ClientError::ArtifactPublishFailed { source, .. } => provider_admission_cause(source),
+        ClientError::RetryExhausted { last_error, .. } => provider_admission_cause(last_error),
+        _ => None,
+    }
 }
 
 fn object_failure(error: &ClientError) -> bool {
@@ -3118,6 +3139,7 @@ mod tests {
 
     use super::*;
     use crate::encode_lowercase_hex;
+    use crate::object_store::refused_provider_config;
 
     fn test_route() -> wire::RootRoute {
         wire::RootRoute {
@@ -3212,13 +3234,8 @@ mod tests {
         Arc<Mutex<Vec<wire::WorkspaceRpcRequest>>>,
         thread::JoinHandle<()>,
     ) {
-        let objects: Arc<dyn ArtifactObjectStore> = Arc::new(
-            CliObjectStore::build(&crate::cli::ObjectConfig {
-                bucket: Some("unused-test-bucket".to_owned()),
-                ..crate::cli::ObjectConfig::default()
-            })
-            .unwrap(),
-        );
+        let objects: Arc<dyn ArtifactObjectStore> =
+            Arc::new(CliObjectStore::build(&refused_provider_config()).unwrap());
         scripted_backend_with_objects(outcomes, objects, 1024)
     }
 
@@ -6267,13 +6284,8 @@ mod tests {
             status: wire::SnapshotStatus::Alive,
             consumer_count: 0,
         };
-        let objects: Arc<dyn ArtifactObjectStore> = Arc::new(
-            CliObjectStore::build(&crate::cli::ObjectConfig {
-                bucket: Some("unused-test-bucket".to_owned()),
-                ..crate::cli::ObjectConfig::default()
-            })
-            .unwrap(),
-        );
+        let objects: Arc<dyn ArtifactObjectStore> =
+            Arc::new(CliObjectStore::build(&refused_provider_config()).unwrap());
         let (backend, requests, server) = scripted_backend_with_objects(
             vec![
                 not_found_failure(),
@@ -6308,6 +6320,71 @@ mod tests {
             ErrorClass::OperatorRequired,
         );
         assert_eq!(requests.lock().unwrap().len(), 3);
+    }
+
+    /// A provider that refuses connections fails its deferred admission as a
+    /// transient admission failure, with the code an eager admission reports.
+    fn assert_refused_provider_admission(error: &agent::BackendError) {
+        assert_eq!(
+            error.kind,
+            agent::BackendErrorKind::Other("ProviderAdmissionFailed".to_owned())
+        );
+        assert!(!error.retryable);
+        assert_eq!(error.class, Some(ErrorClass::Transient));
+        let cause = error.details["code"].as_str().unwrap();
+        assert!(
+            matches!(
+                cause,
+                "ProviderAdmissionUnavailable" | "ProviderAdmissionInconclusive"
+            ),
+            "{cause}"
+        );
+    }
+
+    #[test]
+    fn an_inline_publish_never_probes_the_object_provider() {
+        let route = test_route();
+        // The provider refuses connections: a probe would fail the publish.
+        let objects = Arc::new(
+            CliObjectStore::build(&refused_provider_config())
+                .unwrap()
+                .assume_namespace(route.object_namespace_id.into()),
+        );
+        let request = publish_request(agent::PublishCondition::CreateOnly);
+        let published = wire::PublishResult {
+            operation_id: wire::OperationIdentity([0x31; 16]),
+            target: workspace_path(&request.path).unwrap(),
+            workspace_revision: 2,
+            generation: 1,
+            artifact_revision_id: wire::ArtifactRevisionIdentity([0x32; 16]),
+            logical_size: request.body.len() as u64,
+            body_digest: wire::sha256_digest_uri(wire::Digest(
+                Sha256::digest(&request.body).into(),
+            )),
+        };
+        let (backend, requests, server) = scripted_backend_with_objects(
+            vec![
+                success(wire::WorkspaceResult::Workspace(workspace_summary(
+                    "implicit-publish",
+                    [5; 16],
+                ))),
+                success(wire::WorkspaceResult::Published(published)),
+            ],
+            Arc::clone(&objects) as Arc<dyn ArtifactObjectStore>,
+            1024,
+        );
+
+        let outcome = agent::WorkbenchBackend::publish(&backend, request).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(outcome.metadata.generation, 1);
+        assert!(objects.provider_admission_receipt().is_none());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            requests[1].operation,
+            wire::WorkspaceRequest::PublishInlineArtifact(_)
+        ));
     }
 
     /// The failure line a CLI invocation of `tool` prints against `backend`.
@@ -6506,13 +6583,8 @@ mod tests {
     fn publish_implicitly_admits_a_missing_workbench_before_provider_use() {
         // A body above the inline bound is the one that needs the provider.
         let body = vec![b' '; nokv_protocol::MAX_INLINE_ARTIFACT_BODY_BYTES + 1];
-        let objects: Arc<dyn ArtifactObjectStore> = Arc::new(
-            CliObjectStore::build(&crate::cli::ObjectConfig {
-                bucket: Some("unused-test-bucket".to_owned()),
-                ..crate::cli::ObjectConfig::default()
-            })
-            .unwrap(),
-        );
+        let objects: Arc<dyn ArtifactObjectStore> =
+            Arc::new(CliObjectStore::build(&refused_provider_config()).unwrap());
         let (backend, requests, server) = scripted_backend_with_objects(
             vec![
                 not_found_failure(),
@@ -6531,11 +6603,9 @@ mod tests {
         let error = agent::WorkbenchBackend::publish(&backend, request).unwrap_err();
         server.join().unwrap();
 
-        assert_eq!(
-            error.kind,
-            agent::BackendErrorKind::Other("ObjectUnavailable".to_owned())
-        );
-        assert_eq!(error.message, "artifact object operation failed");
+        // The first object write admits the provider; its refusal stops the
+        // publication before any publication request.
+        assert_refused_provider_admission(&error);
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert!(matches!(
@@ -6566,11 +6636,9 @@ mod tests {
         let error = agent::WorkbenchBackend::append(&backend, append_request()).unwrap_err();
         server.join().unwrap();
 
-        assert_eq!(
-            error.kind,
-            agent::BackendErrorKind::Other("ObjectUnavailable".to_owned())
-        );
-        assert_eq!(error.message, "artifact object operation failed");
+        // An append asks for admission before it knows whether its result
+        // is inline.
+        assert_refused_provider_admission(&error);
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert!(matches!(

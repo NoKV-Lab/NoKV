@@ -104,8 +104,8 @@ impl CliObjectStore {
         })
     }
 
-    /// Verify the immutable object semantics required by every Agent tool
-    /// before the CLI advertises its MCP surface.
+    /// Verify the immutable single-put semantics every Agent object write
+    /// requires.
     pub fn validate_agent_capabilities(&self) -> Result<(), ProviderAdmissionError> {
         self.cache_admission(&self.admission, |store| {
             let profile = ProviderAdmissionProfile::single_put(DEFAULT_ARTIFACT_BLOCK_SIZE)?;
@@ -149,6 +149,14 @@ impl CliObjectStore {
         Ok(self)
     }
 
+    /// Bind to `namespace_id` without reading its marker, for tests that
+    /// must not reach the provider.
+    #[cfg(test)]
+    pub(crate) fn assume_namespace(mut self, namespace_id: ObjectNamespaceId) -> Self {
+        self.namespace_id = Some(namespace_id);
+        self
+    }
+
     pub fn load_namespace(&self) -> Result<Option<ObjectNamespaceId>, String> {
         load_object_namespace(self.durable()).map_err(|error| error.to_string())
     }
@@ -185,6 +193,17 @@ impl ArtifactObjectStore for CliObjectStore {
 
     fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
         self.append_admission.get().or_else(|| self.admission.get())
+    }
+
+    /// Admit the provider once, before the first object write of this process
+    /// or session; a command that writes no objects never probes it.
+    fn admit_object_writes(&self) -> Result<&ProviderAdmissionReceipt, ObjectError> {
+        if self.provider_admission_receipt().is_none() {
+            self.validate_agent_capabilities()
+                .map_err(ObjectError::ProviderAdmissionFailed)?;
+        }
+        self.provider_admission_receipt()
+            .ok_or(ObjectError::ProviderAdmissionRequired)
     }
 
     fn create_immutable(
@@ -227,9 +246,24 @@ impl ArtifactObjectStore for CliObjectStore {
     }
 }
 
+/// A configuration whose provider refuses connections, so an admission probe
+/// fails at once without leaving the host: nothing listens on privileged
+/// port 1, and no test can bind it.
+#[cfg(test)]
+pub(crate) fn refused_provider_config() -> ObjectConfig {
+    ObjectConfig {
+        bucket: Some("unused-test-bucket".to_owned()),
+        endpoint: Some("http://127.0.0.1:1".to_owned()),
+        skip_signature: true,
+        ..ObjectConfig::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use nokv_types::ErrorClass;
 
     use super::*;
 
@@ -293,5 +327,18 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(store.provider_admission_receipt().is_none());
+    }
+
+    #[test]
+    fn a_failed_deferred_admission_is_typed_and_keeps_no_receipt() {
+        let store = CliObjectStore::build(&refused_provider_config()).unwrap();
+        for _ in 0..2 {
+            let Err(ObjectError::ProviderAdmissionFailed(cause)) = store.admit_object_writes()
+            else {
+                panic!("an unreachable provider admitted object writes");
+            };
+            assert_eq!(cause.class(), ErrorClass::Transient);
+            assert!(store.provider_admission_receipt().is_none());
+        }
     }
 }
