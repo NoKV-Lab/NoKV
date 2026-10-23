@@ -5223,6 +5223,43 @@ mod tests {
     }
 
     #[test]
+    fn an_inline_identity_reused_with_another_claim_is_refused_without_a_stale_receipt() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(
+                &store,
+                publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE),
+                b"first",
+            )
+            .unwrap();
+
+        // Only the claim differs: the create-only receipt records this
+        // operation, target, revision, and body, but its generation 1 does not
+        // follow a replace of generation 1.
+        let mut options = publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE);
+        options.condition = PublishCondition::ReplaceOnly {
+            expected_generation: 1,
+        };
+        let error = client
+            .publish_artifact(&store, options, b"first")
+            .unwrap_err();
+
+        expect_inline_failure_without_abort(&error, ErrorCode::RequestReplayMismatch);
+        let state = inspector.state();
+        assert_eq!(state.abort_applies, 0);
+        let path = state.path.as_ref().unwrap();
+        assert_eq!(
+            path.metadata.as_ref().map(|metadata| metadata.generation),
+            Some(1)
+        );
+        assert_eq!(path.inline_body.as_deref(), Some(&b"first"[..]));
+    }
+
+    #[test]
     fn an_inline_publication_whose_response_was_lost_returns_its_receipt_as_a_replay() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
