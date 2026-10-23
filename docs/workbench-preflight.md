@@ -8,8 +8,9 @@ SPDX-License-Identifier: Apache-2.0
 This guide covers bringing up a live NoKV deployment and qualifying it before
 a production handoff. Downstream systems provide skills over the native full
 CLI; embedded callers use the Python SDK. Every surface uses the same workspace
-format and compatibility rules. Only the native CLI checks the
-RootId-to-AgentId binding, and no surface authenticates callers yet
+format and compatibility rules. Without RPC TLS, only the native CLI checks the
+RootId-to-AgentId binding and no surface authenticates callers; over RPC TLS,
+the owner authenticates each client and authorizes each request by role
 ([SECURITY.md](../SECURITY.md)).
 
 ## Required Inputs
@@ -101,10 +102,11 @@ The selected `--workbench-root` is durable presentation configuration because
 canonical v1 manifests contain its projected paths. Keep it identical across
 restart/replay; it never replaces `RootId` as the storage or routing identity.
 Agent-facing commands require control routing (a local control directory or
-etcd) and verify the immutable
+etcd). Without RPC TLS they also verify the immutable
 RootId-to-AgentId binding before RPC preflight, object binding, stdin reads, or
 tool advertisement. This is a fail-closed deployment identity check, not
-authentication. Planned server-side tenant identity and RBAC retire it. A legacy root without a binding requires a one-time,
+authentication; over RPC TLS the owner authorizes each request by role instead
+and the binding is not checked. A legacy root without a binding requires a one-time,
 operator-verified provision with `--adopt-legacy-agent-binding`; NoKV never
 infers identity from the presentation path.
 Before serving any Agent-facing command, the CLI performs the typed workspace
@@ -116,7 +118,8 @@ Bring-up must stop if:
 - the tool set is not exactly 18 tools;
 - any normalized input schema differs;
 - the root route is stale or belongs to another logical shard;
-- the root has no durable Agent binding or is bound to another AgentId;
+- without RPC TLS, the root has no durable Agent binding or is bound to another
+  AgentId;
 - the metadata schema marker differs from `nokv_workspace`;
 - the object backend cannot guarantee immutable creation;
 - a write/read/snapshot/restore probe returns a placeholder or unsupported

@@ -40,7 +40,9 @@ service credentials, and configure object-store IAM and encryption appropriate
 to their environment. Do not expose NoKV server or control-plane endpoints
 directly to untrusted networks.
 
-Role-based access control enforced by the server is planned
+Server-enforced role-based access control covers workspace RPC over TLS only.
+Recording the principal that starts each durable operation, and access control
+for the object store and control plane, are planned
 ([code contract](docs/development/code_contract.md#tenant-identity-and-access-control)).
 Until a release note states otherwise, the boundary above applies to every
 release.

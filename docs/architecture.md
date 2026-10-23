@@ -98,10 +98,10 @@ PathCurrent(root_id, incarnation, path)
 ```
 
 The control plane also binds each root to one object namespace and one
-`AgentId`. The native CLI checks the `AgentId` binding to catch misconfigured
-routing. It is not authorization, and planned tenant identity and RBAC retire
-it: tenants own roots, principals hold roles on roots, and the server
-authorizes every request
+`AgentId`. Without RPC TLS, the native CLI checks the `AgentId` binding to
+catch misconfigured routing; it is not authorization. Over RPC TLS, tenants own
+roots, principals hold roles on roots, and the owner authorizes every request
+instead, as [Read Path](#read-path) describes
 ([code contract](development/code_contract.md#tenant-identity-and-access-control)).
 
 `PathCurrent` is the only namespace truth. Workbench names are separated from

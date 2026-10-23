@@ -244,9 +244,9 @@ real-service acceptance gate is still **not qualified**.
 | `nokv operation status` | Query an append, publish, commit (`--commit-identity`), or restore by its identity and report its stored receipt or next action. | Metadata only: no payload, current workspace, or object-store connection is required. |
 | `nokv operation inspect` | Inspect a bounded page of retained staged objects and save the exact operation token. | Metadata only; the cursor binds one observation and fails if state changes. |
 | `nokv operation recover` | Ask the owner to retry quarantined append cleanup. | No payload or object credentials; an explicit saved state digest replays one durable recovery request. |
-| `nokv provision` | Bind `RootId` to `AgentId`, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. Planned tenant RBAC replaces this binding. |
+| `nokv provision` | Bind `RootId` to `AgentId`, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. Over RPC TLS, the owner checks roles instead and the binding is not consulted. |
 | `nokv serve` | Start one explicit metadata owner from create, same-namespace reopen, or recovery-log state. | Shared recovery publication is opt-in and not currently qualified. |
-| `nokv identity` | Create tenants and principals, bind certificate fingerprints to principals, grant or revoke tenant- and root-scoped roles, and bind roots to tenants. | Operator command that writes the control store directly. The server does not enforce these records yet. |
+| `nokv identity` | Create tenants and principals, bind certificate fingerprints to principals, grant or revoke tenant- and root-scoped roles, and bind roots to tenants. | Operator command that writes the control store directly. An owner that serves RPC TLS enforces these records within about a second. |
 | `nokv mcp` | Deprecated stdio transport retained only because qualification runners still use it. | **Unsupported for integration.** |
 
 For an append that must survive a lost reply or a harness restart, save one
@@ -387,13 +387,13 @@ that class's code; see the [CLI Contract](docs/cli-contract.md). Use Python when
 needs in-process range reads, fsspec/checkpoint integration, or direct typed
 methods. Use Rust for provider, routing, change-feed, or recovery-aware work.
 
-Every agent-facing CLI command requires self-refreshing control routing plus
-the durable `RootId` to `AgentId` binding: `--control-dir PATH` when the owner
-and its clients share one host, `--etcd-endpoint URL` when they span hosts.
-Static route pins remain an SDK/testing option and are rejected by the
-agent-facing CLI. The binding is a CLI-only misconfiguration check, not
-authorization. Planned server-side tenant identity and RBAC retire it; see
-[SECURITY.md](SECURITY.md).
+Every agent-facing CLI command requires self-refreshing control routing:
+`--control-dir PATH` when the owner and its clients share one host,
+`--etcd-endpoint URL` when they span hosts. Static route pins remain an
+SDK/testing option and are rejected by the agent-facing CLI. Without RPC TLS,
+the CLI also requires the durable `RootId` to `AgentId` binding, a CLI-only
+misconfiguration check that is not authorization. Over RPC TLS, the owner
+authorizes every request by role instead; see [SECURITY.md](SECURITY.md).
 
 ## Core Semantics
 
@@ -431,8 +431,9 @@ authorization. Planned server-side tenant identity and RBAC retire it; see
 - Transactions, snapshots, commit closure, restore, and GC barriers are
   shard-local. NoKV does not provide cross-shard transactions.
 - Workbench jailing and `RootId` to `AgentId` binding are safety boundaries,
-  not tenant authentication, authorization, or RBAC. Server-enforced tenant
-  identity and RBAC, with many agents per root, are planned.
+  not tenant authentication, authorization, or RBAC. Over RPC TLS, the owner
+  authenticates each client and authorizes each request by role, and many
+  agents can share a root.
 
 ## Why Holt Fits the Current Local Profile
 
@@ -549,8 +550,9 @@ Holt rows ran from a checkout of Holt `v0.8.7`:
 
 ### Planned, not yet offered
 
-- tenant identity, authentication, and RBAC enforced by the server, with many
-  agents per root and one agent on many roots.
+- recording the principal that starts each durable operation, access control
+  for the object store and control plane, and one client session that spans
+  many roots.
 
 ### Not offered by NoKV
 
