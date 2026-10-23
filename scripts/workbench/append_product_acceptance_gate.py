@@ -1928,12 +1928,16 @@ def identity_errors_and_status(stack):
             stack, workbench, operation_id, label="intent-mismatch-" + name, **options
         )
         details = result.get("details", {})
-        expected_cause = (
-            "Conflict" if name == "incarnation" else "RequestReplayMismatch"
+        # The fence is refused before admission, so it is the conflict
+        # itself rather than an unresolved append.
+        expected_code, expected_cause = (
+            ("Conflict", "Conflict")
+            if name == "incarnation"
+            else ("AppendUnresolved", "RequestReplayMismatch")
         )
         require(
             result.get("status") == "error"
-            and result.get("code") == "AppendUnresolved"
+            and result.get("code") == expected_code
             and details.get("code") == expected_cause
             and details.get("operation_id") == operation_id,
             "altered intent has exact mismatch cause",
@@ -1941,7 +1945,9 @@ def identity_errors_and_status(stack):
         )
         if name == "incarnation":
             require(
-                details.get("conflict") == "WorkspaceIncarnation",
+                details.get("conflict") == "WorkspaceIncarnation"
+                and result.get("class") == "precondition_failed"
+                and result.get("next_action") == "reread_then_retry",
                 "explicit incarnation is a typed fence conflict",
                 result,
             )

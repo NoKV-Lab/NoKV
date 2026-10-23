@@ -100,9 +100,10 @@ reused, `workspace_revision`, the path `generation`, and the immutable
 workspace's incarnation.
 
 `put` without `--expected-generation` is create-only; with it, the path must
-still be at that generation. `--expected-workspace-incarnation-id` fences the
-publication on the workspace instance. A refusal is `precondition_failed`
-and, for a path conflict, carries `details.current_generation`.
+still be at that generation. `--expected-workspace-incarnation-id` fences a
+`put` or an `append` on the workspace instance. A refusal is
+`precondition_failed` and, for a path conflict, carries
+`details.current_generation`.
 
 A path generation restarts at `1` after the path is removed and recreated, so
 a generation alone cannot tell two lineages apart. Compare

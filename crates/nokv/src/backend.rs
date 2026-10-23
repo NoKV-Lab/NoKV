@@ -7294,6 +7294,43 @@ mod tests {
     }
 
     #[test]
+    fn native_append_fence_refused_before_admission_is_a_precondition_to_reread() {
+        let (backend, requests, server) = scripted_backend(vec![
+            not_found_failure(),
+            success(wire::WorkspaceResult::Workspace(workspace_summary(
+                "reincarnated",
+                [0x77; 16],
+            ))),
+        ]);
+        let operation_id = wire::OperationIdentity([0xaa; 16]);
+        let error = backend
+            .client
+            .resolve_append_workspace_incarnation(
+                operation_id,
+                &wire::WorkspacePath {
+                    workbench: wire::WorkbenchName::new("reincarnated").unwrap(),
+                    path: wire::RelativePath::new("logs/events.jsonl").unwrap(),
+                },
+                Some(wire::WorkspaceIdentity([0x66; 16])),
+            )
+            .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+
+        // The operation does not exist, so querying it would report it absent
+        // and resubmitting would be refused again.
+        let failure = crate::with_append_details(crate::append_client_failure(error), operation_id);
+        assert_eq!(failure.exit_code(), 4);
+        let failure: Value = serde_json::from_str(&failure.to_line()).unwrap();
+        assert_eq!(failure["code"], "Conflict");
+        assert_eq!(failure["class"], "precondition_failed");
+        assert_eq!(failure["next_action"], "reread_then_retry");
+        assert_eq!(failure["details"]["next_action"], "reread_then_retry");
+        assert_eq!(failure["details"]["conflict"], "WorkspaceIncarnation");
+        assert_eq!(failure["details"]["operation_id"], "aa".repeat(16));
+    }
+
+    #[test]
     fn append_local_options_use_input_errors_without_reclassifying_uncertain_results() {
         let error =
             map_append_client_error(ClientError::InvalidOptions("block size is zero".to_owned()));

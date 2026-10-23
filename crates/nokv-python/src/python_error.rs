@@ -789,29 +789,22 @@ pub(crate) mod tests {
                     "reread_then_retry".to_owned()
                 )
             );
-            // An append resolves its fence before admission and reports it
-            // as unresolved; the exception keeps the class the client gives.
-            let unresolved = ClientError::AppendUnresolved {
-                operation_id: OPERATION,
-                state: None,
-                source: Box::new(fenced),
-            };
-            let class = unresolved.class();
+            // An append resolves its fence before admission, so the refusal
+            // applied nothing and is the fence conflict itself.
             let append = append_failure(
                 py,
-                unresolved,
+                fenced,
                 OPERATION,
                 Some(WorkspaceIdentity([0xbb; 16])),
                 OperationCall::Append,
             );
-            let (kind, error_class, next_action) = contract_of(py, &append);
-            assert_eq!(kind, "WorkspaceIncarnationMismatch");
-            assert_eq!(error_class, class.as_str());
             assert_eq!(
-                next_action,
-                class
-                    .next_action(IdempotencyScope::CallerOperation)
-                    .as_str()
+                contract_of(py, &append),
+                (
+                    "WorkspaceIncarnationMismatch".to_owned(),
+                    "precondition_failed".to_owned(),
+                    "reread_then_retry".to_owned()
+                )
             );
             let value = append.value(py);
             let field = |name: &str| value.getattr(name).unwrap();
@@ -819,10 +812,8 @@ pub(crate) mod tests {
                 field("operation_id").extract::<String>().unwrap(),
                 "aa".repeat(16)
             );
-            assert_eq!(
-                field("code").extract::<String>().unwrap(),
-                "AppendUnresolved"
-            );
+            assert!(field("state").is_none());
+            assert_eq!(field("code").extract::<String>().unwrap(), "Conflict");
             assert_eq!(field("cause_code").extract::<String>().unwrap(), "Conflict");
             assert!(field("publication_operation_id").is_none());
             assert!(!field("retryable").extract::<bool>().unwrap());
