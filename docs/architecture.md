@@ -97,6 +97,13 @@ PathCurrent(root_id, incarnation, path)
      dependency bounds, content type, typed projection
 ```
 
+The control plane also binds each root to one object namespace and one
+`AgentId`. The native CLI checks the `AgentId` binding to catch misconfigured
+routing. It is not authorization, and planned tenant identity and RBAC retire
+it: tenants own roots, principals hold roles on roots, and the server
+authorizes every request
+([code contract](development/code_contract.md#tenant-identity-and-access-control)).
+
 `PathCurrent` is the only namespace truth. Workbench names are separated from
 path keys by a never-reused incarnation. This prevents a failed restore or
 retired Workbench's rows from appearing under a later claim.

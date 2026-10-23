@@ -895,6 +895,36 @@ mod tests {
         }
     }
 
+    /// Replies under the received request id: `preflight` mints a
+    /// time-ordered id, so a test cannot predict it across a millisecond.
+    #[derive(Debug)]
+    struct PreflightTransport {
+        requests: Mutex<Vec<WorkspaceRpcRequest>>,
+        result: WorkspacePreflightResult,
+    }
+
+    impl RpcTransport for PreflightTransport {
+        fn round_trip(
+            &self,
+            _endpoint: SocketAddr,
+            request: &[u8],
+        ) -> Result<Vec<u8>, crate::TransportError> {
+            let request = decode_request(request)
+                .map_err(|error| crate::TransportError::new(error.to_string(), false))?;
+            self.requests.lock().unwrap().push(request.clone());
+            encode_response(&WorkspaceRpcResponse {
+                route: request.route,
+                request_id: request.request_id,
+                commit_version: None,
+                replayed: false,
+                outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::Preflight(
+                    self.result.clone(),
+                ))),
+            })
+            .map_err(|error| crate::TransportError::new(error.to_string(), false))
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct ScriptedResolver {
         initial: ResolvedRoute,
@@ -1567,7 +1597,10 @@ mod tests {
 
     #[test]
     fn typed_preflight_canonicalizes_requirements_and_verifies_the_route() {
-        let transport = ScriptedTransport::new(Vec::new());
+        let transport = PreflightTransport {
+            requests: Mutex::new(Vec::new()),
+            result: WorkspacePreflightResult::new(route(7), WorkspaceCapability::ALL),
+        };
         let resolver = StaticRouteResolver::new(route(7), resolved(7, 4107).endpoint).unwrap();
         let client = WorkspaceClient::new(
             route(7).root_id,
@@ -1576,22 +1609,6 @@ mod tests {
             ClientOptions::default(),
         )
         .unwrap();
-        let request_id = client.new_request_id();
-        client.request_sequence.store(0, Ordering::Relaxed);
-        client
-            .transport
-            .responses
-            .lock()
-            .unwrap()
-            .push_back(WorkspaceRpcResponse {
-                route: route(7),
-                request_id,
-                commit_version: None,
-                replayed: false,
-                outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::Preflight(
-                    WorkspacePreflightResult::new(route(7), WorkspaceCapability::ALL),
-                ))),
-            });
 
         let preflight = client
             .preflight([
@@ -1603,6 +1620,7 @@ mod tests {
         assert_eq!(preflight.value.route, route(7));
         assert!(preflight.value.supports(WorkspaceCapability::RestoreV1));
         let requests = client.transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
         let WorkspaceRequest::Preflight(request) = &requests[0].operation else {
             panic!("typed preflight must emit the preflight operation");
         };
@@ -1614,7 +1632,10 @@ mod tests {
 
     #[test]
     fn typed_preflight_fails_closed_when_a_required_capability_is_missing() {
-        let transport = ScriptedTransport::new(Vec::new());
+        let transport = PreflightTransport {
+            requests: Mutex::new(Vec::new()),
+            result: WorkspacePreflightResult::new(route(7), [WorkspaceCapability::QueryV1]),
+        };
         let resolver = StaticRouteResolver::new(route(7), resolved(7, 4107).endpoint).unwrap();
         let client = WorkspaceClient::new(
             route(7).root_id,
@@ -1623,22 +1644,6 @@ mod tests {
             ClientOptions::default(),
         )
         .unwrap();
-        let request_id = client.new_request_id();
-        client.request_sequence.store(0, Ordering::Relaxed);
-        client
-            .transport
-            .responses
-            .lock()
-            .unwrap()
-            .push_back(WorkspaceRpcResponse {
-                route: route(7),
-                request_id,
-                commit_version: None,
-                replayed: false,
-                outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::Preflight(
-                    WorkspacePreflightResult::new(route(7), [WorkspaceCapability::QueryV1]),
-                ))),
-            });
 
         assert_eq!(
             client.preflight([WorkspaceCapability::RestoreV1]),

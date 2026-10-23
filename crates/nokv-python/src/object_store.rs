@@ -39,7 +39,7 @@ enum ConfiguredObjectStoreOptions {
     S3(S3ArtifactStoreOptions),
 }
 
-#[pyclass(name = "ObjectStoreConfig", frozen, skip_from_py_object)]
+#[pyclass(name = "ObjectStoreConfig", frozen)]
 #[derive(Clone, Debug)]
 pub(crate) struct PythonObjectStoreConfig {
     options: ConfiguredObjectStoreOptions,
