@@ -19,8 +19,10 @@ The supported front doors, in delivery order, are:
 2. the direct Python SDK for embedded programmatic callers;
 3. the Rust SDK for lower-level native integrations.
 
-The complete 18-tool [Workbench contract](./workbench-contract.md) fixes shared
-behavior across these surfaces. Downstream Agent systems normally provide
+The frozen 18-tool [Workbench contract](./workbench-contract.md) defines the
+Workbench facade. The full CLI also exposes durable append submission and
+operation recovery; the direct Python and Rust SDKs expose corresponding
+methods over the same lifecycle. Downstream Agent systems normally provide
 skills that invoke the CLI, or call the Python SDK when an in-process boundary
 is preferable.
 
@@ -75,7 +77,8 @@ Workbench-specific result shaping stays above the storage core:
 - exact-string edit behavior;
 - grep matching;
 - section projection;
-- the delta digest returned by append;
+- the delta digest returned by `workbench_append` (the stable append receipt
+  instead identifies the resulting artifact and its whole-body digest);
 - friendly errors, and the JSON-RPC result envelope the qualification harness
   consumes;
 - stable `run_manifest.json` and `restore_manifest.json` projections.
@@ -159,13 +162,44 @@ revision, manifest, path, workspace revision, indexes, event, reference
 changes, and deterministic replay result.
 
 Readers therefore see the previous complete revision or the new complete
-revision, never a partial body. A response lost after commit is safely replayed
-with the same request id. Failed or abandoned uploads remain invisible and are
+revision, never a partial body. An exact metadata-command replay uses the same request
+id. Across process restarts, stable append instead binds the complete intent
+to a caller-persisted logical operation ID. Failed or abandoned uploads remain invisible and are
 recovered from a durable staged-object ledger.
 
 Whole-artifact replacement is the generic write primitive. Logs use immutable
 append segments plus a conditional stream-head advance. Range reads and
 multipart uploads remain first-class SDK operations.
+
+## Durable Append Delivery
+
+Consider a queue event that is appended remotely before its consumer dies. A
+new consumer must know whether it is redelivering that action or appending a
+new one. The caller saves the root, logical operation ID, exact delta and full
+intent before the first request; NoKV durably binds that identity to the
+workspace incarnation, target, content-type options, block size and size limit.
+Different business actions use different IDs even when their bytes match.
+
+The logical operation owns predecessor-fenced publication attempts. An attempt
+publishes at most one receipt; a successor is admitted only after its predecessor
+cannot publish and its registered private objects are safely cleaned. After
+commitment, a lost reply is resolved by the original receipt; earlier uncertainty
+is queried under the same logical ID and follows its recovery state. Reusing an
+ID with different intent is rejected. The native `workspace-path append`
+command and the Python SDK provide this contract; `workbench_append` retains
+its fixed per-invocation contract and has no caller-supplied durable identity.
+
+The public operator path is `operation status`, bounded `operation inspect`,
+and exact-token `operation recover`. A recovery receipt records acceptance of
+one owner cleanup request, not completion of the append. The caller polls and
+resubmits the same saved append only when `ready_to_retry` allows it; it durably
+saves the committed append receipt before acknowledging its own queue event.
+A receipt is evidence of a past effect, not an artifact-retention hold or a
+transaction with the queue, model call, or other external side effect.
+
+The [append guide](./append.md) defines the caller workflow; the
+[product contract](./development/append-product-spec.md) defines its complete
+intent, retention and failure boundaries.
 
 ## Discovery And Provenance
 
@@ -188,7 +222,7 @@ and evidence an Agent needs to find and cite.
 
 ## Recovery Products
 
-NoKV exposes three different promises:
+Snapshots, commits and tags retain readable state in different ways:
 
 | Mechanism | Purpose | Retention |
 | --- | --- | --- |
@@ -200,6 +234,10 @@ Restore creates a new Workbench. It copies path metadata in bounded batches,
 shares immutable revisions inside one root/shard, and reveals the destination
 with one final marker transition. Normal reads do not pay for a lazy overlay
 chain.
+
+An append operation receipt serves a different purpose: it answers whether one
+logical action committed. Its retained identity does not pin the old body. Use
+a commit or a live snapshot when those bytes must remain readable.
 
 ## Safe Object Lifetime
 
@@ -213,6 +251,13 @@ GC claims `Available -> Deleting` against the epoch. New references also
 require `Available`, so restore/commit/publication cannot race with deletion.
 Snapshots and in-progress scans protect older metadata with read-version
 history holds. Ambiguous provider deletes are quarantined rather than guessed.
+
+Failed stable append attempts also retain revision reservations and conditional
+zero-byte object seals. These permanently prevent delayed immutable PUTs from
+recreating private payloads after cleanup. They are separate from published
+revision references and must not be removed by bucket expiration or ordinary
+GC. Quarantined append cleanup can be retried through the owner; generic
+publication/GC reconciliation remains an internal lifecycle operation.
 
 This reference model intentionally stays root/shard-local.
 
@@ -259,4 +304,7 @@ unknown, malformed, incompatible, or mixed store before serving requests.
 
 Source presence and unit tests do not prove durability, recovery, failover, GC,
 or product behavior. Required boundary-level evidence is defined in
-[Workspace Acceptance](./development/workspace-acceptance.md).
+[Workspace Acceptance](./development/workspace-acceptance.md). The
+[append qualification record](./development/append-qualification.md) names the
+executed local and remote scenarios without extending them to full-platform
+release, old-store migration, cross-host failover or physical power loss.

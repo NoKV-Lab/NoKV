@@ -8,6 +8,13 @@
 //! The SDK owns route refresh, exact request replay, retry policy, and typed
 //! result extraction. Metadata layout and shard-owner implementation remain
 //! outside this crate.
+//!
+//! For an action that must survive caller replacement, persist the root, logical ID,
+//! full `IdempotentAppendOptions` and exact delta before calling
+//! `WorkspaceClient::append_artifact_idempotent`. Its status, inspection and
+//! exact-token recovery APIs share the durable append lifecycle. The lower-level
+//! `append_artifact` API and the fixed Workbench facade are not substitutes for
+//! saving that business identity. A replayed receipt does not retain old bytes.
 
 mod append_operations;
 mod artifact;

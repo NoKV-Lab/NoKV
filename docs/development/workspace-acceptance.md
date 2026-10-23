@@ -34,7 +34,8 @@ Every qualification record includes:
 
 - NoKV commit and dirty-worktree state;
 - Rust toolchain, operating system, CPU, memory, and storage devices;
-- Holt commit and durability profile;
+- linked Holt version, source and checksum (or commit for a Git dependency),
+  plus durability profile;
 - logical-shard count, physical owners, root placement, and owner epochs;
 - object provider, endpoint class, bucket policy, and consistency assumptions;
 - client/adapter versions and the Workbench schema digest;
@@ -146,6 +147,50 @@ Required evidence:
 - failed upload, verification, predicate, command, or acknowledgment cannot
   expose a partial artifact;
 - abort and cleanup race publication through one durable operation state.
+
+### Stable Append
+
+The native `workspace-path append` and direct SDK append APIs require separate
+evidence from the frozen `workbench_append` tool, whose schema has no
+caller-owned stable operation id. The
+[append product specification](./append-product-spec.md) defines this bounded
+contract. Required evidence includes:
+
+- persist a root-scoped logical id and complete intent before dispatch; replay
+  returns the original append receipt after process loss and later live writes,
+  while different ids with identical bytes remain independent;
+- reject changed intent, incarnation, and cross-kind identity reuse with exact
+  typed errors, without mutation;
+- atomically bind the logical operation to its publication attempt and publish
+  its receipt with the path; admit a successor only after its predecessor is
+  durably cleaned;
+- kill callers at observed publication boundaries, lose successful responses,
+  and reopen the same Holt directory after owner death; verify eventual
+  completion as well as at-most-once effect and exact ordered bytes;
+- delay a real PUT until after cleanup; prove a permanent conditional zero-byte
+  seal rejects its late arrival, and quarantine an unprovable seal outcome;
+- query status and inspect the retained ledger through public CLI/Python APIs
+  without delta or provider credentials; paginate past a cleaned prefix and
+  reject stale, foreign-root, and former-child cursors;
+- persist the inspected state digest for one cleanup request; concurrent
+  calls, lost recovery acknowledgements, owner restart, and repeated quarantine
+  replay its original receipt without admitting another round;
+- recover through the owner, not a caller-supplied provider verdict; distinguish
+  cleanup admission from completion and from the committed append receipt;
+- check zero bytes, block and batch boundaries, result/delta limits, repeated
+  replay without live revision changes, CLI/Python parity, and actual old-format
+  rejection without changing the old files;
+- redeliver a durable downstream queue through its real consumer after killing
+  it between NoKV commit and the queue's local acknowledgement.
+
+Run the [core product gate](../../scripts/workbench/append_product_acceptance_gate.py)
+and [public operations gate](../../scripts/workbench/append_operations_acceptance_gate.py)
+with matching frozen CLI/Python artifacts; invocation and historical baseline
+instructions are in the [runner guide](../../scripts/workbench/README.md#stable-append-gates).
+The [dated append qualification record](./append-qualification.md) separates the
+local 21 + 4 executions (one overlapping scenario), remote NoKV CI, and the
+separate Linux demo consumer test. Passing these feature gates does not resolve
+Gate 0's full-profile gaps or qualify every gate in this document.
 
 ## Gate 4: Snapshot, Commit, And Restore
 

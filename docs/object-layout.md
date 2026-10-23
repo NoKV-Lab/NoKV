@@ -5,8 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # Object Layout
 
-NoKV keeps artifact bytes outside Holt. Metadata stores compact immutable
-revision and manifest records; an S3-compatible provider stores the blocks.
+NoKV keeps artifact bytes outside the serving Holt 0.8.6 adapter. Metadata
+stores compact immutable revision and manifest records; an S3-compatible
+provider stores the blocks.
 
 ## Permanent Block Identity
 
@@ -18,7 +19,9 @@ nokv/artifacts/{logical_shard_id}/{root_id}/{artifact_revision_id}/blocks/{objec
 - `object_index` is a fixed-width hexadecimal counter;
 - physical process addresses, owner epochs, bucket endpoints, and Workbench
   names are absent;
-- an object key is never reused for different bytes.
+- a published block key is never reused for a different payload;
+- an abandoned stable-append key may only move to its permanent zero-byte seal,
+  as described below; it cannot be reused for another artifact.
 
 The logical shard, root, and revision remain stable when physical ownership
 moves.
@@ -84,6 +87,12 @@ Create, replace, append, and edit retain distinct metadata predicates. An exact
 request retry returns the same deterministic result and never allocates a
 second published revision.
 
+For [durable append](append.md), the logical action ID survives across physical
+publication attempts. The current child must be durably cleaned before a new
+child/revision can be admitted. A failed child's keys are not reused by that
+successor. A successful logical receipt is installed atomically with the
+publication and remains queryable independently of the current live path.
+
 ## Reused Blocks
 
 A new revision may reference blocks physically owned by older revisions. The
@@ -118,6 +127,34 @@ A claimed revision rejects new references. Provider deletion then advances
 through durable states. Timeout or uncertain completion is quarantined and
 reconciled; object listing is never used as reachability truth.
 
+## Failed Append Keys
+
+Stable append cleanup permanently occupies every registered failed-child key
+with an empty object. It conditionally creates an absent key with
+`If-None-Match: *`, or replaces an existing payload with an empty seal using
+`If-Match` on its observed ETag. This path never DELETEs a key: a delayed DELETE
+could otherwise remove a newer seal, allowing a late upload to recreate an
+unreachable payload. A nonempty immutable create cannot replace a seal.
+
+Only the fenced owner performs this operation after verifying the current
+parent/child binding, revision reservation, and absence of a published
+revision. Metadata cleanup records `Sealed`, retires the processed staging
+rows, and eventually marks the child `Cleaned`. The failed child's revision
+claim is retained permanently, including after a successor succeeds. A missing
+key alone is not sealing proof; an uncertain result quarantines the child.
+
+Public `operation recover` requests owner cleanup using a saved logical state
+token. It neither supplies a trusted provider verdict nor writes the objects
+from the caller. Generic publication reconciliation and ordinary
+published-revision GC continue to use their existing deletion semantics.
+
+These seals and revision reservations have no automatic expiration. They retain
+key/metadata overhead even though the live object has zero payload bytes.
+Logical receipts also remain, but do not pin historical body contents against
+normal reference/hold/GC rules. With bucket versioning, replacing the current
+payload does not prove removal of older versions. External expiration or
+overwrite policies must not remove live seals or other NoKV-owned objects.
+
 ## Provider Boundary
 
 AWS S3, RustFS, MinIO, and Ceph RGW can use the same provider-neutral
@@ -138,9 +175,17 @@ block larger than the admitted maximum fails before object or metadata
 publication. Admission v1 deliberately does not qualify multipart creation,
 completion, or abort; those paths cannot inherit a single-PUT receipt.
 
+Stable append and serving owners advertising it additionally require the
+append-sealing admission profile: conditional creation of an empty seal,
+ETag-conditional replacement, rejection of late immutable writes, and stable
+empty-key observations must be exercised on that handle. A generic single-PUT
+receipt is insufficient. A tiered store seals the durable provider and attempts
+to evict its cached copy; cache eviction is best effort. Only the durable seal
+is authoritative; an evictable cache cannot provide the proof.
+
 The provider interface also retains idempotent deletion with explicit
 ambiguous-outcome handling. Public provider-admission errors and ambiguous
-create/delete errors do not render endpoint, bucket, or physical object-key
+create/delete/seal errors do not render endpoint, bucket, or physical object-key
 details.
 
 Provider credentials and endpoints are deployment configuration, not durable
