@@ -15,7 +15,7 @@ use std::fmt;
 
 use nokv_types::{
     CommandDigest, CommitVersion, LogicalShardId, NormalizedRelativePath, ObjectNamespaceId,
-    OwnerEpoch, PlacementGeneration, ReadVersion, RequestId, RootId, WorkbenchId,
+    OwnerEpoch, PlacementGeneration, PrincipalId, ReadVersion, RequestId, RootId, WorkbenchId,
     WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState, SHA256_BYTES,
 };
 
@@ -90,10 +90,26 @@ pub struct RootWriteContext {
     pub owner_epoch: OwnerEpoch,
     pub request_id: RequestId,
     pub read_version: ReadVersion,
+    pub authority: WriteAuthority,
+}
+
+/// Who asked for a metadata write: the authenticated principal, or none on a
+/// trusted plaintext deployment and for the owner's own background work.
+/// Durable operations record it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriteAuthority {
+    pub initiator: Option<PrincipalId>,
+}
+
+impl WriteAuthority {
+    /// A trusted deployment or the owner itself: nobody is recorded.
+    pub const TRUSTED: Self = Self { initiator: None };
 }
 
 impl RootWriteContext {
-    /// Capture the store's current durable read version for a new request.
+    /// Capture the store's current durable read version for a request the
+    /// owner makes on its own behalf. A client request carries its authority
+    /// through the executor instead.
     pub fn current(
         store: &MetaShard,
         root_id: RootId,
@@ -111,6 +127,8 @@ impl RootWriteContext {
             owner_epoch,
             request_id,
             read_version: store.current_read_version()?,
+            // The owner's own work and its tests: no principal is recorded.
+            authority: WriteAuthority::TRUSTED,
         })
     }
 }
@@ -316,6 +334,7 @@ pub fn create_visible_workspace(
     .encode()
     .map_err(|source| codec_error("WorkspaceIncarnationClaim", source))?;
     let event = change_event_projection(&ChangeEventRecord {
+        initiator: context.authority.initiator,
         workbench_id: workbench_id.clone(),
         workspace_incarnation_id: incarnation_id,
         kind: ChangeEventKind::WorkspaceCreated,
@@ -330,6 +349,7 @@ pub fn create_visible_workspace(
         )]))?,
     })?;
     let command = MetadataCommand {
+        initiator: context.authority.initiator,
         schema_id: SCHEMA_ID.to_owned(),
         root_id: context.root_id,
         logical_shard_id: context.logical_shard_id,
@@ -977,6 +997,7 @@ mod tests {
         action: RootFenceAction,
     ) -> MetadataCommand {
         MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(2),
             logical_shard_id: shard(1),
@@ -1062,6 +1083,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: context.authority.initiator,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: context.root_id,
                     logical_shard_id: context.logical_shard_id,
@@ -1350,6 +1372,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: context.authority.initiator,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: context.root_id,
                     logical_shard_id: context.logical_shard_id,
@@ -1751,6 +1774,7 @@ mod tests {
         let added_payload = path_entry(5, 5).encode().unwrap();
         let context = write_context(&store, 5);
         let mut command = MetadataCommand {
+            initiator: context.authority.initiator,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: context.root_id,
             logical_shard_id: context.logical_shard_id,

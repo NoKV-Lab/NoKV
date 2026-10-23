@@ -351,8 +351,8 @@ functional demand, not a benchmark target or a promised commercial SLA.
 
 ## Version and deployment boundary
 
-The workspace RPC schema is `nokv.workspace.rpc.v14`, the system format is 14,
-the publication value format is 7, and the publish operation value format is 8. A parent row is a new operation kind;
+The workspace RPC schema is `nokv.workspace.rpc.v15`, the system format is 15,
+the publication value format is 7, and the publish operation value format is 9. A parent row is a new operation kind;
 the child includes the monotonic cleanup retry counter. These version gates
 also reject the preceding unreleased append candidate's v11/system-12 layout.
 Older stores and protocol clients are rejected explicitly. Existing Holt stores

@@ -24,7 +24,9 @@ const GENERIC_INDEX_APPEND_RECEIPT_DISCRIMINATOR: u8 = 3;
 
 const FIXED_ID_BYTES: usize = 16;
 pub(crate) const SYSTEM_SCHEMA_KEY: &[u8] = b"schema";
-const SYSTEM_FORMAT_VERSION: u32 = 14;
+/// Format 15 records the principal that started every durable operation and
+/// every command; it does not migrate a format-14 store.
+const SYSTEM_FORMAT_VERSION: u32 = 15;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SchemaMarkerVersion {
@@ -32,11 +34,28 @@ pub(crate) enum SchemaMarkerVersion {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SchemaMarkerError;
+pub(crate) enum SchemaMarkerError {
+    Malformed,
+    /// A well-formed marker of another format; the store was written by a
+    /// NoKV of another generation and is not migrated.
+    UnsupportedVersion {
+        found: u32,
+        supported: u32,
+    },
+}
 
 impl std::fmt::Display for SchemaMarkerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("missing, unknown, or malformed workspace schema marker")
+        match self {
+            Self::Malformed => {
+                formatter.write_str("missing, unknown, or malformed workspace schema marker")
+            }
+            Self::UnsupportedVersion { found, supported } => write!(
+                formatter,
+                "workspace format {found} is not served by this build, which serves format \
+                 {supported}; a store written by another NoKV generation is not migrated"
+            ),
+        }
     }
 }
 
@@ -834,20 +853,27 @@ fn encode_schema_marker_version(format_version: u32) -> Vec<u8> {
 }
 
 pub(crate) fn validate_schema_marker(value: &[u8]) -> Result<(), SchemaMarkerError> {
-    if value == encode_schema_marker() {
-        Ok(())
-    } else {
-        Err(SchemaMarkerError)
-    }
+    classify_schema_marker_for_open(value).map(|_| ())
 }
 
+/// The current marker opens; a marker of another format is refused by its
+/// version, so an operator learns which NoKV wrote the store.
 pub(crate) fn classify_schema_marker_for_open(
     value: &[u8],
 ) -> Result<SchemaMarkerVersion, SchemaMarkerError> {
     if value == encode_schema_marker() {
-        Ok(SchemaMarkerVersion::Current)
-    } else {
-        Err(SchemaMarkerError)
+        return Ok(SchemaMarkerVersion::Current);
+    }
+    let prefix = encode_schema_marker_version(0);
+    let prefix = &prefix[..prefix.len() - std::mem::size_of::<u32>()];
+    match value.strip_prefix(prefix) {
+        Some(version) if version.len() == std::mem::size_of::<u32>() => {
+            Err(SchemaMarkerError::UnsupportedVersion {
+                found: u32::from_be_bytes(version.try_into().expect("four bytes")),
+                supported: SYSTEM_FORMAT_VERSION,
+            })
+        }
+        _ => Err(SchemaMarkerError::Malformed),
     }
 }
 
@@ -1314,7 +1340,7 @@ mod tests {
 
     #[test]
     fn schema_marker_is_exact_and_versioned() {
-        assert_eq!(SYSTEM_FORMAT_VERSION, 14);
+        assert_eq!(SYSTEM_FORMAT_VERSION, 15);
         let marker = encode_schema_marker();
         assert_eq!(marker[0], VALUE_FORMAT_VERSION);
         assert_eq!(
@@ -1327,22 +1353,34 @@ mod tests {
             SchemaMarkerVersion::Current
         );
 
-        let previous_layout = encode_schema_marker_version(13);
-        assert_eq!(
-            validate_schema_marker(&previous_layout),
-            Err(SchemaMarkerError)
-        );
+        // A format-14 store, as NoKV 0.12.x wrote it, is refused by name.
+        let previous_layout = encode_schema_marker_version(14);
+        let refused = |found| SchemaMarkerError::UnsupportedVersion {
+            found,
+            supported: 15,
+        };
+        assert_eq!(validate_schema_marker(&previous_layout), Err(refused(14)));
         assert_eq!(
             classify_schema_marker_for_open(&previous_layout),
-            Err(SchemaMarkerError)
+            Err(refused(14))
         );
+        assert_eq!(
+            classify_schema_marker_for_open(&encode_schema_marker_version(16)),
+            Err(refused(16))
+        );
+        assert!(refused(14)
+            .to_string()
+            .contains("workspace format 14 is not served by this build"));
 
         let mut unknown = marker;
         unknown[0] = VALUE_FORMAT_VERSION + 1;
-        assert_eq!(validate_schema_marker(&unknown), Err(SchemaMarkerError));
+        assert_eq!(
+            validate_schema_marker(&unknown),
+            Err(SchemaMarkerError::Malformed)
+        );
         assert_eq!(
             classify_schema_marker_for_open(&unknown),
-            Err(SchemaMarkerError)
+            Err(SchemaMarkerError::Malformed)
         );
     }
 }

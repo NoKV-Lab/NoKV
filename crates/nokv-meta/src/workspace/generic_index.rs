@@ -462,6 +462,7 @@ impl<'a> GenericIndexRegistrationService<'a> {
             phase: GenericIndexRegistrationPhase::Appending,
             published_pointer_generation: None,
             terminal_error: None,
+            initiator: request.context.authority.initiator,
         };
         let generation = GenericIndexGenerationRecord {
             capabilities: request.capabilities,
@@ -1740,6 +1741,7 @@ fn build_command(
     deterministic_result: Vec<u8>,
 ) -> MetadataCommand {
     MetadataCommand {
+        initiator: context.authority.initiator,
         schema_id: SCHEMA_ID.to_owned(),
         root_id: context.root_id,
         logical_shard_id: context.logical_shard_id,
@@ -1786,7 +1788,14 @@ fn registration_request_digest(
     capability_digest: [u8; SHA256_BYTES],
 ) -> CommandDigest {
     let mut hasher = Sha256::new();
-    hasher.update(b"nokv.generic-index.registration.v1\0");
+    hasher.update(b"nokv.generic-index.registration.v2\0");
+    match request.context.authority.initiator {
+        None => hasher.update([0]),
+        Some(initiator) => {
+            hasher.update([1]);
+            hasher.update(initiator.as_bytes());
+        }
+    }
     hasher.update(request.operation_id.as_bytes());
     hasher.update(request.generation_id.as_bytes());
     hasher.update(request.workbench_id.as_bytes());
@@ -2014,6 +2023,7 @@ mod tests {
         action: RootFenceAction,
     ) -> MetadataCommand {
         MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
@@ -2089,6 +2099,7 @@ mod tests {
             store
                 .execute(
                     &MetadataCommand {
+                        initiator: None,
                         schema_id: SCHEMA_ID.to_owned(),
                         root_id: root(),
                         logical_shard_id: shard(),
@@ -2586,6 +2597,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: None,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),

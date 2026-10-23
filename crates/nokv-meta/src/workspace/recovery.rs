@@ -8,7 +8,7 @@ use std::fmt;
 
 use nokv_types::{
     CommandDigest, CommitVersion, LogicalShardId, ObjectNamespaceId, OwnerEpoch,
-    PlacementGeneration, ReadVersion, RequestId, RootActivationState, RootId,
+    PlacementGeneration, PrincipalId, ReadVersion, RequestId, RootActivationState, RootId,
 };
 use sha2::{Digest, Sha256};
 
@@ -19,8 +19,10 @@ use super::engine::{
 };
 use super::keyspace::MetadataFamily;
 
-pub const RECOVERY_OUTBOX_VALUE_FORMAT_VERSION: u8 = 3;
-const LEGACY_RECOVERY_OUTBOX_VALUE_FORMAT_VERSION: u8 = 2;
+/// Version 4 records the initiating principal of a command. Older entries,
+/// which only a format-14 owner wrote, are refused by version rather than
+/// replayed into a format-15 store.
+pub const RECOVERY_OUTBOX_VALUE_FORMAT_VERSION: u8 = 4;
 pub const RECOVERY_CHAIN_DIGEST_BYTES: usize = 32;
 pub(crate) const MAX_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_RECOVERY_SEGMENT_BYTES: usize = MAX_RECOVERY_BYTES;
@@ -602,7 +604,6 @@ impl RecoveryMutationV1 {
                 bytes.extend_from_slice(command.root_id.as_bytes());
                 bytes.extend_from_slice(command.logical_shard_id.as_bytes());
                 match (format_version, command.object_namespace_id) {
-                    (LEGACY_RECOVERY_OUTBOX_VALUE_FORMAT_VERSION, None) => {}
                     (RECOVERY_OUTBOX_VALUE_FORMAT_VERSION, Some(object_namespace_id)) => {
                         bytes.extend_from_slice(object_namespace_id.as_bytes());
                     }
@@ -615,6 +616,13 @@ impl RecoveryMutationV1 {
                 bytes.extend_from_slice(&command.placement_generation.get().to_be_bytes());
                 bytes.extend_from_slice(&command.owner_epoch.get().to_be_bytes());
                 bytes.extend_from_slice(command.request_id.as_bytes());
+                match command.initiator {
+                    None => bytes.push(0),
+                    Some(initiator) => {
+                        bytes.push(1);
+                        bytes.extend_from_slice(initiator.as_bytes());
+                    }
+                }
                 bytes.extend_from_slice(command.command_digest.as_bytes());
                 bytes.extend_from_slice(&command.read_version.get().to_be_bytes());
                 encode_root_action(&mut bytes, &command.root_fence_action);
@@ -711,22 +719,26 @@ impl RecoveryMutationV1 {
                 let root_id = RootId::from_bytes(decoder.fixed("root_id")?);
                 let logical_shard_id =
                     LogicalShardId::from_bytes(decoder.fixed("logical_shard_id")?);
-                let object_namespace_id = match format_version {
-                    LEGACY_RECOVERY_OUTBOX_VALUE_FORMAT_VERSION => None,
-                    RECOVERY_OUTBOX_VALUE_FORMAT_VERSION => Some(ObjectNamespaceId::from_bytes(
-                        decoder.fixed("object_namespace_id")?,
-                    )),
-                    _ => {
-                        return Err(RecoveryCodecError::UnsupportedVersion {
-                            actual: format_version,
-                            expected: RECOVERY_OUTBOX_VALUE_FORMAT_VERSION,
-                        });
-                    }
-                };
+                if format_version != RECOVERY_OUTBOX_VALUE_FORMAT_VERSION {
+                    return Err(RecoveryCodecError::UnsupportedVersion {
+                        actual: format_version,
+                        expected: RECOVERY_OUTBOX_VALUE_FORMAT_VERSION,
+                    });
+                }
+                let object_namespace_id = Some(ObjectNamespaceId::from_bytes(
+                    decoder.fixed("object_namespace_id")?,
+                ));
                 let placement_generation =
                     nonzero_generation(decoder.u64("placement_generation")?)?;
                 let owner_epoch = nonzero_owner(decoder.u64("owner_epoch")?, "owner_epoch")?;
                 let request_id = RequestId::from_bytes(decoder.fixed("request_id")?);
+                let initiator = match decoder.u8("initiator")? {
+                    0 => None,
+                    1 => Some(PrincipalId::from_bytes(decoder.fixed("initiator")?)),
+                    _ => {
+                        return Err(RecoveryCodecError::InvalidValue { field: "initiator" });
+                    }
+                };
                 let command_digest = CommandDigest::from_bytes(decoder.fixed("command_digest")?);
                 let read_version =
                     ReadVersion::new(decoder.u64("read_version")?).map_err(|_| {
@@ -770,6 +782,7 @@ impl RecoveryMutationV1 {
                     placement_generation,
                     owner_epoch,
                     request_id,
+                    initiator,
                     command_digest,
                     read_version,
                     root_fence_action,
@@ -1539,9 +1552,7 @@ impl<'a> Decoder<'a> {
 
     fn recovery_version(&mut self) -> Result<u8, RecoveryCodecError> {
         let actual = self.u8("value_format_version")?;
-        if actual == LEGACY_RECOVERY_OUTBOX_VALUE_FORMAT_VERSION
-            || actual == RECOVERY_OUTBOX_VALUE_FORMAT_VERSION
-        {
+        if actual == RECOVERY_OUTBOX_VALUE_FORMAT_VERSION {
             Ok(actual)
         } else {
             Err(RecoveryCodecError::UnsupportedVersion {
@@ -1673,6 +1684,7 @@ mod tests {
     fn command() -> MetadataCommand {
         let root = RootId::from_bytes([1; 16]);
         MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root,
             logical_shard_id: LogicalShardId::from_bytes([2; 16]),
@@ -1776,7 +1788,7 @@ mod tests {
         };
         let record = RecoveryOutboxRecord::new(8, [0x11; 32], mutation, result).unwrap();
         let encoded = record.encode().unwrap();
-        assert_eq!(hex_encode(&encoded), "030000000000000008111111111111111111111111111111111111111111111111111111111111111167bcc73b77c67e87b06fe9b72e888d6ee6ed531065032bd8a36567af7648db8800000116010000000e6e6f6b765f776f726b73706163650101010101010101010101010101010102020202020202020202020202020202080808080808080808080808080808080000000000000003000000000000000405050505050505050505050505050505a5a3252ff9a303877dbcc8ca4a4bff31d0e14b1e19982ed20a06419d80b9a08700000000000000060200000001011100000013010101010101010101010101010101016b657901000000066265666f726500000001011100000013010101010101010101010101010101016b6579000000056166746572000000011100000013010101010101010101010101010101016b657900000001000000056576656e7400000006726573756c740100000000000000630000001301000000000000000700000006726573756c74");
+        assert_eq!(hex_encode(&encoded), "04000000000000000811111111111111111111111111111111111111111111111111111111111111117570fd8a9c3286b0323f031a74d4c1c77da7490f58aeb764b4655b1281303b6800000117010000000e6e6f6b765f776f726b73706163650101010101010101010101010101010102020202020202020202020202020202080808080808080808080808080808080000000000000003000000000000000405050505050505050505050505050505002b345062696cf35a064b6118e100973aaf9cfe6d9d00c677ae008fb90530aed400000000000000060200000001011100000013010101010101010101010101010101016b657901000000066265666f726500000001011100000013010101010101010101010101010101016b6579000000056166746572000000011100000013010101010101010101010101010101016b657900000001000000056576656e7400000006726573756c740100000000000000630000001301000000000000000700000006726573756c74");
         assert_eq!(RecoveryOutboxRecord::decode(&encoded).unwrap(), record);
 
         let mut unknown = encoded.clone();
@@ -1794,14 +1806,33 @@ mod tests {
     }
 
     #[test]
-    fn recovery_record_decodes_and_preserves_v2_without_namespace_bytes() {
-        let legacy = hex_decode("0200000000000000081111111111111111111111111111111111111111111111111111111111111111f5e3ab61f72ceba583774bcd1e8d98c4f38621f8c5682c7586ac004c35d25d4200000106010000000e6e6f6b765f776f726b737061636501010101010101010101010101010101020202020202020202020202020202020000000000000003000000000000000405050505050505050505050505050505caf0269cc277bd5e16dbed022e7a3fdb4d49948b467ed050725cd6fdbcfc72df00000000000000060200000001011100000013010101010101010101010101010101016b657901000000066265666f726500000001011100000013010101010101010101010101010101016b6579000000056166746572000000011100000013010101010101010101010101010101016b657900000001000000056576656e7400000006726573756c740100000000000000630000001301000000000000000700000006726573756c74");
-        let decoded = RecoveryOutboxRecord::decode(&legacy).unwrap();
-        let RecoveryMutationV1::MetadataCommand { command, .. } = &decoded.mutation else {
-            panic!("legacy fixture must contain a metadata command");
+    fn an_outbox_entry_of_an_older_owner_is_refused_by_version() {
+        // A version-3 entry, as a format-14 owner wrote it: refused rather
+        // than replayed into a format-15 store.
+        let older = hex_decode("030000000000000008111111111111111111111111111111111111111111111111111111111111111167bcc73b77c67e87b06fe9b72e888d6ee6ed531065032bd8a36567af7648db8800000116010000000e6e6f6b765f776f726b73706163650101010101010101010101010101010102020202020202020202020202020202080808080808080808080808080808080000000000000003000000000000000405050505050505050505050505050505a5a3252ff9a303877dbcc8ca4a4bff31d0e14b1e19982ed20a06419d80b9a08700000000000000060200000001011100000013010101010101010101010101010101016b657901000000066265666f726500000001011100000013010101010101010101010101010101016b6579000000056166746572000000011100000013010101010101010101010101010101016b657900000001000000056576656e7400000006726573756c740100000000000000630000001301000000000000000700000006726573756c74");
+        assert_eq!(
+            RecoveryOutboxRecord::decode(&older),
+            Err(RecoveryCodecError::UnsupportedVersion {
+                actual: 3,
+                expected: 4
+            })
+        );
+    }
+
+    #[test]
+    fn an_attributed_command_round_trips_through_the_outbox() {
+        let mut attributed = command();
+        attributed.initiator = Some(PrincipalId::from_bytes([0xa1; 16]));
+        let attributed = attributed.seal();
+        let mutation = RecoveryMutationV1::MetadataCommand {
+            command: Box::new(attributed),
+            lease_deadline_ms: None,
         };
-        assert_eq!(command.object_namespace_id, None);
-        assert_eq!(decoded.encode().unwrap(), legacy);
+        let encoded = mutation.encode_canonical().unwrap();
+        assert_eq!(
+            RecoveryMutationV1::decode_canonical(&encoded).unwrap(),
+            mutation
+        );
     }
 
     #[test]

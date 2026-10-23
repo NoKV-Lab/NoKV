@@ -387,6 +387,7 @@ pub fn remove_path(
     }
 
     let event = change_event_projection(&ChangeEventRecord {
+        initiator: request.context.authority.initiator,
         workbench_id: request.workbench_id.clone(),
         workspace_incarnation_id: workspace.incarnation_id,
         kind: ChangeEventKind::PathRemoved,
@@ -400,6 +401,7 @@ pub fn remove_path(
     let deterministic_result =
         encode_remove_result(input_digest, workspace_revision, path.artifact_revision_id);
     let command = MetadataCommand {
+        initiator: request.context.authority.initiator,
         schema_id: SCHEMA_ID.to_owned(),
         root_id: request.context.root_id,
         logical_shard_id: request.context.logical_shard_id,
@@ -642,6 +644,7 @@ mod tests {
         action: RootFenceAction,
     ) -> MetadataCommand {
         MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
@@ -763,6 +766,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: context.authority.initiator,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: context.root_id,
                     logical_shard_id: context.logical_shard_id,

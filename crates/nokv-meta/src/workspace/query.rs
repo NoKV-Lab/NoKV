@@ -3906,6 +3906,7 @@ mod tests {
         action: RootFenceAction,
     ) -> MetadataCommand {
         MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id,
             logical_shard_id: shard(),
@@ -3994,6 +3995,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: None,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id,
                     logical_shard_id: shard(),
@@ -6771,6 +6773,7 @@ mod tests {
             ],
         );
         let visible_event = ChangeEventRecord {
+            initiator: None,
             workbench_id: visible.clone(),
             workspace_incarnation_id: visible_incarnation,
             kind: super::super::query_records::ChangeEventKind::ArtifactPublished,
@@ -6786,6 +6789,7 @@ mod tests {
             .unwrap(),
         };
         let hidden_event = ChangeEventRecord {
+            initiator: None,
             workbench_id: hidden.clone(),
             workspace_incarnation_id: hidden_incarnation,
             kind: super::super::query_records::ChangeEventKind::WorkspaceRestored,
@@ -6797,6 +6801,7 @@ mod tests {
             after: TypedProjection::empty(),
         };
         let mismatched_name_event = ChangeEventRecord {
+            initiator: None,
             workbench_id: workbench("forged-events"),
             workspace_incarnation_id: visible_incarnation,
             kind: super::super::query_records::ChangeEventKind::ArtifactPublished,
@@ -6895,6 +6900,7 @@ mod tests {
             )],
         );
         let event = |path_value: &str| ChangeEventRecord {
+            initiator: None,
             workbench_id: name.clone(),
             workspace_incarnation_id: incarnation_id,
             kind: super::super::query_records::ChangeEventKind::ArtifactPublished,
@@ -7063,6 +7069,7 @@ mod tests {
             )],
         );
         let valid_event = ChangeEventRecord {
+            initiator: None,
             workbench_id: name.clone(),
             workspace_incarnation_id: incarnation_id,
             kind: super::super::query_records::ChangeEventKind::ArtifactPublished,
@@ -7091,6 +7098,7 @@ mod tests {
         );
 
         let mut corrupt = MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),

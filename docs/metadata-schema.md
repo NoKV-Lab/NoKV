@@ -19,19 +19,20 @@ Every logical-shard store has one authoritative marker:
 System("schema")
   -> value_format_version = 1
      schema_id = "nokv_workspace"
-     format_version = 14
+     format_version = 15
 ```
 
 Startup is fail-closed:
 
 - an empty store is initialized with the exact supported marker and logical
   keyspace catalog;
-- format-13 and older stores are rejected without writes; there is no marker-only
-  upgrade because format 14 adds the `ArtifactInlineBody` family and changes
-  the durable publish operation codec;
+- format-14 and older stores are rejected without writes, by the version the
+  marker names ("workspace format 14 is not served by this build"); there is
+  no migration, because format 15 records the initiating principal in every
+  durable operation, command, and change event;
 - a nonempty current store opens only when its marker, value format, and
   configured adapter catalog match this contract;
-- a missing, malformed, unknown-version, or inconsistent store is rejected.
+- a missing, malformed, or inconsistent store is rejected.
 
 ## Ids, Names, And Keys
 
@@ -106,7 +107,12 @@ float, timestamp, bytes, and string values.
 
 ## Durable Format Registry
 
-`System.format_version` is `14`. Version 14 adds the write-once
+`System.format_version` is `15`. Version 15 records the authenticated
+principal that started every durable operation (publish, append, commit,
+restore, snapshot, Generic index registration), every metadata command, and
+every change event; the publish identity digest and the Generic index
+registration digest seal it, and the recovery outbox refuses entries of an
+older owner. Version 14 added the write-once
 `ArtifactInlineBody` family and the sealed inline body digest of a publish
 operation. Version 13 added the monotonic append cleanup
 retry counter and durable exact-token retry receipts in CommandDedupe.
@@ -116,38 +122,39 @@ existing Operation family. It retains the format-11 full SHA-256 append intent,
 format-10 Generic index families, and format-9 RecoveryOutbox fixed-width decimal
 LSN keys. Existing logical recovery and object formats are unchanged.
 
-Ordinary open does not migrate a format-13 or older marker. A marker-only
-upgrade would reinterpret publication records without their required codec and
-omit the active index. Migration remains not qualified; every older or unknown
-marker is fail-closed and unchanged.
+Ordinary open does not migrate a format-14 or older marker, and no offline
+migrator exists: a store written by NoKV 0.12.x is left as it is, and a
+format-15 owner is given a new store. Every older or unknown marker is
+fail-closed and unchanged.
 
 Durable codecs are independently versioned:
-the publish operation record uses value version `8` and rejects version `7`;
+the publish operation record uses value version `9` and rejects version `8`;
 staged-object and manifest-row records use value version
 `7` and reject version `6`; an append publication binds both the full 256-bit
 intent and logical parent/attempt, with a cleanup retry counter that prevents
 repeated quarantine from recreating an earlier state token. `AppendOperationRecord` uses value version
-`1` and retains the current attempt and optional compact receipt. An
+`2` and retains the current attempt, optional compact receipt, and initiator. An
 `Operation(ActivePublish)` marker has the exact one-byte value `[1]`. Other
 publication rows retain their existing layouts.
 publication-owned workspace/path/revision records use value version `2`;
 `CommitRecord` uses version `3` and dual-decodes version `2`, while its member,
-consumer, head, and tag records remain version `2`; `ChangeEvent` and the
-logical recovery-outbox record use value version `2`; other ordinary workspace
+consumer, head, and tag records remain version `2`; `ChangeEvent` uses value version `3` and the
+logical recovery-outbox record value version `4`, both carrying the initiator; other ordinary workspace
 records and the recovery storage header/chunk records currently use value
 version `1`; `CommandDedupe` uses version `2` to bind its exact result to a
-recovery LSN. `BuildCommitOperation` and `CommitRetireOperation` use version `6`
-and dual-decode version `5`; the build record retains the complete exact commit
+recovery LSN. `BuildCommitOperation` uses version `7` and dual-decodes versions `6` and `5`;
+`CommitRetireOperation` uses version `6` and dual-decodes version `5`; the build record retains the complete exact commit
 request, opaque Agent projection-input digest, first owner-observed commit time,
 run-manifest publication condition, immutable staged-manifest binding, and the
 sealed Generic-index closure needed for head- and path-independent replay.
-`RestoreOperation` uses version `6` and dual-decodes version `5`; it retains the
+`RestoreOperation` uses version `7` and dual-decodes versions `6` and `5`; it retains the
 complete source workbench/incarnation, concrete source selector, and both path
 and Generic-index closure progress needed for source-independent terminal
 replay. Unknown versions fail closed. Keys do not repeat a version because the
 store-level schema marker gates their codec.
-Generic index current, generation, row, reference, append-receipt,
-registration-operation, and commit-member payloads use value version `1`.
+Generic index current, generation, row, reference, append-receipt, and
+commit-member payloads use value version `1`; the registration-operation
+payload uses value version `2`.
 Row binding is explicit: `Directory` cannot later decorate an artifact,
 `Unbound` retains the path-keyed contract for a node created after registration,
 and `Artifact` carries the exact artifact revision and path-generation fence.
@@ -691,7 +698,7 @@ deterministic result is the request fingerprint:
 
 ```text
 SHA-256("nokv.server.request-fingerprint.v1\0"
-        || principal            (0x00; 0x01 || agent_id is reserved)
+        || principal            (0x00 on a plaintext connection; 0x01 || principal_id over TLS)
         || root_id || logical_shard_id || object_namespace_id
         || request_id || u64be(len(operation)) || operation)
 ```

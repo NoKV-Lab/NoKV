@@ -8,16 +8,18 @@
 use std::fmt;
 
 use nokv_types::{
-    ArtifactRevisionId, CommitId, Generation, NormalizedRelativePath, OperationId, ReadVersion,
-    RestorePhase, RestoreSourceKind, SnapshotId, WorkbenchId, WorkspaceIncarnationId,
-    WorkspaceRevision, SHA256_BYTES,
+    ArtifactRevisionId, CommitId, Generation, NormalizedRelativePath, OperationId, PrincipalId,
+    ReadVersion, RestorePhase, RestoreSourceKind, SnapshotId, WorkbenchId, WorkspaceIncarnationId,
+    WorkspaceRevision, FIXED_ID_BYTES, SHA256_BYTES,
 };
 
 use super::commit_closure::advance_commit_parent_rolling_digest;
 use super::commit_records::MAX_COMMIT_DIGEST_URI_BYTES;
 
-/// Current value format for restore-operation payloads.
-pub const RESTORE_OPERATION_VALUE_FORMAT_VERSION: u8 = 6;
+/// Current value format for restore-operation payloads. Version 7 records the
+/// initiating principal; version 6 added the Generic index closure.
+pub const RESTORE_OPERATION_VALUE_FORMAT_VERSION: u8 = 7;
+const PREVIOUS_RESTORE_OPERATION_VALUE_FORMAT_VERSION: u8 = 6;
 const LEGACY_RESTORE_OPERATION_VALUE_FORMAT_VERSION: u8 = 5;
 /// Restore-member rows retain their v4 layout; operation v6 owns the Generic
 /// index closure while operation v5 remains dual-decodable.
@@ -533,6 +535,10 @@ pub struct RestoreOperationRecord {
     pub cleanup_generic_index_cursor: u64,
     pub result: Option<RestoreResult>,
     pub terminal_error: Option<RestoreTerminalError>,
+    /// The authenticated principal that prepared the restore. A restore's
+    /// operation id derives from its source and destination, so another
+    /// principal preparing the same pair observes this one.
+    pub initiator: Option<PrincipalId>,
 }
 
 /// One exact destination row in canonical source order.
@@ -1068,6 +1074,10 @@ impl RestoreOperationRecord {
         encoded.extend_from_slice(&self.cleanup_generic_index_cursor.to_be_bytes());
         put_optional_result(&mut encoded, self.result.as_ref());
         put_optional_terminal_error(&mut encoded, self.terminal_error.as_ref())?;
+        put_optional_fixed(
+            &mut encoded,
+            self.initiator.as_ref().map(PrincipalId::as_bytes),
+        );
         Ok(encoded)
     }
 
@@ -1107,6 +1117,9 @@ impl RestoreOperationRecord {
         match encoded.first().copied() {
             Some(RESTORE_OPERATION_VALUE_FORMAT_VERSION) => {
                 Self::decode_versioned(encoded, RESTORE_OPERATION_VALUE_FORMAT_VERSION)
+            }
+            Some(PREVIOUS_RESTORE_OPERATION_VALUE_FORMAT_VERSION) => {
+                Self::decode_versioned(encoded, PREVIOUS_RESTORE_OPERATION_VALUE_FORMAT_VERSION)
             }
             Some(LEGACY_RESTORE_OPERATION_VALUE_FORMAT_VERSION) => {
                 Self::decode_versioned(encoded, LEGACY_RESTORE_OPERATION_VALUE_FORMAT_VERSION)
@@ -1155,7 +1168,7 @@ impl RestoreOperationRecord {
             source_generic_index_rolling_digest,
             source_generic_index_seal,
             source_generic_indexes_match_base_commit,
-        ) = if value_version == RESTORE_OPERATION_VALUE_FORMAT_VERSION {
+        ) = if value_version >= PREVIOUS_RESTORE_OPERATION_VALUE_FORMAT_VERSION {
             (
                 decoder.boolean("source_paths_eof")?,
                 decoder.optional_path("source_generic_index_cursor")?,
@@ -1191,13 +1204,20 @@ impl RestoreOperationRecord {
         let member_seal = decoder.optional_fixed("member_seal")?;
         let cleanup_member_cursor = decoder.u64("cleanup_member_cursor")?;
         let cleanup_generic_index_cursor =
-            if value_version == RESTORE_OPERATION_VALUE_FORMAT_VERSION {
+            if value_version >= PREVIOUS_RESTORE_OPERATION_VALUE_FORMAT_VERSION {
                 decoder.u64("cleanup_generic_index_cursor")?
             } else {
                 0
             };
         let result = decoder.optional_result("result")?;
         let terminal_error = decoder.optional_terminal_error("terminal_error")?;
+        let initiator = if value_version == RESTORE_OPERATION_VALUE_FORMAT_VERSION {
+            decoder
+                .optional_fixed::<FIXED_ID_BYTES>("initiator")?
+                .map(PrincipalId::from_bytes)
+        } else {
+            None
+        };
         decoder.finish()?;
         let record = Self {
             operation_id,
@@ -1231,6 +1251,7 @@ impl RestoreOperationRecord {
             cleanup_generic_index_cursor,
             result,
             terminal_error,
+            initiator,
         };
         record.validate()?;
         Ok(record)
@@ -2088,6 +2109,7 @@ fn decode_legacy_v4_operation(
         cleanup_generic_index_cursor: 0,
         result,
         terminal_error,
+        initiator: None,
     };
     record.validate()?;
     Ok(record)
@@ -2192,12 +2214,15 @@ impl<'a> Decoder<'a> {
             unique_revision_count: self.u64("source_commit.unique_revision_count")?,
             revision_digest: self.fixed("source_commit.revision_digest")?,
             parent_digest: self.fixed("source_commit.parent_digest")?,
-            generic_index_count: if value_version == RESTORE_OPERATION_VALUE_FORMAT_VERSION {
+            generic_index_count: if value_version >= PREVIOUS_RESTORE_OPERATION_VALUE_FORMAT_VERSION
+            {
                 self.u64("source_commit.generic_index_count")?
             } else {
                 0
             },
-            generic_index_digest: if value_version == RESTORE_OPERATION_VALUE_FORMAT_VERSION {
+            generic_index_digest: if value_version
+                >= PREVIOUS_RESTORE_OPERATION_VALUE_FORMAT_VERSION
+            {
                 self.fixed("source_commit.generic_index_digest")?
             } else {
                 [0; SHA256_BYTES]
@@ -2249,7 +2274,7 @@ impl<'a> Decoder<'a> {
             generic_index_count,
             generic_index_digest,
             generic_indexes_complete,
-        ) = if value_version == RESTORE_OPERATION_VALUE_FORMAT_VERSION {
+        ) = if value_version >= PREVIOUS_RESTORE_OPERATION_VALUE_FORMAT_VERSION {
             (
                 self.boolean("commit_closure.path_members_complete")?,
                 self.optional_path("commit_closure.generic_index_cursor")?,
@@ -2277,12 +2302,12 @@ impl<'a> Decoder<'a> {
         let parent_digest = self.fixed("commit_closure.parent_digest")?;
         let parent_seal = self.optional_fixed("commit_closure.parent_seal")?;
         let cleanup_member_count = self.u64("commit_closure.cleanup_member_count")?;
-        let cleanup_generic_index_count = if value_version == RESTORE_OPERATION_VALUE_FORMAT_VERSION
-        {
-            self.u64("commit_closure.cleanup_generic_index_count")?
-        } else {
-            0
-        };
+        let cleanup_generic_index_count =
+            if value_version >= PREVIOUS_RESTORE_OPERATION_VALUE_FORMAT_VERSION {
+                self.u64("commit_closure.cleanup_generic_index_count")?
+            } else {
+                0
+            };
         let cleanup_revision_count = self.u64("commit_closure.cleanup_revision_count")?;
         let destination_head_generation = match self.u8("destination_head_generation")? {
             0 => None,
@@ -2535,6 +2560,7 @@ mod tests {
         let mut identity_digest = [2; SHA256_BYTES];
         identity_digest[..OperationId::BYTE_WIDTH].fill(1);
         RestoreOperationRecord {
+            initiator: None,
             operation_id: OperationId::from_bytes([1; 16]),
             identity_digest,
             initialization_digest: None,
@@ -2852,16 +2878,16 @@ mod tests {
     }
 
     #[test]
-    fn restore_operation_v6_has_frozen_golden_digest_and_strict_envelope() {
+    fn restore_operation_v7_has_frozen_golden_digest_and_strict_envelope() {
         let record = operation(RestorePhase::Preparing);
         let encoded = record.encode().unwrap();
         assert_eq!(encoded[0], RESTORE_OPERATION_VALUE_FORMAT_VERSION);
-        assert_eq!(encoded.len(), 952);
+        assert_eq!(encoded.len(), 953);
         assert_eq!(
             <[u8; SHA256_BYTES]>::from(Sha256::digest(&encoded)),
             [
-                226, 8, 70, 170, 145, 81, 148, 158, 122, 225, 7, 132, 154, 68, 14, 27, 180, 242,
-                123, 163, 69, 205, 160, 15, 163, 103, 182, 254, 215, 125, 78, 92,
+                125, 253, 32, 21, 44, 47, 117, 154, 190, 27, 124, 122, 173, 182, 230, 115, 222,
+                234, 129, 57, 3, 83, 30, 162, 3, 9, 129, 215, 252, 80, 188, 132,
             ]
         );
         assert_eq!(RestoreOperationRecord::decode(&encoded).unwrap(), record);
