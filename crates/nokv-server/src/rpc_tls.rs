@@ -274,6 +274,7 @@ pub(crate) fn drain_tls_record(socket: &mut DeadlineSocket) -> io::Result<()> {
 /// `reader` a tenant-wide reader, and `unregistered` no credential at all.
 #[cfg(test)]
 pub(crate) mod test_pki {
+    use crate::access::DEFAULT_MAX_POLICY_AGE;
     use std::sync::Arc;
 
     use nokv_control::{
@@ -390,7 +391,7 @@ pub(crate) mod test_pki {
             let tls = RpcServerTls::new(
                 vec![self.server.der.clone()],
                 self.server.key.clone_key(),
-                TenantAccess::load(store.clone(), TENANT).unwrap(),
+                TenantAccess::load(store.clone(), TENANT, DEFAULT_MAX_POLICY_AGE).unwrap(),
             )
             .unwrap();
             (tls, store)

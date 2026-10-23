@@ -17,8 +17,9 @@ use nokv_protocol::{
     WorkspaceHandshake, WorkspaceRpcOutcome, WorkspaceRpcRequest, WorkspaceRpcResponse,
     HANDSHAKE_FRAME_BYTES, HANDSHAKE_PAYLOAD_BYTES, MAX_FRAME_BYTES, WORKSPACE_PROTOCOL_SCHEMA,
 };
+use sha2::{Digest as _, Sha256};
 
-use crate::access::{AccessDenial, ConnectionPrincipal, MAX_POLICY_AGE, POLICY_REFRESH_INTERVAL};
+use crate::access::{classify, AccessDenial, ConnectionPrincipal, POLICY_REFRESH_INTERVAL};
 use crate::legacy_rejection::{legacy_rejection_response, MAX_LEGACY_FIRST_FRAME_BYTES};
 use crate::rpc_tls::{
     accept_tls, drain_tls_record, opens_tls_record, DeadlineSocket, RpcServerTls, RpcStream,
@@ -305,14 +306,55 @@ fn serve_socket_loop(
     listener
         .set_nonblocking(true)
         .map_err(ServerError::Connection)?;
+    // The policy copy refreshes on its own thread: a slow control plane
+    // delays no accept and no renewal, and the thread ends with the loop.
+    let refresh_stopped = AtomicBool::new(false);
+    thread::scope(|scope| {
+        if let Some(tls) = tls.as_deref() {
+            thread::Builder::new()
+                .name("nokv-policy-refresh".to_owned())
+                .spawn_scoped(scope, || refresh_policy_until(tls, &refresh_stopped))
+                .map_err(ServerError::Connection)?;
+        }
+        let served = accept_until_shutdown(
+            &listener,
+            options,
+            &registry,
+            &tls,
+            &owner_loss,
+            shutdown,
+            &mut renew_ownership,
+        );
+        refresh_stopped.store(true, Ordering::Release);
+        served
+    })
+}
+
+/// Refresh the tenant policy on its interval until `stopped`.
+fn refresh_policy_until(tls: &RpcServerTls, stopped: &AtomicBool) {
+    let mut policy = PolicyRefresh::new(tls);
+    while !stopped.load(Ordering::Acquire) {
+        policy.refresh_when_due(Instant::now());
+        thread::sleep(RUNTIME_EVENT_POLL);
+    }
+}
+
+fn accept_until_shutdown(
+    listener: &TcpListener,
+    options: ServerOptions,
+    registry: &Arc<RootOwnerRegistry>,
+    tls: &Option<Arc<RpcServerTls>>,
+    owner_loss: &OwnerLossSignal,
+    shutdown: &AtomicBool,
+    renew_ownership: &mut impl FnMut() -> Result<(), ServerError>,
+) -> Result<(), ServerError> {
     let mut next_renewal = Instant::now();
-    let mut policy = tls.as_deref().map(PolicyRefresh::new);
     let connections = Arc::new(
         ConnectionLimiter::new(options.max_inflight_connections)
             .expect("validated connection maximum is nonzero"),
     );
     loop {
-        require_owner_retained(&owner_loss)?;
+        require_owner_retained(owner_loss)?;
         if shutdown.load(Ordering::Acquire) {
             break;
         }
@@ -321,12 +363,9 @@ fn serve_socket_loop(
             renew_ownership()?;
             next_renewal = Instant::now() + options.lease_renew_interval;
         }
-        if let Some(policy) = &mut policy {
-            policy.refresh_when_due(now);
-        }
         match listener.accept() {
             Ok((stream, _)) => {
-                require_owner_retained(&owner_loss)?;
+                require_owner_retained(owner_loss)?;
                 if shutdown.load(Ordering::Acquire) {
                     drop(stream);
                     continue;
@@ -338,7 +377,7 @@ fn serve_socket_loop(
                 stream
                     .set_nonblocking(false)
                     .map_err(ServerError::Connection)?;
-                let registry = Arc::clone(&registry);
+                let registry = Arc::clone(registry);
                 let tls = tls.clone();
                 thread::Builder::new()
                     .name("nokv-workspace-rpc".to_owned())
@@ -349,30 +388,27 @@ fn serve_socket_loop(
                     .map_err(ServerError::Connection)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                wait_for_connection(&listener, next_renewal);
+                wait_for_connection(listener, next_renewal);
             }
             Err(error) => return Err(ServerError::Connection(error)),
         }
     }
 
     while connections.in_flight() != 0 {
-        require_owner_retained(&owner_loss)?;
+        require_owner_retained(owner_loss)?;
         let now = Instant::now();
         if now >= next_renewal {
             renew_ownership()?;
             next_renewal = Instant::now() + options.lease_renew_interval;
         }
-        if let Some(policy) = &mut policy {
-            policy.refresh_when_due(now);
-        }
         sleep_until_runtime_event(next_renewal);
     }
-    require_owner_retained(&owner_loss)
+    require_owner_retained(owner_loss)
 }
 
 /// Refreshes the tenant policy of a TLS listener on its interval. A failure
 /// is reported once and again when it clears; meanwhile the last copy serves
-/// until it is `MAX_POLICY_AGE` old.
+/// until it reaches the owner's policy age bound.
 struct PolicyRefresh<'a> {
     tls: &'a RpcServerTls,
     next: Instant,
@@ -402,7 +438,7 @@ impl<'a> PolicyRefresh<'a> {
                 eprintln!(
                     "nokv-server: cannot refresh the tenant policy: {error}; requests are refused \
                      once the last copy is {} s old",
-                    MAX_POLICY_AGE.as_secs()
+                    self.tls.access.max_age().as_secs()
                 );
                 self.failing = true;
             }
@@ -571,12 +607,14 @@ fn serve_connection(
     // segment. This runs per connection, not in the accept loop, so a failure
     // closes only this connection.
     stream.set_nodelay(true).map_err(ServerError::Connection)?;
+    let peer = stream.peer_addr().ok();
     let Some((mut stream, principal)) = admit(stream, options.handshake_timeout, tls)? else {
         return Ok(());
     };
     stream
         .finish_admission(options.read_timeout, options.write_timeout)
         .map_err(ServerError::Connection)?;
+    let mut denials_logged = 0_u32;
     while let Some(request) = read_frame(&mut stream)? {
         let request = decode_request(&request)?;
         // Authorization comes before any route lookup, so a denied caller
@@ -586,6 +624,7 @@ fn serve_connection(
                 return Ok(());
             };
             if let Err(denial) = tls.access.authorize(principal, &request, unix_now()) {
+                log_denial(peer, principal, &request, denial, &mut denials_logged);
                 write_frame(
                     &mut stream,
                     &encode_response(&denied_response(&request, denial))?,
@@ -603,6 +642,40 @@ fn serve_connection(
         require_owner_retained(&registry.owner_loss_signal())?;
     }
     Ok(())
+}
+
+/// Denials on one connection are logged up to this many times; a client
+/// that keeps retrying a refused request does not flood the owner's log.
+const LOGGED_DENIALS_PER_CONNECTION: u32 = 3;
+
+fn log_denial(
+    peer: Option<std::net::SocketAddr>,
+    principal: &ConnectionPrincipal,
+    request: &WorkspaceRpcRequest,
+    denial: AccessDenial,
+    logged: &mut u32,
+) {
+    if *logged >= LOGGED_DENIALS_PER_CONNECTION {
+        return;
+    }
+    *logged += 1;
+    let reason = match denial {
+        AccessDenial::NotACurrentCredential => "its credential is no longer current".to_owned(),
+        AccessDenial::PermissionDenied { required } => format!("it holds no {required:?} role"),
+        AccessDenial::PolicyStale => "the tenant policy copy is stale".to_owned(),
+    };
+    let peer = peer.map_or(String::new(), |peer| format!(", peer {peer}"));
+    let more = if *logged == LOGGED_DENIALS_PER_CONNECTION {
+        "; further denials on this connection are not logged"
+    } else {
+        ""
+    };
+    eprintln!(
+        "nokv-server: denied {} on root {} to principal {}{peer}: {reason}{more}",
+        classify(&request.operation).name,
+        lowercase_hex(&request.route.root_id.0),
+        lowercase_hex(principal.principal_id.as_bytes()),
+    );
 }
 
 /// The failure for a request the connection's principal may not make. It
@@ -702,6 +775,7 @@ fn admit(
             // A TLS client reads this plaintext answer before parsing records.
             drain_tls_record(&mut socket).map_err(ServerError::Connection)?;
             write_handshake(&mut socket, HandshakeKind::TlsUnavailable)?;
+            log_refusal(&socket.socket, "a TLS client; this owner serves plaintext");
             Ok(None)
         }
         (tls, false) => Ok(admit_plaintext(&mut socket, tls.is_some())?
@@ -747,6 +821,18 @@ fn admit_plaintext(socket: &mut DeadlineSocket, tls_required: bool) -> Result<bo
                 HandshakeKind::Accepted
             };
             write_handshake(socket, verdict)?;
+            match verdict {
+                HandshakeKind::TlsRequired => {
+                    log_refusal(
+                        &socket.socket,
+                        "a plaintext client; this owner requires TLS",
+                    );
+                }
+                HandshakeKind::Incompatible => {
+                    log_refusal(&socket.socket, "a client speaking another protocol schema");
+                }
+                _ => {}
+            }
             return Ok(verdict == HandshakeKind::Accepted);
         }
         write_legacy_rejection(socket, &payload)?;
@@ -780,6 +866,10 @@ fn admit_tls(
     }
     let mut principal = None;
     let verdict = if hello.operation_schema() != WORKSPACE_PROTOCOL_SCHEMA {
+        log_refusal(
+            &stream.sock.socket,
+            "a client speaking another protocol schema",
+        );
         HandshakeKind::Incompatible
     } else {
         match tls.access.authenticate(&certificate, unix_now()) {
@@ -788,8 +878,24 @@ fn admit_tls(
                 HandshakeKind::Accepted
             }
             // Unanswered, so the client retries once the policy refreshes.
-            Err(AccessDenial::PolicyStale) => return Ok(None),
-            Err(_) => HandshakeKind::Unauthenticated,
+            Err(AccessDenial::PolicyStale) => {
+                log_refusal(
+                    &stream.sock.socket,
+                    "a TLS client while the tenant policy copy is stale; left unanswered",
+                );
+                return Ok(None);
+            }
+            Err(_) => {
+                // The fingerprint lets an operator register the certificate.
+                log_refusal(
+                    &stream.sock.socket,
+                    &format!(
+                        "a TLS client whose certificate {} is not a current credential of the tenant",
+                        lowercase_hex(&Sha256::digest(&certificate))
+                    ),
+                );
+                HandshakeKind::Unauthenticated
+            }
         }
     };
     write_handshake(&mut stream, verdict)?;
@@ -799,6 +905,19 @@ fn admit_tls(
         return Ok(None);
     }
     Ok(Some((RpcStream::Tls(Box::new(stream)), principal)))
+}
+
+/// One line per refused connection, so an operator sees who was turned away
+/// and why without any client-side evidence.
+fn log_refusal(socket: &TcpStream, what: &str) {
+    match socket.peer_addr() {
+        Ok(peer) => eprintln!("nokv-server: refused {what} (peer {peer})"),
+        Err(_) => eprintln!("nokv-server: refused {what}"),
+    }
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Seconds since the Unix epoch; a clock before it expires every credential.
@@ -1653,7 +1772,7 @@ mod tests {
         let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.registered)));
         assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
         tls.access
-            .age_for_test(MAX_POLICY_AGE + Duration::from_secs(1));
+            .age_for_test(tls.access.max_age() + Duration::from_secs(1));
         let response = tls_exchange(&mut stream, &request());
         assert_eq!(failure_of(&response).code, ErrorCode::Unauthenticated);
         assert!(failure_of(&response).retryable);

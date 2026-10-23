@@ -12,10 +12,11 @@
 //! request's root that permits the request. A denied request learns nothing
 //! about routes.
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use nokv_control::{ControlError, IdentityStore, TenantPolicy};
+use nokv_control::{ControlError, CredentialBinding, IdentityStore, RoleBinding, TenantPolicy};
 use nokv_protocol::{WorkspaceRequest, WorkspaceRpcRequest};
 use nokv_types::{CredentialFingerprint, PrincipalId, Role, RoleScope, RootId, TenantId};
 use rustls::pki_types::CertificateDer;
@@ -29,20 +30,69 @@ use crate::ServerError;
 pub const POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How long an owner trusts its copy of the policy without a successful
-/// refresh. After that it refuses every request until a refresh succeeds.
-pub const MAX_POLICY_AGE: Duration = Duration::from_secs(10);
+/// refresh when its control plane sets no other bound. An owner on etcd uses
+/// its lease TTL instead: past that it has lost the right to serve anyway.
+pub const DEFAULT_MAX_POLICY_AGE: Duration = Duration::from_secs(10);
 
 /// The latest copy of one tenant's identity records, and the decisions an
 /// owner makes from it.
 pub struct TenantAccess {
     identity: Arc<dyn IdentityStore>,
     tenant_id: TenantId,
+    max_age: Duration,
     copy: RwLock<PolicyCopy>,
 }
 
+/// One policy revision, indexed for the two lookups every decision makes.
 struct PolicyCopy {
-    policy: TenantPolicy,
+    revision: u64,
+    credentials: HashMap<CredentialFingerprint, CredentialBinding>,
+    roles: HashMap<PrincipalId, Vec<RoleBinding>>,
     refreshed_at: Instant,
+}
+
+impl PolicyCopy {
+    fn index(policy: TenantPolicy) -> Self {
+        let mut roles: HashMap<PrincipalId, Vec<RoleBinding>> = HashMap::new();
+        for binding in policy.role_bindings {
+            roles.entry(binding.principal_id).or_default().push(binding);
+        }
+        Self {
+            revision: policy.revision,
+            credentials: policy
+                .credentials
+                .into_iter()
+                .map(|credential| (credential.fingerprint, credential))
+                .collect(),
+            roles,
+            refreshed_at: Instant::now(),
+        }
+    }
+
+    /// The credential behind `fingerprint`, when it is current.
+    fn current_credential(
+        &self,
+        fingerprint: &CredentialFingerprint,
+        now_unix_seconds: u64,
+    ) -> Option<&CredentialBinding> {
+        self.credentials
+            .get(fingerprint)
+            .filter(|credential| credential.expires_at_unix_seconds > now_unix_seconds)
+    }
+
+    /// The highest role `principal_id` holds on `root_id`: tenant-wide roles
+    /// cover every root of the tenant, and root roles cover their own root.
+    fn effective_role(&self, principal_id: PrincipalId, root_id: RootId) -> Option<Role> {
+        self.roles
+            .get(&principal_id)?
+            .iter()
+            .filter(|binding| match binding.scope {
+                RoleScope::Tenant => true,
+                RoleScope::Root(scope) => scope == root_id,
+            })
+            .map(|binding| binding.role)
+            .max()
+    }
 }
 
 /// The credential a TLS connection authenticated with, and its principal.
@@ -68,10 +118,12 @@ pub enum AccessDenial {
 
 impl TenantAccess {
     /// Load the tenant's records; an owner without them cannot authenticate
-    /// anyone and must not start.
+    /// anyone and must not start. `max_age` bounds how long the copy serves
+    /// without a successful refresh.
     pub fn load(
         identity: Arc<dyn IdentityStore>,
         tenant_id: TenantId,
+        max_age: Duration,
     ) -> Result<Self, ServerError> {
         let policy = identity
             .load_tenant_policy(&tenant_id)?
@@ -81,18 +133,21 @@ impl TenantAccess {
         Ok(Self {
             identity,
             tenant_id,
-            copy: RwLock::new(PolicyCopy {
-                policy,
-                refreshed_at: Instant::now(),
-            }),
+            max_age,
+            copy: RwLock::new(PolicyCopy::index(policy)),
         })
     }
 
+    /// How long the copy serves without a successful refresh.
+    pub fn max_age(&self) -> Duration {
+        self.max_age
+    }
+
     /// Reload the policy when its revision moved. A failure keeps the last
-    /// copy, which stops authorizing once it is older than `MAX_POLICY_AGE`.
+    /// copy, which stops authorizing once it is older than `max_age`.
     pub fn refresh(&self) -> Result<(), ControlError> {
         let revision = self.identity.tenant_policy_revision(&self.tenant_id)?;
-        let current = self.read_copy().policy.revision;
+        let current = self.read_copy().revision;
         let reloaded = if revision == Some(current) {
             None
         } else {
@@ -106,13 +161,13 @@ impl TenantAccess {
             .copy
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(policy) = reloaded {
+        match reloaded {
             // Revisions only grow; a slower concurrent read never wins.
-            if policy.revision >= copy.policy.revision {
-                copy.policy = policy;
+            Some(policy) if policy.revision >= copy.revision => {
+                *copy = PolicyCopy::index(policy);
             }
+            _ => copy.refreshed_at = Instant::now(),
         }
-        copy.refreshed_at = Instant::now();
         Ok(())
     }
 
@@ -125,11 +180,7 @@ impl TenantAccess {
         let fingerprint = CredentialFingerprint::from_bytes(Sha256::digest(certificate).into());
         let copy = self.fresh_copy()?;
         let credential = copy
-            .policy
-            .credentials
-            .iter()
-            .find(|credential| credential.fingerprint == fingerprint)
-            .filter(|credential| credential.expires_at_unix_seconds > now_unix_seconds)
+            .current_credential(&fingerprint, now_unix_seconds)
             .ok_or(AccessDenial::NotACurrentCredential)?;
         Ok(ConnectionPrincipal {
             principal_id: credential.principal_id,
@@ -146,17 +197,15 @@ impl TenantAccess {
         now_unix_seconds: u64,
     ) -> Result<(), AccessDenial> {
         let copy = self.fresh_copy()?;
-        let current = copy.policy.credentials.iter().any(|credential| {
-            credential.fingerprint == principal.fingerprint
-                && credential.principal_id == principal.principal_id
-                && credential.expires_at_unix_seconds > now_unix_seconds
-        });
+        let current = copy
+            .current_credential(&principal.fingerprint, now_unix_seconds)
+            .is_some_and(|credential| credential.principal_id == principal.principal_id);
         if !current {
             return Err(AccessDenial::NotACurrentCredential);
         }
-        let required = required_role(&request.operation);
+        let required = classify(&request.operation).role;
         let root_id = RootId::from_bytes(request.route.root_id.0);
-        let held = effective_role(&copy.policy, principal.principal_id, root_id);
+        let held = copy.effective_role(principal.principal_id, root_id);
         if held.is_some_and(|role| role >= required) {
             Ok(())
         } else {
@@ -172,7 +221,7 @@ impl TenantAccess {
 
     fn fresh_copy(&self) -> Result<std::sync::RwLockReadGuard<'_, PolicyCopy>, AccessDenial> {
         let copy = self.read_copy();
-        if copy.refreshed_at.elapsed() > MAX_POLICY_AGE {
+        if copy.refreshed_at.elapsed() > self.max_age {
             return Err(AccessDenial::PolicyStale);
         }
         Ok(copy)
@@ -185,71 +234,74 @@ impl TenantAccess {
     }
 }
 
-/// The highest role `principal_id` holds on `root_id`: tenant-wide roles
-/// cover every root of the tenant, and root roles cover their own root.
-fn effective_role(
-    policy: &TenantPolicy,
-    principal_id: PrincipalId,
-    root_id: RootId,
-) -> Option<Role> {
-    policy
-        .role_bindings
-        .iter()
-        .filter(|binding| binding.principal_id == principal_id)
-        .filter(|binding| match binding.scope {
-            RoleScope::Tenant => true,
-            RoleScope::Root(scope) => scope == root_id,
-        })
-        .map(|binding| binding.role)
-        .max()
+/// What an operation is called in logs and the least role that permits it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OperationClass {
+    pub(crate) name: &'static str,
+    pub(crate) role: Role,
 }
 
-/// The least role that permits an operation. Every operation is listed, so a
-/// new one cannot compile until it is classified.
-pub(crate) fn required_role(operation: &WorkspaceRequest) -> Role {
-    match operation {
-        WorkspaceRequest::Preflight(_)
-        | WorkspaceRequest::GetWorkspace(_)
-        | WorkspaceRequest::GetPath(_)
-        | WorkspaceRequest::ListPaths(_)
-        | WorkspaceRequest::GetSnapshot(_)
-        | WorkspaceRequest::ListSnapshots(_)
-        | WorkspaceRequest::ReadRestoreSourceRunManifest(_)
-        | WorkspaceRequest::GetOperation(_)
-        | WorkspaceRequest::InspectAppendCleanup(_)
-        | WorkspaceRequest::GetGenericIndexRegistration(_)
-        | WorkspaceRequest::Search(_)
-        | WorkspaceRequest::Aggregate(_)
-        | WorkspaceRequest::Catalog(_)
-        | WorkspaceRequest::FindWorkspaces(_)
-        | WorkspaceRequest::ReadChanges(_) => Role::Reader,
-        WorkspaceRequest::CreateWorkspace(_)
-        | WorkspaceRequest::RenamePath(_)
-        | WorkspaceRequest::RemovePath(_)
-        | WorkspaceRequest::BeginArtifactPublish(_)
-        | WorkspaceRequest::StageArtifactObjects(_)
-        | WorkspaceRequest::MarkArtifactObjectsUploaded(_)
-        | WorkspaceRequest::StageArtifactManifest(_)
-        | WorkspaceRequest::CompleteArtifactPublish(_)
-        | WorkspaceRequest::PrepareArtifactPublish(_)
-        | WorkspaceRequest::FinishArtifactPublish(_)
-        | WorkspaceRequest::PublishInlineArtifact(_)
-        | WorkspaceRequest::AbortArtifactPublish(_)
-        | WorkspaceRequest::Commit(_)
-        | WorkspaceRequest::MintSnapshot(_)
-        | WorkspaceRequest::RenewSnapshot(_)
-        | WorkspaceRequest::RetireSnapshot(_)
-        | WorkspaceRequest::PrepareRestore(_)
-        | WorkspaceRequest::BindRestoreDestination(_)
-        | WorkspaceRequest::FinalizeRestore(_)
+/// Every operation is listed, so a new one cannot compile until it is
+/// classified.
+pub(crate) fn classify(operation: &WorkspaceRequest) -> OperationClass {
+    let (name, role) = match operation {
+        WorkspaceRequest::Preflight(_) => ("Preflight", Role::Reader),
+        WorkspaceRequest::GetWorkspace(_) => ("GetWorkspace", Role::Reader),
+        WorkspaceRequest::GetPath(_) => ("GetPath", Role::Reader),
+        WorkspaceRequest::ListPaths(_) => ("ListPaths", Role::Reader),
+        WorkspaceRequest::GetSnapshot(_) => ("GetSnapshot", Role::Reader),
+        WorkspaceRequest::ListSnapshots(_) => ("ListSnapshots", Role::Reader),
+        WorkspaceRequest::ReadRestoreSourceRunManifest(_) => {
+            ("ReadRestoreSourceRunManifest", Role::Reader)
+        }
+        WorkspaceRequest::GetOperation(_) => ("GetOperation", Role::Reader),
+        WorkspaceRequest::InspectAppendCleanup(_) => ("InspectAppendCleanup", Role::Reader),
+        WorkspaceRequest::GetGenericIndexRegistration(_) => {
+            ("GetGenericIndexRegistration", Role::Reader)
+        }
+        WorkspaceRequest::Search(_) => ("Search", Role::Reader),
+        WorkspaceRequest::Aggregate(_) => ("Aggregate", Role::Reader),
+        WorkspaceRequest::Catalog(_) => ("Catalog", Role::Reader),
+        WorkspaceRequest::FindWorkspaces(_) => ("FindWorkspaces", Role::Reader),
+        WorkspaceRequest::ReadChanges(_) => ("ReadChanges", Role::Reader),
+        WorkspaceRequest::CreateWorkspace(_) => ("CreateWorkspace", Role::Writer),
+        WorkspaceRequest::RenamePath(_) => ("RenamePath", Role::Writer),
+        WorkspaceRequest::RemovePath(_) => ("RemovePath", Role::Writer),
+        WorkspaceRequest::BeginArtifactPublish(_) => ("BeginArtifactPublish", Role::Writer),
+        WorkspaceRequest::StageArtifactObjects(_) => ("StageArtifactObjects", Role::Writer),
+        WorkspaceRequest::MarkArtifactObjectsUploaded(_) => {
+            ("MarkArtifactObjectsUploaded", Role::Writer)
+        }
+        WorkspaceRequest::StageArtifactManifest(_) => ("StageArtifactManifest", Role::Writer),
+        WorkspaceRequest::CompleteArtifactPublish(_) => ("CompleteArtifactPublish", Role::Writer),
+        WorkspaceRequest::PrepareArtifactPublish(_) => ("PrepareArtifactPublish", Role::Writer),
+        WorkspaceRequest::FinishArtifactPublish(_) => ("FinishArtifactPublish", Role::Writer),
+        WorkspaceRequest::PublishInlineArtifact(_) => ("PublishInlineArtifact", Role::Writer),
+        WorkspaceRequest::AbortArtifactPublish(_) => ("AbortArtifactPublish", Role::Writer),
+        WorkspaceRequest::Commit(_) => ("Commit", Role::Writer),
+        WorkspaceRequest::MintSnapshot(_) => ("MintSnapshot", Role::Writer),
+        WorkspaceRequest::RenewSnapshot(_) => ("RenewSnapshot", Role::Writer),
+        WorkspaceRequest::RetireSnapshot(_) => ("RetireSnapshot", Role::Writer),
+        WorkspaceRequest::PrepareRestore(_) => ("PrepareRestore", Role::Writer),
+        WorkspaceRequest::BindRestoreDestination(_) => ("BindRestoreDestination", Role::Writer),
+        WorkspaceRequest::FinalizeRestore(_) => ("FinalizeRestore", Role::Writer),
         // An Agent retries its own quarantined append cleanup.
-        | WorkspaceRequest::RetryAppendCleanup(_)
-        | WorkspaceRequest::BeginGenericIndexRegistration(_)
-        | WorkspaceRequest::AppendGenericIndexRows(_)
-        | WorkspaceRequest::FinalizeGenericIndexRegistration(_)
-        | WorkspaceRequest::AbortGenericIndexRegistration(_) => Role::Writer,
-        WorkspaceRequest::ReconcileQuarantinedArtifactPublish(_) => Role::Operator,
-    }
+        WorkspaceRequest::RetryAppendCleanup(_) => ("RetryAppendCleanup", Role::Writer),
+        WorkspaceRequest::BeginGenericIndexRegistration(_) => {
+            ("BeginGenericIndexRegistration", Role::Writer)
+        }
+        WorkspaceRequest::AppendGenericIndexRows(_) => ("AppendGenericIndexRows", Role::Writer),
+        WorkspaceRequest::FinalizeGenericIndexRegistration(_) => {
+            ("FinalizeGenericIndexRegistration", Role::Writer)
+        }
+        WorkspaceRequest::AbortGenericIndexRegistration(_) => {
+            ("AbortGenericIndexRegistration", Role::Writer)
+        }
+        WorkspaceRequest::ReconcileQuarantinedArtifactPublish(_) => {
+            ("ReconcileQuarantinedArtifactPublish", Role::Operator)
+        }
+    };
+    OperationClass { name, role }
 }
 
 #[cfg(test)]
@@ -394,7 +446,7 @@ mod tests {
             if let Some(role) = role {
                 grant(&store, role, RoleScope::Tenant);
             }
-            let access = TenantAccess::load(store, TENANT).unwrap();
+            let access = TenantAccess::load(store, TENANT, DEFAULT_MAX_POLICY_AGE).unwrap();
             let decisions = [read(1), write(1), operate(1)]
                 .map(|request| access.authorize(&agent(), &request, NOW));
             assert_eq!(decisions, expected, "{role:?}");
@@ -410,7 +462,7 @@ mod tests {
             Role::Writer,
             RoleScope::Root(RootId::from_bytes([1; 16])),
         );
-        let access = TenantAccess::load(store, TENANT).unwrap();
+        let access = TenantAccess::load(store, TENANT, DEFAULT_MAX_POLICY_AGE).unwrap();
 
         assert_eq!(access.authorize(&agent(), &write(1), NOW), Ok(()));
         assert_eq!(access.authorize(&agent(), &read(2), NOW), Ok(()));
@@ -426,7 +478,7 @@ mod tests {
     fn a_revoked_or_expired_credential_stops_an_open_connection() {
         let store = store();
         grant(&store, Role::Writer, RoleScope::Tenant);
-        let access = TenantAccess::load(store.clone(), TENANT).unwrap();
+        let access = TenantAccess::load(store.clone(), TENANT, DEFAULT_MAX_POLICY_AGE).unwrap();
         assert_eq!(access.authorize(&agent(), &write(1), NOW), Ok(()));
         assert_eq!(
             access.authorize(&agent(), &write(1), NOW + 60),
@@ -455,7 +507,7 @@ mod tests {
     #[test]
     fn a_granted_or_revoked_role_takes_effect_at_the_next_refresh() {
         let store = store();
-        let access = TenantAccess::load(store.clone(), TENANT).unwrap();
+        let access = TenantAccess::load(store.clone(), TENANT, DEFAULT_MAX_POLICY_AGE).unwrap();
         let reader_denied = Err(AccessDenial::PermissionDenied {
             required: Role::Reader,
         });
@@ -474,8 +526,8 @@ mod tests {
     fn a_copy_that_cannot_be_refreshed_stops_authorizing_after_its_bound() {
         let store = store();
         grant(&store, Role::Writer, RoleScope::Tenant);
-        let access = TenantAccess::load(store, TENANT).unwrap();
-        access.age_for_test(MAX_POLICY_AGE + Duration::from_secs(1));
+        let access = TenantAccess::load(store, TENANT, DEFAULT_MAX_POLICY_AGE).unwrap();
+        access.age_for_test(DEFAULT_MAX_POLICY_AGE + Duration::from_secs(1));
         assert_eq!(
             access.authorize(&agent(), &read(1), NOW),
             Err(AccessDenial::PolicyStale)
@@ -510,7 +562,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let access = TenantAccess::load(store, TENANT).unwrap();
+        let access = TenantAccess::load(store, TENANT, DEFAULT_MAX_POLICY_AGE).unwrap();
 
         let principal = access.authenticate(&current, NOW).unwrap();
         assert_eq!(principal.principal_id, AGENT);
@@ -529,7 +581,7 @@ mod tests {
     fn an_owner_without_tenant_records_does_not_start() {
         let store = Arc::new(InMemoryControlStore::new());
         assert!(matches!(
-            TenantAccess::load(store, TENANT),
+            TenantAccess::load(store, TENANT, DEFAULT_MAX_POLICY_AGE),
             Err(ServerError::Control(ControlError::TenantNotFound(tenant))) if tenant == TENANT
         ));
     }

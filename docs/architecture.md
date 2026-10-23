@@ -221,7 +221,11 @@ added or revoked therefore takes effect within a second, plus a request
 already in flight; a revoked credential also closes its open connections
 after one `Unauthenticated` answer. If the copy cannot be refreshed for 10
 seconds, the owner refuses requests with a retryable `Unauthenticated` until a
-refresh succeeds. Over TLS the CLI does not check the plaintext `AgentId`
+refresh succeeds. The copy is refreshed on a thread of its own, and every
+control-plane call is bounded by the owner's lease timing, so a slow control
+plane delays no connection. A root bound to a tenant is served only over TLS:
+an owner started without TLS refuses such a root instead of serving it to
+anyone. Over TLS the CLI does not check the plaintext `AgentId`
 binding, so many principals can work on one root and one principal on many
 roots.
 
