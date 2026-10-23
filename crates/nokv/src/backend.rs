@@ -6473,6 +6473,36 @@ mod tests {
     }
 
     #[test]
+    fn commit_conflict_keeps_the_client_class_through_the_tool_rename() {
+        // A read that kept losing to concurrent writers applied nothing, so
+        // the same content-derived commit may be repeated.
+        let (backend, _, server) =
+            scripted_backend(vec![wire::WorkspaceRpcOutcome::Failure(wire::RpcFailure {
+                code: wire::ErrorCode::Conflict,
+                message: "read stability exhausted".to_owned(),
+                retryable: true,
+                conflict: Some(wire::ConflictKind::ReadVersion),
+                current_generation: None,
+                route_hint: None,
+            })]);
+
+        let failure = cli_tool_failure(
+            backend,
+            "workbench_commit",
+            json!({
+                "id": "clock-stable-run",
+                "manifest": {"model": "viking", "steps": [1, 2]},
+                "content_digest_uri": commit_request().content_digest_uri,
+            }),
+        );
+        server.join().unwrap();
+
+        assert_eq!(failure["code"], "WorkbenchCommitConflict");
+        assert_eq!(failure["class"], "transient");
+        assert_eq!(failure["next_action"], "resubmit_same");
+    }
+
+    #[test]
     fn publish_implicitly_admits_a_missing_workbench_before_provider_use() {
         // A body above the inline bound is the one that needs the provider.
         let body = vec![b' '; nokv_protocol::MAX_INLINE_ARTIFACT_BODY_BYTES + 1];
