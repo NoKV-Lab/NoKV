@@ -517,32 +517,12 @@ pub struct S3ArtifactStore {
 impl S3ArtifactStore {
     pub fn new(options: S3ArtifactStoreOptions) -> Result<Self, ObjectError> {
         options.validate()?;
-        let mut builder = S3::default()
-            .bucket(&options.bucket)
-            .root(&options.root)
-            .region(&options.region);
-        if let Some(endpoint) = &options.endpoint {
-            builder = builder.endpoint(endpoint);
-        }
-        if let Some(access_key_id) = &options.access_key_id {
-            builder = builder.access_key_id(access_key_id);
-        }
-        if let Some(secret_access_key) = &options.secret_access_key {
-            builder = builder.secret_access_key(secret_access_key);
-        }
-        if let Some(session_token) = &options.session_token {
-            builder = builder.session_token(session_token);
-        }
-        if options.virtual_host_style {
-            builder = builder.enable_virtual_host_style();
-        }
-        if options.skip_signature {
-            builder = builder.skip_signature();
-        }
-
-        let operator = Operator::new(builder)
-            .map_err(ObjectError::opendal_backend)?
-            .finish();
+        // The facade installs its reqwest transport only through
+        // `auto-register-services`, which `default-features = false` disables.
+        // Without it every request fails with "default HTTP transport is not
+        // installed". Installation is idempotent and first-installed-wins.
+        opendal::install_default();
+        let operator = Operator::new(s3_builder(&options)).map_err(ObjectError::opendal_backend)?;
         let _runtime_guard = OPENDAL_RUNTIME.enter();
         let operator = BlockingOperator::new(operator).map_err(ObjectError::opendal_backend)?;
         Ok(Self {
@@ -603,16 +583,12 @@ impl ArtifactObjectStore for S3ArtifactStore {
         if let Err(error) = writer.write(bytes.to_vec()) {
             return self.read_existing_for_replay(key, bytes, error);
         }
+        // Every failure reconciles against the key's current bytes rather than
+        // the error kind: a failed precondition (`ConditionNotMatch`), a
+        // service-reported conflict (`Conflict`), and a lost response all
+        // leave the stored object as the only authority.
         match writer.close() {
             Ok(_) => Ok(ImmutableCreateOutcome::Created),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
-                ) =>
-            {
-                self.read_existing_for_replay(key, bytes, error)
-            }
             Err(error) => self.read_existing_for_replay(key, bytes, error),
         }
     }
@@ -660,7 +636,7 @@ impl ArtifactObjectStore for S3ArtifactStore {
     }
 
     fn seal_immutable(&self, key: &ObjectKey) -> Result<ObjectSealOutcome, ObjectError> {
-        let capabilities = self.operator.info().full_capability();
+        let capabilities = self.operator.info().capability();
         if !capabilities.write_with_if_match || !capabilities.write_with_if_not_exists {
             return Err(ObjectError::ImmutableSealingUnsupported);
         }
@@ -695,10 +671,15 @@ impl ArtifactObjectStore for S3ArtifactStore {
                 .write_options(key.as_str(), Vec::<u8>::new(), options)
             {
                 Ok(_) => return Ok(ObjectSealOutcome::Sealed),
+                // The conditional PUT was not applied: its precondition failed,
+                // or the service rejected it for a concurrent conflicting
+                // write. Reobserve and retry within the budget.
                 Err(error)
                     if matches!(
                         error.kind(),
-                        ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
+                        ErrorKind::AlreadyExists
+                            | ErrorKind::ConditionNotMatch
+                            | ErrorKind::Conflict
                     ) => {}
                 Err(error) => {
                     // A lost response is success only after observing the
@@ -743,6 +724,32 @@ impl ArtifactObjectStore for S3ArtifactStore {
             }),
         }
     }
+}
+
+fn s3_builder(options: &S3ArtifactStoreOptions) -> S3 {
+    let mut builder = S3::default()
+        .bucket(&options.bucket)
+        .root(&options.root)
+        .region(&options.region);
+    if let Some(endpoint) = &options.endpoint {
+        builder = builder.endpoint(endpoint);
+    }
+    if let Some(access_key_id) = &options.access_key_id {
+        builder = builder.access_key_id(access_key_id);
+    }
+    if let Some(secret_access_key) = &options.secret_access_key {
+        builder = builder.secret_access_key(secret_access_key);
+    }
+    if let Some(session_token) = &options.session_token {
+        builder = builder.session_token(session_token);
+    }
+    if options.virtual_host_style {
+        builder = builder.enable_virtual_host_style();
+    }
+    if options.skip_signature {
+        builder = builder.skip_signature();
+    }
+    builder
 }
 
 fn validate_key(raw: &str) -> Result<(), ObjectError> {
@@ -947,3 +954,7 @@ impl fmt::Debug for ObjectError {
 }
 
 impl std::error::Error for ObjectError {}
+
+#[cfg(test)]
+#[path = "s3_store_test.rs"]
+mod s3_store_test;
