@@ -3,17 +3,20 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use nokv_client::{ArtifactPublishOutcome, ArtifactReadOutcome};
+use nokv_client::{ArtifactPublishOutcome, ArtifactReadOutcome, IdempotentPublishReceipt};
 use nokv_protocol::{
     AggregateFunction, AggregateResult, AggregateSpec, AppendCleanupRetryResult, CatalogResult,
-    CommitResult, FacetResult, FieldValue, FindWorkspacesResult, OperationToken, PathListEntry,
-    PathMetadata, PathPage, PublishResult, QueryOperand, QueryOperator, QueryPredicate,
-    ScalarValue, SearchResult, SearchRow, SnapshotResult, SnapshotStatus, SortDirection, SortField,
+    CommitResult, FacetResult, FieldValue, FindWorkspacesResult, OperationIdentity,
+    OperationProgress, OperationToken, PathListEntry, PathMetadata, PathPage, PublishResult,
+    QueryOperand, QueryOperator, QueryPredicate, RestoreResult, RpcFailure, ScalarValue,
+    SearchResult, SearchRow, SnapshotResult, SnapshotStatus, SortDirection, SortField,
     WorkspaceSummary,
 };
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use nokv_types::NextAction;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
+
+use crate::python_error::{internal, invalid_input};
 
 pub(crate) type PythonFieldSpec = (String, String, String);
 pub(crate) type PythonPredicateSpec = (String, String, String, String);
@@ -57,7 +60,7 @@ pub(crate) fn parse_fixed_hex<const WIDTH: usize>(
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err(PyValueError::new_err(format!(
+        return Err(invalid_input(format!(
             "{field} must contain exactly {} lower-case hexadecimal characters",
             WIDTH * 2
         )));
@@ -79,7 +82,7 @@ pub(crate) fn parse_field_specs(specs: Vec<PythonFieldSpec>) -> PyResult<Vec<Fie
             };
             field
                 .validate()
-                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+                .map_err(|error| invalid_input(error.to_string()))?;
             Ok(field)
         })
         .collect()
@@ -93,14 +96,14 @@ pub(crate) fn parse_predicates(specs: Vec<PythonPredicateSpec>) -> PyResult<Vec<
             let operand = match operator {
                 QueryOperator::Exists | QueryOperator::NotExists => {
                     if !kind.is_empty() || !value.is_empty() {
-                        return Err(PyValueError::new_err(
+                        return Err(invalid_input(
                             "exists and not_exists predicates require empty kind and value strings",
                         ));
                     }
                     QueryOperand::None
                 }
                 QueryOperator::In => {
-                    return Err(PyValueError::new_err(
+                    return Err(invalid_input(
                         "in predicates require a set-valued API and are not accepted by the scalar tuple surface",
                     ));
                 }
@@ -125,7 +128,7 @@ pub(crate) fn parse_sort(specs: Vec<PythonSortSpec>) -> PyResult<Vec<SortField>>
                     "ascending" => SortDirection::Ascending,
                     "descending" => SortDirection::Descending,
                     _ => {
-                        return Err(PyValueError::new_err(format!(
+                        return Err(invalid_input(format!(
                             "invalid sort direction {direction:?}; expected 'ascending' or 'descending'"
                         )));
                     }
@@ -147,7 +150,7 @@ pub(crate) fn parse_aggregates(specs: Vec<PythonAggregateSpec>) -> PyResult<Vec<
                     "minimum" => AggregateFunction::Minimum,
                     "maximum" => AggregateFunction::Maximum,
                     _ => {
-                        return Err(PyValueError::new_err(format!(
+                        return Err(invalid_input(format!(
                             "invalid aggregate function {function:?}"
                         )));
                     }
@@ -173,7 +176,7 @@ fn parse_query_operator(operator: &str) -> PyResult<QueryOperator> {
         "contains" => Ok(QueryOperator::Contains),
         "exists" => Ok(QueryOperator::Exists),
         "not_exists" => Ok(QueryOperator::NotExists),
-        _ => Err(PyValueError::new_err(format!(
+        _ => Err(invalid_input(format!(
             "invalid query operator {operator:?}"
         ))),
     }
@@ -183,7 +186,7 @@ fn parse_scalar(kind: &str, value: &str) -> PyResult<ScalarValue> {
     let scalar = match kind {
         "null" if value.is_empty() => ScalarValue::Null,
         "null" => {
-            return Err(PyValueError::new_err(
+            return Err(invalid_input(
                 "null scalar values require an empty encoded value",
             ));
         }
@@ -191,7 +194,7 @@ fn parse_scalar(kind: &str, value: &str) -> PyResult<ScalarValue> {
             "true" => ScalarValue::Boolean(true),
             "false" => ScalarValue::Boolean(false),
             _ => {
-                return Err(PyValueError::new_err(
+                return Err(invalid_input(
                     "boolean scalar values must be 'true' or 'false'",
                 ));
             }
@@ -203,14 +206,14 @@ fn parse_scalar(kind: &str, value: &str) -> PyResult<ScalarValue> {
         "string" => ScalarValue::String(value.to_owned()),
         "bytes" => ScalarValue::Bytes(parse_variable_hex("bytes", value)?),
         _ => {
-            return Err(PyValueError::new_err(format!(
+            return Err(invalid_input(format!(
                 "invalid scalar kind {kind:?}; expected null, boolean, signed, unsigned, decimal, timestamp, string, or bytes"
             )));
         }
     };
     scalar
         .validate()
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        .map_err(|error| invalid_input(error.to_string()))?;
     Ok(scalar)
 }
 
@@ -219,9 +222,9 @@ where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
-    value.parse::<T>().map_err(|error| {
-        PyValueError::new_err(format!("invalid {kind} scalar value {value:?}: {error}"))
-    })
+    value
+        .parse::<T>()
+        .map_err(|error| invalid_input(format!("invalid {kind} scalar value {value:?}: {error}")))
 }
 
 fn parse_variable_hex(field: &str, encoded: &str) -> PyResult<Vec<u8>> {
@@ -230,7 +233,7 @@ fn parse_variable_hex(field: &str, encoded: &str) -> PyResult<Vec<u8>> {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err(PyValueError::new_err(format!(
+        return Err(invalid_input(format!(
             "{field} must contain an even number of lower-case hexadecimal characters"
         )));
     }
@@ -443,6 +446,114 @@ pub(crate) fn append_result_to_py<'py>(
     Ok(dict)
 }
 
+/// A `put_bytes` result, as native `workspace-path put` reports it:
+/// `operation_id` is the caller's identity and `publication_operation_id`
+/// the attempt that published.
+pub(crate) fn identified_put_to_py<'py>(
+    py: Python<'py>,
+    operation_id: OperationIdentity,
+    receipt: &IdempotentPublishReceipt,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = publication_receipt_to_py(py, &receipt.publication)?;
+    dict.set_item("status", "success")?;
+    dict.set_item("operation", "put")?;
+    dict.set_item("operation_id", hex(&operation_id.0))?;
+    dict.set_item(
+        "publication_operation_id",
+        hex(&receipt.publication.operation_id.0),
+    )?;
+    dict.set_item("attempt", receipt.attempt)?;
+    dict.set_item("state", "committed")?;
+    dict.set_item("next_action", NextAction::None.as_str())?;
+    dict.set_item("commit_version", receipt.commit_version)?;
+    dict.set_item("replayed", receipt.replayed)?;
+    Ok(dict)
+}
+
+/// A stored publication receipt, keyed as native `operation status` reports
+/// it. `publish_result_to_py` keeps the version 1 `publish_bytes` keys.
+pub(crate) fn publication_receipt_to_py<'py>(
+    py: Python<'py>,
+    result: &PublishResult,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("operation_id", hex(&result.operation_id.0))?;
+    dict.set_item("workbench_id", result.target.workbench.as_str())?;
+    dict.set_item("path", result.target.path.as_str())?;
+    dict.set_item("workspace_revision", result.workspace_revision)?;
+    dict.set_item("generation", result.generation)?;
+    dict.set_item("artifact_revision_id", hex(&result.artifact_revision_id.0))?;
+    dict.set_item("logical_size", result.logical_size)?;
+    dict.set_item("body_digest", result.body_digest.as_str())?;
+    Ok(dict)
+}
+
+/// A stored commit receipt, keyed as native `operation status` reports it.
+pub(crate) fn commit_receipt_to_py<'py>(
+    py: Python<'py>,
+    result: &CommitResult,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("operation_id", hex(&result.operation_id.0))?;
+    dict.set_item("commit_identity", hex(&result.commit_id.0))?;
+    dict.set_item("workbench_id", result.workbench.as_str())?;
+    dict.set_item("head_generation", result.head_generation)?;
+    dict.set_item("member_count", result.member_count)?;
+    dict.set_item("member_digest", hex(&result.member_digest.0))?;
+    Ok(dict)
+}
+
+/// A stored restore receipt, keyed as native `operation status` reports it.
+pub(crate) fn restore_receipt_to_py<'py>(
+    py: Python<'py>,
+    result: &RestoreResult,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("operation_id", hex(&result.operation_id.0))?;
+    dict.set_item(
+        "destination_workbench_id",
+        result.destination.workbench.as_str(),
+    )?;
+    dict.set_item(
+        "destination_workspace_incarnation_id",
+        hex(&result.destination.workspace_incarnation_id.0),
+    )?;
+    dict.set_item("member_count", result.member_count)?;
+    dict.set_item("member_digest", hex(&result.member_digest.0))?;
+    dict.set_item("metadata_rows_copied", result.metadata_rows_copied)?;
+    dict.set_item("object_bytes_copied", result.object_bytes_copied)?;
+    Ok(dict)
+}
+
+pub(crate) fn operation_progress_to_py<'py>(
+    py: Python<'py>,
+    progress: &OperationProgress,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("completed_rows", progress.completed_rows)?;
+    dict.set_item("total_rows", progress.total_rows)?;
+    dict.set_item("completed_bytes", progress.completed_bytes)?;
+    dict.set_item("total_bytes", progress.total_bytes)?;
+    Ok(dict)
+}
+
+/// An owner's recorded refusal of an operation or attempt.
+pub(crate) fn rpc_failure_to_py<'py>(
+    py: Python<'py>,
+    failure: &RpcFailure,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("code", format!("{:?}", failure.code))?;
+    dict.set_item("message", &failure.message)?;
+    dict.set_item("retryable", failure.retryable)?;
+    dict.set_item(
+        "conflict",
+        failure.conflict.map(|conflict| format!("{conflict:?}")),
+    )?;
+    dict.set_item("current_generation", failure.current_generation)?;
+    Ok(dict)
+}
+
 pub(crate) fn publish_outcome_to_py<'py>(
     py: Python<'py>,
     outcome: &ArtifactPublishOutcome,
@@ -485,7 +596,7 @@ pub(crate) fn search_result_to_py<'py>(
     let hits = PyList::empty(py);
     for row in &result.hits {
         let SearchRow::Artifact(hit) = row else {
-            return Err(PyRuntimeError::new_err(
+            return Err(internal(
                 "ArtifactV1 search returned a generic custom-index row",
             ));
         };

@@ -408,6 +408,17 @@ def assert_rejected(result, operation_id):
     ), result
 
 
+def assert_refused_fence(result):
+    # An explicit incarnation fence is checked before admission, so it applied
+    # nothing and repeating it unchanged is refused again.
+    assert (
+        result.get("code") == "Conflict"
+        and result.get("details", {}).get("conflict") == "WorkspaceIncarnation"
+        and result.get("class") == "precondition_failed"
+        and result.get("next_action") == "reread_then_retry"
+    ), result
+
+
 def assert_dropped_receipt(result, dropped, operation_id):
     observed = dropped["response"]["payload"]["outcome"]["body"]
     assert observed["result"] == "published", observed
@@ -539,6 +550,8 @@ def identity_binding_and_history(stack):
             **changed,
         )
         assert_rejected(result, operation_id)
+        if label == "incarnation":
+            assert_refused_fence(result)
         rejected.append({"changed": label, "result": result})
     fresh_fence = native_append(
         stack,
@@ -550,6 +563,7 @@ def identity_binding_and_history(stack):
         check=False,
     )
     assert_rejected(fresh_fence, "27" * 16)
+    assert_refused_fence(fresh_fence)
     rejected.append(
         {"changed": "fresh-operation-incarnation-fence", "result": fresh_fence}
     )
@@ -980,6 +994,7 @@ except Exception as error:
         "operation_id": getattr(error, "operation_id", None), "state": getattr(error, "state", None),
         "code": getattr(error, "code", None), "cause_code": getattr(error, "cause_code", None),
         "retryable": getattr(error, "retryable", None), "expected": getattr(error, "expected", None),
+        "error_class": getattr(error, "error_class", None), "next_action": getattr(error, "next_action", None),
         "is_append_error": isinstance(error, nokv.AppendError),
         "is_incarnation_mismatch": isinstance(error, nokv.WorkspaceIncarnationMismatch),
         "identity": identity,
@@ -1085,6 +1100,8 @@ def python_interoperability(stack):
         and mismatch["operation_id"] == operation_id
         and mismatch["code"] == "AppendUnresolved"
         and mismatch["cause_code"] == "RequestReplayMismatch"
+        and mismatch["error_class"] == "identity_conflict"
+        and mismatch["next_action"] == "do_not_retry"
         and mismatch["retryable"] is False
     ), mismatch
     fence = python_call(
@@ -1102,6 +1119,11 @@ def python_interoperability(stack):
         fence["status"] == "error"
         and fence["is_incarnation_mismatch"] is True
         and fence["operation_id"] == "8a" * 16
+        and fence["code"] == "Conflict"
+        and fence["cause_code"] == "Conflict"
+        and fence["error_class"] == "precondition_failed"
+        and fence["next_action"] == "reread_then_retry"
+        and fence["retryable"] is False
     ), fence
     expected = b"seed\ncli\npython\n"
     assert (
