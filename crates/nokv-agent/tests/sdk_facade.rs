@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use base64::Engine;
 use nokv_agent::*;
 use nokv_types::{
-    ArtifactRevisionId, NormalizedRelativePath, RootId, WorkbenchId, WorkspaceIncarnationId,
+    ArtifactRevisionId, ErrorClass, NormalizedRelativePath, RootId, WorkbenchId,
+    WorkspaceIncarnationId,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -4780,6 +4781,34 @@ fn commit_identity_uses_recursively_canonical_manifest_json() {
         first["manifest_digest_uri"],
         sha256_uri(&state.commit_requests[0].canonical_manifest)
     );
+}
+
+#[test]
+fn a_commit_conflict_keeps_the_class_its_backend_determined() {
+    let backend = FakeBackend::default();
+    let handler = test_handler(backend.clone());
+    let arguments = json!({
+        "id": "wb-conflict", "manifest": {"model": "viking"},
+        "content_digest_uri": format!("sha256:{}", "ce".repeat(32))
+    });
+    // A lost metadata race applied nothing: the same content may be repeated.
+    backend.lock().commit_error = Some(
+        BackendError::new(
+            BackendErrorKind::Conflict,
+            "write conflict",
+            true,
+            json!({}),
+        )
+        .with_class(ErrorClass::Transient),
+    );
+    let lost_race = run(&handler, "workbench_commit", arguments.clone()).unwrap_err();
+    assert_eq!(lost_race.code, "WorkbenchCommitConflict");
+    assert_eq!(lost_race.class(), ErrorClass::Transient);
+    // Without a backend class, the tool's code decides.
+    backend.lock().commit_error = Some(BackendError::conflict("commit head moved"));
+    let unclassified = run(&handler, "workbench_commit", arguments).unwrap_err();
+    assert_eq!(unclassified.code, "WorkbenchCommitConflict");
+    assert_eq!(unclassified.class(), ErrorClass::PreconditionFailed);
 }
 
 #[test]

@@ -2575,15 +2575,10 @@ fn read_loaded_range(
 /// Whether a publication stores its body inline in shard metadata: a
 /// visible, non-empty body that would be one object no larger than the
 /// inline bound.
-/// Whether a visible, non-empty body of `body_len` bytes publishes inline in
-/// shard metadata, instead of as objects, at `block_size`.
-pub fn visible_body_publishes_inline(body_len: usize, block_size: usize) -> bool {
-    body_len > 0 && body_len <= MAX_INLINE_ARTIFACT_BODY_BYTES.min(block_size)
-}
-
 fn publishes_inline(authority: &PublicationAuthority, bytes: &[u8], block_size: usize) -> bool {
     matches!(authority, PublicationAuthority::Visible)
-        && visible_body_publishes_inline(bytes.len(), block_size)
+        && !bytes.is_empty()
+        && bytes.len() <= MAX_INLINE_ARTIFACT_BODY_BYTES.min(block_size)
 }
 
 /// An inline revision has no manifest rows, so its manifest digest is the
@@ -2857,9 +2852,7 @@ fn require_provider_admission(
     if block_size == 0 {
         return Ok(());
     }
-    let receipt = store
-        .provider_admission_receipt()
-        .ok_or(ObjectError::ProviderAdmissionRequired)?;
+    let receipt = store.admit_object_writes()?;
     if !receipt.is_bound_to_store(store) {
         return Err(ObjectError::ProviderAdmissionRequired.into());
     }
@@ -3517,7 +3510,7 @@ mod tests {
     use nokv_object::{
         admit_artifact_provider, ArtifactStoreCapabilities, ImmutableCreateOutcome,
         MemoryArtifactStore, ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectRange,
-        ProviderAdmissionProfile, ProviderAdmissionReceipt,
+        ProviderAdmissionError, ProviderAdmissionProfile, ProviderAdmissionReceipt,
     };
     use nokv_protocol::{
         decode_request, encode_response, ConflictKind, OperationProgress, PathReadResult,
@@ -4627,6 +4620,99 @@ mod tests {
         }
     }
 
+    /// Proves the provider at its first object write and keeps only success,
+    /// as the native CLI composes its store.
+    struct DeferredAdmissionStore {
+        inner: RecordingStore,
+        proof: Result<ProviderAdmissionReceipt, ProviderAdmissionError>,
+        admitted: AtomicBool,
+        probes: AtomicUsize,
+    }
+
+    impl DeferredAdmissionStore {
+        fn proving(
+            events: Arc<Mutex<Vec<&'static str>>>,
+            max_verified_object_bytes: usize,
+        ) -> Self {
+            let AdmissionOverrideStore { inner, receipt } =
+                AdmissionOverrideStore::admitted_for(events, max_verified_object_bytes);
+            Self {
+                inner,
+                proof: Ok(receipt.unwrap()),
+                admitted: AtomicBool::new(false),
+                probes: AtomicUsize::new(0),
+            }
+        }
+
+        fn refusing(events: Arc<Mutex<Vec<&'static str>>>, cause: ProviderAdmissionError) -> Self {
+            Self {
+                inner: RecordingStore::new(events, None),
+                proof: Err(cause),
+                admitted: AtomicBool::new(false),
+                probes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ArtifactObjectStore for DeferredAdmissionStore {
+        fn object_namespace(&self) -> Option<nokv_types::ObjectNamespaceId> {
+            self.inner.object_namespace()
+        }
+
+        fn capabilities(&self) -> ArtifactStoreCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn provider_handle_identity(&self) -> nokv_object::ProviderHandleIdentity {
+            self.inner.provider_handle_identity()
+        }
+
+        fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
+            self.admitted
+                .load(Ordering::SeqCst)
+                .then(|| self.proof.as_ref().ok())
+                .flatten()
+        }
+
+        fn admit_object_writes(&self) -> Result<&ProviderAdmissionReceipt, ObjectError> {
+            if let Some(receipt) = self.provider_admission_receipt() {
+                return Ok(receipt);
+            }
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            self.inner.events.lock().unwrap().push("provider_admission");
+            let receipt = self
+                .proof
+                .as_ref()
+                .map_err(|cause| ObjectError::ProviderAdmissionFailed(*cause))?;
+            self.admitted.store(true, Ordering::SeqCst);
+            Ok(receipt)
+        }
+
+        fn create_immutable(
+            &self,
+            key: &ObjectKey,
+            bytes: &[u8],
+        ) -> Result<ImmutableCreateOutcome, ObjectError> {
+            self.inner.create_immutable(key, bytes)
+        }
+
+        fn read(
+            &self,
+            key: &ObjectKey,
+            range: Option<ObjectRange>,
+        ) -> Result<Vec<u8>, ObjectError> {
+            self.inner.read(key, range)
+        }
+
+        fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
+            self.inner.head(key)
+        }
+
+        fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
+            self.inner.delete(key)
+        }
+    }
+
     fn route() -> RootRoute {
         RootRoute {
             root_id: RootIdentity([1; 16]),
@@ -4737,6 +4823,66 @@ mod tests {
             ClientError::Object(ObjectError::ProviderAdmissionRequired)
         ));
         assert!(events.lock().unwrap().is_empty());
+        assert_eq!(store.inner.creates.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn deferred_admission_runs_once_before_the_first_object_write() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let client = client(transport);
+        let store = DeferredAdmissionStore::proving(Arc::clone(&events), 4);
+
+        client
+            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .unwrap();
+        // Admission precedes the publication's first request and its first
+        // object write, and the publication asks for it only once.
+        let events = events.lock().unwrap();
+        assert_eq!(events[0], "provider_admission");
+        assert!(!events[1..].contains(&"provider_admission"));
+        assert!(events.contains(&"object_create"));
+        assert_eq!(store.probes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_inline_publication_never_asks_for_provider_admission() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let client = client(transport);
+        let store = DeferredAdmissionStore::refusing(
+            Arc::clone(&events),
+            ProviderAdmissionError::Unavailable,
+        );
+
+        client
+            .publish_artifact(&store, publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE), b"ok")
+            .unwrap();
+        assert_eq!(events.lock().unwrap().as_slice(), ["publish_inline"]);
+        assert_eq!(store.probes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_failed_deferred_admission_stops_before_begin_and_any_object_write() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let client = client(transport);
+        let store = DeferredAdmissionStore::refusing(
+            Arc::clone(&events),
+            ProviderAdmissionError::Unavailable,
+        );
+
+        let error = client
+            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::Object(ObjectError::ProviderAdmissionFailed(
+                ProviderAdmissionError::Unavailable
+            ))
+        ));
+        assert_eq!(error.class(), nokv_types::ErrorClass::Transient);
+        assert_eq!(events.lock().unwrap().as_slice(), ["provider_admission"]);
         assert_eq!(store.inner.creates.load(Ordering::SeqCst), 0);
     }
 
@@ -5225,6 +5371,43 @@ mod tests {
                 Some(&b"first"[..])
             );
         }
+    }
+
+    #[test]
+    fn an_inline_identity_reused_with_another_claim_is_refused_without_a_stale_receipt() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(
+                &store,
+                publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE),
+                b"first",
+            )
+            .unwrap();
+
+        // Only the claim differs: the create-only receipt records this
+        // operation, target, revision, and body, but its generation 1 does not
+        // follow a replace of generation 1.
+        let mut options = publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE);
+        options.condition = PublishCondition::ReplaceOnly {
+            expected_generation: 1,
+        };
+        let error = client
+            .publish_artifact(&store, options, b"first")
+            .unwrap_err();
+
+        expect_inline_failure_without_abort(&error, ErrorCode::RequestReplayMismatch);
+        let state = inspector.state();
+        assert_eq!(state.abort_applies, 0);
+        let path = state.path.as_ref().unwrap();
+        assert_eq!(
+            path.metadata.as_ref().map(|metadata| metadata.generation),
+            Some(1)
+        );
+        assert_eq!(path.inline_body.as_deref(), Some(&b"first"[..]));
     }
 
     #[test]

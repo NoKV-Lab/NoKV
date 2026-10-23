@@ -100,9 +100,10 @@ reused, `workspace_revision`, the path `generation`, and the immutable
 workspace's incarnation.
 
 `put` without `--expected-generation` is create-only; with it, the path must
-still be at that generation. `--expected-workspace-incarnation-id` fences the
-publication on the workspace instance. A refusal is `precondition_failed`
-and, for a path conflict, carries `details.current_generation`.
+still be at that generation. `--expected-workspace-incarnation-id` fences a
+`put` or an `append` on the workspace instance. A refusal is
+`precondition_failed` and, for a path conflict, carries
+`details.current_generation`.
 
 A path generation restarts at `1` after the path is removed and recreated, so
 a generation alone cannot tell two lineages apart. Compare
@@ -119,6 +120,16 @@ carries its stored `receipt`: the original result, not a re-evaluation of
 current state. An absent operation is `not_found` with `resubmit_same`: absence
 is a point-in-time observation, and resubmitting the same command admits it at
 most once.
+
+## Python SDK
+
+The direct Python SDK reports this contract on its exceptions: every
+exception a `Client` call raises carries `error_class` and `next_action` with
+the names above. `Client.put_bytes` is `workspace-path put` and
+`Client.operation_status`, whose `commit_identity` is `--commit-identity`, is
+`operation status`; both return the fields this CLI prints, and a put or an
+append made through one surface replays through the other. See
+[the Python SDK](../crates/nokv-python/README.md).
 
 ## Scope
 

@@ -201,6 +201,8 @@ where
     ///
     /// Explicit fences always take precedence. Only an operation with no
     /// observed durable admission obtains its incarnation from the live name.
+    /// A fence that differs is refused as a typed workspace incarnation
+    /// conflict: resolution only reads, so the refusal applied nothing.
     pub fn resolve_append_workspace_incarnation(
         &self,
         operation_id: OperationIdentity,
@@ -235,19 +237,14 @@ where
             Err(error) => return Err(append_unresolved(operation_id, None, error)),
         };
         if expected.is_some_and(|value| value != incarnation) {
-            return Err(append_unresolved(
-                operation_id,
-                None,
-                ClientError::Rpc(RpcFailure {
-                    code: ErrorCode::Conflict,
-                    message: "append workspace incarnation differs from the explicit fence"
-                        .to_owned(),
-                    retryable: false,
-                    conflict: Some(ConflictKind::WorkspaceIncarnation),
-                    current_generation: None,
-                    route_hint: None,
-                }),
-            ));
+            return Err(ClientError::Rpc(RpcFailure {
+                code: ErrorCode::Conflict,
+                message: "append workspace incarnation differs from the explicit fence".to_owned(),
+                retryable: false,
+                conflict: Some(ConflictKind::WorkspaceIncarnation),
+                current_generation: None,
+                route_hint: None,
+            }));
         }
         Ok(incarnation)
     }
@@ -649,8 +646,9 @@ mod tests {
         decode_request, encode_response, AppendPreparation, LogicalShardIdentity,
         ObjectNamespaceIdentity, OperationProgress, OperationToken, RelativePath, RootRoute,
         WorkbenchName, WorkspaceRequest, WorkspaceResult, WorkspaceRpcOutcome,
-        WorkspaceRpcResponse,
+        WorkspaceRpcResponse, WorkspaceSummary,
     };
+    use nokv_types::ErrorClass;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -975,8 +973,17 @@ mod tests {
         );
     }
 
+    fn assert_refused_fence(error: &ClientError) {
+        assert!(
+            matches!(error, ClientError::Rpc(failure) if failure.code == ErrorCode::Conflict
+                && failure.conflict == Some(ConflictKind::WorkspaceIncarnation)),
+            "{error:?}"
+        );
+        assert_eq!(error.class(), ErrorClass::PreconditionFailed);
+    }
+
     #[test]
-    fn explicit_incarnation_and_target_mismatches_keep_logical_id_in_errors() {
+    fn explicit_incarnation_mismatch_is_refused_and_target_mismatch_keeps_logical_id() {
         let options = options();
         let (client, _) = client(committed_status(&options));
         let error = client
@@ -986,16 +993,100 @@ mod tests {
                 Some(WorkspaceIdentity([8; 16])),
             )
             .unwrap_err();
-        assert_eq!(error.rpc_code(), Some(ErrorCode::Conflict));
-        assert!(
-            matches!(error, ClientError::AppendUnresolved {operation_id, ..} if operation_id == options.operation_id)
-        );
+        assert_refused_fence(&error);
         let mut target = options.target;
         target.path = RelativePath::new("changed").unwrap();
         let error = client
             .resolve_append_workspace_incarnation(options.operation_id, &target, None)
             .unwrap_err();
         assert_eq!(error.rpc_code(), Some(ErrorCode::RequestReplayMismatch));
+        assert!(
+            matches!(error, ClientError::AppendUnresolved {operation_id, ..} if operation_id == options.operation_id)
+        );
+    }
+
+    /// Answers an absent operation and a live workspace of another incarnation.
+    struct ReincarnatedWorkspaceTransport {
+        live: WorkspaceIdentity,
+    }
+
+    impl RpcTransport for ReincarnatedWorkspaceTransport {
+        fn round_trip(
+            &self,
+            _endpoint: std::net::SocketAddr,
+            bytes: &[u8],
+        ) -> Result<Vec<u8>, TransportError> {
+            let request = decode_request(bytes).unwrap();
+            let outcome = match &request.operation {
+                WorkspaceRequest::GetOperation(_) => WorkspaceRpcOutcome::Failure(RpcFailure {
+                    code: ErrorCode::NotFound,
+                    message: "operation not found".to_owned(),
+                    retryable: false,
+                    conflict: None,
+                    current_generation: None,
+                    route_hint: None,
+                }),
+                WorkspaceRequest::GetWorkspace(lookup) => WorkspaceRpcOutcome::Success(Box::new(
+                    WorkspaceResult::Workspace(WorkspaceSummary {
+                        workbench: lookup.workbench.clone(),
+                        workspace_incarnation_id: self.live,
+                        workspace_revision: 1,
+                        commit_head: None,
+                        commit_head_generation: None,
+                    }),
+                )),
+                other => panic!("resolving a fence must not send {other:?}"),
+            };
+            encode_response(&WorkspaceRpcResponse {
+                route: request.route,
+                request_id: request.request_id,
+                commit_version: None,
+                replayed: false,
+                outcome,
+            })
+            .map_err(|error| TransportError::new(error.to_string(), false))
+        }
+    }
+
+    #[test]
+    fn a_fence_on_a_reincarnated_workspace_is_refused_before_admission() {
+        let options = options();
+        let route = RootRoute {
+            root_id: RootIdentity([3; 16]),
+            logical_shard_id: LogicalShardIdentity([4; 16]),
+            object_namespace_id: ObjectNamespaceIdentity([5; 16]),
+            placement_generation: 1,
+            owner_epoch: 1,
+        };
+        let client = WorkspaceClient::new(
+            route.root_id,
+            ReincarnatedWorkspaceTransport {
+                live: WorkspaceIdentity([7; 16]),
+            },
+            StaticRouteResolver::new(route, ([127, 0, 0, 1], 4100).into()).unwrap(),
+            ClientOptions::default(),
+        )
+        .unwrap();
+        // No operation exists, so the refusal is not an unresolved append:
+        // repeating it fails the same way until the caller reads the workspace.
+        let error = client
+            .resolve_append_workspace_incarnation(
+                options.operation_id,
+                &options.target,
+                Some(options.expected_workspace_incarnation_id),
+            )
+            .unwrap_err();
+        assert_refused_fence(&error);
+        assert_eq!(
+            client
+                .resolve_append_workspace_incarnation(
+                    options.operation_id,
+                    &options.target,
+                    Some(WorkspaceIdentity([7; 16])),
+                )
+                .unwrap(),
+            WorkspaceIdentity([7; 16])
+        );
     }
 
     #[test]

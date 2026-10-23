@@ -1928,12 +1928,16 @@ def identity_errors_and_status(stack):
             stack, workbench, operation_id, label="intent-mismatch-" + name, **options
         )
         details = result.get("details", {})
-        expected_cause = (
-            "Conflict" if name == "incarnation" else "RequestReplayMismatch"
+        # The fence is refused before admission, so it is the conflict
+        # itself rather than an unresolved append.
+        expected_code, expected_cause = (
+            ("Conflict", "Conflict")
+            if name == "incarnation"
+            else ("AppendUnresolved", "RequestReplayMismatch")
         )
         require(
             result.get("status") == "error"
-            and result.get("code") == "AppendUnresolved"
+            and result.get("code") == expected_code
             and details.get("code") == expected_cause
             and details.get("operation_id") == operation_id,
             "altered intent has exact mismatch cause",
@@ -1941,7 +1945,9 @@ def identity_errors_and_status(stack):
         )
         if name == "incarnation":
             require(
-                details.get("conflict") == "WorkspaceIncarnation",
+                details.get("conflict") == "WorkspaceIncarnation"
+                and result.get("class") == "precondition_failed"
+                and result.get("next_action") == "reread_then_retry",
                 "explicit incarnation is a typed fence conflict",
                 result,
             )
@@ -2162,7 +2168,7 @@ try:
     result = client.append_bytes(config["workbench"], "logs/effects.log", bytes.fromhex(config["payload_hex"]), config["operation_id"], content_type=config["content_type"], block_size=config["block_size"], max_logical_size=config["max_logical_size"])
     print(json.dumps({"status":"success", "result":result, "object_store_configured":objects is not None, "native_sha256":hashlib.sha256(Path(_native.__file__).read_bytes()).hexdigest()}))
 except Exception as error:
-    print(json.dumps({"status":"error", "type":type(error).__name__, "message":str(error), **{field:getattr(error, field, None) for field in ("operation_id", "code", "cause_code", "next_action", "publication_operation_id", "state", "retryable")}}))
+    print(json.dumps({"status":"error", "type":type(error).__name__, "message":str(error), **{field:getattr(error, field, None) for field in ("operation_id", "code", "cause_code", "error_class", "next_action", "publication_operation_id", "state", "retryable")}}))
 """
 
 PYTHON_ADMISSION_RECOVERY_PROGRAM = r"""
@@ -2189,7 +2195,7 @@ def append_once():
     try:
         return {"status":"success", "result":client.append_bytes(config["workbench"], "logs/effects.log", b"admission-recovered\n", config["operation_id"], content_type="text/plain", max_logical_size=1048576)}
     except Exception as error:
-        return {"status":"error", "type":type(error).__name__, "message":str(error), **{field:getattr(error,field,None) for field in ("operation_id","code","cause_code","next_action","state")}}
+        return {"status":"error", "type":type(error).__name__, "message":str(error), **{field:getattr(error,field,None) for field in ("operation_id","code","cause_code","error_class","next_action","state")}}
 
 # Generic publication binds and caches this exact Client's object handle before
 # the append-specific admission fault is armed by the parent coordinator.
@@ -2266,7 +2272,9 @@ def python_same_client_admission_recovery(stack):
                 and first.get("operation_id") == operation_id
                 and first.get("code") == "AppendFailed"
                 and first.get("cause_code") == "ProviderAdmissionInconclusive"
-                and first.get("next_action") == "query_same"
+                # Admission runs before any append request, as on the CLI.
+                and first.get("error_class") == "transient"
+                and first.get("next_action") == "resubmit_same"
                 and first.get("state") is None,
                 "temporary seal admission failure is typed and keeps logical identity",
                 first,
@@ -2495,6 +2503,8 @@ def python_metadata_status(stack):
     require(
         mismatch.get("type") == "AppendError"
         and mismatch.get("cause_code") == "RequestReplayMismatch"
+        and mismatch.get("error_class") == "identity_conflict"
+        and mismatch.get("next_action") == "do_not_retry"
         and mismatch.get("operation_id") == operation_id,
         "Python mismatch exposes stable cause and identity",
         mismatch,
