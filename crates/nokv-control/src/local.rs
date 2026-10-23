@@ -13,6 +13,9 @@
 //! records, with the touched shard's session taken from its lock, so the two
 //! stores cannot diverge on owner, epoch, or recovery rules.
 //!
+//! Tenant identity records live in a second file under the same store lock,
+//! so readers that predate them never parse it.
+//!
 //! The directory must be on a local filesystem of the one host that runs the
 //! owner: network filesystems do not give `flock` these semantics. Owners or
 //! clients that span hosts use the etcd store.
@@ -25,16 +28,24 @@ use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
-use crate::codec::{decode_local_control_state, encode_fixed_id, encode_local_control_state};
+use crate::codec::{
+    decode_local_control_state, decode_local_identity_state, encode_fixed_id,
+    encode_local_control_state, encode_local_identity_state,
+};
+use crate::identity::IdentityState;
 use crate::store::{validate_record_lease, InMemoryState};
 use crate::{
-    ControlError, ControlStore, InMemoryControlStore, LogicalShardId, LogicalShardLease,
-    LogicalShardRecord, NodeId, OwnerEpoch, RecoveryPublication, RecoveryUploadIntent,
-    RootAgentBinding, RootId, RootObjectNamespaceBinding, RootPlacement,
+    ControlError, ControlStore, CredentialBinding, CredentialFingerprint, IdentityLimits,
+    IdentityStore, InMemoryControlStore, LogicalShardId, LogicalShardLease, LogicalShardRecord,
+    NodeId, OwnerEpoch, PrincipalRecord, RecoveryPublication, RecoveryUploadIntent, RoleBinding,
+    RootAgentBinding, RootId, RootObjectNamespaceBinding, RootPlacement, RootTenantBinding,
+    TenantId, TenantPolicy, TenantRecord,
 };
 
 const STATE_FILE: &str = "control-state.json";
 const STATE_TEMP_FILE: &str = "control-state.json.tmp";
+const IDENTITY_FILE: &str = "identity-state.json";
+const IDENTITY_TEMP_FILE: &str = "identity-state.json.tmp";
 const STORE_LOCK_FILE: &str = "control.lock";
 const SESSION_DIRECTORY: &str = "sessions";
 /// How often a locker reopens a lock file that was replaced while it waited.
@@ -269,15 +280,65 @@ impl LocalControlStore {
     }
 
     fn write_state(&self, encoded: &[u8]) -> Result<(), ControlError> {
-        let temporary = self.directory.join(STATE_TEMP_FILE);
-        let mut file = File::create(&temporary).map_err(io_error("write control state"))?;
+        self.replace_file(
+            STATE_TEMP_FILE,
+            STATE_FILE,
+            encoded,
+            ("write control state", "replace control state"),
+        )
+    }
+
+    /// Durably replace `target` with `encoded`: write and sync a temporary
+    /// file, rename it over the target, then sync the directory.
+    fn replace_file(
+        &self,
+        temporary: &str,
+        target: &str,
+        encoded: &[u8],
+        (write, replace): (&'static str, &'static str),
+    ) -> Result<(), ControlError> {
+        let temporary = self.directory.join(temporary);
+        let mut file = File::create(&temporary).map_err(io_error(write))?;
         file.write_all(encoded)
             .and_then(|()| file.sync_all())
-            .map_err(io_error("write control state"))?;
+            .map_err(io_error(write))?;
         drop(file);
-        fs::rename(&temporary, self.directory.join(STATE_FILE))
-            .map_err(io_error("replace control state"))?;
+        fs::rename(&temporary, self.directory.join(target)).map_err(io_error(replace))?;
         sync_directory(&self.directory).map_err(io_error("sync control directory"))
+    }
+
+    fn read_identity(&self) -> Result<(Vec<u8>, IdentityState), ControlError> {
+        match fs::read(self.directory.join(IDENTITY_FILE)) {
+            Ok(bytes) => {
+                let state = decode_local_identity_state(&bytes)?;
+                Ok((bytes, state))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok((Vec::new(), IdentityState::default()))
+            }
+            Err(error) => Err(io_error("read identity state")(error)),
+        }
+    }
+
+    /// Run one identity transition under the store lock and persist its
+    /// result if it changed anything.
+    fn mutate_identity<T>(
+        &self,
+        operation: impl FnOnce(&mut IdentityState) -> Result<T, ControlError>,
+    ) -> Result<T, ControlError> {
+        let _store_lock = self.lock_store()?;
+        let (loaded, mut state) = self.read_identity()?;
+        let value = operation(&mut state)?;
+        let encoded = encode_local_identity_state(&state)?;
+        if encoded != loaded {
+            self.replace_file(
+                IDENTITY_TEMP_FILE,
+                IDENTITY_FILE,
+                &encoded,
+                ("write identity state", "replace identity state"),
+            )?;
+        }
+        Ok(value)
     }
 
     fn session_lock_path(&self, shard: &LogicalShardId) -> PathBuf {
@@ -433,6 +494,64 @@ fn io_error(context: &'static str) -> impl Fn(io::Error) -> ControlError {
 
 fn poisoned_session_table() -> ControlError {
     ControlError::Backend("local control session table is poisoned".to_owned())
+}
+
+impl IdentityStore for LocalControlStore {
+    fn create_tenant(&self, tenant: TenantRecord) -> Result<TenantRecord, ControlError> {
+        self.mutate_identity(|state| Ok(state.create_tenant(tenant)))
+    }
+
+    fn create_principal(
+        &self,
+        principal: PrincipalRecord,
+    ) -> Result<PrincipalRecord, ControlError> {
+        self.mutate_identity(|state| state.create_principal(principal, IdentityLimits::DEFAULT))
+    }
+
+    fn add_credential(
+        &self,
+        credential: CredentialBinding,
+    ) -> Result<CredentialBinding, ControlError> {
+        self.mutate_identity(|state| state.add_credential(credential, IdentityLimits::DEFAULT))
+    }
+
+    fn revoke_credential(
+        &self,
+        tenant_id: &TenantId,
+        fingerprint: &CredentialFingerprint,
+    ) -> Result<bool, ControlError> {
+        self.mutate_identity(|state| state.revoke_credential(tenant_id, fingerprint))
+    }
+
+    fn grant_role(&self, binding: RoleBinding) -> Result<RoleBinding, ControlError> {
+        self.mutate_identity(|state| state.grant_role(binding, IdentityLimits::DEFAULT))
+    }
+
+    fn revoke_role(&self, binding: &RoleBinding) -> Result<bool, ControlError> {
+        self.mutate_identity(|state| state.revoke_role(binding))
+    }
+
+    fn bind_root_tenant(
+        &self,
+        binding: RootTenantBinding,
+    ) -> Result<RootTenantBinding, ControlError> {
+        self.mutate_identity(|state| state.bind_root_tenant(binding))
+    }
+
+    fn get_root_tenant(&self, root_id: &RootId) -> Result<Option<RootTenantBinding>, ControlError> {
+        Ok(self.read_identity()?.1.root_tenant(root_id))
+    }
+
+    fn load_tenant_policy(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Option<TenantPolicy>, ControlError> {
+        Ok(self.read_identity()?.1.policy(tenant_id))
+    }
+
+    fn tenant_policy_revision(&self, tenant_id: &TenantId) -> Result<Option<u64>, ControlError> {
+        Ok(self.read_identity()?.1.revision(tenant_id))
+    }
 }
 
 impl ControlStore for LocalControlStore {
@@ -687,6 +806,46 @@ mod tests {
             })
             .unwrap();
         shard
+    }
+
+    #[test]
+    fn local_store_passes_identity_conformance() {
+        let directory = tempfile::tempdir().unwrap();
+        let next = std::cell::Cell::new(0_u32);
+        crate::identity_conformance::run_all(&|scenario| {
+            next.set(next.get() + 1);
+            scenario(
+                &LocalControlStore::open(directory.path().join(format!("control-{}", next.get())))
+                    .unwrap(),
+            );
+        });
+    }
+
+    #[test]
+    fn identity_records_leave_the_control_state_file_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalControlStore::open(directory.path().join("control")).unwrap();
+        placed_shard(&store, 3);
+        let control_state = fs::read(store.directory().join(STATE_FILE)).unwrap();
+        let tenant_id = TenantId::from_bytes([5; 16]);
+        store.create_tenant(TenantRecord { tenant_id }).unwrap();
+        store
+            .bind_root_tenant(RootTenantBinding {
+                root_id: RootId::from_bytes([3; 16]),
+                tenant_id,
+            })
+            .unwrap();
+        // Readers that predate identity records parse only the control file.
+        assert_eq!(
+            fs::read(store.directory().join(STATE_FILE)).unwrap(),
+            control_state
+        );
+        let reopened = LocalControlStore::open(store.directory()).unwrap();
+        assert_eq!(
+            reopened.tenant_policy_revision(&tenant_id).unwrap(),
+            Some(1)
+        );
+        assert_eq!(reopened.list_root_placements().unwrap().len(), 1);
     }
 
     #[test]

@@ -2,7 +2,9 @@
 use crate::codec::encode_fixed_id;
 use crate::ControlError;
 #[cfg(any(feature = "etcd", test))]
-use crate::{LogicalShardId, RootId};
+use crate::{
+    CredentialFingerprint, LogicalShardId, PrincipalId, RoleBinding, RoleScope, RootId, TenantId,
+};
 
 const DEFAULT_ETCD_KEY_PREFIX: &str = "/nokv/control";
 const DEFAULT_ETCD_LEASE_TTL_SECONDS: i64 = 10;
@@ -160,6 +162,81 @@ impl EtcdControlStoreOptions {
         format!("{}/logical-shard-recovery/", self.normalized_key_prefix()).into_bytes()
     }
 
+    /// Every identity record of one tenant lives under this prefix; the tenant
+    /// record itself sits at the prefix without its trailing slash.
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn tenant_key(&self, tenant_id: &TenantId) -> Vec<u8> {
+        format!(
+            "{}/tenants/{}",
+            self.normalized_key_prefix(),
+            encode_fixed_id(tenant_id.as_bytes())
+        )
+        .into_bytes()
+    }
+
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn tenant_records_prefix(&self, tenant_id: &TenantId) -> Vec<u8> {
+        let mut prefix = self.tenant_key(tenant_id);
+        prefix.push(b'/');
+        prefix
+    }
+
+    /// The tenant's policy revision and record counts.
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn tenant_counter_key(&self, tenant_id: &TenantId) -> Vec<u8> {
+        tenant_record_key(self.tenant_records_prefix(tenant_id), "revision")
+    }
+
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn tenant_principal_key(
+        &self,
+        tenant_id: &TenantId,
+        principal_id: &PrincipalId,
+    ) -> Vec<u8> {
+        tenant_record_key(
+            self.tenant_records_prefix(tenant_id),
+            &format!("principals/{}", encode_fixed_id(principal_id.as_bytes())),
+        )
+    }
+
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn tenant_credential_key(
+        &self,
+        tenant_id: &TenantId,
+        fingerprint: &CredentialFingerprint,
+    ) -> Vec<u8> {
+        tenant_record_key(
+            self.tenant_records_prefix(tenant_id),
+            &format!("credentials/{}", encode_fixed_id(fingerprint.as_bytes())),
+        )
+    }
+
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn tenant_role_binding_key(&self, binding: &RoleBinding) -> Vec<u8> {
+        let scope = match binding.scope {
+            RoleScope::Tenant => "tenant".to_owned(),
+            RoleScope::Root(root_id) => encode_fixed_id(root_id.as_bytes()),
+        };
+        tenant_record_key(
+            self.tenant_records_prefix(&binding.tenant_id),
+            &format!(
+                "role-bindings/{}/{}/{scope}",
+                encode_fixed_id(binding.principal_id.as_bytes()),
+                u8::from(binding.role)
+            ),
+        )
+    }
+
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn root_tenant_key(&self, root_id: &RootId) -> Vec<u8> {
+        format!(
+            "{}/root-tenants/{}",
+            self.normalized_key_prefix(),
+            encode_fixed_id(root_id.as_bytes())
+        )
+        .into_bytes()
+    }
+
     /// Stable session key shared by every owner generation of one logical shard.
     #[cfg(any(feature = "etcd", test))]
     pub(crate) fn logical_shard_session_key(&self, logical_shard_id: &LogicalShardId) -> Vec<u8> {
@@ -174,6 +251,12 @@ impl EtcdControlStoreOptions {
     fn normalized_key_prefix(&self) -> String {
         self.key_prefix.trim_end_matches('/').to_owned()
     }
+}
+
+#[cfg(any(feature = "etcd", test))]
+fn tenant_record_key(mut prefix: Vec<u8>, suffix: &str) -> Vec<u8> {
+    prefix.extend_from_slice(suffix.as_bytes());
+    prefix
 }
 
 #[cfg(test)]
@@ -236,6 +319,55 @@ mod tests {
         assert_eq!(
             String::from_utf8(options.logical_shard_session_key(&shard_id(0x02))).unwrap(),
             "/nokv/test/sessions/02020202020202020202020202020202"
+        );
+    }
+
+    #[test]
+    fn tenant_identity_keys_nest_under_their_tenant() {
+        let options =
+            EtcdControlStoreOptions::new(["http://127.0.0.1:2379"]).with_key_prefix("/nokv/test/");
+        let tenant_id = TenantId::from_bytes([0x05; 16]);
+        let principal_id = PrincipalId::from_bytes([0x06; 16]);
+        let key = |bytes: Vec<u8>| String::from_utf8(bytes).unwrap();
+        let tenant = "/nokv/test/tenants/05050505050505050505050505050505";
+
+        assert_eq!(key(options.tenant_key(&tenant_id)), tenant);
+        assert_eq!(
+            key(options.tenant_records_prefix(&tenant_id)),
+            format!("{tenant}/")
+        );
+        assert_eq!(
+            key(options.tenant_counter_key(&tenant_id)),
+            format!("{tenant}/revision")
+        );
+        assert_eq!(
+            key(options.tenant_principal_key(&tenant_id, &principal_id)),
+            format!("{tenant}/principals/06060606060606060606060606060606")
+        );
+        assert_eq!(
+            key(options
+                .tenant_credential_key(&tenant_id, &CredentialFingerprint::from_bytes([0x07; 32]))),
+            format!("{tenant}/credentials/{}", "07".repeat(32))
+        );
+        let binding = |scope| RoleBinding {
+            tenant_id,
+            principal_id,
+            role: crate::Role::Writer,
+            scope,
+        };
+        assert_eq!(
+            key(options.tenant_role_binding_key(&binding(RoleScope::Tenant))),
+            format!("{tenant}/role-bindings/06060606060606060606060606060606/2/tenant")
+        );
+        assert_eq!(
+            key(options.tenant_role_binding_key(&binding(RoleScope::Root(root_id(0x01))))),
+            format!(
+                "{tenant}/role-bindings/06060606060606060606060606060606/2/01010101010101010101010101010101"
+            )
+        );
+        assert_eq!(
+            key(options.root_tenant_key(&root_id(0x01))),
+            "/nokv/test/root-tenants/01010101010101010101010101010101"
         );
     }
 

@@ -584,6 +584,67 @@ An admitted successor must include every commit that returned `Applied` under
 that authority. Adapter conformance and server failover tests must prove this
 before the profile can qualify.
 
+## Tenant Identity Records
+
+Tenant identity records say which principals may use which roots. This section
+is their storage contract. No server path reads them yet: server authorization
+enforces them in a later change (#566), and until then every deployment remains
+trusted, as `SECURITY.md` states.
+
+- **Records.** A tenant; its principals; credential bindings that map the
+  SHA-256 fingerprint of a client certificate to one principal until an expiry
+  time; role bindings (`reader`, `writer`, `operator`) scoped to the tenant or
+  to one root; and the binding of a root to the tenant that owns it.
+- **Lifecycle.** Records are create-only. An exact replay succeeds and changes
+  nothing; a different record under the same identity fails
+  (`CredentialAlreadyBound`, `RootTenantAlreadyBound`). Credentials and role
+  bindings can be revoked. Tenants, principals, and root bindings cannot be
+  removed, and a root is never rebound to another tenant.
+- **Invariants.** A credential or role names a registered principal of its own
+  tenant. A root-scoped role names a root already bound to the same tenant, so
+  no record grants access across tenants. A fingerprint authenticates at most
+  one principal in a tenant.
+- **Revision.** Every change to a tenant's principals, credentials, or roles
+  advances that tenant's policy revision by exactly one. Replays and refused
+  changes leave it alone, and binding a root does not move it. A reader polls
+  the revision and reloads the policy when it moves.
+- **Limits.** A tenant holds at most 1,024 principals, 2,048 credentials, and
+  4,096 role bindings, so one policy read stays bounded. A change beyond a
+  limit fails with `TenantPolicyLimitExceeded` and needs an operator.
+
+In etcd, under the configured key prefix:
+
+| Key | Value |
+| --- | --- |
+| `tenants/<tenant>` | The tenant record. |
+| `tenants/<tenant>/revision` | The policy counter: the revision and the three record counts. |
+| `tenants/<tenant>/principals/<principal>` | A principal. |
+| `tenants/<tenant>/credentials/<fingerprint>` | A credential binding. |
+| `tenants/<tenant>/role-bindings/<principal>/<role>/<tenant or root>` | A role binding. |
+| `root-tenants/<root>` | The tenant that owns the root. |
+
+Every change writes its record and the advanced counter in one transaction
+guarded by the counter's modification revision, and retries up to 16 times
+when concurrent changes to the same tenant win. A policy read fetches the
+tenant record and its whole prefix in one transaction, so it sees one etcd
+revision. The read fails closed with `ControlError::Codec` when a key and its
+value disagree, a record names an unregistered principal, or the counter's
+counts differ from the records it covers.
+
+A local control directory keeps the same records in `identity-state.json`,
+written under the same `control.lock` as `control-state.json` and with the
+same write, sync, rename, and directory-sync sequence. Its decoder checks the
+same invariants, limits, and non-zero revisions.
+
+Every value is codec version 1, encoded canonically and decoded with an
+exact-version reader that rejects unknown fields; golden tests freeze the
+bytes. The records use new etcd key families and a separate local file, so
+released owners and clients, which never read them, keep working against a
+control plane that holds them.
+
+`nokv identity` administers these records by writing the control store
+directly, so it needs control-plane write access.
+
 ## Store Profiles
 
 The initial profiles are:

@@ -127,6 +127,23 @@ fixed_bytes_type!(
     FIXED_ID_BYTES
 );
 fixed_bytes_type!(
+    /// Identity of one tenant: the isolation boundary that owns roots and
+    /// principals. No role grants access across tenants.
+    TenantId,
+    FIXED_ID_BYTES
+);
+fixed_bytes_type!(
+    /// Identity of one agent, user, or service that acts within one tenant.
+    PrincipalId,
+    FIXED_ID_BYTES
+);
+fixed_bytes_type!(
+    /// SHA-256 of one DER-encoded client certificate that authenticates a
+    /// principal.
+    CredentialFingerprint,
+    SHA256_BYTES
+);
+fixed_bytes_type!(
     /// Globally unique identity for one persisted logical metadata shard.
     LogicalShardId,
     FIXED_ID_BYTES
@@ -579,6 +596,29 @@ macro_rules! durable_enum {
             }
         }
     };
+}
+
+durable_enum! {
+    /// What a principal may do on the roots a role binding covers. Each role
+    /// includes the permissions of the roles before it.
+    pub enum Role {
+        /// Read workbenches, paths, snapshots, and operation results.
+        Reader = 1,
+        /// Also publish, append, edit, rename, remove, snapshot, commit, and
+        /// restore.
+        Writer = 2,
+        /// Also reconcile quarantined operations.
+        Operator = 3,
+    }
+}
+
+/// The roots one role binding covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RoleScope {
+    /// Every root of the binding's tenant.
+    Tenant,
+    /// One root of the binding's tenant.
+    Root(RootId),
 }
 
 durable_enum! {
@@ -1047,6 +1087,14 @@ mod tests {
     }
 
     #[test]
+    fn roles_are_ordered_by_the_permissions_they_include() {
+        assert!(Role::Reader < Role::Writer && Role::Writer < Role::Operator);
+        let root = RootId::from_bytes([1; FIXED_ID_BYTES]);
+        assert_ne!(RoleScope::Tenant, RoleScope::Root(root));
+        assert!(RoleScope::Tenant < RoleScope::Root(root));
+    }
+
+    #[test]
     fn fixed_width_ids_round_trip_exact_bytes() {
         let bytes = std::array::from_fn(|index| index as u8);
         let digest_bytes = std::array::from_fn(|index| (index as u8).wrapping_mul(3));
@@ -1063,7 +1111,15 @@ mod tests {
         let commit = CommitId::from_bytes(digest_bytes);
         let command_digest = CommandDigest::from_bytes(digest_bytes);
 
+        let tenant = TenantId::from_bytes(bytes);
+        let principal = PrincipalId::from_bytes(bytes);
+        let fingerprint = CredentialFingerprint::from_bytes(digest_bytes);
+
         assert_eq!(root.as_bytes(), &bytes);
+        assert_eq!(tenant.as_bytes(), &bytes);
+        assert_eq!(principal.into_bytes(), bytes);
+        assert_eq!(fingerprint.as_bytes(), &digest_bytes);
+        assert_eq!(std::mem::size_of::<CredentialFingerprint>(), SHA256_BYTES);
         assert_eq!(agent.as_bytes(), &bytes);
         assert_eq!(agent.into_bytes(), bytes);
         assert_eq!(shard.as_bytes(), &bytes);
@@ -1175,6 +1231,7 @@ mod tests {
 
     #[test]
     fn durable_enum_registry_round_trips_and_rejects_every_unknown_byte() {
+        assert_durable_registry(&[(Role::Reader, 1), (Role::Writer, 2), (Role::Operator, 3)]);
         assert_durable_registry(&[
             (WorkspaceState::Staging, 1),
             (WorkspaceState::Visible, 2),

@@ -143,11 +143,16 @@ impl EtcdControlStore {
         &self.options
     }
 
-    fn block_on<T>(
+    pub(crate) fn block_on<T>(
         &self,
         future: impl Future<Output = Result<T, ControlError>>,
     ) -> Result<T, ControlError> {
         self.runtime.block_on(future)
+    }
+
+    /// A handle on the shared etcd connection.
+    pub(crate) fn client(&self) -> Client {
+        self.client.clone()
     }
 }
 
@@ -1549,7 +1554,7 @@ fn lease_id_i64(lease_id: u64) -> Result<i64, ControlError> {
         .map_err(|_| ControlError::Codec(format!("etcd lease id {lease_id} exceeds i64")))
 }
 
-fn etcd_backend(error: etcd_client::Error) -> ControlError {
+pub(crate) fn etcd_backend(error: etcd_client::Error) -> ControlError {
     ControlError::Backend(format!("etcd: {error}"))
 }
 
@@ -1564,7 +1569,7 @@ fn etcd_backend(error: etcd_client::Error) -> ControlError {
 // unique key prefix and shard id, and the suspend-recovery pause hook is
 // per-store state, not a process global.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1610,13 +1615,15 @@ mod tests {
         ));
     }
 
-    struct EtcdHarness {
-        store: EtcdControlStore,
+    /// One store under a key prefix of its own, deleted on drop. Each test
+    /// passes its own `label`, so tests running in parallel never share keys.
+    pub(crate) struct EtcdHarness {
+        pub(crate) store: EtcdControlStore,
         prefix: String,
     }
 
     impl EtcdHarness {
-        fn connect(label: &str) -> Self {
+        pub(crate) fn connect(label: &str) -> Self {
             let endpoint = std::env::var("NOKV_TEST_ETCD_ENDPOINT")
                 .expect("NOKV_TEST_ETCD_ENDPOINT must name an isolated test etcd endpoint");
             let nonce = SystemTime::now()

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use crate::identity::IdentityState;
 use crate::types::endpoint_is_canonical;
 use crate::{
     CheckpointRef, ControlError, LogRef, LogicalShardId, LogicalShardLease, LogicalShardRecord,
@@ -187,6 +188,7 @@ pub(crate) struct InMemoryState {
 #[derive(Default)]
 pub struct InMemoryControlStore {
     state: Mutex<InMemoryState>,
+    identity: Mutex<IdentityState>,
 }
 
 impl InMemoryControlStore {
@@ -197,7 +199,12 @@ impl InMemoryControlStore {
     pub(crate) fn with_state(state: InMemoryState) -> Self {
         Self {
             state: Mutex::new(state),
+            identity: Mutex::default(),
         }
+    }
+
+    pub(crate) fn identity(&self) -> std::sync::MutexGuard<'_, IdentityState> {
+        self.identity.lock().expect("identity store mutex poisoned")
     }
 
     pub(crate) fn into_state(self) -> InMemoryState {
