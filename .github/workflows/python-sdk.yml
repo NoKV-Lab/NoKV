@@ -48,7 +48,22 @@ jobs:
           manylinux: 2_28
           before-script-linux: |
             set -euo pipefail
-            dnf install -y protobuf-compiler
+            # etcd-client compiles proto3 files that use `optional` fields and
+            # import the well-known types. AlmaLinux 8's protoc 3.5 cannot build
+            # them, so install the official protoc release, pinned by checksum.
+            protoc_version=36.2
+            case "$(uname -m)" in
+              x86_64) protoc_arch=x86_64; protoc_sha256=121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278 ;;
+              aarch64) protoc_arch=aarch_64; protoc_sha256=8b8f18bd2b30346efbc698dd5a73dd7c805f3ef8380f6dfc95c768f3f1852f6a ;;
+              *) echo "no pinned protoc for $(uname -m)" >&2; exit 1 ;;
+            esac
+            curl --proto '=https' --tlsv1.2 --retry 5 --location --silent --show-error --fail \
+              --output /tmp/protoc.zip \
+              "https://github.com/protocolbuffers/protobuf/releases/download/v${protoc_version}/protoc-${protoc_version}-linux-${protoc_arch}.zip"
+            echo "${protoc_sha256}  /tmp/protoc.zip" | sha256sum -c -
+            python="$(ls /opt/python/cp3*/bin/python3 | sort -V | tail -n 1)"
+            "$python" -m zipfile -e /tmp/protoc.zip /usr/local
+            chmod 0755 /usr/local/bin/protoc
             protoc --version
 
       - name: Install the built wheel into a clean environment and test it

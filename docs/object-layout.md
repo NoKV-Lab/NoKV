@@ -138,6 +138,13 @@ block larger than the admitted maximum fails before object or metadata
 publication. Admission v1 deliberately does not qualify multipart creation,
 completion, or abort; those paths cannot inherit a single-PUT receipt.
 
+The native CLI admits its provider handle at the first object write of a
+process or `workbench-session` and keeps only a successful receipt. A command
+that writes no objects, such as a read or a publication stored inline, never
+probes the provider. A failed probe fails that write with
+`ProviderAdmissionFailed` before the publication's first request; the next
+write probes again.
+
 The provider interface also retains idempotent deletion with explicit
 ambiguous-outcome handling. Public provider-admission errors and ambiguous
 create/delete errors do not render endpoint, bucket, or physical object-key

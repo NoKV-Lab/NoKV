@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use nokv_object::ArtifactObjectStore;
 use nokv_protocol as wire;
-use nokv_types::WorkbenchId;
+use nokv_types::{ErrorClass, WorkbenchId};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
@@ -271,6 +271,26 @@ pub enum WorkbenchLifecycleError<ProjectionError> {
         actual_bytes: usize,
         max_bytes: usize,
     },
+}
+
+impl<ProjectionError> WorkbenchLifecycleError<ProjectionError> {
+    /// What this failure means for durable state when it ends a commit or
+    /// restore.
+    pub fn class(&self) -> ErrorClass {
+        match self {
+            Self::Client(error) | Self::SnapshotLookup(error) => error.class(),
+            Self::RestoreWorkflow(error) => error.client_error().class(),
+            // The facade could not form typed requests from its inputs, so
+            // nothing was sent.
+            Self::ProtocolInput(_) => ErrorClass::InvalidInput,
+            // The commit head, run manifest, or restore destination no longer
+            // admits this request, so repeating it unchanged cannot succeed.
+            Self::Conflict(_) | Self::ProjectionInvalid { .. } => ErrorClass::PreconditionFailed,
+            // Lifecycle state contradicts its protocol: read it before deciding.
+            Self::ProtocolMismatch(_) => ErrorClass::PreconditionFailed,
+            Self::ResourceExhausted { .. } => ErrorClass::OperatorRequired,
+        }
+    }
 }
 
 impl<ProjectionError: fmt::Display> fmt::Display for WorkbenchLifecycleError<ProjectionError> {
@@ -1394,5 +1414,52 @@ mod tests {
             &WorkbenchRestoreOrigin::Snapshot(WorkbenchSnapshotSelector::Name("a".to_owned())),
             commit,
         ));
+    }
+
+    #[test]
+    fn a_lifecycle_refusal_is_a_precondition_and_never_a_blind_repeat() {
+        type Error = WorkbenchLifecycleError<String>;
+        let lost = || ClientError::Transport(crate::TransportError::new("connection reset", true));
+        // A different commit head without replace fails the same way on every
+        // repeat, so it must not read as transient.
+        assert_eq!(
+            Error::Conflict("workbench already has a different commit head".to_owned()).class(),
+            ErrorClass::PreconditionFailed
+        );
+        assert_eq!(
+            Error::ProjectionInvalid {
+                context: "run manifest violates the v1 projection",
+                source: "bad".to_owned(),
+            }
+            .class(),
+            ErrorClass::PreconditionFailed
+        );
+        assert_eq!(
+            Error::ProtocolMismatch("path stat omitted metadata".to_owned()).class(),
+            ErrorClass::PreconditionFailed
+        );
+        assert_eq!(
+            Error::ProtocolInput(wire::WorkbenchName::new("").unwrap_err()).class(),
+            ErrorClass::InvalidInput
+        );
+        assert_eq!(
+            Error::ResourceExhausted {
+                artifact: "run manifest",
+                actual_bytes: 2,
+                max_bytes: 1,
+            }
+            .class(),
+            ErrorClass::OperatorRequired
+        );
+        // A client failure keeps the class the client gave it.
+        assert_eq!(Error::Client(lost()).class(), ErrorClass::OutcomeUnknown);
+        assert_eq!(
+            Error::SnapshotLookup(lost()).class(),
+            ErrorClass::OutcomeUnknown
+        );
+        assert_eq!(
+            Error::from(RestoreWorkflowError::Finalize(lost())).class(),
+            ErrorClass::OutcomeUnknown
+        );
     }
 }

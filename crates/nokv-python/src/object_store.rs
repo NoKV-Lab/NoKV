@@ -13,6 +13,7 @@ use nokv_object::{
     ProviderAdmissionReceipt, ProviderHandleIdentity, S3ArtifactStore, S3ArtifactStoreOptions,
     DEFAULT_ARTIFACT_BLOCK_SIZE,
 };
+use nokv_types::ErrorClass;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -39,7 +40,7 @@ enum ConfiguredObjectStoreOptions {
     S3(S3ArtifactStoreOptions),
 }
 
-#[pyclass(name = "ObjectStoreConfig", frozen, skip_from_py_object)]
+#[pyclass(name = "ObjectStoreConfig", frozen)]
 #[derive(Clone, Debug)]
 pub(crate) struct PythonObjectStoreConfig {
     options: ConfiguredObjectStoreOptions,
@@ -176,6 +177,18 @@ impl PythonObjectStoreConfig {
                     admission_probe: Arc::new(Mutex::new(())),
                 })
             }
+        }
+    }
+}
+
+impl ConfiguredObjectStoreBuildError {
+    /// What this failure means for the caller. A store that cannot be
+    /// constructed is a configuration the caller must change, as the native
+    /// CLI reports it; an admission probe carries its own class.
+    pub(crate) fn class(&self) -> ErrorClass {
+        match self {
+            Self::Object(_) => ErrorClass::InvalidInput,
+            Self::Admission(error) => error.class(),
         }
     }
 }

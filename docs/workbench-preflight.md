@@ -8,7 +8,9 @@ SPDX-License-Identifier: Apache-2.0
 This guide covers bringing up a live NoKV deployment and qualifying it before
 a production handoff. Downstream systems provide skills over the native full
 CLI; embedded callers use the Python SDK. Every surface uses the same workspace
-format and grants no additional authority or compatibility route.
+format and compatibility rules. Only the native CLI checks the
+RootId-to-AgentId binding, and no surface authenticates callers yet
+([SECURITY.md](../SECURITY.md)).
 
 ## Required Inputs
 
@@ -102,7 +104,7 @@ Agent-facing commands require control routing (a local control directory or
 etcd) and verify the immutable
 RootId-to-AgentId binding before RPC preflight, object binding, stdin reads, or
 tool advertisement. This is a fail-closed deployment identity check, not
-authentication. A legacy root without a binding requires a one-time,
+authentication. Planned server-side tenant identity and RBAC retire it. A legacy root without a binding requires a one-time,
 operator-verified provision with `--adopt-legacy-agent-binding`; NoKV never
 infers identity from the presentation path.
 Before serving any Agent-facing command, the CLI performs the typed workspace
@@ -132,7 +134,10 @@ evidence for:
 - immutable object upload, range verification, and ambiguous-provider errors;
 - hidden-then-atomic restore;
 - revision retention and GC fencing;
-- golden Workbench results and errors, not only input schemas.
+- golden Workbench results and errors, not only input schemas;
+- the trusted-deployment boundary in [SECURITY.md](../SECURITY.md): network
+  isolation, transport security, and scoped object-store and control-plane
+  credentials.
 
 Keep raw commands, environment profile, logs, and result artifacts with the
 qualification report.

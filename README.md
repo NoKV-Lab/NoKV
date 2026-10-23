@@ -244,7 +244,7 @@ real-service acceptance gate is still **not qualified**.
 | `nokv operation status` | Query an append, publish, commit (`--commit-identity`), or restore by its identity and report its stored receipt or next action. | Metadata only: no payload, current workspace, or object-store connection is required. |
 | `nokv operation inspect` | Inspect a bounded page of retained staged objects and save the exact operation token. | Metadata only; the cursor binds one observation and fails if state changes. |
 | `nokv operation recover` | Ask the owner to retry quarantined append cleanup. | No payload or object credentials; an explicit saved state digest replays one durable recovery request. |
-| `nokv provision` | Bind `RootId` to `AgentId`, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. |
+| `nokv provision` | Bind `RootId` to `AgentId`, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. Planned tenant RBAC replaces this binding. |
 | `nokv serve` | Start one explicit metadata owner from create, same-namespace reopen, or recovery-log state. | Shared recovery publication is opt-in and not currently qualified. |
 | `nokv identity` | Create tenants and principals, bind certificate fingerprints to principals, grant or revoke tenant- and root-scoped roles, and bind roots to tenants. | Operator command that writes the control store directly. The server does not enforce these records yet. |
 | `nokv mcp` | Deprecated stdio transport retained only because qualification runners still use it. | **Unsupported for integration.** |
@@ -391,7 +391,9 @@ Every agent-facing CLI command requires self-refreshing control routing plus
 the durable `RootId` to `AgentId` binding: `--control-dir PATH` when the owner
 and its clients share one host, `--etcd-endpoint URL` when they span hosts.
 Static route pins remain an SDK/testing option and are rejected by the
-agent-facing CLI.
+agent-facing CLI. The binding is a CLI-only misconfiguration check, not
+authorization. Planned server-side tenant identity and RBAC retire it; see
+[SECURITY.md](SECURITY.md).
 
 ## Core Semantics
 
@@ -429,7 +431,8 @@ agent-facing CLI.
 - Transactions, snapshots, commit closure, restore, and GC barriers are
   shard-local. NoKV does not provide cross-shard transactions.
 - Workbench jailing and `RootId` to `AgentId` binding are safety boundaries,
-  not tenant authentication, authorization, or RBAC.
+  not tenant authentication, authorization, or RBAC. Server-enforced tenant
+  identity and RBAC, with many agents per root, are planned.
 
 ## Why Holt Fits the Current Local Profile
 
@@ -441,7 +444,7 @@ over the storage-neutral `TxnStore` contract; Holt is the currently wired and
 tested `LocalSync` implementation, while S3-compatible storage still owns
 artifact bytes.
 
-This evidence snapshot covers NoKV's exact `holt = "=0.8.6"` dependency.
+This evidence snapshot covers NoKV's exact `holt = "=0.8.7"` dependency.
 Later upstream Holt `main` features are outside this section's claims; identify
 an installed build with `nokv version --json`.
 
@@ -469,6 +472,10 @@ fault qualification. Current tests cover deterministic torn-frame injection
 and a real child `SIGKILL` after a durable non-empty partial manifest record;
 they do **not** constitute a physical power-cycle, remote failover, cross-host
 fencing, or metadata-HA test. No current third-party A/B number is claimed.
+NoKV's end-to-end performance evidence is the single-host agent-harness release
+check for 0.12.0: see the
+[release notes](https://github.com/NoKV-Lab/NoKV/releases/tag/v0.12.0) and the
+[raw evidence](https://gist.github.com/wchwawa/e9f86ba66c3211f1514d618e9827546a).
 
 ## Evidence and Qualification
 
@@ -481,26 +488,50 @@ The labels below mean exactly:
 - **Live-qualified:** the supported entrypoint ran against the required real
   dependencies at the pinned revision and produced accepted evidence.
 
-Evidence snapshot:
+Evidence snapshot, rerun on 2026-10-21:
 
-- NoKV commit [`0f1995ebee96`](https://github.com/NoKV-Lab/NoKV/commit/0f1995ebee96048e5d4f9d4745d84c3518c64351);
-- pinned Holt `0.8.6` dependency.
+- NoKV tag `v0.12.1`, commit
+  [`6be80629aa9b`](https://github.com/NoKV-Lab/NoKV/commit/6be80629aa9ba481f0e52bf57f83f7d6ae9e8542),
+  with workspace RPC `nokv.workspace.rpc.v14` and System format 14;
+- pinned Holt `=0.8.7` from crates.io, whose packaged `src/` and `tests/`
+  match Holt tag [`v0.8.7`](https://github.com/NoKV-Lab/holt/tree/v0.8.7),
+  where the Holt rows ran;
+- one Apple M3 Pro laptop, macOS 26.6, Rust 1.99.1 (the CI toolchain pin).
 
 | Surface | Current evidence | Status |
 | --- | --- | --- |
-| Rust workspace | 1,090 passed, 0 failed; 10 ignored real-etcd/S3 cases | Implemented and layer-tested; ignored cases are NQ |
-| 18 Workbench operations | all names execute against typed backend primitives; parser, facade, client/protocol, server, metadata, Holt, and object layers pass focused tests | Implemented and layer-tested |
-| Built CLI identity/schema/fail-closed admission | real process checks passed for help, version, exact schema, missing-etcd/static-route rejection, generation/request-id validation, and absence of a mount command | Local smoke passed |
-| Native CLI against real etcd + server + S3 | partial real-service CLI paths exist, but no accepted full-surface Gate 0 transcript covers the complete lifecycle; the current black-box runner uses deprecated MCP and also lacks terminal snapshot-reap evidence | **Not qualified** |
-| Installed Python wheel against real service | native ABI surface checks and focused unit/mock tests pass; fsspec/checkpoint/torch tests are mock/stub based | **Not qualified** |
-| Holt 0.8.6 | 705 listed entries; 10 marked ignored; all executed entries passed; the NoKV adapter adds 32 unit and one reopen/conformance integration test | Layer-tested for the embedded local boundary |
-| Holt third-party A/B | the current v0.8.6 Holt/RocksDB/SQLite/sled comparator target was attempted; local `librocksdb-sys`/`libclang` build failed before measurement | No result; no performance claim |
+| Rust workspace | 1,224 passed, 0 failed; 13 ignored real-etcd/S3 cases; the Linux CI run on the same commit reports the same counts | Implemented and layer-tested; ignored cases are NQ |
+| 18 Workbench operations | `all_eighteen_tools_execute_against_typed_backend_primitives` passes, as do the focused parser, facade, client/protocol, server, metadata, Holt, and object layer tests; the frozen-contract test passes 8 checks | Implemented and layer-tested |
+| Built CLI identity/schema/fail-closed admission | 15 process checks passed: help; `--version` and `version --json` report 0.12.1, the tag commit, Holt 0.8.7 from crates.io, and 18 tools; `schema` matches the frozen contract; static, missing, and mixed control routing, a malformed `--request-id` or `--expected-generation`, and an unpinned `--expected-generation` are rejected without opening a control store; there is no mount command | Local smoke passed |
+| Native CLI against real etcd + server + S3 | not rerun here; bounded real-service gates drive parts of the CLI, but no accepted full-surface Gate 0 transcript covers the complete lifecycle; the black-box runner still uses deprecated MCP and lacks terminal snapshot-reap evidence | **Not qualified** |
+| Installed Python wheel against real service | the release's macOS arm64 wheel, checked against the release `SHA256SUMS`, passed `verify-install` and 34 out-of-tree tests in a clean Python 3.12 venv; 7 tests import the installed wheel, while the 27 fsspec/checkpoint/torch tests load the source adapters over fakes and stubs; no real service ran | **Not qualified** |
+| Holt 0.8.7 | 713 listed lib, integration, and example tests: 705 passed, 0 failed, 8 ignored, 4 of them child-process bodies that their parent tests run; doctests: 1 compile-only pass, 3 ignored; the NoKV adapter adds 33 unit tests and one reopen/conformance integration test | Layer-tested for the embedded local boundary |
+| Holt third-party A/B | the v0.8.7 Holt/RocksDB/SQLite/sled comparator target (`benches/`) builds once its build scripts can load libclang (here `LIBCLANG_PATH` and `DYLD_FALLBACK_LIBRARY_PATH` set to the Command Line Tools library directory) and the stale `holt` entry in `benches/Cargo.lock` is refreshed; a partial sweep ran without errors on the shared laptop as an uncontrolled diagnostic: 34 measurements across all four engines, covering the `kv` groups and the first `objstore` groups, before it was stopped | No accepted result; no performance claim |
+| Agent-harness performance | the 0.12.0 release check on the Pi durable agent harness: W1 and W2 at 1, 4, and 16 agents, 3 rotated repetitions per cell, one owner with RustFS in Docker on one Apple M3 Pro laptop; it measured merged `main` at `bbbd435f03`, and all 36 trials of that build passed file verification ([release notes](https://github.com/NoKV-Lab/NoKV/releases/tag/v0.12.0), [raw evidence](https://gist.github.com/wchwawa/e9f86ba66c3211f1514d618e9827546a)); not rerun here, and 0.12.1, whose only product-code change is the [#555](https://github.com/NoKV-Lab/NoKV/pull/555) client fix, was not re-measured | Single-host release check; not a production, tail-latency, or HA result |
 
-The 10 ignored NoKV workspace tests are six real-etcd tests, two direct object
-provider tests, and two Python S3-admission tests. They are gaps, not passes.
-See [Workspace acceptance](docs/development/workspace-acceptance.md) for the
-normative gate and [Benchmarks and evidence](docs/benchmarks.md) for evidence
-rules.
+The 13 ignored NoKV workspace tests are eight real-etcd control tests, three
+direct S3-compatible provider tests, and two Python S3-admission tests. They
+are gaps, not passes. See [Workspace acceptance](docs/development/workspace-acceptance.md)
+for the normative gate and [Benchmarks and evidence](docs/benchmarks.md) for
+evidence rules.
+
+The rerun rows come from these commands, run from a checkout of the tag; the
+Holt rows ran from a checkout of Holt `v0.8.7`:
+
+- Rust workspace, 18 operations, and adapter counts:
+  `cargo test --workspace --locked` and
+  `python3 scripts/workbench/workbench_contract_test.py`;
+- built CLI: `nokv --help`, `--version`, `version --json`, and `schema`
+  (compared through `scripts/workbench/workbench_contract.py`), then
+  Agent-facing commands with static, missing, or mixed routing, malformed
+  `--request-id` and `--expected-generation` values, and `nokv mount`;
+- installed wheel: `pip install` of the release wheel into a clean venv, then
+  `python3 scripts/release/python_sdk_release.py verify-install` and
+  `python -m pytest -q crates/nokv-python/tests`;
+- Holt: `cargo test --workspace --all-features --lib --tests --examples --locked`
+  (the inventory from `-- --list` and `-- --list --ignored`) and
+  `cargo test --workspace --all-features --doc --locked`;
+- Holt A/B: `cargo bench --manifest-path benches/Cargo.toml --bench main`.
 
 ### Implemented, but not currently live-qualified
 
@@ -516,9 +547,13 @@ rules.
 - physical power-cycle behavior, production tail latency, write amplification,
   RSS advantage, or universal ART performance.
 
+### Planned, not yet offered
+
+- tenant identity, authentication, and RBAC enforced by the server, with many
+  agents per root and one agent on many roots.
+
 ### Not offered by NoKV
 
-- tenant identity, authentication, or RBAC;
 - cross-shard transactions;
 - transparent POSIX/FUSE/CSI/NAS behavior.
 

@@ -363,32 +363,17 @@ fn provider_admission_failure(
     failure
 }
 
-/// The object-provider admission a command needs before its requests.
+/// When a command proves the object provider's write semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ObjectAdmission {
-    /// Monotonic sealing for stable append uploads.
+    /// Monotonic sealing, before any request of a stable append.
     Append,
-    /// Immutable single-put objects for Agent tools.
-    Agent,
-    /// The command writes no objects.
-    None,
-}
-
-fn command_object_admission(command: &Command) -> ObjectAdmission {
-    if matches!(
-        command,
-        Command::WorkspacePath(WorkspacePathCommand::Append { .. })
-    ) {
-        ObjectAdmission::Append
-    } else if command.creates_objects() {
-        ObjectAdmission::Agent
-    } else {
-        ObjectAdmission::None
-    }
+    /// Immutable single-put objects, before the first object write; a
+    /// command that writes no objects never probes the provider.
+    FirstWrite,
 }
 
 fn build_backend(invocation: &Invocation) -> Result<CliWorkbenchBackend, CliFailure> {
-    let object_admission = command_object_admission(&invocation.command);
     let admission = configured_agent_admission(invocation)?;
     #[cfg(feature = "control")]
     {
@@ -396,7 +381,7 @@ fn build_backend(invocation: &Invocation) -> Result<CliWorkbenchBackend, CliFail
         let connect = || {
             let client = connection::connect(&invocation.client, Some(control.clone()))
                 .map_err(connection_failure)?;
-            build_backend_after_agent_admission(invocation, client, object_admission)
+            build_backend_after_agent_admission(invocation, client, ObjectAdmission::FirstWrite)
         };
         match admission {
             Some(admission) => after_agent_root_admission(
@@ -410,7 +395,7 @@ fn build_backend(invocation: &Invocation) -> Result<CliWorkbenchBackend, CliFail
     }
     #[cfg(not(feature = "control"))]
     {
-        let _ = (admission, object_admission);
+        let _ = admission;
         Err(CliFailure::invalid_input(
             "Agent-facing commands require the nokv control feature",
         ))
@@ -434,14 +419,10 @@ fn build_backend_after_agent_admission(
                 .bind(expected_namespace)
                 .map_err(object_failure)?,
         );
-        match object_admission {
-            ObjectAdmission::Append => objects
+        if object_admission == ObjectAdmission::Append {
+            objects
                 .validate_append_capabilities()
-                .map_err(|error| provider_admission_failure("AppendFailed", error))?,
-            ObjectAdmission::Agent => objects
-                .validate_agent_capabilities()
-                .map_err(|error| provider_admission_failure("ProviderAdmissionFailed", error))?,
-            ObjectAdmission::None => {}
+                .map_err(|error| provider_admission_failure("AppendFailed", error))?;
         }
         Ok(CliWorkbenchBackend::new(
             client,
@@ -820,7 +801,7 @@ fn run_identified_put(invocation: &Invocation, put: IdentifiedPut<'_>) -> Result
             options = options.with_block_size(block_size);
         }
         // A replay or a refused identity needs only metadata; the object
-        // provider is admitted only when an attempt has to publish.
+        // provider is admitted only when an attempt writes objects.
         let client = build_workspace_path_client(invocation)?;
         if let Some(receipt) = client
             .replay_idempotent_publish(&options, &body)
@@ -832,16 +813,8 @@ fn run_identified_put(invocation: &Invocation, put: IdentifiedPut<'_>) -> Result
                 &receipt,
             ))?);
         }
-        let block_size = put
-            .block_size
-            .unwrap_or(nokv_object::DEFAULT_ARTIFACT_BLOCK_SIZE);
-        // An inline body never reaches the object provider.
-        let admission = if nokv_client::visible_body_publishes_inline(body.len(), block_size) {
-            ObjectAdmission::None
-        } else {
-            ObjectAdmission::Agent
-        };
-        let backend = build_backend_after_agent_admission(invocation, client, admission)?;
+        let backend =
+            build_backend_after_agent_admission(invocation, client, ObjectAdmission::FirstWrite)?;
         let receipt = backend
             .publish_idempotent(&options, &body)
             .map_err(identified_publish_failure)?;
@@ -2305,6 +2278,57 @@ mod tests {
             );
             assert_eq!(result["details"]["next_action"], result["next_action"]);
             assert_eq!(result["retryable"], false);
+        }
+    }
+
+    #[test]
+    fn a_deferred_admission_failure_keeps_the_envelope_of_an_admission_before_the_command() {
+        use nokv_object::{ObjectError, ProviderAdmissionCapability, ProviderAdmissionError};
+        let operation_id = nokv_protocol::OperationIdentity([0xaa; 16]);
+        for cause in [
+            ProviderAdmissionError::Unavailable,
+            ProviderAdmissionError::Inconclusive,
+            ProviderAdmissionError::Rejected {
+                capability: ProviderAdmissionCapability::AtomicCreateIfAbsent,
+            },
+        ] {
+            let refused =
+                || nokv_client::ClientError::Object(ObjectError::ProviderAdmissionFailed(cause));
+            let before: Value = serde_json::from_str(
+                &provider_admission_failure("ProviderAdmissionFailed", cause).to_line(),
+            )
+            .unwrap();
+            assert_eq!(before["code"], "ProviderAdmissionFailed");
+            assert_eq!(before["details"]["code"], cause.code());
+
+            // A Workbench tool reports its first object write's admission
+            // under its own idempotency scope.
+            let tool = CliFailure::from_agent(
+                &backend::map_client_error(refused()).into(),
+                IdempotencyScope::Unidentified,
+            );
+            let tool: Value = serde_json::from_str(&tool.to_line()).unwrap();
+            assert_eq!(tool, before);
+
+            // A caller-identified put adds its attempt to the same envelope.
+            let put = with_append_details(
+                identified_publish_failure(nokv_client::IdempotentPublishError::Client {
+                    attempt: 0,
+                    source: Box::new(refused()),
+                }),
+                operation_id,
+            );
+            let mut put: Value = serde_json::from_str(&put.to_line()).unwrap();
+            assert_eq!(put["details"]["attempt"], 0);
+            put["details"].as_object_mut().unwrap().remove("attempt");
+            let before = with_append_details(
+                provider_admission_failure("ProviderAdmissionFailed", cause),
+                operation_id,
+            );
+            assert_eq!(
+                put,
+                serde_json::from_str::<Value>(&before.to_line()).unwrap()
+            );
         }
     }
 
