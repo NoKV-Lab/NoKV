@@ -137,22 +137,37 @@ pub fn connect(
     workspace_client(config, root_id, routes)
 }
 
-/// Open the durable control store that control-backed routing names.
-pub fn open_control(routing: &RoutingConfig) -> Result<Arc<dyn ControlStore>, ConnectionError> {
+/// One opened control plane: its routing and placement records, and its
+/// tenant identity records, which the same store holds.
+pub struct ControlPlane {
+    pub control: Arc<dyn ControlStore>,
+    pub identity: Arc<dyn IdentityStore>,
+}
+
+/// Open the control plane that control-backed routing names, once.
+pub fn open_control_plane(routing: &RoutingConfig) -> Result<ControlPlane, ConnectionError> {
+    fn both<S: ControlStore + IdentityStore + 'static>(store: S) -> ControlPlane {
+        let store = Arc::new(store);
+        ControlPlane {
+            control: store.clone(),
+            identity: store,
+        }
+    }
     match routing {
         RoutingConfig::Static(_) => Err(ConnectionError::StaticControl),
-        RoutingConfig::Etcd(config) => Ok(Arc::new(etcd_store(config)?)),
-        RoutingConfig::Local(config) => Ok(Arc::new(local_store(config)?)),
+        RoutingConfig::Etcd(config) => Ok(both(etcd_store(config)?)),
+        RoutingConfig::Local(config) => Ok(both(local_store(config)?)),
     }
+}
+
+/// Open the durable control store that control-backed routing names.
+pub fn open_control(routing: &RoutingConfig) -> Result<Arc<dyn ControlStore>, ConnectionError> {
+    Ok(open_control_plane(routing)?.control)
 }
 
 /// Open the tenant identity records of the configured control plane.
 pub fn open_identity(routing: &RoutingConfig) -> Result<Arc<dyn IdentityStore>, ConnectionError> {
-    match routing {
-        RoutingConfig::Static(_) => Err(ConnectionError::StaticControl),
-        RoutingConfig::Etcd(config) => Ok(Arc::new(etcd_store(config)?)),
-        RoutingConfig::Local(config) => Ok(Arc::new(local_store(config)?)),
-    }
+    Ok(open_control_plane(routing)?.identity)
 }
 
 fn workspace_client(
@@ -432,13 +447,7 @@ mod tests {
                 ]
                 .into_iter()
                 .chain(extra.iter().copied())
-                .chain([
-                    "--workbench-root",
-                    "/agents/test/wb",
-                    "workbench",
-                    "workbench_create",
-                    r#"{"id":"run-1"}"#,
-                ])
+                .chain(["workbench", "workbench_create", r#"{"id":"run-1"}"#])
                 .map(str::to_owned),
             )
             .unwrap()

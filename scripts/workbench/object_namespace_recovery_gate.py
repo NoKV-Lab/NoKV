@@ -979,7 +979,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         agent_common = [*common, "--agent-id", agent_id]
         objects = object_args(s3_endpoint, bucket, object_root, access_key, secret_key)
         provision = run(
-            [*agent_common, *objects, "provision", shard_id],
+            [*agent_common, *objects, "provision", shard_id, "--workbench-root", "/agents/phymat/wb"],
             cwd=repo,
             timeout=args.timeout,
             evidence=evidence,
@@ -1012,8 +1012,6 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             *agent_common,
             "--max-attempts",
             "3",
-            "--workbench-root",
-            "/agents/phymat/wb",
             *objects,
         ]
         structure, relaxation = phymat_documents()
@@ -1161,7 +1159,10 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             s3_endpoint, bucket, wrong_object_root, access_key, secret_key
         )
         run(
-            [*other_agent_common, *wrong_objects, "provision", other_shard_id],
+            [
+                *other_agent_common, *wrong_objects, "provision", other_shard_id,
+                "--workbench-root", "/agents/phymat/wb",
+            ],
             cwd=repo,
             timeout=args.timeout,
             evidence=evidence,
@@ -1174,8 +1175,6 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             *agent_common,
             "--max-attempts",
             "3",
-            "--workbench-root",
-            "/agents/phymat/wb",
             *wrong_objects,
         ]
         mismatch_arguments = {"id": "namespace-mismatch-probe"}

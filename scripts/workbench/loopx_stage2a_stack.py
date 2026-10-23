@@ -228,6 +228,8 @@ def provision_command(binary: Path, identity: StackIdentity, endpoints: Endpoint
         *object_args(identity, endpoints),
         "provision",
         identity.shard_id,
+        "--workbench-root",
+        WORKBENCH_ROOT,
     ]
 
 

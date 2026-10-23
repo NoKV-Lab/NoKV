@@ -486,7 +486,9 @@ def run_stage(
     logs: list[TextIO] = []
 
     try:
-        provision_command = [*agent_common, *objects, "provision", shard_id]
+        provision_command = [
+            *agent_common, *objects, "provision", shard_id, "--workbench-root", "/agents/issue450/wb"
+        ]
         provision = run(provision_command, cwd=repo, timeout=timeout)
         (stage_dir / "provision.stdout.log").write_text(provision.stdout)
         (stage_dir / "provision.stderr.log").write_text(provision.stderr)
@@ -506,12 +508,7 @@ def run_stage(
         processes.append(first)
         wait_tcp(first, first_port, timeout)
 
-        client = [
-            *agent_common,
-            "--workbench-root",
-            "/agents/issue450/wb",
-            *objects,
-        ]
+        client = [*agent_common, *objects]
         create_command = [
             *client,
             "workbench",
@@ -679,7 +676,9 @@ def run_graceful_stage(
     logs: list[TextIO] = []
 
     try:
-        provision_command = [*agent_common, *objects, "provision", shard_id]
+        provision_command = [
+            *agent_common, *objects, "provision", shard_id, "--workbench-root", "/agents/issue450/wb"
+        ]
         provision = run(provision_command, cwd=repo, timeout=timeout)
         (stage_dir / "provision.stdout.log").write_text(provision.stdout)
         (stage_dir / "provision.stderr.log").write_text(provision.stderr)
@@ -699,12 +698,7 @@ def run_graceful_stage(
         processes.append(owner)
         wait_tcp(owner, owner_port, timeout)
 
-        client = [
-            *agent_common,
-            "--workbench-root",
-            "/agents/issue450/wb",
-            *objects,
-        ]
+        client = [*agent_common, *objects]
         create_command = [
             *client,
             "workbench",
@@ -874,7 +868,9 @@ def run_concurrent_stage(
     logs: list[TextIO] = []
 
     try:
-        provision_command = [*agent_common, *objects, "provision", shard_id]
+        provision_command = [
+            *agent_common, *objects, "provision", shard_id, "--workbench-root", "/agents/issue450/wb"
+        ]
         provision = run(provision_command, cwd=repo, timeout=timeout)
         (stage_dir / "provision.stdout.log").write_text(provision.stdout)
         (stage_dir / "provision.stderr.log").write_text(provision.stderr)
@@ -894,12 +890,7 @@ def run_concurrent_stage(
         processes.append(incumbent)
         wait_tcp(incumbent, incumbent_port, timeout)
 
-        client = [
-            *agent_common,
-            "--workbench-root",
-            "/agents/issue450/wb",
-            *objects,
-        ]
+        client = [*agent_common, *objects]
         create_command = [
             *client,
             "workbench",

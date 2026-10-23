@@ -1038,8 +1038,6 @@ def client_args(config: Config, runtime: Runtime) -> list[str]:
         *control_args(config, runtime),
         "--agent-id",
         runtime.agent_id,
-        "--workbench-root",
-        runtime.workbench_root,
         *object_args(runtime),
     ]
 
@@ -2236,6 +2234,8 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
                 *object_args(runtime),
                 "provision",
                 runtime.shard_id,
+                "--workbench-root",
+                runtime.workbench_root,
             ],
             config=config,
             evidence=evidence,

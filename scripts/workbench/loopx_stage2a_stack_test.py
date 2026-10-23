@@ -79,7 +79,10 @@ class CommandShapeTest(unittest.TestCase):
     def test_provision_carries_agent_id_and_positional_shard(self) -> None:
         argv = stack.provision_command(self.binary, self.identity, self.endpoints)
         self.assertEqual(argv[0], str(self.binary))
-        self.assertEqual(argv[-2:], ["provision", self.identity.shard_id])
+        self.assertEqual(
+            argv[-4:],
+            ["provision", self.identity.shard_id, "--workbench-root", stack.WORKBENCH_ROOT],
+        )
         self.assertIn("--agent-id", argv)
         self.assertEqual(argv[argv.index("--agent-id") + 1], self.identity.agent_id)
         self.assertEqual(argv[argv.index("--etcd-endpoint") + 1], "http://127.0.0.1:23791")

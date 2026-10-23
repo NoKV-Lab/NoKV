@@ -684,8 +684,6 @@ def client_args(config: Config) -> list[str]:
         *control_args(config),
         "--agent-id",
         config.agent_id,
-        "--workbench-root",
-        config.workbench_root,
         *object_args(config),
     ]
 
@@ -699,6 +697,8 @@ def provision_command(config: Config) -> list[str]:
         *object_args(config),
         "provision",
         config.shard_id,
+        "--workbench-root",
+        config.workbench_root,
     ]
 
 

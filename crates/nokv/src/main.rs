@@ -93,11 +93,13 @@ fn run() -> Result<(), CliFailure> {
         Command::Version { json } => Ok(print_version(*json)?),
         Command::Provision {
             logical_shard_id,
+            workbench_root,
             adopt_legacy_object_namespace,
             adopt_legacy_agent_binding,
         } => Ok(run_provision(
             &invocation,
             logical_shard_id,
+            workbench_root,
             *adopt_legacy_object_namespace,
             *adopt_legacy_agent_binding,
         )?),
@@ -126,8 +128,13 @@ fn run() -> Result<(), CliFailure> {
             Ok(print_json(&result)?)
         }
         Command::WorkbenchSession => {
-            let backend = build_backend(&invocation)?;
-            let handler = handler_for_backend(&invocation, backend.clone())?;
+            let admitted = admit_root(&invocation)?;
+            let handler = handler_for(
+                &invocation,
+                admitted.backend.clone(),
+                &admitted.workbench_root,
+            )?;
+            let backend = admitted.backend;
             let input = io::stdin();
             let output = io::stdout();
             workbench_session::serve(
@@ -373,25 +380,43 @@ enum ObjectAdmission {
     FirstWrite,
 }
 
-fn build_backend(invocation: &Invocation) -> Result<CliWorkbenchBackend, CliFailure> {
+/// An Agent-facing command's admitted connection to its root, and the
+/// Workbench root the control plane binds that root to.
+struct AdmittedRoot {
+    backend: CliWorkbenchBackend,
+    workbench_root: nokv_types::WorkbenchRoot,
+}
+
+/// Admit the configured root before any RPC: its Workbench root must be
+/// bound, and without RPC TLS its AgentId binding must match.
+fn admit_root(invocation: &Invocation) -> Result<AdmittedRoot, CliFailure> {
     let admission = configured_agent_admission(invocation)?;
     #[cfg(feature = "control")]
     {
-        let control = open_control(invocation)?;
+        let plane = open_control_plane(invocation)?;
+        let root_id = nokv_control::RootId::from(
+            connection::configured_root_id(&invocation.client)
+                .map_err(|error| CliFailure::invalid_input(error.to_string()))?,
+        );
+        let workbench_root = bound_workbench_root(plane.identity.as_ref(), root_id)?;
         let connect = || {
-            let client = connection::connect(&invocation.client, Some(control.clone()))
+            let client = connection::connect(&invocation.client, Some(plane.control.clone()))
                 .map_err(connection_failure)?;
             build_backend_after_agent_admission(invocation, client, ObjectAdmission::FirstWrite)
         };
-        match admission {
+        let backend = match admission {
             Some(admission) => after_agent_root_admission(
-                control.as_ref(),
+                plane.control.as_ref(),
                 admission.root_id,
                 admission.agent_id,
                 connect,
             ),
             None => connect(),
-        }
+        }?;
+        Ok(AdmittedRoot {
+            backend,
+            workbench_root,
+        })
     }
     #[cfg(not(feature = "control"))]
     {
@@ -400,6 +425,32 @@ fn build_backend(invocation: &Invocation) -> Result<CliWorkbenchBackend, CliFail
             "Agent-facing commands require the nokv control feature",
         ))
     }
+}
+
+fn build_backend(invocation: &Invocation) -> Result<CliWorkbenchBackend, CliFailure> {
+    Ok(admit_root(invocation)?.backend)
+}
+
+/// The Workbench root provision bound to `root_id`.
+#[cfg(feature = "control")]
+fn bound_workbench_root(
+    identity: &dyn nokv_control::IdentityStore,
+    root_id: nokv_control::RootId,
+) -> Result<nokv_types::WorkbenchRoot, CliFailure> {
+    identity
+        .get_root_presentation(&root_id)
+        .map_err(|error| control_failure("ControlFailure", error.to_string(), error.class()))?
+        .map(|binding| binding.workbench_root)
+        .ok_or_else(|| {
+            control_failure(
+                "RootNotProvisioned",
+                format!(
+                    "root {} has no Workbench root in this control store; run provision with --workbench-root",
+                    encode_lowercase_hex(root_id.as_bytes())
+                ),
+                ErrorClass::OperatorRequired,
+            )
+        })
 }
 
 fn build_backend_after_agent_admission(
@@ -440,22 +491,21 @@ fn build_backend_after_agent_admission(
 }
 
 fn build_handler(invocation: &Invocation) -> Result<CliHandler, CliFailure> {
-    handler_for_backend(invocation, build_backend(invocation)?)
+    let admitted = admit_root(invocation)?;
+    handler_for(invocation, admitted.backend, &admitted.workbench_root)
 }
 
-fn handler_for_backend(
+fn handler_for(
     invocation: &Invocation,
     backend: CliWorkbenchBackend,
+    workbench_root: &nokv_types::WorkbenchRoot,
 ) -> Result<CliHandler, CliFailure> {
-    let workbench_root = invocation.workbench_root.as_deref().ok_or_else(|| {
-        CliFailure::invalid_input("--workbench-root is required for Agent-facing commands")
-    })?;
     SdkWorkbenchToolHandler::with_limits(
         backend,
         invocation.client.max_artifact_bytes,
         usize::try_from(invocation.client.max_attempts)
             .map_err(|_| CliFailure::invalid_input("--max-attempts does not fit this platform"))?,
-        workbench_root,
+        workbench_root.as_str(),
     )
     .map_err(|error| CliFailure::from_agent(&error, IdempotencyScope::ReadOnly))
 }
@@ -463,13 +513,11 @@ fn handler_for_backend(
 fn build_generic_agent_handler(
     invocation: &Invocation,
 ) -> Result<CliGenericAgentHandler, CliFailure> {
-    let workbench_root = invocation.workbench_root.as_deref().ok_or_else(|| {
-        CliFailure::invalid_input("--workbench-root is required for Agent-facing commands")
-    })?;
+    let admitted = admit_root(invocation)?;
     SdkGenericAgentToolHandler::with_max_bytes(
-        build_backend(invocation)?,
+        admitted.backend,
         invocation.client.max_artifact_bytes,
-        workbench_root,
+        admitted.workbench_root.as_str(),
     )
     .map_err(|error| CliFailure::from_agent(&error, IdempotencyScope::ReadOnly))
 }
@@ -1562,7 +1610,7 @@ USAGE:
   nokv [route/agent options] workspace-path stat <workbench> <section> <path>
   nokv [route/agent/object options] workspace-path put <workbench> <section> <path> --operation-id HEX32 (--text TEXT | --base64 BASE64 | --file PATH) [--expected-generation N] [--expected-workspace-incarnation-id HEX32] [--content-type TYPE] [--block-size N]
   nokv [route/agent/object options] workspace-path append <workbench> <section> <path> --operation-id HEX32 (--text TEXT | --base64 BASE64 | --file PATH) [--content-type TYPE] [--max-logical-size N] [--block-size N] [--expected-workspace-incarnation-id HEX32]
-  nokv --root-id HEX32 --agent-id HEX32 (--etcd-endpoint URL | --control-dir PATH) provision <logical-shard-id-hex32> [adoption options]
+  nokv --root-id HEX32 --agent-id HEX32 (--etcd-endpoint URL | --control-dir PATH) provision <logical-shard-id-hex32> --workbench-root PATH [adoption options]
   nokv [owner options] serve
   nokv (--etcd-endpoint URL | --control-dir PATH) identity <identity command>
   nokv schema
@@ -1585,8 +1633,10 @@ AGENT CONTROL ROUTING:
     session is an OS file lock released when the owner process exits; not for network filesystems
 
 AGENT PRESENTATION:
-  --workbench-root /agents/AGENT_NAME/wb is required by workbench, collect, and mcp
-  keep this presentation root stable: it shapes responses and canonical v1 manifest paths
+  provision --workbench-root /agents/TEAM/wb binds the root's presentation root once; workbench,
+    workbench-session, materialize, collect, and mcp read it from the control plane, so every Agent
+    of a root presents it the same way
+  the presentation root is durable: it shapes responses and canonical v1 manifest paths
   RootId remains the only storage/routing identity; the presentation root never enters Holt keys
   mcp is DEPRECATED and is not a supported NoKV integration surface: use `nokv workbench <tool>`
   or the direct Python SDK; it is retained only as the live qualification harness transport
@@ -1610,7 +1660,7 @@ AGENT PRESENTATION:
   append limits the delta with --max-artifact-bytes; --max-logical-size optionally limits the resulting body
 
 OWNER:
-  provision first binds RootId to an explicit AgentId, then creates namespace, shard, and affinity
+  provision binds RootId to an explicit AgentId and a Workbench root, then creates namespace, shard, and affinity
   --adopt-legacy-agent-binding is a one-time explicit migration for a verified legacy root
   --adopt-legacy-object-namespace is a one-time explicit migration after verifying bucket/prefix
   serve validates every active root's Agent binding; it does not require or compare one shard-wide AgentId
@@ -1673,14 +1723,20 @@ fn open_control(
 }
 
 #[cfg(feature = "control")]
+fn open_control_plane(invocation: &Invocation) -> Result<connection::ControlPlane, CliFailure> {
+    connection::open_control_plane(&invocation.client.routing).map_err(connection_failure)
+}
+
+#[cfg(feature = "control")]
 fn run_provision(
     invocation: &Invocation,
     logical_shard_id: &str,
+    workbench_root: &str,
     adopt_legacy_object_namespace: bool,
     adopt_legacy_agent_binding: bool,
 ) -> Result<(), String> {
-    use nokv_control::{LogicalShardId, RootId};
-    use nokv_types::RootPlacementLifecycle;
+    use nokv_control::{LogicalShardId, RootId, RootPresentationBinding};
+    use nokv_types::{RootPlacementLifecycle, WorkbenchRoot};
 
     let root_id = RootId::from(
         connection::configured_root_id(&invocation.client).map_err(|error| error.to_string())?,
@@ -1695,7 +1751,10 @@ fn run_provision(
             .ok_or_else(|| "provision requires --agent-id".to_owned())?,
     )
     .map_err(|error| error.to_string())?;
-    let control = open_control(invocation).map_err(|failure| failure.message())?;
+    let workbench_root =
+        WorkbenchRoot::new(workbench_root).map_err(|error| format!("--workbench-root: {error}"))?;
+    let connection::ControlPlane { control, identity } =
+        open_control_plane(invocation).map_err(|failure| failure.message())?;
     let existing_placement =
         provision::preflight_provision(control.as_ref(), root_id, logical_shard_id)
             .map_err(|error| error.to_string())?;
@@ -1706,6 +1765,17 @@ fn run_provision(
         adopt_legacy_agent_binding,
     )
     .map_err(|error| error.to_string())?;
+    // Every Agent of the root presents it under this one Workbench root.
+    let presentation_preexisting = identity
+        .get_root_presentation(&root_id)
+        .map_err(|error| error.to_string())?
+        .is_some();
+    let presentation = identity
+        .bind_root_presentation(RootPresentationBinding {
+            root_id,
+            workbench_root,
+        })
+        .map_err(|error| error.to_string())?;
     let objects = CliObjectStore::build(&invocation.client.object)?;
     objects
         .validate_agent_capabilities()
@@ -1759,6 +1829,8 @@ fn run_provision(
         "root_id": encode_lowercase_hex(root_id.as_bytes()),
         "agent_id": encode_lowercase_hex(agent_id.as_bytes()),
         "binding_preexisting": binding_preexisting,
+        "workbench_root": presentation.workbench_root.as_str(),
+        "presentation_preexisting": presentation_preexisting,
         "logical_shard_id": encode_lowercase_hex(logical_shard_id.as_bytes()),
         "object_namespace_id": encode_lowercase_hex(namespace_id.as_bytes()),
         "placement_generation": outcome.placement.placement_generation.get(),
@@ -1774,6 +1846,7 @@ fn run_provision(
 fn run_provision(
     _invocation: &Invocation,
     _logical_shard_id: &str,
+    _workbench_root: &str,
     _adopt_legacy_object_namespace: bool,
     _adopt_legacy_agent_binding: bool,
 ) -> Result<(), String> {
@@ -2729,8 +2802,6 @@ mod tests {
                 "11111111111111111111111111111111",
                 "--agent-id",
                 "77777777777777777777777777777777",
-                "--workbench-root",
-                "/agents/test/wb",
                 "--logical-shard-id",
                 "not-a-valid-shard-id",
                 "mcp",
