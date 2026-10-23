@@ -1112,6 +1112,7 @@ mod tests {
         );
 
         let status = OperationStatus {
+            initiator: None,
             append_preparation: None,
             publish_preparation: None,
             token: OperationToken {

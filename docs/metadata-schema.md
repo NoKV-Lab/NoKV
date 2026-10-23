@@ -112,7 +112,11 @@ principal that started every durable operation (publish, append, commit,
 restore, snapshot, Generic index registration), every metadata command, and
 every change event; the publish identity digest and the Generic index
 registration digest seal it, and the recovery outbox refuses entries of an
-older owner. Version 14 added the write-once
+older owner. An operation is continued, aborted, or completed only by its
+recorded initiator, by a principal holding the operator role on the root, or
+by the owner itself; a commit or restore of the same content begun by another
+principal waits while the first is in flight and replays it once it is
+terminal. Version 14 added the write-once
 `ArtifactInlineBody` family and the sealed inline body digest of a publish
 operation. Version 13 added the monotonic append cleanup
 retry counter and durable exact-token retry receipts in CommandDedupe.

@@ -188,14 +188,15 @@ impl TenantAccess {
         })
     }
 
-    /// Whether `principal` may make `request` now. The credential is checked
-    /// again, so a revoked or expired one stops an open connection too.
+    /// Whether `principal` may make `request` now, and the role it holds on
+    /// the request's root. The credential is checked again, so a revoked or
+    /// expired one stops an open connection too.
     pub(crate) fn authorize(
         &self,
         principal: &ConnectionPrincipal,
         request: &WorkspaceRpcRequest,
         now_unix_seconds: u64,
-    ) -> Result<(), AccessDenial> {
+    ) -> Result<Role, AccessDenial> {
         let copy = self.fresh_copy()?;
         let current = copy
             .current_credential(&principal.fingerprint, now_unix_seconds)
@@ -205,11 +206,9 @@ impl TenantAccess {
         }
         let required = classify(&request.operation).role;
         let root_id = RootId::from_bytes(request.route.root_id.0);
-        let held = copy.effective_role(principal.principal_id, root_id);
-        if held.is_some_and(|role| role >= required) {
-            Ok(())
-        } else {
-            Err(AccessDenial::PermissionDenied { required })
+        match copy.effective_role(principal.principal_id, root_id) {
+            Some(held) if held >= required => Ok(held),
+            _ => Err(AccessDenial::PermissionDenied { required }),
         }
     }
 
@@ -437,10 +436,20 @@ mod tests {
             ),
             (
                 Some(Role::Reader),
-                [Ok(()), denied(Role::Writer), denied(Role::Operator)],
+                [
+                    Ok(Role::Reader),
+                    denied(Role::Writer),
+                    denied(Role::Operator),
+                ],
             ),
-            (Some(Role::Writer), [Ok(()), Ok(()), denied(Role::Operator)]),
-            (Some(Role::Operator), [Ok(()), Ok(()), Ok(())]),
+            (
+                Some(Role::Writer),
+                [Ok(Role::Writer), Ok(Role::Writer), denied(Role::Operator)],
+            ),
+            (
+                Some(Role::Operator),
+                [Ok(Role::Operator), Ok(Role::Operator), Ok(Role::Operator)],
+            ),
         ] {
             let store = store();
             if let Some(role) = role {
@@ -464,8 +473,8 @@ mod tests {
         );
         let access = TenantAccess::load(store, TENANT, DEFAULT_MAX_POLICY_AGE).unwrap();
 
-        assert_eq!(access.authorize(&agent(), &write(1), NOW), Ok(()));
-        assert_eq!(access.authorize(&agent(), &read(2), NOW), Ok(()));
+        assert_eq!(access.authorize(&agent(), &write(1), NOW), Ok(Role::Writer));
+        assert_eq!(access.authorize(&agent(), &read(2), NOW), Ok(Role::Reader));
         assert_eq!(
             access.authorize(&agent(), &write(2), NOW),
             Err(AccessDenial::PermissionDenied {
@@ -479,7 +488,7 @@ mod tests {
         let store = store();
         grant(&store, Role::Writer, RoleScope::Tenant);
         let access = TenantAccess::load(store.clone(), TENANT, DEFAULT_MAX_POLICY_AGE).unwrap();
-        assert_eq!(access.authorize(&agent(), &write(1), NOW), Ok(()));
+        assert_eq!(access.authorize(&agent(), &write(1), NOW), Ok(Role::Writer));
         assert_eq!(
             access.authorize(&agent(), &write(1), NOW + 60),
             Err(AccessDenial::NotACurrentCredential)
@@ -496,7 +505,7 @@ mod tests {
 
         store.revoke_credential(&TENANT, &FINGERPRINT).unwrap();
         // Until the next refresh the owner still holds the old copy.
-        assert_eq!(access.authorize(&agent(), &write(1), NOW), Ok(()));
+        assert_eq!(access.authorize(&agent(), &write(1), NOW), Ok(Role::Writer));
         access.refresh().unwrap();
         assert_eq!(
             access.authorize(&agent(), &write(1), NOW),
@@ -515,7 +524,7 @@ mod tests {
 
         let binding = grant(&store, Role::Reader, RoleScope::Tenant);
         access.refresh().unwrap();
-        assert_eq!(access.authorize(&agent(), &read(1), NOW), Ok(()));
+        assert_eq!(access.authorize(&agent(), &read(1), NOW), Ok(Role::Reader));
 
         store.revoke_role(&binding).unwrap();
         access.refresh().unwrap();
@@ -533,7 +542,7 @@ mod tests {
             Err(AccessDenial::PolicyStale)
         );
         access.refresh().unwrap();
-        assert_eq!(access.authorize(&agent(), &read(1), NOW), Ok(()));
+        assert_eq!(access.authorize(&agent(), &read(1), NOW), Ok(Role::Writer));
     }
 
     fn certificate() -> CertificateDer<'static> {

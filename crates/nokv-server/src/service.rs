@@ -6,24 +6,29 @@
 use std::sync::Arc;
 
 use nokv_protocol::{RpcFailure, WorkspaceResult, WorkspaceRpcRequest};
-use nokv_types::PrincipalId;
+use nokv_types::{PrincipalId, Role};
 
 /// The authority the server established for one request: the principal it
-/// authenticated and authorized for the request's root, or none on a trusted
-/// plaintext deployment.
+/// authenticated and the role that principal holds on the request's root, or
+/// neither on a trusted plaintext deployment.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RequestAuthority {
     pub principal: Option<PrincipalId>,
+    pub role: Option<Role>,
 }
 
 impl RequestAuthority {
     /// A plaintext connection: nobody is authenticated and nothing is refused.
-    pub const TRUSTED: Self = Self { principal: None };
+    pub const TRUSTED: Self = Self {
+        principal: None,
+        role: None,
+    };
 
-    /// What metadata writes record for this request.
+    /// What metadata writes record and check for this request.
     pub fn write_authority(self) -> nokv_meta::workspace::WriteAuthority {
         nokv_meta::workspace::WriteAuthority {
             initiator: self.principal,
+            operator: self.role == Some(Role::Operator),
         }
     }
 }

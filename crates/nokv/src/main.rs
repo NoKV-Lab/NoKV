@@ -1129,6 +1129,7 @@ fn operation_status_json(
         "status": "success",
         "operation": operation,
         "operation_id": encode_lowercase_hex(&status.token.operation_id.0),
+        "initiator": status.initiator.map(|initiator| encode_lowercase_hex(&initiator.0)),
         "state": observation.state.as_str(),
         "next_action": observation.next_action.as_str(),
         "observed_state": format!("{:?}", status.state),
@@ -1162,6 +1163,7 @@ fn append_operation_json(status: &nokv_protocol::OperationStatus) -> Result<Valu
         "status": "success",
         "operation": "append",
         "operation_id": encode_lowercase_hex(&status.token.operation_id.0),
+        "initiator": status.initiator.map(|initiator| encode_lowercase_hex(&initiator.0)),
         "state": recovery.state.as_str(),
         "next_action": recovery.next_action.as_str(),
         "observed_state": format!("{:?}", status.state),
@@ -2527,6 +2529,7 @@ mod tests {
     fn append_status_does_not_report_pending_or_cleaned_attempts_as_committed() {
         let mut call = nokv_client::ClientCall {
             value: nokv_protocol::OperationStatus {
+                initiator: Some(nokv_protocol::PrincipalIdentity([0xa1; 16])),
                 token: nokv_protocol::OperationToken {
                     operation_id: nokv_protocol::OperationIdentity([0xaa; 16]),
                     state_digest: nokv_protocol::Digest([0x11; 32]),
@@ -2567,6 +2570,7 @@ mod tests {
         assert_eq!(pending["attempt"], 2);
         assert_eq!(pending["activity_deadline_ms"], 123_000);
         assert_eq!(pending["operation_id"], "aa".repeat(16));
+        assert_eq!(pending["initiator"], "a1".repeat(16));
         assert_eq!(pending["publication_operation_id"], "cc".repeat(16));
         assert!(pending["receipt"].is_null());
         let preparation = call.value.append_preparation.as_mut().unwrap();

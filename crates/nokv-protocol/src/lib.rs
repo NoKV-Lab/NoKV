@@ -84,8 +84,8 @@ pub use types::{
     AppendSegment, ArtifactDescriptor, ArtifactManifestRow, ArtifactRevisionIdentity, ByteRange,
     CommitIdentity, ContentType, Digest, DigestUri, FieldValue, GenericIndexGenerationIdentity,
     LogicalShardIdentity, ObjectIdentity, ObjectNamespaceIdentity, OperationIdentity,
-    OperationKind, OperationToken, PageRequest, PathMetadata, PublicationAuthority,
-    PublishCondition, RelativePath, RequestIdentity, RootIdentity, RootRoute, ScalarValue,
-    SnapshotAlias, SnapshotSelector, StagedObject, Tag, WorkbenchName, WorkspaceCapability,
-    WorkspaceIdentity, WorkspacePath, WorkspaceReadView,
+    OperationKind, OperationToken, PageRequest, PathMetadata, PrincipalIdentity,
+    PublicationAuthority, PublishCondition, RelativePath, RequestIdentity, RootIdentity, RootRoute,
+    ScalarValue, SnapshotAlias, SnapshotSelector, StagedObject, Tag, WorkbenchName,
+    WorkspaceCapability, WorkspaceIdentity, WorkspacePath, WorkspaceReadView,
 };

@@ -229,6 +229,20 @@ anyone. Over TLS the CLI does not check the plaintext `AgentId`
 binding, so many principals can work on one root and one principal on many
 roots.
 
+Every durable operation records the principal that began it, and only that
+principal continues, aborts, or completes it. A principal with the operator
+role on the root continues any operation, and the owner's own recovery and
+cleanup continue everything. A request that continues another principal's
+operation is refused with `PermissionDenied` and changes nothing. Commit and
+restore operation ids derive from their content, so another principal
+beginning the same commit or restore observes the first one: while it is in
+flight the request is refused with a retryable `Conflict`, and once it is
+terminal the request replays its outcome. Publish, append, snapshot, and
+Generic index operation ids are caller-chosen and sealed with the initiator,
+so another principal presenting the same id is refused as a different intent.
+A request id replays only for the principal that claimed it. Operation
+status and change events name the initiator.
+
 Secondary-index queries run at one read version and filter every result by the
 matching visible incarnation. `ArtifactV1` remains the default Workbench query
 contract. `GenericNamespaceV1` carries a bounded, normalized, display-only

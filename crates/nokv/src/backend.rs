@@ -3748,6 +3748,7 @@ mod tests {
     fn running_restore_status(fixture: &RestorePlanFixture) -> wire::OperationStatus {
         let request = prepare_restore_request(fixture);
         wire::OperationStatus {
+            initiator: None,
             append_preparation: None,
             token: wire::OperationToken {
                 operation_id: fixture.preparation.operation_id,
@@ -3914,6 +3915,7 @@ mod tests {
             lineage_projection: Vec::new(),
         };
         let commit_status = wire::OperationStatus {
+            initiator: None,
             append_preparation: None,
             token: wire::OperationToken {
                 operation_id: identities.operation_id,
@@ -3945,6 +3947,7 @@ mod tests {
             failure: None,
         };
         let publish_status = wire::OperationStatus {
+            initiator: None,
             append_preparation: None,
             token: wire::OperationToken {
                 operation_id: identities.manifest_publish_operation_id,

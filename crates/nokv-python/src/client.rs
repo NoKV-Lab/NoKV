@@ -2190,6 +2190,7 @@ mod tests {
         result: Option<OperationResult>,
     ) -> nokv_protocol::OperationStatus {
         nokv_protocol::OperationStatus {
+            initiator: None,
             append_preparation: None,
             token: nokv_protocol::OperationToken {
                 operation_id: OperationIdentity([1; 16]),

@@ -621,15 +621,16 @@ fn serve_connection(
         let request = decode_request(&request)?;
         // Authorization comes before any route lookup, so a denied caller
         // learns nothing about the root. The executor then records the
-        // authorized principal.
+        // authorized principal and checks it against what it continues.
         let authority = match tls {
             Some(tls) => {
                 let Some(principal) = &principal else {
                     return Ok(());
                 };
                 match tls.access.authorize(principal, &request, unix_now()) {
-                    Ok(()) => RequestAuthority {
+                    Ok(role) => RequestAuthority {
                         principal: Some(principal.principal_id),
+                        role: Some(role),
                     },
                     Err(denial) => {
                         log_denial(peer, principal, &request, denial, &mut denials_logged);
@@ -1715,7 +1716,7 @@ mod tests {
     }
 
     #[test]
-    fn an_authorized_request_reaches_the_executor_with_its_principal() {
+    fn an_authorized_request_reaches_the_executor_with_its_principal_and_role() {
         let pki = crate::rpc_tls::test_pki::TestPki::new();
         let tls = pki.server_tls();
         let (client, server) = streams();
@@ -1736,6 +1737,7 @@ mod tests {
             *executor.last_authority.lock().unwrap(),
             Some(RequestAuthority {
                 principal: Some(nokv_types::PrincipalId::from_bytes([6; 16])),
+                role: Some(nokv_types::Role::Writer),
             })
         );
     }

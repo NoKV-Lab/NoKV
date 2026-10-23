@@ -91,6 +91,7 @@ mod tests {
         result: Option<OperationResult>,
     ) -> OperationStatus {
         OperationStatus {
+            initiator: None,
             append_preparation: None,
             token: OperationToken {
                 operation_id: OperationIdentity([1; 16]),

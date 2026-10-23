@@ -2110,6 +2110,7 @@ mod tests {
         result: Option<CommitResult>,
     ) -> OperationStatus {
         OperationStatus {
+            initiator: None,
             token: OperationToken {
                 operation_id: options.identities.operation_id,
                 state_digest: Digest([8; 32]),
@@ -2175,6 +2176,7 @@ mod tests {
         binding: &CommitManifestBinding,
     ) -> OperationStatus {
         OperationStatus {
+            initiator: None,
             token: OperationToken {
                 operation_id: options.identities.manifest_publish_operation_id,
                 state_digest: Digest([0x18; 32]),
@@ -2436,6 +2438,7 @@ mod tests {
         result: RestoreResult,
     ) -> OperationStatus {
         OperationStatus {
+            initiator: None,
             token: OperationToken {
                 operation_id: options.identities.operation_id,
                 state_digest: Digest([10; 32]),
@@ -2462,6 +2465,7 @@ mod tests {
         binding: Option<RestoreDestinationBinding>,
     ) -> OperationStatus {
         OperationStatus {
+            initiator: None,
             token: OperationToken {
                 operation_id: options.identities.operation_id,
                 state_digest: Digest([10; 32]),

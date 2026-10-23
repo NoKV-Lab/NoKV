@@ -30,6 +30,7 @@ fn status(phase: AppendAttemptPhase, count: u64) -> OperationStatus {
     let (publication_operation_id, artifact_revision_id) =
         stable_append_attempt_identities(route().root_id, operation_id, 0);
     OperationStatus {
+        initiator: None,
         token: OperationToken {
             operation_id,
             state_digest: Digest([count as u8 + 10; 32]),
