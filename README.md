@@ -242,7 +242,7 @@ real-service acceptance gate is still **not qualified**.
 | `nokv operation status` | Query an append by its logical identity and report its receipt or next recovery action. | Metadata only: no payload, current workspace, or object-store connection is required. |
 | `nokv operation inspect` | Inspect a bounded page of retained staged objects and save the exact operation token. | Metadata only; the cursor binds one observation and fails if state changes. |
 | `nokv operation recover` | Ask the owner to retry quarantined append cleanup. | No payload or object credentials; an explicit saved state digest replays one durable recovery request. |
-| `nokv provision` | Bind `RootId` to `AgentId`, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. |
+| `nokv provision` | Bind `RootId` to `AgentId`, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. Planned tenant RBAC replaces this binding. |
 | `nokv serve` | Start one explicit metadata owner from create, same-namespace reopen, or recovery-log state. | Shared recovery publication is opt-in and not currently qualified. |
 | `nokv mcp` | Deprecated stdio transport retained only because qualification runners still use it. | **Unsupported for integration.** |
 
@@ -385,7 +385,9 @@ Every agent-facing CLI command requires self-refreshing control routing plus
 the durable `RootId` to `AgentId` binding: `--control-dir PATH` when the owner
 and its clients share one host, `--etcd-endpoint URL` when they span hosts.
 Static route pins remain an SDK/testing option and are rejected by the
-agent-facing CLI.
+agent-facing CLI. The binding is a CLI-only misconfiguration check, not
+authorization. Planned server-side tenant identity and RBAC retire it; see
+[SECURITY.md](SECURITY.md).
 
 ## Core Semantics
 
@@ -423,7 +425,8 @@ agent-facing CLI.
 - Transactions, snapshots, commit closure, restore, and GC barriers are
   shard-local. NoKV does not provide cross-shard transactions.
 - Workbench jailing and `RootId` to `AgentId` binding are safety boundaries,
-  not tenant authentication, authorization, or RBAC.
+  not tenant authentication, authorization, or RBAC. Server-enforced tenant
+  identity and RBAC, with many agents per root, are planned.
 
 ## Why Holt Fits the Current Local Profile
 
@@ -538,9 +541,13 @@ Holt rows ran from a checkout of Holt `v0.8.7`:
 - physical power-cycle behavior, production tail latency, write amplification,
   RSS advantage, or universal ART performance.
 
+### Planned, not yet offered
+
+- tenant identity, authentication, and RBAC enforced by the server, with many
+  agents per root and one agent on many roots.
+
 ### Not offered by NoKV
 
-- tenant identity, authentication, or RBAC;
 - cross-shard transactions;
 - transparent POSIX/FUSE/CSI/NAS behavior.
 

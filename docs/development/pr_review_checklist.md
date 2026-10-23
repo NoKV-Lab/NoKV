@@ -68,8 +68,9 @@ boundaries, or Workbench behavior.
 - Does `nokv-meta` own schema, command execution, history, indexes, holds,
   lifecycle, GC policy, and recovery semantics without importing a physical
   store implementation?
-- Does `nokv-control` own placement/leases/epochs without learning path or
-  artifact semantics?
+- Does `nokv-control` own placement, leases, epochs, root bindings, and
+  identity and role-binding records without learning path or artifact
+  semantics?
 - Does `nokv-object` avoid namespace, reachability, and metadata transaction
   ownership?
 - Does `nokv-client` avoid dependencies on `nokv-meta` and `nokv-server`?
@@ -184,11 +185,24 @@ boundaries, or Workbench behavior.
 - Are `inode`, `source_root`, `destination_root`, and `checkpoints.jsonl`
   absent from Workbench responses and contract state?
 
+## Identity And Access
+
+- Does the server authenticate the caller from a verified credential, and
+  authorize every RPC before route lookup, replay, or execution, denying by
+  default?
+- Do durable operations record their initiating principal, and refuse
+  continuation, abort, or finalization by another principal?
+- Does the change cover the object and control planes, not metadata RPCs
+  alone?
+- Are credentials kept out of argv, logs, errors, and evidence, and do denials
+  avoid revealing another tenant's state?
+- Does new work avoid extending the retired one-Agent-per-root binding?
+
 ## Claims And Evidence
 
 - Do public docs distinguish current, experimental, and planned capabilities?
-- Do security claims avoid treating a Workbench root or Agent scope as tenant
-  authentication or authorization?
+- Do security claims avoid treating a Workbench root, presentation path,
+  `AgentId`, or root binding as tenant authentication or authorization?
 - Do performance claims state the topology, comparison boundary, cache state,
   run count, and raw-evidence location?
 - Does benchmark-only behavior leave product semantics unchanged?
