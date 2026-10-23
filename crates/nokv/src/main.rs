@@ -10,6 +10,7 @@ mod build_info;
 mod cli;
 mod connection;
 mod failure_envelope;
+mod identity_admin;
 mod object_store;
 mod provision;
 mod transfer;
@@ -100,6 +101,16 @@ fn run() -> Result<(), CliFailure> {
             *adopt_legacy_agent_binding,
         )?),
         Command::Serve => Ok(run_server(&invocation)?),
+        Command::Identity(command) => {
+            let store = connection::open_identity(&invocation.client.routing)
+                .map_err(connection_failure)?;
+            let now_unix_seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let result = identity_admin::run(store.as_ref(), command, now_unix_seconds)?;
+            Ok(print_json(&result)?)
+        }
         Command::Workbench { tool, arguments } => {
             // Malformed arguments fail before any connection.
             let arguments: Value = serde_json::from_str(arguments).map_err(|error| {
@@ -1568,6 +1579,7 @@ USAGE:
   nokv [route/agent/object options] workspace-path append <workbench> <section> <path> --operation-id HEX32 (--text TEXT | --base64 BASE64 | --file PATH) [--content-type TYPE] [--max-logical-size N] [--block-size N] [--expected-workspace-incarnation-id HEX32]
   nokv --root-id HEX32 --agent-id HEX32 (--etcd-endpoint URL | --control-dir PATH) provision <logical-shard-id-hex32> [adoption options]
   nokv [owner options] serve
+  nokv (--etcd-endpoint URL | --control-dir PATH) identity <identity command>
   nokv schema
   nokv version [--json]
   nokv --version
@@ -1630,6 +1642,21 @@ OWNER:
     shared publishes every applied outbox tail as immutable log segments plus control references
     before a response leaves the shard; without checkpoint compaction the chain is bounded by the
     control record size, and a shard that reaches that bound stops accepting writes
+
+TENANT IDENTITY:
+  identity tenant create <tenant-id-hex32>
+  identity principal create <tenant-id-hex32> <principal-id-hex32>
+  identity credential add <tenant-id-hex32> <principal-id-hex32> (--certificate PEM | --fingerprint HEX64)
+    --expires-at-unix N
+  identity credential revoke <tenant-id-hex32> <fingerprint-hex64>
+  identity role (grant | revoke) <tenant-id-hex32> <principal-id-hex32> --role reader|writer|operator
+    (--tenant-wide | --root HEX32)
+  identity root bind <root-id-hex32> <tenant-id-hex32>
+  identity show <tenant-id-hex32>
+  records live in the control plane; running these commands requires write access to the control store
+  a credential is the SHA-256 of a client certificate's DER bytes; --certificate reads the first PEM certificate
+  a root belongs to one tenant, and a root-scoped role requires that binding first
+  the server does not enforce these records yet: until it does, every deployment remains trusted
 
 OBJECT DATA:
   --object-bucket NAME [--object-endpoint URL] [--object-root PREFIX]
