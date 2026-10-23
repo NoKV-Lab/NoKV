@@ -3045,7 +3045,8 @@ fn error_code_name(code: wire::ErrorCode) -> &'static str {
 }
 
 fn protocol_input(error: wire::ProtocolError) -> agent::BackendError {
-    invalid_state("typed protocol input was rejected", error)
+    // Repeating the same input fails the same way.
+    invalid_state("typed protocol input was rejected", error).with_class(ErrorClass::InvalidInput)
 }
 
 fn domain_input(error: impl ToString) -> agent::BackendError {
@@ -6431,6 +6432,44 @@ mod tests {
         assert_eq!(failure["next_action"], "fix_input");
         // The alias is rejected before the snapshot lookup.
         assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn protocol_input_the_tool_schema_admits_is_input_to_fix() {
+        let mut committed = workspace_summary("run-42", [5; 16]);
+        committed.commit_head = Some(wire::CommitIdentity([0xee; 32]));
+        committed.commit_head_generation = Some(1);
+        // The tool schemas bound neither a content type nor a snapshot name.
+        for (tool, arguments, outcomes) in [
+            (
+                "workbench_put_file",
+                json!({
+                    "id": "run-42",
+                    "section": "outputs",
+                    "path": "a.txt",
+                    "text": "x",
+                    "content_type": "t".repeat(wire::ContentType::MAX_BYTES + 1),
+                }),
+                Vec::new(),
+            ),
+            (
+                "workbench_snapshot",
+                json!({
+                    "id": "run-42",
+                    "name": "s".repeat(nokv_types::SnapshotAliasName::MAX_BYTES + 1),
+                }),
+                vec![success(wire::WorkspaceResult::Workspace(committed.clone()))],
+            ),
+        ] {
+            let sent = outcomes.len();
+            let (backend, requests, server) = scripted_backend(outcomes);
+            let failure = cli_tool_failure(backend, tool, arguments);
+            server.join().unwrap();
+
+            assert_eq!(failure["class"], "invalid_input", "{tool}: {failure}");
+            assert_eq!(failure["next_action"], "fix_input", "{tool}");
+            assert_eq!(requests.lock().unwrap().len(), sent, "{tool}");
+        }
     }
 
     #[test]
