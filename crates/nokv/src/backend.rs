@@ -2947,6 +2947,13 @@ fn map_snapshot_client_error(error: ClientError) -> agent::BackendError {
 fn map_lifecycle_error(
     error: WorkbenchLifecycleError<agent::ProjectionError>,
 ) -> agent::BackendError {
+    let class = error.class();
+    map_lifecycle_error_shape(error).with_class(class)
+}
+
+fn map_lifecycle_error_shape(
+    error: WorkbenchLifecycleError<agent::ProjectionError>,
+) -> agent::BackendError {
     match error {
         WorkbenchLifecycleError::Client(error) => map_client_error(error),
         WorkbenchLifecycleError::SnapshotLookup(error) => map_snapshot_client_error(error),
@@ -5992,10 +5999,12 @@ mod tests {
         kind: agent::BackendErrorKind,
         message: impl Into<String>,
         source: &'static str,
+        class: ErrorClass,
     ) {
         assert_eq!(
             actual,
             agent::BackendError::new(kind, message, false, json!({"source": source}))
+                .with_class(class)
         );
     }
 
@@ -6020,6 +6029,7 @@ mod tests {
             agent::BackendErrorKind::InvalidState,
             "created workbench resolved to a different incarnation",
             "nokv-protocol",
+            ErrorClass::PreconditionFailed,
         );
         assert_eq!(requests.lock().unwrap().len(), 3);
     }
@@ -6053,6 +6063,7 @@ mod tests {
             agent::BackendErrorKind::InvalidState,
             "run manifest violates the v1 projection: run manifest bytes are not recursively canonical compact JSON",
             "workbench-backend",
+            ErrorClass::PreconditionFailed,
         );
         assert_eq!(requests.lock().unwrap().len(), 5);
     }
@@ -6092,6 +6103,7 @@ mod tests {
             agent::BackendErrorKind::InvalidState,
             "restore manifest violates the v1 projection: restore manifest bytes are not recursively canonical compact JSON",
             "workbench-backend",
+            ErrorClass::PreconditionFailed,
         );
         assert_eq!(requests.lock().unwrap().len(), 4);
     }
@@ -6130,6 +6142,7 @@ mod tests {
                 agent::BackendErrorKind::InvalidState,
                 "run manifest envelope does not match its path descriptor or typed commit head",
                 "nokv-protocol",
+                ErrorClass::PreconditionFailed,
             );
         }
     }
@@ -6180,6 +6193,7 @@ mod tests {
             agent::BackendErrorKind::InvalidState,
             "restore manifest envelope does not match its live destination path descriptor",
             "nokv-protocol",
+            ErrorClass::PreconditionFailed,
         );
     }
 
@@ -6211,6 +6225,7 @@ mod tests {
             agent::BackendErrorKind::Other("ResourceExhausted".to_owned()),
             format!("artifact is {envelope_bytes} bytes, maximum is 1024"),
             "workbench-backend",
+            ErrorClass::OperatorRequired,
         );
     }
 
@@ -6289,8 +6304,133 @@ mod tests {
             agent::BackendErrorKind::Other("ResourceExhausted".to_owned()),
             format!("artifact is {envelope_bytes} bytes, maximum is 1"),
             "workbench-backend",
+            ErrorClass::OperatorRequired,
         );
         assert_eq!(requests.lock().unwrap().len(), 3);
+    }
+
+    /// The failure line a CLI invocation of `tool` prints against `backend`.
+    fn cli_tool_failure(backend: CliWorkbenchBackend, tool: &str, arguments: Value) -> Value {
+        let handler = agent::SdkWorkbenchToolHandler::new(backend, "/agents/test/wb").unwrap();
+        let error = agent::execute_tool(&handler, tool, &arguments).unwrap_err();
+        let failure = crate::failure_envelope::CliFailure::from_agent(
+            &error,
+            agent::workbench_tool_idempotency(tool),
+        );
+        serde_json::from_str(&failure.to_line()).unwrap()
+    }
+
+    #[test]
+    fn commit_over_a_different_head_is_a_precondition_to_reread() {
+        let head = commit_request();
+        let fixture = manifest_artifact_fixture(
+            "clock-stable-run",
+            RUN_MANIFEST_PATH,
+            wire::WorkspaceIdentity([5; 16]),
+            wire::ArtifactRevisionIdentity([0x73; 16]),
+            JSON_CONTENT_TYPE,
+            &test_commit_envelope(&head, 1_700_000_123),
+        );
+        let mut workspace = workspace_summary("clock-stable-run", [5; 16]);
+        workspace.commit_head = Some(wire::CommitIdentity(head.stable_commit_id));
+        workspace.commit_head_generation = Some(1);
+        let mut outcomes = vec![
+            not_found_failure(),
+            success(wire::WorkspaceResult::Workspace(workspace)),
+        ];
+        outcomes.extend(manifest_read_outcomes(&fixture));
+        let (backend, _, server) =
+            scripted_backend_with_objects(outcomes, Arc::clone(&fixture.objects), 1024);
+
+        let failure = cli_tool_failure(
+            backend,
+            "workbench_commit",
+            json!({
+                "id": "clock-stable-run",
+                "manifest": {"model": "viking", "steps": [1, 2, 3]},
+                "content_digest_uri": head.content_digest_uri,
+            }),
+        );
+        server.join().unwrap();
+
+        assert_eq!(
+            failure["message"],
+            "workbench already has a different commit head; set replace=true"
+        );
+        assert_eq!(failure["class"], "precondition_failed");
+        assert_eq!(failure["next_action"], "reread_then_retry");
+    }
+
+    #[test]
+    fn restore_over_a_destination_of_other_provenance_is_a_precondition_to_reread() {
+        let source_id = WorkbenchId::new("source-run").unwrap();
+        let destination_id = WorkbenchId::new("destination-run").unwrap();
+        let body = agent::build_restore_manifest_v1(
+            [0x91; 16],
+            &source_id,
+            "/agents/test/wb/source-run",
+            &destination_id,
+            "/agents/test/wb/destination-run",
+            7,
+        )
+        .unwrap();
+        let fixture = manifest_artifact_fixture(
+            "destination-run",
+            "metadata/restore_manifest.json",
+            wire::WorkspaceIdentity([0x22; 16]),
+            wire::ArtifactRevisionIdentity([0x74; 16]),
+            JSON_CONTENT_TYPE,
+            &body,
+        );
+        let mut outcomes = vec![success(wire::WorkspaceResult::Workspace(
+            workspace_summary("destination-run", [0x22; 16]),
+        ))];
+        outcomes.extend(manifest_read_outcomes(&fixture));
+        let (backend, _, server) =
+            scripted_backend_with_objects(outcomes, Arc::clone(&fixture.objects), 1024);
+
+        // The destination was restored from snapshot 7, so restoring snapshot
+        // 8 into it is refused however often it is repeated.
+        let failure = cli_tool_failure(
+            backend,
+            "workbench_restore",
+            json!({"id": "source-run", "at_snapshot": 8, "destination_id": "destination-run"}),
+        );
+        server.join().unwrap();
+
+        assert_eq!(
+            failure["message"],
+            "existing destination restore manifest belongs to different provenance"
+        );
+        assert_eq!(failure["class"], "precondition_failed");
+        assert_eq!(failure["next_action"], "reread_then_retry");
+    }
+
+    #[test]
+    fn restore_from_an_alias_the_protocol_rejects_is_input_to_fix() {
+        let (backend, requests, server) = scripted_backend(vec![
+            not_found_failure(),
+            success(wire::WorkspaceResult::Workspace(workspace_summary(
+                "source-run",
+                [0x21; 16],
+            ))),
+        ]);
+
+        let failure = cli_tool_failure(
+            backend,
+            "workbench_restore",
+            json!({
+                "id": "source-run",
+                "at_snapshot": "a".repeat(nokv_types::SnapshotAliasName::MAX_BYTES + 1),
+                "destination_id": "destination-run",
+            }),
+        );
+        server.join().unwrap();
+
+        assert_eq!(failure["class"], "invalid_input");
+        assert_eq!(failure["next_action"], "fix_input");
+        // The alias is rejected before the snapshot lookup.
+        assert_eq!(requests.lock().unwrap().len(), 2);
     }
 
     #[test]
