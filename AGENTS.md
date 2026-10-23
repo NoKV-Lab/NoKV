@@ -70,6 +70,26 @@ and do not delete them while they are the only executed live path. The stable
 18-tool Workbench contract itself is independent of MCP and remains
 authoritative.
 
+## Tenant Identity And Access Direction
+
+NoKV is adding tenant identity, authentication, and role-based access control
+(RBAC) enforced by the metadata server. The target lets many agents act on one
+root, and one agent act on many roots in parallel, each under its own
+authenticated principal and roles. Follow the invariants and package ownership
+in
+[Tenant Identity And Access Control](docs/development/code_contract.md#tenant-identity-and-access-control).
+
+The one-Agent-per-root rule (`RootAgentBinding`, `--agent-id`) is retired as a
+design direction. The native CLI still checks it until server-side
+authorization replaces it.
+
+- Do not extend the rule or add new dependencies on it.
+- Do not describe it, an `AgentId`, a Workbench root, or a presentation path as
+  access control.
+- Until authentication and authorization ship, the trusted-deployment boundary
+  in [SECURITY.md](SECURITY.md) applies; never claim tenant isolation for a
+  current release.
+
 Before reviewing or editing a PR:
 
 1. Read `docs/development/code_contract.md`.

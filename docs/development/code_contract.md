@@ -35,7 +35,7 @@ These are the package boundaries:
 | `crates/nokv-meta-store/` | Storage-neutral ordered byte-key reads, conditional writes, limits, acknowledgement boundaries, recovery authority, and physical store errors. | Own workspace records or codecs, import `nokv-meta`, bind Holt or FoundationDB, or define server composition. |
 | `crates/nokv-meta-holt/` | The serving local Holt implementation of the metadata transaction-store contract, including physical options, read diagnostics, strict open checks, and adapter conformance. | Import `nokv-meta`, own workspace records or codecs, define server composition, or claim shared recovery authority. |
 | `crates/nokv-meta/` | `nokv_workspace` schema and codec, `MetaShard`, `MetadataCommand`, workspace visibility, history, indexes, commits, snapshots, holds, operations, change events, GC policy, and recovery/fsck semantics over `nokv-meta-store`. | Import Holt or FoundationDB in production code, own provider-specific object I/O, client routing, Workbench result shaping, Python bindings, FUSE, or wire fallback schemas. Adapter-backed dev tests may use the package test-support boundary. |
-| `crates/nokv-control/` | Persisted root placement, shard map, owner leases and epochs, checkpoint/log pointers, movement, and failover coordination. | Own path/artifact semantics, Holt records, object GC policy, query behavior, data-cache placement, or filename-based shard routing. |
+| `crates/nokv-control/` | Persisted root placement, root `AgentId` and object-namespace bindings, shard map, owner leases and epochs, checkpoint/log pointers, movement, and failover coordination. | Own path/artifact semantics, Holt records, object GC policy, query behavior, data-cache placement, or filename-based shard routing. |
 | `crates/nokv-object/` | Immutable object upload/read, multipart and range planning, S3-compatible providers, local hot-tier soft cache, integrity verification, and in-memory test backend. | Own namespace metadata, revision reachability, metadata transactions, root placement, Holt, protobuf, FUSE, or Workbench semantics. |
 | `crates/nokv-client/` | Rust Agent SDK, routing, conditional path operations, lifecycle APIs, retries, and the direct immutable-object data path. | Depend on `nokv-meta` or `nokv-server`, know Holt keys, expose provider internals, implement FUSE semantics, or define wire DTOs. |
 | `crates/nokv-agent/` | Transport-free Workbench/Agent tool schemas, the 18-tool Workbench facade, the seven-tool generic Agent profile, stable result shaping, and adapters over SDK traits. | Import Holt/layout, object providers, server implementations, FUSE, or duplicate SDK state machines. |
@@ -150,6 +150,51 @@ that owns them. Do not move domain-specific or single-use logic into a generic
 - Do not introduce provider-specific RustFS metadata; RustFS uses the common
   S3-compatible boundary.
 - Prefer explicit invariants and local reasoning over manager-style wrappers.
+
+## Tenant Identity And Access Control
+
+NoKV is adding tenant identity, authentication, and RBAC. Until they ship,
+deployments are trusted ([SECURITY.md](../../SECURITY.md)). New work follows
+these rules:
+
+- **Tenants.** A tenant is the isolation boundary. A root belongs to exactly
+  one tenant, and an agent, user, or service principal belongs to exactly one
+  tenant. Tenant roles never grant access across tenants. Deployment operators
+  use a separate operator role, not a tenant role.
+- **Many agents, many roots.** Many principals may hold roles on one root, and
+  one principal may use many roots concurrently. The one-Agent-per-root
+  `RootAgentBinding` is retired; do not extend it or add new dependencies on
+  it.
+- **Authentication.** The server authenticates the caller from a verified
+  transport credential. A request never asserts its own identity.
+- **Authorization.** The server authorizes every RPC before route lookup,
+  replay, or execution. It denies by default, and every RPC variant has an
+  explicit permission class. Client-side checks are conveniences, not
+  enforcement.
+- **Durable operations.** A durable operation records its initiating
+  principal. Only that principal, or an explicit operator path, may continue,
+  abort, or finalize it; reads follow root roles. Request and operation
+  identities bind the principal, and that change ships with a wire and
+  metadata format version.
+- **Object and control planes.** Both are part of the boundary. An agent never
+  holds object-store or control-plane credentials that bypass metadata
+  authorization.
+- **Credentials and disclosure.** Credentials never appear in argv, logs,
+  errors, or evidence. An authorization failure does not reveal another
+  tenant's roots, paths, or versions.
+- **Not authorization.** `AgentId` flags, Workbench roots, and presentation
+  paths never authorize anything.
+
+Ownership:
+
+| Package | Owns |
+| --- | --- |
+| `nokv-types` | Tenant and principal identifiers. |
+| `nokv-control` | Tenant, principal, credential-metadata, and role-binding records. |
+| `nokv-protocol` | Authentication handshake and permission-denied DTOs. |
+| `nokv-server` | Authentication and per-request authorization. |
+| `nokv-client` | Credential presentation and multi-root clients. |
+| `nokv` | CLI configuration and administration commands. |
 
 ## PR Communication And DCO
 

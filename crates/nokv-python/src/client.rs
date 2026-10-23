@@ -2164,6 +2164,7 @@ mod tests {
 
     #[test]
     fn snapshot_read_views_reject_zero_and_preserve_the_exact_selector() {
+        Python::initialize();
         assert_eq!(parse_read_view(None).unwrap(), WorkspaceReadView::Live);
         assert_eq!(
             parse_read_view(Some(17)).unwrap(),

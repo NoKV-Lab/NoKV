@@ -22,15 +22,25 @@ are explicitly named in a security advisory or release note.
 ## Current Security Boundary
 
 NoKV's metadata service and control-plane endpoints currently assume a trusted
-deployment environment. The current `main` branch does not enforce tenant
-identity, role-based access control, or a live workspace-freeze policy at the
-service boundary. Workbench-root and Agent-scope checks constrain namespace
-access; they are not a substitute for tenant authentication or authorization.
+deployment environment. The current `main` branch does not authenticate callers
+and does not enforce tenant identity, role-based access control, or a live
+workspace-freeze policy at the service boundary.
+
+- Workbench-root jailing only contains paths.
+- The native CLI's `RootId`-to-`AgentId` check only catches misconfigured
+  routing. The SDKs and raw RPC clients do not perform it.
+
+Neither is authentication or authorization.
 
 Deployments must provide network isolation and transport security, protect
 service credentials, and configure object-store IAM and encryption appropriate
 to their environment. Do not expose NoKV server or control-plane endpoints
 directly to untrusted networks.
+
+Tenant identity, authentication, and RBAC enforced by the server are planned
+([code contract](docs/development/code_contract.md#tenant-identity-and-access-control)).
+Until a release note states otherwise, the boundary above applies to every
+release.
 
 ## Reporting a Vulnerability
 

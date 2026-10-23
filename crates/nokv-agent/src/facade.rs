@@ -1515,16 +1515,13 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
                 replace,
             })
             .map_err(|error| {
-                if error.kind == BackendErrorKind::Conflict {
-                    AgentError::backend(
-                        "WorkbenchCommitConflict",
-                        error.message,
-                        error.retryable,
-                        error.details,
-                    )
-                } else {
-                    error.into()
+                let conflict = error.kind == BackendErrorKind::Conflict;
+                let mut error = AgentError::from(error);
+                if conflict {
+                    // Only the code is the tool's; the class stays the backend's.
+                    error.code = "WorkbenchCommitConflict".to_owned();
                 }
+                error
             })?;
         if outcome.commit_id != stable_commit_id {
             return Err(AgentError::backend(

@@ -30,7 +30,7 @@ enum ConfiguredRouting {
 }
 
 /// Explicit route discovery configuration for one Agent root.
-#[pyclass(name = "RoutingConfig", frozen, skip_from_py_object)]
+#[pyclass(name = "RoutingConfig", frozen)]
 #[derive(Clone, Debug)]
 pub(crate) struct PythonRoutingConfig {
     routing: ConfiguredRouting,

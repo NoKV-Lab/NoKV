@@ -2858,6 +2858,16 @@ fn map_client_error_shape(error: ClientError) -> agent::BackendError {
         }
         return mapped;
     }
+    if let Some(cause) = provider_admission_cause(&error) {
+        // Admission failed before the first object write; the command
+        // reports it as an admission at its start would have.
+        return agent::BackendError::new(
+            agent::BackendErrorKind::Other("ProviderAdmissionFailed".to_owned()),
+            cause.to_string(),
+            false,
+            json!({"code": cause.code()}),
+        );
+    }
     let is_object_failure = object_failure(&error);
     let is_artifact_integrity_failure = artifact_integrity_failure(&error);
     let kind = if is_object_failure {
@@ -2906,6 +2916,17 @@ fn map_client_error_shape(error: ClientError) -> agent::BackendError {
     mapped
 }
 
+fn provider_admission_cause(error: &ClientError) -> Option<nokv_object::ProviderAdmissionError> {
+    match error {
+        ClientError::Object(nokv_object::ObjectError::ProviderAdmissionFailed(cause)) => {
+            Some(*cause)
+        }
+        ClientError::ArtifactPublishFailed { source, .. } => provider_admission_cause(source),
+        ClientError::RetryExhausted { last_error, .. } => provider_admission_cause(last_error),
+        _ => None,
+    }
+}
+
 fn object_failure(error: &ClientError) -> bool {
     match error {
         ClientError::Object(_) | ClientError::ArtifactUpload(_) => true,
@@ -2945,6 +2966,13 @@ fn map_snapshot_client_error(error: ClientError) -> agent::BackendError {
 }
 
 fn map_lifecycle_error(
+    error: WorkbenchLifecycleError<agent::ProjectionError>,
+) -> agent::BackendError {
+    let class = error.class();
+    map_lifecycle_error_shape(error).with_class(class)
+}
+
+fn map_lifecycle_error_shape(
     error: WorkbenchLifecycleError<agent::ProjectionError>,
 ) -> agent::BackendError {
     match error {
@@ -3038,7 +3066,8 @@ fn error_code_name(code: wire::ErrorCode) -> &'static str {
 }
 
 fn protocol_input(error: wire::ProtocolError) -> agent::BackendError {
-    invalid_state("typed protocol input was rejected", error)
+    // Repeating the same input fails the same way.
+    invalid_state("typed protocol input was rejected", error).with_class(ErrorClass::InvalidInput)
 }
 
 fn domain_input(error: impl ToString) -> agent::BackendError {
@@ -3110,6 +3139,7 @@ mod tests {
 
     use super::*;
     use crate::encode_lowercase_hex;
+    use crate::object_store::refused_provider_config;
 
     fn test_route() -> wire::RootRoute {
         wire::RootRoute {
@@ -3204,13 +3234,8 @@ mod tests {
         Arc<Mutex<Vec<wire::WorkspaceRpcRequest>>>,
         thread::JoinHandle<()>,
     ) {
-        let objects: Arc<dyn ArtifactObjectStore> = Arc::new(
-            CliObjectStore::build(&crate::cli::ObjectConfig {
-                bucket: Some("unused-test-bucket".to_owned()),
-                ..crate::cli::ObjectConfig::default()
-            })
-            .unwrap(),
-        );
+        let objects: Arc<dyn ArtifactObjectStore> =
+            Arc::new(CliObjectStore::build(&refused_provider_config()).unwrap());
         scripted_backend_with_objects(outcomes, objects, 1024)
     }
 
@@ -5992,10 +6017,12 @@ mod tests {
         kind: agent::BackendErrorKind,
         message: impl Into<String>,
         source: &'static str,
+        class: ErrorClass,
     ) {
         assert_eq!(
             actual,
             agent::BackendError::new(kind, message, false, json!({"source": source}))
+                .with_class(class)
         );
     }
 
@@ -6020,6 +6047,7 @@ mod tests {
             agent::BackendErrorKind::InvalidState,
             "created workbench resolved to a different incarnation",
             "nokv-protocol",
+            ErrorClass::PreconditionFailed,
         );
         assert_eq!(requests.lock().unwrap().len(), 3);
     }
@@ -6053,6 +6081,7 @@ mod tests {
             agent::BackendErrorKind::InvalidState,
             "run manifest violates the v1 projection: run manifest bytes are not recursively canonical compact JSON",
             "workbench-backend",
+            ErrorClass::PreconditionFailed,
         );
         assert_eq!(requests.lock().unwrap().len(), 5);
     }
@@ -6092,6 +6121,7 @@ mod tests {
             agent::BackendErrorKind::InvalidState,
             "restore manifest violates the v1 projection: restore manifest bytes are not recursively canonical compact JSON",
             "workbench-backend",
+            ErrorClass::PreconditionFailed,
         );
         assert_eq!(requests.lock().unwrap().len(), 4);
     }
@@ -6130,6 +6160,7 @@ mod tests {
                 agent::BackendErrorKind::InvalidState,
                 "run manifest envelope does not match its path descriptor or typed commit head",
                 "nokv-protocol",
+                ErrorClass::PreconditionFailed,
             );
         }
     }
@@ -6180,6 +6211,7 @@ mod tests {
             agent::BackendErrorKind::InvalidState,
             "restore manifest envelope does not match its live destination path descriptor",
             "nokv-protocol",
+            ErrorClass::PreconditionFailed,
         );
     }
 
@@ -6211,6 +6243,7 @@ mod tests {
             agent::BackendErrorKind::Other("ResourceExhausted".to_owned()),
             format!("artifact is {envelope_bytes} bytes, maximum is 1024"),
             "workbench-backend",
+            ErrorClass::OperatorRequired,
         );
     }
 
@@ -6251,13 +6284,8 @@ mod tests {
             status: wire::SnapshotStatus::Alive,
             consumer_count: 0,
         };
-        let objects: Arc<dyn ArtifactObjectStore> = Arc::new(
-            CliObjectStore::build(&crate::cli::ObjectConfig {
-                bucket: Some("unused-test-bucket".to_owned()),
-                ..crate::cli::ObjectConfig::default()
-            })
-            .unwrap(),
-        );
+        let objects: Arc<dyn ArtifactObjectStore> =
+            Arc::new(CliObjectStore::build(&refused_provider_config()).unwrap());
         let (backend, requests, server) = scripted_backend_with_objects(
             vec![
                 not_found_failure(),
@@ -6289,21 +6317,274 @@ mod tests {
             agent::BackendErrorKind::Other("ResourceExhausted".to_owned()),
             format!("artifact is {envelope_bytes} bytes, maximum is 1"),
             "workbench-backend",
+            ErrorClass::OperatorRequired,
         );
         assert_eq!(requests.lock().unwrap().len(), 3);
+    }
+
+    /// A provider that refuses connections fails its deferred admission as a
+    /// transient admission failure, with the code an eager admission reports.
+    fn assert_refused_provider_admission(error: &agent::BackendError) {
+        assert_eq!(
+            error.kind,
+            agent::BackendErrorKind::Other("ProviderAdmissionFailed".to_owned())
+        );
+        assert!(!error.retryable);
+        assert_eq!(error.class, Some(ErrorClass::Transient));
+        let cause = error.details["code"].as_str().unwrap();
+        assert!(
+            matches!(
+                cause,
+                "ProviderAdmissionUnavailable" | "ProviderAdmissionInconclusive"
+            ),
+            "{cause}"
+        );
+    }
+
+    #[test]
+    fn an_inline_publish_never_probes_the_object_provider() {
+        let route = test_route();
+        // The provider refuses connections: a probe would fail the publish.
+        let objects = Arc::new(
+            CliObjectStore::build(&refused_provider_config())
+                .unwrap()
+                .assume_namespace(route.object_namespace_id.into()),
+        );
+        let request = publish_request(agent::PublishCondition::CreateOnly);
+        let published = wire::PublishResult {
+            operation_id: wire::OperationIdentity([0x31; 16]),
+            target: workspace_path(&request.path).unwrap(),
+            workspace_revision: 2,
+            generation: 1,
+            artifact_revision_id: wire::ArtifactRevisionIdentity([0x32; 16]),
+            logical_size: request.body.len() as u64,
+            body_digest: wire::sha256_digest_uri(wire::Digest(
+                Sha256::digest(&request.body).into(),
+            )),
+        };
+        let (backend, requests, server) = scripted_backend_with_objects(
+            vec![
+                success(wire::WorkspaceResult::Workspace(workspace_summary(
+                    "implicit-publish",
+                    [5; 16],
+                ))),
+                success(wire::WorkspaceResult::Published(published)),
+            ],
+            Arc::clone(&objects) as Arc<dyn ArtifactObjectStore>,
+            1024,
+        );
+
+        let outcome = agent::WorkbenchBackend::publish(&backend, request).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(outcome.metadata.generation, 1);
+        assert!(objects.provider_admission_receipt().is_none());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            requests[1].operation,
+            wire::WorkspaceRequest::PublishInlineArtifact(_)
+        ));
+    }
+
+    /// The failure line a CLI invocation of `tool` prints against `backend`.
+    fn cli_tool_failure(backend: CliWorkbenchBackend, tool: &str, arguments: Value) -> Value {
+        let handler = agent::SdkWorkbenchToolHandler::new(backend, "/agents/test/wb").unwrap();
+        let error = agent::execute_tool(&handler, tool, &arguments).unwrap_err();
+        let failure = crate::failure_envelope::CliFailure::from_agent(
+            &error,
+            agent::workbench_tool_idempotency(tool),
+        );
+        serde_json::from_str(&failure.to_line()).unwrap()
+    }
+
+    #[test]
+    fn commit_over_a_different_head_is_a_precondition_to_reread() {
+        let head = commit_request();
+        let fixture = manifest_artifact_fixture(
+            "clock-stable-run",
+            RUN_MANIFEST_PATH,
+            wire::WorkspaceIdentity([5; 16]),
+            wire::ArtifactRevisionIdentity([0x73; 16]),
+            JSON_CONTENT_TYPE,
+            &test_commit_envelope(&head, 1_700_000_123),
+        );
+        let mut workspace = workspace_summary("clock-stable-run", [5; 16]);
+        workspace.commit_head = Some(wire::CommitIdentity(head.stable_commit_id));
+        workspace.commit_head_generation = Some(1);
+        let mut outcomes = vec![
+            not_found_failure(),
+            success(wire::WorkspaceResult::Workspace(workspace)),
+        ];
+        outcomes.extend(manifest_read_outcomes(&fixture));
+        let (backend, _, server) =
+            scripted_backend_with_objects(outcomes, Arc::clone(&fixture.objects), 1024);
+
+        let failure = cli_tool_failure(
+            backend,
+            "workbench_commit",
+            json!({
+                "id": "clock-stable-run",
+                "manifest": {"model": "viking", "steps": [1, 2, 3]},
+                "content_digest_uri": head.content_digest_uri,
+            }),
+        );
+        server.join().unwrap();
+
+        assert_eq!(
+            failure["message"],
+            "workbench already has a different commit head; set replace=true"
+        );
+        assert_eq!(failure["class"], "precondition_failed");
+        assert_eq!(failure["next_action"], "reread_then_retry");
+    }
+
+    #[test]
+    fn restore_over_a_destination_of_other_provenance_is_a_precondition_to_reread() {
+        let source_id = WorkbenchId::new("source-run").unwrap();
+        let destination_id = WorkbenchId::new("destination-run").unwrap();
+        let body = agent::build_restore_manifest_v1(
+            [0x91; 16],
+            &source_id,
+            "/agents/test/wb/source-run",
+            &destination_id,
+            "/agents/test/wb/destination-run",
+            7,
+        )
+        .unwrap();
+        let fixture = manifest_artifact_fixture(
+            "destination-run",
+            "metadata/restore_manifest.json",
+            wire::WorkspaceIdentity([0x22; 16]),
+            wire::ArtifactRevisionIdentity([0x74; 16]),
+            JSON_CONTENT_TYPE,
+            &body,
+        );
+        let mut outcomes = vec![success(wire::WorkspaceResult::Workspace(
+            workspace_summary("destination-run", [0x22; 16]),
+        ))];
+        outcomes.extend(manifest_read_outcomes(&fixture));
+        let (backend, _, server) =
+            scripted_backend_with_objects(outcomes, Arc::clone(&fixture.objects), 1024);
+
+        // The destination was restored from snapshot 7, so restoring snapshot
+        // 8 into it is refused however often it is repeated.
+        let failure = cli_tool_failure(
+            backend,
+            "workbench_restore",
+            json!({"id": "source-run", "at_snapshot": 8, "destination_id": "destination-run"}),
+        );
+        server.join().unwrap();
+
+        assert_eq!(
+            failure["message"],
+            "existing destination restore manifest belongs to different provenance"
+        );
+        assert_eq!(failure["class"], "precondition_failed");
+        assert_eq!(failure["next_action"], "reread_then_retry");
+    }
+
+    #[test]
+    fn restore_from_an_alias_the_protocol_rejects_is_input_to_fix() {
+        let (backend, requests, server) = scripted_backend(vec![
+            not_found_failure(),
+            success(wire::WorkspaceResult::Workspace(workspace_summary(
+                "source-run",
+                [0x21; 16],
+            ))),
+        ]);
+
+        let failure = cli_tool_failure(
+            backend,
+            "workbench_restore",
+            json!({
+                "id": "source-run",
+                "at_snapshot": "a".repeat(nokv_types::SnapshotAliasName::MAX_BYTES + 1),
+                "destination_id": "destination-run",
+            }),
+        );
+        server.join().unwrap();
+
+        assert_eq!(failure["class"], "invalid_input");
+        assert_eq!(failure["next_action"], "fix_input");
+        // The alias is rejected before the snapshot lookup.
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn protocol_input_the_tool_schema_admits_is_input_to_fix() {
+        let mut committed = workspace_summary("run-42", [5; 16]);
+        committed.commit_head = Some(wire::CommitIdentity([0xee; 32]));
+        committed.commit_head_generation = Some(1);
+        // The tool schemas bound neither a content type nor a snapshot name.
+        for (tool, arguments, outcomes) in [
+            (
+                "workbench_put_file",
+                json!({
+                    "id": "run-42",
+                    "section": "outputs",
+                    "path": "a.txt",
+                    "text": "x",
+                    "content_type": "t".repeat(wire::ContentType::MAX_BYTES + 1),
+                }),
+                Vec::new(),
+            ),
+            (
+                "workbench_snapshot",
+                json!({
+                    "id": "run-42",
+                    "name": "s".repeat(nokv_types::SnapshotAliasName::MAX_BYTES + 1),
+                }),
+                vec![success(wire::WorkspaceResult::Workspace(committed.clone()))],
+            ),
+        ] {
+            let sent = outcomes.len();
+            let (backend, requests, server) = scripted_backend(outcomes);
+            let failure = cli_tool_failure(backend, tool, arguments);
+            server.join().unwrap();
+
+            assert_eq!(failure["class"], "invalid_input", "{tool}: {failure}");
+            assert_eq!(failure["next_action"], "fix_input", "{tool}");
+            assert_eq!(requests.lock().unwrap().len(), sent, "{tool}");
+        }
+    }
+
+    #[test]
+    fn commit_conflict_keeps_the_client_class_through_the_tool_rename() {
+        // A read that kept losing to concurrent writers applied nothing, so
+        // the same content-derived commit may be repeated.
+        let (backend, _, server) =
+            scripted_backend(vec![wire::WorkspaceRpcOutcome::Failure(wire::RpcFailure {
+                code: wire::ErrorCode::Conflict,
+                message: "read stability exhausted".to_owned(),
+                retryable: true,
+                conflict: Some(wire::ConflictKind::ReadVersion),
+                current_generation: None,
+                route_hint: None,
+            })]);
+
+        let failure = cli_tool_failure(
+            backend,
+            "workbench_commit",
+            json!({
+                "id": "clock-stable-run",
+                "manifest": {"model": "viking", "steps": [1, 2]},
+                "content_digest_uri": commit_request().content_digest_uri,
+            }),
+        );
+        server.join().unwrap();
+
+        assert_eq!(failure["code"], "WorkbenchCommitConflict");
+        assert_eq!(failure["class"], "transient");
+        assert_eq!(failure["next_action"], "resubmit_same");
     }
 
     #[test]
     fn publish_implicitly_admits_a_missing_workbench_before_provider_use() {
         // A body above the inline bound is the one that needs the provider.
         let body = vec![b' '; nokv_protocol::MAX_INLINE_ARTIFACT_BODY_BYTES + 1];
-        let objects: Arc<dyn ArtifactObjectStore> = Arc::new(
-            CliObjectStore::build(&crate::cli::ObjectConfig {
-                bucket: Some("unused-test-bucket".to_owned()),
-                ..crate::cli::ObjectConfig::default()
-            })
-            .unwrap(),
-        );
+        let objects: Arc<dyn ArtifactObjectStore> =
+            Arc::new(CliObjectStore::build(&refused_provider_config()).unwrap());
         let (backend, requests, server) = scripted_backend_with_objects(
             vec![
                 not_found_failure(),
@@ -6322,11 +6603,9 @@ mod tests {
         let error = agent::WorkbenchBackend::publish(&backend, request).unwrap_err();
         server.join().unwrap();
 
-        assert_eq!(
-            error.kind,
-            agent::BackendErrorKind::Other("ObjectUnavailable".to_owned())
-        );
-        assert_eq!(error.message, "artifact object operation failed");
+        // The first object write admits the provider; its refusal stops the
+        // publication before any publication request.
+        assert_refused_provider_admission(&error);
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert!(matches!(
@@ -6357,11 +6636,9 @@ mod tests {
         let error = agent::WorkbenchBackend::append(&backend, append_request()).unwrap_err();
         server.join().unwrap();
 
-        assert_eq!(
-            error.kind,
-            agent::BackendErrorKind::Other("ObjectUnavailable".to_owned())
-        );
-        assert_eq!(error.message, "artifact object operation failed");
+        // An append asks for admission before it knows whether its result
+        // is inline.
+        assert_refused_provider_admission(&error);
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert!(matches!(
@@ -7151,6 +7428,43 @@ mod tests {
             &requests[1].operation,
             wire::WorkspaceRequest::GetWorkspace(_)
         ));
+    }
+
+    #[test]
+    fn native_append_fence_refused_before_admission_is_a_precondition_to_reread() {
+        let (backend, requests, server) = scripted_backend(vec![
+            not_found_failure(),
+            success(wire::WorkspaceResult::Workspace(workspace_summary(
+                "reincarnated",
+                [0x77; 16],
+            ))),
+        ]);
+        let operation_id = wire::OperationIdentity([0xaa; 16]);
+        let error = backend
+            .client
+            .resolve_append_workspace_incarnation(
+                operation_id,
+                &wire::WorkspacePath {
+                    workbench: wire::WorkbenchName::new("reincarnated").unwrap(),
+                    path: wire::RelativePath::new("logs/events.jsonl").unwrap(),
+                },
+                Some(wire::WorkspaceIdentity([0x66; 16])),
+            )
+            .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+
+        // The operation does not exist, so querying it would report it absent
+        // and resubmitting would be refused again.
+        let failure = crate::with_append_details(crate::append_client_failure(error), operation_id);
+        assert_eq!(failure.exit_code(), 4);
+        let failure: Value = serde_json::from_str(&failure.to_line()).unwrap();
+        assert_eq!(failure["code"], "Conflict");
+        assert_eq!(failure["class"], "precondition_failed");
+        assert_eq!(failure["next_action"], "reread_then_retry");
+        assert_eq!(failure["details"]["next_action"], "reread_then_retry");
+        assert_eq!(failure["details"]["conflict"], "WorkspaceIncarnation");
+        assert_eq!(failure["details"]["operation_id"], "aa".repeat(16));
     }
 
     #[test]
