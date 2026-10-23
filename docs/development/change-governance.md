@@ -21,6 +21,9 @@ protection:
 - the current-head pusher cannot supply that approval;
 - unresolved review conversations block merge;
 - administrators are subject to the same restrictions;
+- PR titles and descriptions follow the
+  [required format](../../CONTRIBUTING.md#pr-description-format), enforced by
+  the required `pr-description` check;
 - the branch must be current with `main` and every required status must pass.
 
 GitHub-reported additions plus deletions are the review-size measure. The
@@ -49,6 +52,15 @@ the workflow does not publish a second custom commit status.
 This distinction is required: a normal `pull_request` workflow is part of the
 proposed diff and can otherwise weaken the check that evaluates itself.
 
+[`pr-description.yml`](../../.github/workflows/pr-description.yml) applies the
+same protected-base boundary to PR metadata. It reads the live title and body
+through `gh`, treats them only as data, and fetches the validator from the exact
+base SHA. It reruns on `edited` as well as creation, reopening, pushes, and
+ready-for-review events. A manual dispatch can recheck a PR with the current
+protected policy. Candidate policy regression tests run separately in
+[`pr-description-tests.yml`](../../.github/workflows/pr-description-tests.yml),
+so a skipped candidate job cannot satisfy the metadata check.
+
 The required status set is:
 
 - `nokv-workspace`;
@@ -56,6 +68,11 @@ The required status set is:
 - `workbench-contract`;
 - `signoff`;
 - `large-change-review`.
+
+The PR writing policy additionally requires `pr-description` and
+`pr-description-tests`. Enable the new required checks after the introducing
+PR has merged and the protected workflow is available; then verify the live
+branch-protection settings without removing existing checks.
 
 Every validation job that runs for each pull-request head is required. The
 Docker `image` check is the only CI exception: it continues in the background

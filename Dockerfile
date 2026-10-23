@@ -3,7 +3,7 @@
 
 # syntax=docker/dockerfile:1
 
-ARG RUST_VERSION=1.88
+ARG RUST_VERSION=1.91
 ARG DEBIAN_VERSION=bookworm
 ARG NOKV_PACKAGE=nokv
 ARG NOKV_BINARY=nokv
@@ -14,7 +14,7 @@ ARG NOKV_BINARY
 WORKDIR /workspace
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./

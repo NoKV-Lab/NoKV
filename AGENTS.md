@@ -9,6 +9,31 @@ This repository uses `docs/development/code_contract.md` as the source of truth
 for Rust package boundaries, naming, errors, metrics, tests, DCO, and storage
 safety review.
 
+## PR Writing
+
+Follow the authoritative
+[PR description format](CONTRIBUTING.md#pr-description-format) and
+[pull request template](.github/pull_request_template.md) when creating or
+updating a PR. This is the repository's required format, including for agents.
+
+- Write a concise English title as `<type>: <outcome>`.
+- Use these body headings in order: `TLDR`, `Problem`, `Consequences`,
+  `Example`, `Solution`, `Gain`, `Tradeoffs`, then `Validation`.
+- Use short, plain English paragraphs. Explain the concrete problem, user
+  impact, and before/after behavior with minimal code details. Avoid file-by-file
+  summaries, pasted diffs, repeated explanations, and conversational history.
+- Link the issue under `Problem`; explain any permitted exception there.
+- Report exact validation commands and results, relevant checks not run, and
+  evidence limits. Do not claim unmeasured gains or unverified recovery.
+- Keep every heading; briefly explain when a section does not apply. Refresh
+  the title and body when the final scope changes.
+- Keep DCO sign-offs and all existing engineering and merge requirements.
+- Before opening or editing a PR, run `scripts/ci/pr_description.py` against a
+  JSON object containing its final `title` and `body`, using
+  `--pull-request-json <path>`. The same policy is the required remote
+  `pr-description` check; its regression tests are in
+  `scripts/ci/pr_description_test.py`.
+
 ## Local Collaboration Direction
 
 LingTai is no longer an active partner or a default integration target.
