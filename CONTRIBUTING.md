@@ -48,13 +48,13 @@ Do not open a public issue with exploit details. Follow the private reporting pr
 - Repository: `github.com/NoKV-Lab/NoKV`
 - Main branch: `main`
 - Main product line: Rust NoKV under `crates/`
-- Minimum supported Rust version: 1.88
+- Minimum supported Rust version: 1.91
 
 ## Development Setup
 
 1. Fork on GitHub and clone your fork.
 2. Add the upstream remote to keep your fork up to date.
-3. Install Rust 1.88 or newer.
+3. Install Rust 1.91 or newer.
 
 ```bash
 git clone https://github.com/YOUR_GITHUB_USER/NoKV.git
