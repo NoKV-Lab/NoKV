@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use nokv_types::ObjectNamespaceId;
+use nokv_types::{ErrorClass, ObjectNamespaceId};
 use opendal::blocking::Operator as BlockingOperator;
 use opendal::options::WriteOptions;
 use opendal::services::S3;
@@ -823,6 +823,45 @@ impl ObjectError {
                 ..
             }
         )
+    }
+
+    /// What this failure means for the caller. Object writes are immutable
+    /// and exact-byte replayable, so only an ambiguous create, delete, or seal
+    /// leaves an outcome unknown.
+    pub fn class(&self) -> ErrorClass {
+        match self {
+            Self::EmptyKey
+            | Self::AbsoluteKey
+            | Self::EmptyKeyComponent
+            | Self::ParentTraversal
+            | Self::CurrentDirectory
+            | Self::BackslashInKey
+            | Self::ContainsNul
+            | Self::InvalidRange { .. }
+            | Self::ProviderAdmissionBlockSizeExceeded { .. } => ErrorClass::InvalidInput,
+            Self::ObjectNotFound { .. } => ErrorClass::NotFound,
+            Self::CreateAmbiguous { .. }
+            | Self::DeleteAmbiguous { .. }
+            | Self::SealAmbiguous { .. } => ErrorClass::OutcomeUnknown,
+            Self::Backend {
+                retryable: true, ..
+            } => ErrorClass::Transient,
+            Self::ImmutableCollision { .. }
+            | Self::DigestMismatch { .. }
+            | Self::InvalidManifest(_)
+            | Self::MissingBucket
+            | Self::MissingRegion
+            | Self::ObjectNamespaceUninitialized
+            | Self::InvalidObjectNamespaceMarker
+            | Self::UnsupportedObjectNamespaceMarkerVersion { .. }
+            | Self::ObjectNamespaceMismatch { .. }
+            | Self::AtomicCreateUnsupported
+            | Self::ImmutableSealingUnsupported
+            | Self::ProviderAdmissionRequired
+            | Self::Backend {
+                retryable: false, ..
+            } => ErrorClass::OperatorRequired,
+        }
     }
 
     pub(crate) fn backend(error: impl fmt::Display) -> Self {

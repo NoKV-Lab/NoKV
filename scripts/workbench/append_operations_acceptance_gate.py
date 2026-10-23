@@ -505,14 +505,17 @@ def exact_input_error(
     code="InvalidArgument",
     cause="InvalidArgument",
     conflict=None,
+    next_action="fix_input",
 ):
+    # The CLI contract (docs/cli-contract.md) names the next action of each
+    # failure class; details.next_action repeats it.
     details = value.get("details", {})
     require(
         value.get("status") == "error"
         and value.get("code") == code
         and details.get("operation_id") == operation_id
         and details.get("cause_code") == cause
-        and details.get("next_action") == "query_same"
+        and value.get("next_action") == details.get("next_action") == next_action
         and (conflict is None or details.get("conflict") == conflict),
         "public operation error has the precise actionable classification",
         value,
@@ -580,7 +583,13 @@ def inspection_input_rejections(stack, fixture, first_page, label):
     results.append(other_root)
     for action in ("inspect", "recover"):
         missing = operation(stack, action, other_id, label + "-missing-" + action)
-        exact_input_error(missing, other_id, code="NotFound", cause="NotFound")
+        exact_input_error(
+            missing,
+            other_id,
+            code="NotFound",
+            cause="NotFound",
+            next_action="resubmit_same",
+        )
         results.append(missing)
     unchanged = operation(
         stack, "inspect", operation_id, label + "-first-page-after-errors"
@@ -1106,6 +1115,7 @@ def recovery_ack_loss_and_aba(stack, deadline):
             code="Conflict",
             cause="Conflict",
             conflict="OperationState",
+            next_action="reread_then_retry",
         )
         release_provider(stack)
         old_again = operation(
@@ -1212,6 +1222,7 @@ def recovery_ack_loss_and_aba(stack, deadline):
             code="Conflict",
             cause="Conflict",
             conflict="OperationState",
+            next_action="reread_then_retry",
         )
         require(
             successor_cli_rejection.get("retryable") is False

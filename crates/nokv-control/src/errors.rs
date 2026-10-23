@@ -1,5 +1,7 @@
 use std::fmt;
 
+use nokv_types::ErrorClass;
+
 use crate::{
     LogicalShardId, LogicalShardLease, LogicalShardState, NodeId, ObjectNamespaceId, OwnerEpoch,
     RootId, RootPlacement,
@@ -81,6 +83,43 @@ pub enum ControlError {
     },
     Codec(String),
     Backend(String),
+}
+
+impl ControlError {
+    /// What this control-plane failure means for the caller.
+    pub fn class(&self) -> ErrorClass {
+        match self {
+            Self::InvalidEndpoint(_)
+            | Self::InvalidOptions(_)
+            | Self::InvalidPlacementMutation { .. } => ErrorClass::InvalidInput,
+            Self::RootPlacementAlreadyExists(_)
+            | Self::RootAgentAlreadyBound { .. }
+            | Self::RootObjectNamespaceAlreadyBound { .. }
+            | Self::ImmutableShardAffinity { .. }
+            | Self::LogicalShardAlreadyExists(_) => ErrorClass::PreconditionFailed,
+            // Ownership is moving or contended: a later attempt observes the
+            // settled state.
+            Self::RootPlacementCasConflict { .. }
+            | Self::LogicalShardAlreadyOwned { .. }
+            | Self::PreviousOwnerSessionLive { .. }
+            | Self::RecoveryAttemptPending { .. }
+            | Self::RecoveryStateConflict { .. }
+            | Self::StaleOwnerEpoch { .. }
+            | Self::NotOwner { .. }
+            | Self::StaleLease(_)
+            | Self::RecoveryPublicationConflict { .. }
+            | Self::RecoveryUploadConflict { .. }
+            | Self::Backend(_) => ErrorClass::Transient,
+            Self::UnsupportedRecordVersion { .. } => ErrorClass::Incompatible,
+            Self::RootPlacementNotFound(_)
+            | Self::LogicalShardNotFound(_)
+            | Self::RootPlacementRequired(_)
+            | Self::OwnerEpochExhausted(_)
+            | Self::LeaseIdExhausted(_)
+            | Self::InvalidRecord(_)
+            | Self::Codec(_) => ErrorClass::OperatorRequired,
+        }
+    }
 }
 
 impl fmt::Display for ControlError {

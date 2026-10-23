@@ -17,7 +17,7 @@ use nokv_client::{
 };
 use nokv_control::ControlStore;
 use nokv_protocol::{LogicalShardIdentity, ObjectNamespaceIdentity, RootIdentity, RootRoute};
-use nokv_types::AgentId;
+use nokv_types::{AgentId, ErrorClass};
 
 use super::cli::{
     ClientConfig, EtcdRoutingConfig, LocalRoutingConfig, RoutingConfig, StaticRoutingConfig,
@@ -46,6 +46,24 @@ pub enum ConnectionError {
     Control(nokv_control::ControlError),
     Transport(TransportError),
     Client(ClientError),
+}
+
+impl ConnectionError {
+    /// What this connection failure means for the caller. Connecting reads
+    /// control state and performs the handshake; it changes nothing.
+    pub fn class(&self) -> ErrorClass {
+        match self {
+            Self::MissingOption(_) | Self::InvalidIdentity { .. } | Self::StaticControl => {
+                ErrorClass::InvalidInput
+            }
+            #[cfg(not(feature = "etcd"))]
+            Self::FeatureDisabled { .. } => ErrorClass::InvalidInput,
+            Self::Control(error) => error.class(),
+            Self::Transport(error) if error.is_incompatible() => ErrorClass::Incompatible,
+            Self::Transport(_) => ErrorClass::Transient,
+            Self::Client(error) => error.class().for_read(),
+        }
+    }
 }
 
 impl fmt::Display for ConnectionError {

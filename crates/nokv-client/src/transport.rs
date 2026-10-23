@@ -280,20 +280,21 @@ fn perform_handshake(stream: &mut TcpStream, timeout: Duration) -> Result<(), Tr
     let mut response = [0_u8; HANDSHAKE_FRAME_BYTES];
     read_exact_until(stream, &mut response, deadline).map_err(io_error)?;
     let response = decode_handshake_frame(&response).map_err(|error| {
-        TransportError::new(format!("invalid workspace RPC handshake: {error}"), false)
+        TransportError::incompatible(format!("invalid workspace RPC handshake: {error}"))
     })?;
     match response.kind() {
         HandshakeKind::Accepted if response.operation_schema() == WORKSPACE_PROTOCOL_SCHEMA => {
             Ok(())
         }
-        HandshakeKind::Incompatible => Err(TransportError::new(
-            "workspace RPC handshake is incompatible; upgrade the NoKV client/server pair",
-            false,
-        )),
-        HandshakeKind::Accepted => Err(TransportError::new(
-            "workspace RPC handshake accepted a different operation schema",
-            false,
-        )),
+        HandshakeKind::Incompatible => Err(TransportError::incompatible(format!(
+            "workspace RPC handshake is incompatible: this client speaks {WORKSPACE_PROTOCOL_SCHEMA} \
+             and the owner answered {}; upgrade the NoKV client/server pair",
+            response.operation_schema()
+        ))),
+        HandshakeKind::Accepted => Err(TransportError::incompatible(format!(
+            "workspace RPC handshake accepted a different operation schema: {}",
+            response.operation_schema()
+        ))),
         HandshakeKind::ClientHello => Err(TransportError::new(
             "workspace RPC server returned a client hello",
             false,

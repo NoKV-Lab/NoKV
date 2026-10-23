@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use nokv_types::ErrorClass;
+
 use crate::digest::{hex, sha256};
 use crate::{
     ArtifactObjectStore, ImmutableCreateOutcome, ObjectError, ObjectKey, ObjectRange,
@@ -39,6 +41,18 @@ pub enum ProviderAdmissionError {
     },
     Unavailable,
     Inconclusive,
+}
+
+impl ProviderAdmissionError {
+    /// What this admission failure means for the caller: a provider without
+    /// a required capability needs an operator, while an unreachable or
+    /// inconclusive probe can be repeated.
+    pub fn class(&self) -> ErrorClass {
+        match self {
+            Self::Rejected { .. } => ErrorClass::OperatorRequired,
+            Self::Unavailable | Self::Inconclusive => ErrorClass::Transient,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

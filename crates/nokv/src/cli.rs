@@ -145,10 +145,18 @@ pub enum Command {
         replace: bool,
         expected_generation: Option<u64>,
         content_type: Option<String>,
+        /// Publishes under this caller identity, replayable across processes.
+        operation_id: Option<[u8; 16]>,
+        expected_workspace_incarnation_id: Option<[u8; 16]>,
     },
     WorkspacePath(WorkspacePathCommand),
     OperationStatus {
         operation_id: [u8; 16],
+    },
+    /// Status of the commit operation whose identity derives from this
+    /// commit identity, as `workbench_commit` reports it.
+    CommitStatus {
+        commit_identity: [u8; 32],
     },
     OperationInspect {
         operation_id: [u8; 16],
@@ -194,6 +202,15 @@ impl Command {
                     | "workbench_stat"
             ),
             Self::Materialize { .. } => false,
+            // A caller-identified publication admits the object provider only
+            // when its body does not publish inline.
+            Self::WorkspacePath(
+                WorkspacePathCommand::Put { .. } | WorkspacePathCommand::Stat { .. },
+            )
+            | Self::Collect {
+                operation_id: Some(_),
+                ..
+            } => false,
             _ => true,
         }
     }
@@ -218,6 +235,25 @@ pub enum WorkspacePathCommand {
         content_type: Option<String>,
         max_logical_size: Option<u64>,
         block_size: usize,
+    },
+    /// Version tokens of one path, read in one metadata read.
+    Stat {
+        workbench: String,
+        section: String,
+        path: String,
+    },
+    /// Create-only or generation-pinned publication of one whole body under
+    /// a caller-chosen operation identity.
+    Put {
+        workbench: String,
+        section: String,
+        path: String,
+        operation_id: [u8; 16],
+        expected_generation: Option<u64>,
+        expected_workspace_incarnation_id: Option<[u8; 16]>,
+        payload: AppendPayload,
+        content_type: Option<String>,
+        block_size: Option<usize>,
     },
     Rename {
         workbench: String,
@@ -272,6 +308,8 @@ pub enum CliError {
     MixedMetadataStoreOptions,
     LocalOnlyRecoverLog,
     UnpinnedExpectedGeneration,
+    UnpinnedIdentifiedReplace,
+    UnidentifiedIncarnationFence,
 }
 
 impl fmt::Display for CliError {
@@ -309,6 +347,12 @@ impl fmt::Display for CliError {
             ),
             Self::UnpinnedExpectedGeneration => formatter.write_str(
                 "--expected-generation pins a replace-only publication and requires --replace",
+            ),
+            Self::UnpinnedIdentifiedReplace => formatter.write_str(
+                "--replace with --operation-id requires --expected-generation: a caller-identified replace names the generation it replaces",
+            ),
+            Self::UnidentifiedIncarnationFence => formatter.write_str(
+                "--expected-workspace-incarnation-id requires --operation-id",
             ),
         }
     }
@@ -632,6 +676,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             | Command::Collect { .. }
             | Command::WorkspacePath(_)
             | Command::OperationStatus { .. }
+            | Command::CommitStatus { .. }
             | Command::OperationInspect { .. }
             | Command::OperationRecover { .. }
             | Command::Provision { .. }
@@ -731,6 +776,19 @@ fn parse_operation(arguments: &mut impl Iterator<Item = String>) -> Result<Comma
     let identity = arguments
         .next()
         .ok_or(CliError::MissingArgument("operation identity"))?;
+    if operation == "status" && identity == "--commit-identity" {
+        let value = arguments
+            .next()
+            .ok_or(CliError::MissingArgument("commit identity"))?;
+        let commit_identity = decode_fixed_hex(&value).ok_or(CliError::InvalidOption {
+            option: "--commit-identity",
+            value,
+        })?;
+        if let Some(argument) = arguments.next() {
+            return Err(CliError::UnexpectedArgument(argument));
+        }
+        return Ok(Command::CommitStatus { commit_identity });
+    }
     let operation_id = parse_append_identity("operation identity", identity)?;
     if operation == "status" {
         return Ok(Command::OperationStatus { operation_id });
@@ -856,6 +914,19 @@ fn parse_workspace_path(arguments: &mut impl Iterator<Item = String>) -> Result<
     if operation == "append" {
         return parse_workspace_append(arguments, workbench, section, first_path);
     }
+    if operation == "put" {
+        return parse_workspace_put(arguments, workbench, section, first_path);
+    }
+    if operation == "stat" {
+        if let Some(argument) = arguments.next() {
+            return Err(CliError::UnexpectedArgument(argument));
+        }
+        return Ok(Command::WorkspacePath(WorkspacePathCommand::Stat {
+            workbench,
+            section,
+            path: first_path,
+        }));
+    }
     let destination = match operation.as_str() {
         "rename" => Some(
             arguments
@@ -910,6 +981,87 @@ fn parse_workspace_path(arguments: &mut impl Iterator<Item = String>) -> Result<
             expected_generation,
             request_id,
         },
+    }))
+}
+
+fn parse_workspace_put(
+    arguments: &mut impl Iterator<Item = String>,
+    workbench: String,
+    section: String,
+    path: String,
+) -> Result<Command, CliError> {
+    let mut operation_id = None;
+    let mut expected_generation = None;
+    let mut expected_workspace_incarnation_id = None;
+    let mut payload = None;
+    let mut content_type = None;
+    let mut block_size = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--operation-id" if operation_id.is_none() => {
+                operation_id = Some(parse_append_identity(
+                    "--operation-id",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--expected-generation" if expected_generation.is_none() => {
+                expected_generation = Some(parse_number(
+                    "--expected-generation",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--expected-workspace-incarnation-id"
+                if expected_workspace_incarnation_id.is_none() =>
+            {
+                expected_workspace_incarnation_id = Some(parse_append_identity(
+                    "--expected-workspace-incarnation-id",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--text" if payload.is_none() => {
+                payload = Some(AppendPayload::Text(next_value(arguments, &argument)?));
+            }
+            "--base64" if payload.is_none() => {
+                payload = Some(AppendPayload::Base64(next_value(arguments, &argument)?));
+            }
+            "--file" if payload.is_none() => {
+                payload = Some(AppendPayload::File(PathBuf::from(next_value(
+                    arguments, &argument,
+                )?)));
+            }
+            "--content-type" if content_type.is_none() => {
+                content_type = Some(next_value(arguments, &argument)?);
+            }
+            "--block-size" if block_size.is_none() => {
+                block_size = Some(parse_number(
+                    "--block-size",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--operation-id"
+            | "--expected-generation"
+            | "--expected-workspace-incarnation-id"
+            | "--text"
+            | "--base64"
+            | "--file"
+            | "--content-type"
+            | "--block-size" => return Err(CliError::UnexpectedArgument(argument)),
+            _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    Ok(Command::WorkspacePath(WorkspacePathCommand::Put {
+        workbench,
+        section,
+        path,
+        operation_id: operation_id.ok_or(CliError::MissingOption("--operation-id"))?,
+        expected_generation,
+        expected_workspace_incarnation_id,
+        payload: payload.ok_or(CliError::MissingArgument(
+            "one of --text, --base64, or --file",
+        ))?,
+        content_type,
+        block_size,
     }))
 }
 
@@ -1046,17 +1198,40 @@ fn parse_collect(arguments: &mut impl Iterator<Item = String>) -> Result<Command
     let mut replace = false;
     let mut expected_generation = None;
     let mut content_type = None;
+    let mut operation_id = None;
+    let mut expected_workspace_incarnation_id = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "--replace" => replace = true,
-            "--expected-generation" => {
+            "--replace" if !replace => replace = true,
+            "--expected-generation" if expected_generation.is_none() => {
                 expected_generation = Some(parse_number(
                     "--expected-generation",
                     next_value(arguments, &argument)?,
                 )?);
             }
-            "--content-type" => {
+            "--content-type" if content_type.is_none() => {
                 content_type = Some(next_value(arguments, &argument)?);
+            }
+            "--operation-id" if operation_id.is_none() => {
+                operation_id = Some(parse_append_identity(
+                    "--operation-id",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--expected-workspace-incarnation-id"
+                if expected_workspace_incarnation_id.is_none() =>
+            {
+                expected_workspace_incarnation_id = Some(parse_append_identity(
+                    "--expected-workspace-incarnation-id",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--replace"
+            | "--expected-generation"
+            | "--content-type"
+            | "--operation-id"
+            | "--expected-workspace-incarnation-id" => {
+                return Err(CliError::UnexpectedArgument(argument));
             }
             _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
             _ => return Err(CliError::UnexpectedArgument(argument)),
@@ -1064,6 +1239,12 @@ fn parse_collect(arguments: &mut impl Iterator<Item = String>) -> Result<Command
     }
     if expected_generation.is_some() && !replace {
         return Err(CliError::UnpinnedExpectedGeneration);
+    }
+    if operation_id.is_some() && replace && expected_generation.is_none() {
+        return Err(CliError::UnpinnedIdentifiedReplace);
+    }
+    if operation_id.is_none() && expected_workspace_incarnation_id.is_some() {
+        return Err(CliError::UnidentifiedIncarnationFence);
     }
     Ok(Command::Collect {
         workbench,
@@ -1073,6 +1254,8 @@ fn parse_collect(arguments: &mut impl Iterator<Item = String>) -> Result<Command
         replace,
         expected_generation,
         content_type,
+        operation_id,
+        expected_workspace_incarnation_id,
     })
 }
 
@@ -1275,8 +1458,162 @@ mod tests {
                 replace: true,
                 expected_generation: None,
                 content_type: Some("application/octet-stream".to_owned()),
+                operation_id: None,
+                expected_workspace_incarnation_id: None,
             }
         );
+    }
+
+    fn agent_args(rest: &[&str]) -> Vec<String> {
+        let mut all = vec![
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--workbench-root",
+            "/agents/test/wb",
+        ];
+        all.extend_from_slice(rest);
+        args(&all)
+    }
+
+    #[test]
+    fn put_names_one_caller_identified_whole_body_publication() {
+        let parsed = parse(agent_args(&[
+            "workspace-path",
+            "put",
+            "run-1",
+            "outputs",
+            "result.json",
+            "--operation-id",
+            "0123456789abcdef0123456789abcdef",
+            "--text",
+            "{}",
+            "--expected-generation",
+            "2",
+            "--content-type",
+            "application/json",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::WorkspacePath(WorkspacePathCommand::Put {
+                workbench: "run-1".to_owned(),
+                section: "outputs".to_owned(),
+                path: "result.json".to_owned(),
+                operation_id: [
+                    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
+                    0xab, 0xcd, 0xef
+                ],
+                expected_generation: Some(2),
+                expected_workspace_incarnation_id: None,
+                payload: AppendPayload::Text("{}".to_owned()),
+                content_type: Some("application/json".to_owned()),
+                block_size: None,
+            })
+        );
+        let put = |rest: &[&str]| {
+            let mut all = vec!["workspace-path", "put", "run-1", "outputs", "a.txt"];
+            all.extend_from_slice(rest);
+            parse(agent_args(&all))
+        };
+        assert_eq!(
+            put(&["--text", "a"]).unwrap_err(),
+            CliError::MissingOption("--operation-id")
+        );
+        let id = "0123456789abcdef0123456789abcdef";
+        assert!(matches!(
+            put(&["--operation-id", id]).unwrap_err(),
+            CliError::MissingArgument(_)
+        ));
+        for duplicated in [
+            vec!["--operation-id", id, "--operation-id", id, "--text", "a"],
+            vec!["--operation-id", id, "--text", "a", "--file", "b"],
+            vec![
+                "--operation-id",
+                id,
+                "--text",
+                "a",
+                "--expected-generation",
+                "1",
+                "--expected-generation",
+                "2",
+            ],
+        ] {
+            assert!(matches!(
+                put(&duplicated).unwrap_err(),
+                CliError::UnexpectedArgument(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn an_identified_collect_pins_its_replace_and_owns_its_fence() {
+        let collect = |rest: &[&str]| {
+            let mut all = vec!["collect", "run-1", "outputs", "/tmp/a.bin", "a.bin"];
+            all.extend_from_slice(rest);
+            parse(agent_args(&all))
+        };
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            collect(&["--operation-id", id, "--replace"]).unwrap_err(),
+            CliError::UnpinnedIdentifiedReplace
+        );
+        assert_eq!(
+            collect(&["--expected-workspace-incarnation-id", id]).unwrap_err(),
+            CliError::UnidentifiedIncarnationFence
+        );
+        for duplicated in [
+            vec!["--replace", "--replace"],
+            vec!["--content-type", "a/b", "--content-type", "c/d"],
+        ] {
+            assert!(matches!(
+                collect(&duplicated).unwrap_err(),
+                CliError::UnexpectedArgument(_)
+            ));
+        }
+        let parsed = collect(&[
+            "--operation-id",
+            id,
+            "--replace",
+            "--expected-generation",
+            "3",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Collect {
+                operation_id: Some(_),
+                expected_generation: Some(3),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn operation_status_names_a_commit_by_its_reported_identity() {
+        let commit = "ab".repeat(32);
+        let parsed = parse(agent_args(&[
+            "operation",
+            "status",
+            "--commit-identity",
+            &commit,
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::CommitStatus {
+                commit_identity: [0xab; 32]
+            }
+        );
+        assert!(matches!(
+            parse(agent_args(&[
+                "operation",
+                "status",
+                "--commit-identity",
+                "ab"
+            ]))
+            .unwrap_err(),
+            CliError::InvalidOption { .. }
+        ));
     }
 
     #[test]
@@ -1306,6 +1643,8 @@ mod tests {
                 replace: true,
                 expected_generation: Some(7),
                 content_type: None,
+                operation_id: None,
+                expected_workspace_incarnation_id: None,
             }
         );
 
