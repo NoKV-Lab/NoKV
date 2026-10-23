@@ -3,14 +3,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Workspace RPC over TLS on one host.
 
-The gate provisions one root on a `--control-dir` control store, registers a
-client certificate as a credential of a tenant, and serves the root over TLS.
-Before the root is bound to that tenant, the owner must refuse to serve at all.
-The gate then drives the native `nokv` binary as the registered client, with an
-unregistered certificate, without TLS, with a mismatched owner name, and with a
-revoked credential. Each refusal must be exactly one `operator_required`
-failure line, and a read-back by the registered client must show that the
-refused write changed nothing. Certificates come from the `openssl` command.
+The gate provisions one root on a `--control-dir` control store, registers
+client certificates as credentials of a tenant's principals, grants them roles,
+and serves the root over TLS. Before the root is bound to that tenant, the
+owner must refuse to serve at all. The gate then drives the native `nokv`
+binary as a registered writer, with an unregistered certificate, without TLS,
+with a mismatched owner name, with a revoked credential, as a reader, as a
+second writer of the same root, and in a session whose role is revoked. Each
+refusal must be exactly one `operator_required` failure line, and a read-back
+by a writer must show that the refused write changed nothing. Certificates come
+from the `openssl` command.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from cli_contract_gate import (
     Call,
     ContractFailure,
     NotQualified,
+    WORKBENCH_ROOT,
     Stack,
     new_id,
     require,
@@ -82,8 +85,13 @@ class TlsStack(Stack):
     def __init__(self, args: argparse.Namespace, evidence: Path) -> None:
         super().__init__(args, evidence)
         self.pki = Pki(evidence / "pki")
-        self.clients = {name: self.pki.client(name) for name in ("agent", "stranger", "rotated")}
-        self.tenant, self.principal = new_id(), new_id()
+        self.clients = {
+            name: self.pki.client(name)
+            for name in ("agent", "stranger", "rotated", "reader", "peer", "session")
+        }
+        self.tenant = new_id()
+        self.principals = {name: new_id() for name in ("agent", "reader", "peer", "session")}
+        self.principal = self.principals["agent"]
 
     def tls_options(self, client: str | None, server_name: str) -> list[str]:
         if client is None:
@@ -97,18 +105,31 @@ class TlsStack(Stack):
         ]
 
     def run(self, label: str, arguments: list[str], *, client: bool = True,
-            tls: str | None = "agent", server_name: str = SERVER_NAME) -> Call:
+            tls: str | None = "agent", server_name: str = SERVER_NAME,
+            agent_id: str | None = None) -> Call:
         options = self.tls_options(tls, server_name) if client else []
-        return super().run(label, [*options, *arguments], client=client)
+        if agent_id is None:
+            return super().run(label, [*options, *arguments], client=client)
+        configured, self.ids["agent"] = self.ids["agent"], agent_id
+        try:
+            return super().run(label, [*options, *arguments], client=client)
+        finally:
+            self.ids["agent"] = configured
 
     def identity(self, label: str, *arguments: str) -> dict[str, Any]:
         return self.success(self.run(label, ["identity", *arguments], client=False))
 
-    def register(self, client: str) -> dict[str, Any]:
+    def register(self, client: str, principal: str = "agent") -> dict[str, Any]:
         certificate, _ = self.clients[client]
         return self.identity(
-            f"credential-{client}", "credential", "add", self.tenant, self.principal,
+            f"credential-{client}", "credential", "add", self.tenant, self.principals[principal],
             "--certificate", str(certificate), "--expires-at-unix", str(int(time.time()) + 3600),
+        )
+
+    def role(self, action: str, principal: str, role: str, scope: list[str]) -> dict[str, Any]:
+        return self.identity(
+            f"role-{action}-{principal}-{role}", "role", action, self.tenant,
+            self.principals[principal], "--role", role, *scope,
         )
 
     def spawn_owner(self, log: str, *, reopen: bool) -> subprocess.Popen:
@@ -205,15 +226,75 @@ def revoked_credential_refused(stack: TlsStack) -> dict[str, Any]:
     """T5: a credential works until it is revoked, and no new connection
     authenticates after that."""
     added = stack.register("rotated")
+    # The owner rereads its tenant's records every second; a new credential
+    # works from the next refresh.
+    time.sleep(2.5)
     stack.stat("t5-before-revoke", WORKBENCH, "registered.txt")
     stack.success(stack.run("t5-before-revoke-as-rotated",
                             ["workspace-path", "stat", WORKBENCH, "outputs", "registered.txt"],
                             tls="rotated"))
     revoked = stack.identity("t5-revoke", "credential", "revoke", stack.tenant, added["fingerprint"])
     require(revoked.get("revoked") is True, "t5: the credential is revoked", revoked)
+    time.sleep(2.5)
     envelope = stack.refused("t5-revoked", "revoked.txt", tls="rotated")
     require("not a current credential" in envelope["message"], "t5: the refusal names the credential", envelope)
     return envelope
+
+
+def reader_cannot_write(stack: TlsStack) -> dict[str, Any]:
+    """T6: a reader reads, and its write is refused without effect."""
+    stack.success(stack.run("t6-read", ["workspace-path", "stat", WORKBENCH, "outputs", "registered.txt"],
+                            tls="reader"))
+    envelope = stack.refused("t6-write", "reader.txt", tls="reader")
+    require(envelope["code"] == "PermissionDenied", "t6: the refusal is PermissionDenied", envelope)
+    return envelope
+
+
+def two_principals_write_one_root(stack: TlsStack) -> dict[str, Any]:
+    """T7: two principals write the same root. The second passes an AgentId
+    the root is not bound to: over TLS the owner authorizes the principal and
+    the CLI checks no AgentId binding."""
+    first = stack.success(stack.put("t7-agent", WORKBENCH, "agent.txt", new_id(), b"agent"))
+    arguments = stack.put_arguments("t7-peer", WORKBENCH, "peer.txt", new_id(), b"peer")
+    second = stack.success(stack.run("t7-peer", arguments, tls="peer", agent_id=new_id()))
+    for label, path, client in [("t7-agent-reads-peer", "peer.txt", "agent"),
+                                ("t7-peer-reads-agent", "agent.txt", "peer")]:
+        stat = stack.success(stack.run(label, ["workspace-path", "stat", WORKBENCH, "outputs", path],
+                                       tls=client))
+        require(stat.get("exists") is True, f"{label}: the other writer's path reads back", stat)
+    return {"agent": first, "peer": second}
+
+
+def revoked_role_stops_an_open_session(stack: TlsStack) -> dict[str, Any]:
+    """T8: a role revoked while a session is open stops that session's next
+    write within the owner's refresh interval."""
+    argv = [str(stack.binary), *stack.route, *stack.objects, "--workbench-root", WORKBENCH_ROOT,
+            *stack.tls_options("session", SERVER_NAME), "workbench-session"]
+    session = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                               env=stack.env)
+
+    def call(index: int) -> dict[str, Any]:
+        request = {"id": str(index), "tool": "workbench_put_file", "arguments": {
+            "id": WORKBENCH, "section": "outputs", "path": f"session-{index}.txt",
+            "text": f"session {index}", "replace": False}}
+        session.stdin.write(json.dumps(request) + "\n")
+        session.stdin.flush()
+        return json.loads(session.stdout.readline())
+
+    try:
+        before = call(1)
+        require("result" in before, "t8: the session writes while its role holds", before)
+        stack.role("revoke", "session", "writer", ["--tenant-wide"])
+        time.sleep(2.5)
+        after = call(2)
+    finally:
+        session.stdin.close()
+        session.wait(timeout=stack.timeout)
+    require(after.get("class") == "operator_required" and after.get("error", {}).get("code") == "PermissionDenied",
+            "t8: the open session's next write is PermissionDenied", after)
+    oracle = stack.stat("t8-oracle", WORKBENCH, "session-2.txt")
+    require(oracle.get("exists") is False, "t8: the refused write left nothing", oracle)
+    return {"before": before, "after": after}
 
 
 SCENARIOS: dict[str, Callable[[TlsStack], dict]] = {
@@ -222,6 +303,9 @@ SCENARIOS: dict[str, Callable[[TlsStack], dict]] = {
     "t3_plaintext_client_refused": plaintext_client_refused,
     "t4_mismatched_owner_name_refused": mismatched_owner_name_refused,
     "t5_revoked_credential_refused": revoked_credential_refused,
+    "t6_reader_cannot_write": reader_cannot_write,
+    "t7_two_principals_write_one_root": two_principals_write_one_root,
+    "t8_revoked_role_stops_an_open_session": revoked_role_stops_an_open_session,
 }
 
 
@@ -264,10 +348,16 @@ def main() -> int:
         stack = TlsStack(args, evidence)
         stack.provision()
         stack.identity("tenant", "tenant", "create", stack.tenant)
-        stack.identity("principal", "principal", "create", stack.tenant, stack.principal)
-        stack.register("agent")
+        for name, principal in stack.principals.items():
+            stack.identity(f"principal-{name}", "principal", "create", stack.tenant, principal)
+            stack.register(name, name)
+        stack.role("grant", "agent", "writer", ["--tenant-wide"])
+        stack.role("grant", "reader", "reader", ["--tenant-wide"])
+        stack.role("grant", "session", "writer", ["--tenant-wide"])
         report["scenarios"]["t0_owner_refuses_an_unbound_root"] = run_scenario(stack, owner_refuses_an_unbound_root)
         stack.identity("root", "root", "bind", stack.ids["root"], stack.tenant)
+        # A root-scoped grant needs the root bound first.
+        stack.role("grant", "peer", "writer", ["--root", stack.ids["root"]])
         stack.start_owner()
         for name, scenario in SCENARIOS.items():
             report["scenarios"][name] = run_scenario(stack, scenario)

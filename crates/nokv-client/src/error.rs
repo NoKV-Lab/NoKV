@@ -254,7 +254,11 @@ pub fn rpc_failure_class(failure: &RpcFailure) -> ErrorClass {
         ErrorCode::NotOwner | ErrorCode::ObjectUnavailable => ErrorClass::OutcomeUnknown,
         ErrorCode::SnapshotExpired | ErrorCode::SnapshotReaped => ErrorClass::NotFound,
         ErrorCode::CommitRetiring | ErrorCode::OperationFailed => ErrorClass::PreconditionFailed,
-        ErrorCode::Quarantined | ErrorCode::ResourceExhausted => ErrorClass::OperatorRequired,
+        // An operator must renew the credential or grant the role.
+        ErrorCode::Quarantined
+        | ErrorCode::ResourceExhausted
+        | ErrorCode::Unauthenticated
+        | ErrorCode::PermissionDenied => ErrorClass::OperatorRequired,
         ErrorCode::Internal => {
             if failure.retryable {
                 ErrorClass::OutcomeUnknown

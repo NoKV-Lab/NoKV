@@ -23,14 +23,15 @@ are explicitly named in a security advisory or release note.
 
 NoKV's metadata service and control-plane endpoints currently assume a trusted
 deployment environment. The current `main` branch can require TLS 1.3 clients
-whose certificate is a current credential of the owner's tenant, but it does not
-authorize requests by role, does not authenticate control-plane or object-store
-access, and does not enforce a live workspace-freeze policy at the service
-boundary. Without TLS it authenticates no caller.
+whose certificate is a current credential of the owner's tenant, and then
+authorizes every request by the roles of that principal on the request's root.
+It does not authenticate control-plane or object-store access, and does not
+enforce a live workspace-freeze policy at the service boundary. Without TLS it
+authenticates and authorizes no caller.
 
 - Workbench-root jailing only contains paths.
-- The native CLI's `RootId`-to-`AgentId` check only catches misconfigured
-  routing. The SDKs and raw RPC clients do not perform it.
+- Without TLS, the native CLI's `RootId`-to-`AgentId` check only catches
+  misconfigured routing. The SDKs and raw RPC clients do not perform it.
 
 Neither is authentication or authorization.
 
@@ -39,7 +40,9 @@ service credentials, and configure object-store IAM and encryption appropriate
 to their environment. Do not expose NoKV server or control-plane endpoints
 directly to untrusted networks.
 
-Role-based access control enforced by the server is planned
+Server-enforced role-based access control covers workspace RPC over TLS only.
+Recording the principal that starts each durable operation, and access control
+for the object store and control plane, are planned
 ([code contract](docs/development/code_contract.md#tenant-identity-and-access-control)).
 Until a release note states otherwise, the boundary above applies to every
 release.

@@ -766,6 +766,8 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             | Command::OperationRecover { .. }
             | Command::Provision { .. }
     ) && agent_id.is_none()
+        // Over RPC TLS the owner authorizes the principal; no AgentId binds.
+        && client.tls.is_none()
     {
         return Err(CliError::MissingOption("--agent-id"));
     }
@@ -2415,6 +2417,30 @@ mod tests {
             })
         );
         assert_eq!(parsed.client.tls, None);
+    }
+
+    #[test]
+    fn a_tls_client_needs_no_agent_id() {
+        let tls = [
+            "--rpc-tls-ca",
+            "ca.pem",
+            "--rpc-tls-cert",
+            "agent.pem",
+            "--rpc-tls-key",
+            "agent.key",
+            "--rpc-tls-server-name",
+            "owner.test",
+        ];
+        let status = ["operation", "status", "11111111111111111111111111111111"];
+        let mut line = tls.to_vec();
+        line.extend_from_slice(&status);
+        let parsed = parse(args(&line)).unwrap();
+        assert!(parsed.client.tls.is_some());
+        assert_eq!(parsed.agent_id, None);
+        assert_eq!(
+            parse(args(&status)),
+            Err(CliError::MissingOption("--agent-id"))
+        );
     }
 
     #[test]

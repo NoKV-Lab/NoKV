@@ -78,6 +78,12 @@ pub enum ErrorCode {
     ObjectUnavailable,
     Quarantined,
     ResourceExhausted,
+    /// The connection's credential is no longer current, or the owner cannot
+    /// confirm that it is.
+    Unauthenticated,
+    /// The authenticated principal holds no role that permits the request on
+    /// its root.
+    PermissionDenied,
     Internal,
 }
 

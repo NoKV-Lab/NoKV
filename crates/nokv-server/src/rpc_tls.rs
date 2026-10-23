@@ -3,21 +3,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! TLS 1.3 for the workspace RPC listener, and authentication of its clients.
+//! TLS 1.3 for the workspace RPC listener.
 //!
 //! A client presents a certificate, and TLS proves that it holds the matching
-//! private key. The SHA-256 of that certificate must be a current credential
-//! of the owner's tenant; that credential names the principal the connection
-//! authenticates. No certificate authority decides which client certificates
-//! to trust: the tenant's credential records alone do.
+//! private key. Whether that certificate authenticates a principal is decided
+//! by the tenant's credential records (see `access`); no certificate
+//! authority decides which client certificates to trust.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nokv_control::{ControlError, IdentityStore, PrincipalRecord};
-use nokv_types::{CredentialFingerprint, TenantId};
+use crate::{ServerError, TenantAccess};
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
@@ -27,22 +25,20 @@ use rustls::{
     DigitallySignedStruct, DistinguishedName, ServerConfig, ServerConnection, SignatureScheme,
     StreamOwned,
 };
-use sha2::{Digest as _, Sha256};
 
-use crate::ServerError;
-
-/// The TLS identity of one RPC listener and the authenticator of its clients.
-/// A listener with this configuration never falls back to plaintext.
+/// The TLS identity of one RPC listener and the tenant access its clients are
+/// checked against. A listener with this configuration never falls back to
+/// plaintext.
 pub struct RpcServerTls {
     pub(crate) config: Arc<ServerConfig>,
-    pub(crate) authenticator: CredentialAuthenticator,
+    pub(crate) access: TenantAccess,
 }
 
 impl RpcServerTls {
     pub fn new(
         server_chain: Vec<CertificateDer<'static>>,
         server_key: PrivateKeyDer<'static>,
-        authenticator: CredentialAuthenticator,
+        access: TenantAccess,
     ) -> Result<Self, ServerError> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let verifier = Arc::new(CredentialCertificateVerifier {
@@ -61,65 +57,13 @@ impl RpcServerTls {
         config.max_early_data_size = 0;
         Ok(Self {
             config: Arc::new(config),
-            authenticator,
+            access,
         })
     }
 }
 
 fn tls_configuration_error(error: rustls::Error) -> ServerError {
     ServerError::TlsConfiguration(error.to_string())
-}
-
-/// Resolves a client certificate to the principal it authenticates in one
-/// tenant.
-pub struct CredentialAuthenticator {
-    identity: Arc<dyn IdentityStore>,
-    tenant_id: TenantId,
-}
-
-/// Why a client certificate authenticated no principal.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AuthenticationError {
-    /// The certificate is not a credential of the tenant, or its credential
-    /// has expired.
-    NotACurrentCredential,
-    /// The tenant's records could not be read; a later attempt may succeed.
-    Unavailable(ControlError),
-}
-
-impl CredentialAuthenticator {
-    pub fn new(identity: Arc<dyn IdentityStore>, tenant_id: TenantId) -> Self {
-        Self {
-            identity,
-            tenant_id,
-        }
-    }
-
-    /// The principal whose credential is `certificate` at `now_unix_seconds`.
-    /// The tenant's records are read on every call, so a revoked or expired
-    /// credential authenticates no new connection.
-    pub fn authenticate(
-        &self,
-        certificate: &CertificateDer<'_>,
-        now_unix_seconds: u64,
-    ) -> Result<PrincipalRecord, AuthenticationError> {
-        let fingerprint = CredentialFingerprint::from_bytes(Sha256::digest(certificate).into());
-        let policy = self
-            .identity
-            .load_tenant_policy(&self.tenant_id)
-            .map_err(AuthenticationError::Unavailable)?
-            .ok_or(AuthenticationError::NotACurrentCredential)?;
-        let credential = policy
-            .credentials
-            .iter()
-            .find(|credential| credential.fingerprint == fingerprint)
-            .filter(|credential| credential.expires_at_unix_seconds > now_unix_seconds)
-            .ok_or(AuthenticationError::NotACurrentCredential)?;
-        Ok(PrincipalRecord {
-            tenant_id: self.tenant_id,
-            principal_id: credential.principal_id,
-        })
-    }
 }
 
 /// Requires a client certificate and checks only that the client holds its
@@ -325,114 +269,27 @@ pub(crate) fn drain_tls_record(socket: &mut DeadlineSocket) -> io::Result<()> {
     socket.read_exact(&mut record)
 }
 
-#[cfg(test)]
-mod tests {
-    use nokv_control::{CredentialBinding, InMemoryControlStore, TenantRecord};
-    use nokv_types::PrincipalId;
-    use rcgen::{CertificateParams, KeyPair};
-
-    use super::*;
-
-    fn certificate() -> CertificateDer<'static> {
-        let key = KeyPair::generate().unwrap();
-        CertificateParams::new(vec!["agent".to_owned()])
-            .unwrap()
-            .self_signed(&key)
-            .unwrap()
-            .der()
-            .clone()
-    }
-
-    #[test]
-    fn a_certificate_authenticates_the_principal_of_its_current_credential() {
-        let store = Arc::new(InMemoryControlStore::new());
-        let tenant_id = TenantId::from_bytes([5; 16]);
-        let principal = PrincipalRecord {
-            tenant_id,
-            principal_id: PrincipalId::from_bytes([6; 16]),
-        };
-        store.create_tenant(TenantRecord { tenant_id }).unwrap();
-        store.create_principal(principal).unwrap();
-        let (current, expired, unknown) = (certificate(), certificate(), certificate());
-        for (certificate, expires_at_unix_seconds) in [(&current, 2_000), (&expired, 1_000)] {
-            store
-                .add_credential(CredentialBinding {
-                    tenant_id,
-                    principal_id: principal.principal_id,
-                    fingerprint: CredentialFingerprint::from_bytes(
-                        Sha256::digest(certificate).into(),
-                    ),
-                    expires_at_unix_seconds,
-                })
-                .unwrap();
-        }
-        let authenticator = CredentialAuthenticator::new(store.clone(), tenant_id);
-
-        assert_eq!(authenticator.authenticate(&current, 1_000), Ok(principal));
-        // Expiry is exclusive.
-        assert_eq!(
-            authenticator.authenticate(&expired, 1_000),
-            Err(AuthenticationError::NotACurrentCredential)
-        );
-        assert_eq!(
-            authenticator.authenticate(&unknown, 1_000),
-            Err(AuthenticationError::NotACurrentCredential)
-        );
-        // Another tenant's authenticator does not know the credential.
-        assert_eq!(
-            CredentialAuthenticator::new(store, TenantId::from_bytes([9; 16]))
-                .authenticate(&current, 1_000),
-            Err(AuthenticationError::NotACurrentCredential)
-        );
-    }
-
-    #[test]
-    fn a_revoked_credential_authenticates_no_later_connection() {
-        let store = Arc::new(InMemoryControlStore::new());
-        let tenant_id = TenantId::from_bytes([5; 16]);
-        let principal = PrincipalRecord {
-            tenant_id,
-            principal_id: PrincipalId::from_bytes([6; 16]),
-        };
-        store.create_tenant(TenantRecord { tenant_id }).unwrap();
-        store.create_principal(principal).unwrap();
-        let certificate = certificate();
-        let fingerprint = CredentialFingerprint::from_bytes(Sha256::digest(&certificate).into());
-        store
-            .add_credential(CredentialBinding {
-                tenant_id,
-                principal_id: principal.principal_id,
-                fingerprint,
-                expires_at_unix_seconds: 2_000,
-            })
-            .unwrap();
-        let authenticator = CredentialAuthenticator::new(store.clone(), tenant_id);
-        assert!(authenticator.authenticate(&certificate, 1_000).is_ok());
-
-        store.revoke_credential(&tenant_id, &fingerprint).unwrap();
-        assert_eq!(
-            authenticator.authenticate(&certificate, 1_000),
-            Err(AuthenticationError::NotACurrentCredential)
-        );
-    }
-}
-
-/// Certificates for TLS tests: an owner certificate signed by a test CA, a
-/// client certificate that is a current credential of tenant 5, and one that
-/// is not.
+/// Certificates for TLS tests: an owner certificate signed by a test CA, and
+/// client certificates of tenant 5. `registered` is a tenant-wide writer,
+/// `reader` a tenant-wide reader, and `unregistered` no credential at all.
 #[cfg(test)]
 pub(crate) mod test_pki {
     use std::sync::Arc;
 
-    use nokv_control::TenantRecord;
-    use nokv_control::{CredentialBinding, IdentityStore, InMemoryControlStore, PrincipalRecord};
-    use nokv_types::{CredentialFingerprint, PrincipalId, TenantId};
+    use nokv_control::{
+        CredentialBinding, IdentityStore, InMemoryControlStore, PrincipalRecord, RoleBinding,
+        TenantRecord,
+    };
+    use nokv_types::{CredentialFingerprint, PrincipalId, Role, RoleScope, TenantId};
     use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     use rustls::{ClientConfig, RootCertStore};
     use sha2::{Digest as _, Sha256};
 
-    use super::{CredentialAuthenticator, RpcServerTls};
+    use super::RpcServerTls;
+    use crate::TenantAccess;
+
+    pub(crate) const TENANT: TenantId = TenantId::from_bytes([5; 16]);
 
     pub(crate) struct TestCertificate {
         der: CertificateDer<'static>,
@@ -451,12 +308,17 @@ pub(crate) mod test_pki {
                 key: PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
             }
         }
+
+        pub(crate) fn fingerprint(&self) -> CredentialFingerprint {
+            CredentialFingerprint::from_bytes(Sha256::digest(&self.der).into())
+        }
     }
 
     pub(crate) struct TestPki {
         ca: CertifiedIssuer<'static, KeyPair>,
         server: TestCertificate,
         pub(crate) registered: TestCertificate,
+        pub(crate) reader: TestCertificate,
         pub(crate) unregistered: TestCertificate,
     }
 
@@ -480,39 +342,58 @@ pub(crate) mod test_pki {
                     key: PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
                 },
                 registered: TestCertificate::self_signed(),
+                reader: TestCertificate::self_signed(),
                 unregistered: TestCertificate::self_signed(),
                 ca,
             }
         }
 
-        /// The owner's TLS, whose tenant knows only `registered`.
+        /// The owner's TLS over tenant 5's records.
         pub(crate) fn server_tls(&self) -> RpcServerTls {
+            self.server_tls_with_store().0
+        }
+
+        /// The owner's TLS and the store its tenant access reads.
+        pub(crate) fn server_tls_with_store(&self) -> (RpcServerTls, Arc<InMemoryControlStore>) {
             let store = Arc::new(InMemoryControlStore::new());
-            let tenant_id = TenantId::from_bytes([5; 16]);
-            let principal_id = PrincipalId::from_bytes([6; 16]);
-            store.create_tenant(TenantRecord { tenant_id }).unwrap();
             store
-                .create_principal(PrincipalRecord {
-                    tenant_id,
-                    principal_id,
-                })
+                .create_tenant(TenantRecord { tenant_id: TENANT })
                 .unwrap();
-            store
-                .add_credential(CredentialBinding {
-                    tenant_id,
-                    principal_id,
-                    fingerprint: CredentialFingerprint::from_bytes(
-                        Sha256::digest(&self.registered.der).into(),
-                    ),
-                    expires_at_unix_seconds: u64::MAX,
-                })
-                .unwrap();
-            RpcServerTls::new(
+            for (fill, certificate, role) in [
+                (6, &self.registered, Role::Writer),
+                (7, &self.reader, Role::Reader),
+            ] {
+                let principal_id = PrincipalId::from_bytes([fill; 16]);
+                store
+                    .create_principal(PrincipalRecord {
+                        tenant_id: TENANT,
+                        principal_id,
+                    })
+                    .unwrap();
+                store
+                    .add_credential(CredentialBinding {
+                        tenant_id: TENANT,
+                        principal_id,
+                        fingerprint: certificate.fingerprint(),
+                        expires_at_unix_seconds: u64::MAX,
+                    })
+                    .unwrap();
+                store
+                    .grant_role(RoleBinding {
+                        tenant_id: TENANT,
+                        principal_id,
+                        role,
+                        scope: RoleScope::Tenant,
+                    })
+                    .unwrap();
+            }
+            let tls = RpcServerTls::new(
                 vec![self.server.der.clone()],
                 self.server.key.clone_key(),
-                CredentialAuthenticator::new(store, tenant_id),
+                TenantAccess::load(store.clone(), TENANT).unwrap(),
             )
-            .unwrap()
+            .unwrap();
+            (tls, store)
         }
 
         /// A client that trusts the test CA and presents `certificate`.

@@ -98,10 +98,10 @@ PathCurrent(root_id, incarnation, path)
 ```
 
 The control plane also binds each root to one object namespace and one
-`AgentId`. The native CLI checks the `AgentId` binding to catch misconfigured
-routing. It is not authorization, and planned tenant identity and RBAC retire
-it: tenants own roots, principals hold roles on roots, and the server
-authorizes every request
+`AgentId`. Without RPC TLS, the native CLI checks the `AgentId` binding to
+catch misconfigured routing; it is not authorization. Over RPC TLS, tenants own
+roots, principals hold roles on roots, and the owner authorizes every request
+instead, as [Read Path](#read-path) describes
 ([code contract](development/code_contract.md#tenant-identity-and-access-control)).
 
 `PathCurrent` is the only namespace truth. Workbench names are separated from
@@ -204,13 +204,26 @@ tenant bound to every root the owner serves; the credential names the
 connection's principal. A current-schema hello from any other certificate gets
 `Unauthenticated`, a plaintext current-schema hello gets `TlsRequired`, and an
 owner without TLS answers a TLS client hello with a plaintext `TlsUnavailable`
-frame that the client reads before parsing TLS records. The owner reads the
-tenant's records on every handshake, so a revoked or expired credential opens
-no new connection; a failure to read them closes the connection unanswered,
-which the client retries. Clients fix the trusted owner name and roots in
-their configuration rather than taking them from routes, and a transport
-reuses a pooled connection only under the identity it was opened with.
-Authenticated principals are not yet authorized per request.
+frame that the client reads before parsing TLS records. Clients fix the
+trusted owner name and roots in their configuration rather than taking them
+from routes, and a transport reuses a pooled connection only under the
+identity it was opened with.
+
+Every request on a TLS connection is authorized before route lookup. The
+principal needs a role on the request's root that includes the operation's
+role: reader for reads, writer for writes, and operator for reconciling a
+quarantined publication. A tenant-wide role covers every root of the tenant,
+and a root role covers its root. A refusal is `PermissionDenied` and carries no
+route hint, generation, or commit version. The owner keeps a copy of its
+tenant's records and rereads them every second, and every handshake and every
+request is checked against the latest copy. A credential or role that is
+added or revoked therefore takes effect within a second, plus a request
+already in flight; a revoked credential also closes its open connections
+after one `Unauthenticated` answer. If the copy cannot be refreshed for 10
+seconds, the owner refuses requests with a retryable `Unauthenticated` until a
+refresh succeeds. Over TLS the CLI does not check the plaintext `AgentId`
+binding, so many principals can work on one root and one principal on many
+roots.
 
 Secondary-index queries run at one read version and filter every result by the
 matching visible incarnation. `ArtifactV1` remains the default Workbench query
