@@ -44,7 +44,7 @@ model carries a class itself, and no new caller should read it.
 | 6 | `in_progress` | The identified operation is still running. |
 | 7 | `identity_conflict` | The identity was already used for other inputs; nothing was applied. |
 | 8 | `incompatible` | The client and owner do not share a protocol version or capability. |
-| 9 | `operator_required` | Durable or control state needs operator action, or the owner refused the client's TLS settings or credential before any request was sent. |
+| 9 | `operator_required` | Durable or control state needs operator action, the owner refused the client's TLS settings or credential, or the principal lacks the role a request needs. |
 <!-- exit-codes:end -->
 
 A Rust panic exits `101`, outside this table. A `nokv workbench-session`

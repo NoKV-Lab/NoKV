@@ -264,13 +264,18 @@ struct ConfiguredAgentAdmission {
     agent_id: nokv_types::AgentId,
 }
 
+/// The root and `AgentId` a plaintext client must match before it connects.
+/// Over RPC TLS there is none: the owner authorizes the principal itself.
 fn configured_agent_admission(
     invocation: &Invocation,
-) -> Result<ConfiguredAgentAdmission, CliFailure> {
+) -> Result<Option<ConfiguredAgentAdmission>, CliFailure> {
     if matches!(invocation.client.routing, cli::RoutingConfig::Static(_)) {
         return Err(CliFailure::invalid_input(
             "Agent-facing commands require durable control routing (--etcd-endpoint or --control-dir); static routes cannot prove the RootId-to-AgentId binding",
         ));
+    }
+    if invocation.client.tls.is_some() {
+        return Ok(None);
     }
     let root_id = nokv_control::RootId::from(
         connection::configured_root_id(&invocation.client)
@@ -280,7 +285,7 @@ fn configured_agent_admission(
         CliFailure::invalid_input("--agent-id is required for Agent-facing commands")
     })?)
     .map_err(|error| CliFailure::invalid_input(error.to_string()))?;
-    Ok(ConfiguredAgentAdmission { root_id, agent_id })
+    Ok(Some(ConfiguredAgentAdmission { root_id, agent_id }))
 }
 
 /// A control-plane failure before any workspace request was sent.
@@ -388,21 +393,24 @@ fn build_backend(invocation: &Invocation) -> Result<CliWorkbenchBackend, CliFail
     #[cfg(feature = "control")]
     {
         let control = open_control(invocation)?;
-        after_agent_root_admission(
-            control.as_ref(),
-            admission.root_id,
-            admission.agent_id,
-            || {
-                let client = connection::connect(&invocation.client, Some(control.clone()))
-                    .map_err(connection_failure)?;
-                build_backend_after_agent_admission(invocation, client, object_admission)
-            },
-        )
+        let connect = || {
+            let client = connection::connect(&invocation.client, Some(control.clone()))
+                .map_err(connection_failure)?;
+            build_backend_after_agent_admission(invocation, client, object_admission)
+        };
+        match admission {
+            Some(admission) => after_agent_root_admission(
+                control.as_ref(),
+                admission.root_id,
+                admission.agent_id,
+                connect,
+            ),
+            None => connect(),
+        }
     }
     #[cfg(not(feature = "control"))]
     {
-        let ConfiguredAgentAdmission { root_id, agent_id } = admission;
-        let _ = (root_id, agent_id, object_admission);
+        let _ = (admission, object_admission);
         Err(CliFailure::invalid_input(
             "Agent-facing commands require the nokv control feature",
         ))
@@ -492,24 +500,27 @@ fn build_workspace_path_client(
     #[cfg(feature = "control")]
     {
         let control = open_control(invocation)?;
-        after_agent_root_admission(
-            control.as_ref(),
-            admission.root_id,
-            admission.agent_id,
-            || {
-                let client = connection::connect(&invocation.client, Some(control.clone()))
-                    .map_err(connection_failure)?;
-                client
-                    .preflight([nokv_protocol::WorkspaceCapability::WorkspacePathV1])
-                    .map_err(preflight_failure)?;
-                Ok(client)
-            },
-        )
+        let connect = || {
+            let client = connection::connect(&invocation.client, Some(control.clone()))
+                .map_err(connection_failure)?;
+            client
+                .preflight([nokv_protocol::WorkspaceCapability::WorkspacePathV1])
+                .map_err(preflight_failure)?;
+            Ok(client)
+        };
+        match admission {
+            Some(admission) => after_agent_root_admission(
+                control.as_ref(),
+                admission.root_id,
+                admission.agent_id,
+                connect,
+            ),
+            None => connect(),
+        }
     }
     #[cfg(not(feature = "control"))]
     {
-        let ConfiguredAgentAdmission { root_id, agent_id } = admission;
-        let _ = (root_id, agent_id);
+        let _ = admission;
         Err(CliFailure::invalid_input(
             "workspace-path commands require the nokv control feature",
         ))
@@ -1587,7 +1598,8 @@ USAGE:
 
 AGENT CONTROL ROUTING:
   --root-id HEX32
-  --agent-id HEX32 is required by provision, workbench, mcp, materialize, collect, workspace-path, and operation commands
+  --agent-id HEX32 is required by provision, and without RPC TLS by workbench, mcp, materialize, collect,
+    workspace-path, and operation commands
   AgentId is a durable deployment identity used to prevent root misconfiguration; it is not an authentication credential
   --metadata-address HOST:PORT --logical-shard-id HEX32 --object-namespace-id HEX32
     --placement-generation N --owner-epoch N
@@ -1651,7 +1663,11 @@ RPC TLS:
     connects to an owner, the roots that sign the owner's certificate, this client's certificate and key,
     and the name the owner's certificate must carry; there is no fallback to plaintext
   a refused credential or a TLS mismatch fails with class operator_required before any request is sent
-  an authenticated principal is not yet limited by its roles
+  every request needs a role on its root: reader reads, writer also writes, and operator also reconciles
+    quarantined publications; a refusal is PermissionDenied, class operator_required
+  the owner rereads its tenant's records every second: a revoked credential or role stops working within
+    that interval plus the request in flight
+  over RPC TLS, --agent-id is not needed and the AgentId binding is not checked
 
 TENANT IDENTITY:
   identity tenant create <tenant-id-hex32>
@@ -1957,7 +1973,11 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "root placement does not exist; provision it before serve".to_owned())?;
     let placements = active_shard_placements(control.as_ref(), &placement)?;
-    validate_served_root_agent_bindings(control.as_ref(), &placements)?;
+    // Over TLS the owner authorizes principals by role; the plaintext
+    // AgentId binding is not consulted.
+    if invocation.server.tls.is_none() {
+        validate_served_root_agent_bindings(control.as_ref(), &placements)?;
+    }
     let object_namespace = control
         .get_root_object_namespace_binding(&root_id)
         .map_err(|error| error.to_string())?
