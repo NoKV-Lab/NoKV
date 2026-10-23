@@ -434,6 +434,29 @@ jobs:
           "$install_dir/etcd" --version
           "$install_dir/etcdctl" version
 
+      - name: Test tenant identity records on etcd
+        shell: bash
+        run: |
+          set -euo pipefail
+          endpoint=http://127.0.0.1:23790
+          etcd --name identity --data-dir "$RUNNER_TEMP/etcd-identity" \
+            --listen-client-urls "$endpoint" --advertise-client-urls "$endpoint" \
+            --listen-peer-urls http://127.0.0.1:23800 \
+            --initial-advertise-peer-urls http://127.0.0.1:23800 \
+            --initial-cluster identity=http://127.0.0.1:23800 \
+            --log-level warn &
+          etcd_pid=$!
+          trap 'kill "$etcd_pid"' EXIT
+          for _ in $(seq 1 50); do
+            if etcdctl --endpoints "$endpoint" endpoint health >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.2
+          done
+          etcdctl --endpoints "$endpoint" endpoint health
+          NOKV_TEST_ETCD_ENDPOINT="$endpoint" \
+            cargo test -p nokv-control --features etcd etcd_identity -- --include-ignored
+
       - name: Start pinned RustFS for namespace admission
         shell: bash
         env:

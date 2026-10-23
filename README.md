@@ -246,6 +246,7 @@ real-service acceptance gate is still **not qualified**.
 | `nokv operation recover` | Ask the owner to retry quarantined append cleanup. | No payload or object credentials; an explicit saved state digest replays one durable recovery request. |
 | `nokv provision` | Bind `RootId` to `AgentId`, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. Planned tenant RBAC replaces this binding. |
 | `nokv serve` | Start one explicit metadata owner from create, same-namespace reopen, or recovery-log state. | Shared recovery publication is opt-in and not currently qualified. |
+| `nokv identity` | Create tenants and principals, bind certificate fingerprints to principals, grant or revoke tenant- and root-scoped roles, and bind roots to tenants. | Operator command that writes the control store directly. The server does not enforce these records yet. |
 | `nokv mcp` | Deprecated stdio transport retained only because qualification runners still use it. | **Unsupported for integration.** |
 
 For an append that must survive a lost reply or a harness restart, save one

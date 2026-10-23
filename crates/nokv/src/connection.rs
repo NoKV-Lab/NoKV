@@ -15,7 +15,7 @@ use nokv_client::{
     ClientError, ClientOptions, FramedTcpOptions, FramedTcpTransport, RouteResolver,
     StaticRouteResolver, TransportError, WorkspaceClient,
 };
-use nokv_control::ControlStore;
+use nokv_control::{ControlStore, IdentityStore};
 use nokv_protocol::{LogicalShardIdentity, ObjectNamespaceIdentity, RootIdentity, RootRoute};
 use nokv_types::{AgentId, ErrorClass};
 
@@ -135,8 +135,17 @@ pub fn connect(
 pub fn open_control(routing: &RoutingConfig) -> Result<Arc<dyn ControlStore>, ConnectionError> {
     match routing {
         RoutingConfig::Static(_) => Err(ConnectionError::StaticControl),
-        RoutingConfig::Etcd(config) => etcd_control(config),
-        RoutingConfig::Local(config) => local_control(config),
+        RoutingConfig::Etcd(config) => Ok(Arc::new(etcd_store(config)?)),
+        RoutingConfig::Local(config) => Ok(Arc::new(local_store(config)?)),
+    }
+}
+
+/// Open the tenant identity records of the configured control plane.
+pub fn open_identity(routing: &RoutingConfig) -> Result<Arc<dyn IdentityStore>, ConnectionError> {
+    match routing {
+        RoutingConfig::Static(_) => Err(ConnectionError::StaticControl),
+        RoutingConfig::Etcd(config) => Ok(Arc::new(etcd_store(config)?)),
+        RoutingConfig::Local(config) => Ok(Arc::new(local_store(config)?)),
     }
 }
 
@@ -234,16 +243,18 @@ fn static_route_resolver(
 }
 
 #[cfg(feature = "etcd")]
-fn etcd_control(config: &EtcdRoutingConfig) -> Result<Arc<dyn ControlStore>, ConnectionError> {
+fn etcd_store(
+    config: &EtcdRoutingConfig,
+) -> Result<nokv_control::EtcdControlStore, ConnectionError> {
     let options = etcd_options(config);
     options.validate().map_err(ConnectionError::Control)?;
-    Ok(Arc::new(
-        nokv_control::EtcdControlStore::connect(options).map_err(ConnectionError::Control)?,
-    ))
+    nokv_control::EtcdControlStore::connect(options).map_err(ConnectionError::Control)
 }
 
 #[cfg(not(feature = "etcd"))]
-fn etcd_control(_config: &EtcdRoutingConfig) -> Result<Arc<dyn ControlStore>, ConnectionError> {
+fn etcd_store(
+    _config: &EtcdRoutingConfig,
+) -> Result<nokv_control::InMemoryControlStore, ConnectionError> {
     Err(ConnectionError::FeatureDisabled {
         routing: "etcd",
         feature: "etcd",
@@ -258,15 +269,16 @@ fn etcd_options(config: &EtcdRoutingConfig) -> nokv_control::EtcdControlStoreOpt
 }
 
 #[cfg(unix)]
-fn local_control(config: &LocalRoutingConfig) -> Result<Arc<dyn ControlStore>, ConnectionError> {
-    Ok(Arc::new(
-        nokv_control::LocalControlStore::open(&config.directory)
-            .map_err(ConnectionError::Control)?,
-    ))
+fn local_store(
+    config: &LocalRoutingConfig,
+) -> Result<nokv_control::LocalControlStore, ConnectionError> {
+    nokv_control::LocalControlStore::open(&config.directory).map_err(ConnectionError::Control)
 }
 
 #[cfg(not(unix))]
-fn local_control(_config: &LocalRoutingConfig) -> Result<Arc<dyn ControlStore>, ConnectionError> {
+fn local_store(
+    _config: &LocalRoutingConfig,
+) -> Result<nokv_control::InMemoryControlStore, ConnectionError> {
     Err(ConnectionError::Control(
         nokv_control::ControlError::InvalidOptions("--control-dir requires a Unix host".to_owned()),
     ))

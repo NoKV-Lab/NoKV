@@ -3,8 +3,8 @@ use std::fmt;
 use nokv_types::ErrorClass;
 
 use crate::{
-    LogicalShardId, LogicalShardLease, LogicalShardState, NodeId, ObjectNamespaceId, OwnerEpoch,
-    RootId, RootPlacement,
+    CredentialFingerprint, LogicalShardId, LogicalShardLease, LogicalShardState, NodeId,
+    ObjectNamespaceId, OwnerEpoch, PrincipalId, RootId, RootPlacement, TenantId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +72,30 @@ pub enum ControlError {
         logical_shard_id: LogicalShardId,
         reason: String,
     },
+    TenantNotFound(TenantId),
+    PrincipalNotFound {
+        tenant_id: TenantId,
+        principal_id: PrincipalId,
+    },
+    /// The fingerprint already authenticates another principal of the tenant,
+    /// or the same principal with another expiry.
+    CredentialAlreadyBound {
+        tenant_id: TenantId,
+        fingerprint: CredentialFingerprint,
+    },
+    RootTenantAlreadyBound {
+        root_id: RootId,
+    },
+    /// A root-scoped role names a root that the tenant does not own.
+    RootNotInTenant {
+        root_id: RootId,
+        tenant_id: TenantId,
+    },
+    TenantPolicyLimitExceeded {
+        tenant_id: TenantId,
+        record: &'static str,
+        limit: usize,
+    },
     InvalidRecord(String),
     InvalidOptions(String),
     /// A durable control record declares a codec version this reader does not
@@ -92,7 +116,11 @@ impl ControlError {
             Self::InvalidEndpoint(_)
             | Self::InvalidOptions(_)
             | Self::InvalidPlacementMutation { .. } => ErrorClass::InvalidInput,
+            Self::TenantNotFound(_) | Self::PrincipalNotFound { .. } => ErrorClass::NotFound,
             Self::RootPlacementAlreadyExists(_)
+            | Self::CredentialAlreadyBound { .. }
+            | Self::RootTenantAlreadyBound { .. }
+            | Self::RootNotInTenant { .. }
             | Self::RootAgentAlreadyBound { .. }
             | Self::RootObjectNamespaceAlreadyBound { .. }
             | Self::ImmutableShardAffinity { .. }
@@ -116,6 +144,7 @@ impl ControlError {
             | Self::RootPlacementRequired(_)
             | Self::OwnerEpochExhausted(_)
             | Self::LeaseIdExhausted(_)
+            | Self::TenantPolicyLimitExceeded { .. }
             | Self::InvalidRecord(_)
             | Self::Codec(_) => ErrorClass::OperatorRequired,
         }
@@ -235,6 +264,38 @@ impl fmt::Display for ControlError {
             } => write!(
                 formatter,
                 "recovery upload for logical shard {logical_shard_id:?} conflicts with durable state: {reason}"
+            ),
+            Self::TenantNotFound(tenant_id) => {
+                write!(formatter, "tenant {tenant_id:?} was not found")
+            }
+            Self::PrincipalNotFound {
+                tenant_id,
+                principal_id,
+            } => write!(
+                formatter,
+                "principal {principal_id:?} was not found in tenant {tenant_id:?}"
+            ),
+            Self::CredentialAlreadyBound {
+                tenant_id,
+                fingerprint,
+            } => write!(
+                formatter,
+                "credential {fingerprint:?} is already bound differently in tenant {tenant_id:?}"
+            ),
+            Self::RootTenantAlreadyBound { root_id } => {
+                write!(formatter, "root {root_id:?} is already bound to another tenant")
+            }
+            Self::RootNotInTenant { root_id, tenant_id } => write!(
+                formatter,
+                "root {root_id:?} is not owned by tenant {tenant_id:?}"
+            ),
+            Self::TenantPolicyLimitExceeded {
+                tenant_id,
+                record,
+                limit,
+            } => write!(
+                formatter,
+                "tenant {tenant_id:?} already holds the maximum of {limit} {record} records"
             ),
             Self::InvalidRecord(reason) => {
                 write!(formatter, "invalid control record: {reason}")

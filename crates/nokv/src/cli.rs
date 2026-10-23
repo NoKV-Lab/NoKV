@@ -12,6 +12,8 @@ use std::str::FromStr;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use nokv_control::RoleBinding;
+use nokv_types::{CredentialFingerprint, PrincipalId, Role, RoleScope, RootId, TenantId};
 
 pub const DEFAULT_METADATA_ADDRESS: &str = "127.0.0.1:7750";
 pub const DEFAULT_SERVER_BIND: &str = "127.0.0.1:7750";
@@ -173,11 +175,66 @@ pub enum Command {
         adopt_legacy_agent_binding: bool,
     },
     Serve,
+    /// Tenant identity administration in the control plane.
+    Identity(IdentityCommand),
     Schema,
     Version {
         json: bool,
     },
     Help,
+}
+
+/// One `nokv identity` administration command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IdentityCommand {
+    CreateTenant {
+        tenant_id: TenantId,
+    },
+    CreatePrincipal {
+        tenant_id: TenantId,
+        principal_id: PrincipalId,
+    },
+    AddCredential {
+        tenant_id: TenantId,
+        principal_id: PrincipalId,
+        credential: CredentialSource,
+        expires_at_unix_seconds: u64,
+    },
+    RevokeCredential {
+        tenant_id: TenantId,
+        fingerprint: CredentialFingerprint,
+    },
+    GrantRole(RoleBinding),
+    RevokeRole(RoleBinding),
+    BindRoot {
+        root_id: RootId,
+        tenant_id: TenantId,
+    },
+    Show {
+        tenant_id: TenantId,
+    },
+}
+
+/// Where `identity credential add` reads the credential fingerprint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CredentialSource {
+    /// The first certificate in this PEM file: the leaf of a chain.
+    Certificate(PathBuf),
+    Fingerprint(CredentialFingerprint),
+}
+
+/// Role names on the command line and in identity results.
+const ROLE_NAMES: [(Role, &str); 3] = [
+    (Role::Reader, "reader"),
+    (Role::Writer, "writer"),
+    (Role::Operator, "operator"),
+];
+
+pub(crate) fn role_name(role: Role) -> &'static str {
+    ROLE_NAMES
+        .iter()
+        .find_map(|(candidate, name)| (*candidate == role).then_some(*name))
+        .expect("every role has a name")
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -722,6 +779,7 @@ fn parse_command(
         "workspace-path" => parse_workspace_path(arguments),
         "operation" => parse_operation(arguments),
         "provision" => parse_provision(arguments),
+        "identity" => parse_identity(arguments).map(Command::Identity),
         "serve" => Ok(Command::Serve),
         "schema" => Ok(Command::Schema),
         "version" => parse_version(arguments),
@@ -1112,6 +1170,190 @@ fn parse_workspace_append(
 
 fn parse_append_identity(option: &'static str, value: String) -> Result<[u8; 16], CliError> {
     parse_request_id(value.clone()).map_err(|_| CliError::InvalidOption { option, value })
+}
+
+fn parse_identity(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<IdentityCommand, CliError> {
+    let noun = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("identity subcommand"))?;
+    let command = match noun.as_str() {
+        "show" => IdentityCommand::Show {
+            tenant_id: identity_argument(arguments, "tenant id")?,
+        },
+        "tenant" => match identity_action(arguments, &noun)?.as_str() {
+            "create" => IdentityCommand::CreateTenant {
+                tenant_id: identity_argument(arguments, "tenant id")?,
+            },
+            other => return Err(CliError::UnknownCommand(format!("identity tenant {other}"))),
+        },
+        "principal" => match identity_action(arguments, &noun)?.as_str() {
+            "create" => IdentityCommand::CreatePrincipal {
+                tenant_id: identity_argument(arguments, "tenant id")?,
+                principal_id: identity_argument(arguments, "principal id")?,
+            },
+            other => {
+                return Err(CliError::UnknownCommand(format!(
+                    "identity principal {other}"
+                )))
+            }
+        },
+        "credential" => match identity_action(arguments, &noun)?.as_str() {
+            "add" => parse_credential_add(arguments)?,
+            "revoke" => IdentityCommand::RevokeCredential {
+                tenant_id: identity_argument(arguments, "tenant id")?,
+                fingerprint: identity_argument(arguments, "credential fingerprint")?,
+            },
+            other => {
+                return Err(CliError::UnknownCommand(format!(
+                    "identity credential {other}"
+                )))
+            }
+        },
+        "role" => match identity_action(arguments, &noun)?.as_str() {
+            "grant" => IdentityCommand::GrantRole(parse_role_binding(arguments)?),
+            "revoke" => IdentityCommand::RevokeRole(parse_role_binding(arguments)?),
+            other => return Err(CliError::UnknownCommand(format!("identity role {other}"))),
+        },
+        "root" => match identity_action(arguments, &noun)?.as_str() {
+            "bind" => IdentityCommand::BindRoot {
+                root_id: identity_argument(arguments, "root id")?,
+                tenant_id: identity_argument(arguments, "tenant id")?,
+            },
+            other => return Err(CliError::UnknownCommand(format!("identity root {other}"))),
+        },
+        other => return Err(CliError::UnknownCommand(format!("identity {other}"))),
+    };
+    Ok(command)
+}
+
+fn identity_action(
+    arguments: &mut impl Iterator<Item = String>,
+    noun: &str,
+) -> Result<String, CliError> {
+    arguments
+        .next()
+        .ok_or_else(|| CliError::UnknownCommand(format!("identity {noun}")))
+}
+
+/// A positional lowercase-hex identity: 32 digits, or 64 for a fingerprint.
+fn identity_argument<T: FixedHexIdentity>(
+    arguments: &mut impl Iterator<Item = String>,
+    name: &'static str,
+) -> Result<T, CliError> {
+    let value = arguments.next().ok_or(CliError::MissingArgument(name))?;
+    T::from_hex(&value).ok_or(CliError::InvalidOption {
+        option: name,
+        value,
+    })
+}
+
+trait FixedHexIdentity: Sized {
+    fn from_hex(value: &str) -> Option<Self>;
+}
+
+macro_rules! fixed_hex_identity {
+    ($($name:ident),+) => {
+        $(impl FixedHexIdentity for $name {
+            fn from_hex(value: &str) -> Option<Self> {
+                decode_fixed_hex(value).map(Self::from_bytes)
+            }
+        })+
+    };
+}
+
+fixed_hex_identity!(TenantId, PrincipalId, RootId, CredentialFingerprint);
+
+fn parse_credential_add(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<IdentityCommand, CliError> {
+    let tenant_id = identity_argument(arguments, "tenant id")?;
+    let principal_id = identity_argument(arguments, "principal id")?;
+    let mut credential = None;
+    let mut expires_at_unix_seconds = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--certificate" if credential.is_none() => {
+                credential = Some(CredentialSource::Certificate(PathBuf::from(next_value(
+                    arguments, &argument,
+                )?)));
+            }
+            "--fingerprint" if credential.is_none() => {
+                let value = next_value(arguments, &argument)?;
+                credential = Some(CredentialSource::Fingerprint(
+                    CredentialFingerprint::from_hex(&value).ok_or(CliError::InvalidOption {
+                        option: "--fingerprint",
+                        value,
+                    })?,
+                ));
+            }
+            "--expires-at-unix" if expires_at_unix_seconds.is_none() => {
+                expires_at_unix_seconds = Some(parse_number(
+                    "--expires-at-unix",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--certificate" | "--fingerprint" | "--expires-at-unix" => {
+                return Err(CliError::UnexpectedArgument(argument))
+            }
+            _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    Ok(IdentityCommand::AddCredential {
+        tenant_id,
+        principal_id,
+        credential: credential.ok_or(CliError::MissingOption("--certificate or --fingerprint"))?,
+        expires_at_unix_seconds: expires_at_unix_seconds
+            .ok_or(CliError::MissingOption("--expires-at-unix"))?,
+    })
+}
+
+fn parse_role_binding(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<RoleBinding, CliError> {
+    let tenant_id = identity_argument(arguments, "tenant id")?;
+    let principal_id = identity_argument(arguments, "principal id")?;
+    let mut role = None;
+    let mut scope = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--role" if role.is_none() => {
+                let value = next_value(arguments, &argument)?;
+                role = Some(
+                    ROLE_NAMES
+                        .iter()
+                        .find_map(|(role, name)| (*name == value).then_some(*role))
+                        .ok_or(CliError::InvalidOption {
+                            option: "--role",
+                            value,
+                        })?,
+                );
+            }
+            "--tenant-wide" if scope.is_none() => scope = Some(RoleScope::Tenant),
+            "--root" if scope.is_none() => {
+                let value = next_value(arguments, &argument)?;
+                scope = Some(RoleScope::Root(RootId::from_hex(&value).ok_or(
+                    CliError::InvalidOption {
+                        option: "--root",
+                        value,
+                    },
+                )?));
+            }
+            "--role" | "--tenant-wide" | "--root" => {
+                return Err(CliError::UnexpectedArgument(argument))
+            }
+            _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    Ok(RoleBinding {
+        tenant_id,
+        principal_id,
+        role: role.ok_or(CliError::MissingOption("--role"))?,
+        scope: scope.ok_or(CliError::MissingOption("--tenant-wide or --root"))?,
+    })
 }
 
 fn parse_provision(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
@@ -1997,6 +2239,188 @@ mod tests {
             }
         );
         assert!(matches!(parsed.client.routing, RoutingConfig::Etcd(_)));
+    }
+
+    #[test]
+    fn parses_identity_commands_without_root_or_agent_options() {
+        let tenant = "05".repeat(16);
+        let principal = "06".repeat(16);
+        let root = "01".repeat(16);
+        let fingerprint = "07".repeat(32);
+        let identity = |words: &[&str]| {
+            let mut line = vec!["--control-dir", "/tmp/nokv-control", "identity"];
+            line.extend_from_slice(words);
+            parse(args(&line)).map(|parsed| parsed.command)
+        };
+        let tenant_id = TenantId::from_bytes([5; 16]);
+        let principal_id = PrincipalId::from_bytes([6; 16]);
+        assert_eq!(
+            identity(&["tenant", "create", &tenant]),
+            Ok(Command::Identity(IdentityCommand::CreateTenant {
+                tenant_id
+            }))
+        );
+        assert_eq!(
+            identity(&["principal", "create", &tenant, &principal]),
+            Ok(Command::Identity(IdentityCommand::CreatePrincipal {
+                tenant_id,
+                principal_id,
+            }))
+        );
+        assert_eq!(
+            identity(&[
+                "credential",
+                "add",
+                &tenant,
+                &principal,
+                "--expires-at-unix",
+                "1800000000",
+                "--certificate",
+                "agent.pem",
+            ]),
+            Ok(Command::Identity(IdentityCommand::AddCredential {
+                tenant_id,
+                principal_id,
+                credential: CredentialSource::Certificate(PathBuf::from("agent.pem")),
+                expires_at_unix_seconds: 1_800_000_000,
+            }))
+        );
+        assert_eq!(
+            identity(&["credential", "revoke", &tenant, &fingerprint]),
+            Ok(Command::Identity(IdentityCommand::RevokeCredential {
+                tenant_id,
+                fingerprint: CredentialFingerprint::from_bytes([7; 32]),
+            }))
+        );
+        assert_eq!(
+            identity(&["role", "grant", &tenant, &principal, "--role", "writer", "--root", &root,]),
+            Ok(Command::Identity(IdentityCommand::GrantRole(RoleBinding {
+                tenant_id,
+                principal_id,
+                role: Role::Writer,
+                scope: RoleScope::Root(RootId::from_bytes([1; 16])),
+            })))
+        );
+        assert_eq!(
+            identity(&[
+                "role",
+                "revoke",
+                &tenant,
+                &principal,
+                "--tenant-wide",
+                "--role",
+                "operator",
+            ]),
+            Ok(Command::Identity(IdentityCommand::RevokeRole(
+                RoleBinding {
+                    tenant_id,
+                    principal_id,
+                    role: Role::Operator,
+                    scope: RoleScope::Tenant,
+                }
+            )))
+        );
+        assert_eq!(
+            identity(&["root", "bind", &root, &tenant]),
+            Ok(Command::Identity(IdentityCommand::BindRoot {
+                root_id: RootId::from_bytes([1; 16]),
+                tenant_id,
+            }))
+        );
+        assert_eq!(
+            identity(&["show", &tenant]),
+            Ok(Command::Identity(IdentityCommand::Show { tenant_id }))
+        );
+    }
+
+    #[test]
+    fn identity_commands_reject_ambiguous_or_malformed_records() {
+        let tenant = "05".repeat(16);
+        let principal = "06".repeat(16);
+        let identity = |words: &[&str]| {
+            let mut line = vec!["--control-dir", "/tmp/nokv-control", "identity"];
+            line.extend_from_slice(words);
+            parse(args(&line)).map(|parsed| parsed.command)
+        };
+        assert_eq!(
+            identity(&["show", &"05".repeat(15)]),
+            Err(CliError::InvalidOption {
+                option: "tenant id",
+                value: "05".repeat(15),
+            })
+        );
+        assert_eq!(
+            identity(&["show", &"AB".repeat(16)]),
+            Err(CliError::InvalidOption {
+                option: "tenant id",
+                value: "AB".repeat(16),
+            })
+        );
+        assert_eq!(
+            identity(&["role", "grant", &tenant, &principal, "--role", "admin"]),
+            Err(CliError::InvalidOption {
+                option: "--role",
+                value: "admin".to_owned(),
+            })
+        );
+        assert_eq!(
+            identity(&["role", "grant", &tenant, &principal, "--role", "reader"]),
+            Err(CliError::MissingOption("--tenant-wide or --root"))
+        );
+        assert_eq!(
+            identity(&[
+                "role",
+                "grant",
+                &tenant,
+                &principal,
+                "--role",
+                "reader",
+                "--tenant-wide",
+                "--root",
+                &"01".repeat(16),
+            ]),
+            Err(CliError::UnexpectedArgument("--root".to_owned()))
+        );
+        assert_eq!(
+            identity(&["role", "grant", &tenant, &principal, "--root"]),
+            Err(CliError::MissingValue("--root".to_owned()))
+        );
+        assert_eq!(
+            identity(&[
+                "credential",
+                "add",
+                &tenant,
+                &principal,
+                "--fingerprint",
+                &"07".repeat(32),
+                "--certificate",
+                "agent.pem",
+                "--expires-at-unix",
+                "1800000000",
+            ]),
+            Err(CliError::UnexpectedArgument("--certificate".to_owned()))
+        );
+        assert_eq!(
+            identity(&[
+                "credential",
+                "add",
+                &tenant,
+                &principal,
+                "--fingerprint",
+                &"07".repeat(32),
+            ]),
+            Err(CliError::MissingOption("--expires-at-unix"))
+        );
+        assert_eq!(
+            identity(&["tenant", "delete", &tenant]),
+            Err(CliError::UnknownCommand(
+                "identity tenant delete".to_owned()
+            ))
+        );
+        assert_eq!(
+            identity(&["show", &tenant, "extra"]),
+            Err(CliError::UnexpectedArgument("extra".to_owned()))
+        );
     }
 
     #[test]

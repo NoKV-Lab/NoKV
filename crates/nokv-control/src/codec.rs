@@ -3,16 +3,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 #[cfg(unix)]
+use crate::identity::{IdentityState, TenantState};
+#[cfg(unix)]
 use crate::store::InMemoryState;
 use crate::store::{validate_logical_shard_record, MAX_LOGICAL_SHARD_RECORD_BYTES};
-#[cfg(any(feature = "etcd", test))]
-use crate::LogicalShardLease;
 use crate::{
-    AgentId, CheckpointRef, ControlError, LogRef, LogSegmentRef, LogicalShardId,
-    LogicalShardRecord, LogicalShardRecoveryState, LogicalShardState, NodeId, ObjectNamespaceId,
-    OwnerEpoch, PlacementGeneration, RecoveryUploadIntent, RootAgentBinding, RootId,
-    RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle,
+    AgentId, CheckpointRef, ControlError, CredentialBinding, CredentialFingerprint, LogRef,
+    LogSegmentRef, LogicalShardId, LogicalShardRecord, LogicalShardRecoveryState,
+    LogicalShardState, NodeId, ObjectNamespaceId, OwnerEpoch, PlacementGeneration, PrincipalId,
+    PrincipalRecord, RecoveryUploadIntent, Role, RoleBinding, RoleScope, RootAgentBinding, RootId,
+    RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle, RootTenantBinding, TenantId,
 };
+#[cfg(any(feature = "etcd", test))]
+use crate::{LogicalShardLease, TenantRecord};
 
 const ROOT_PLACEMENT_CODEC_VERSION: u8 = 1;
 const ROOT_AGENT_BINDING_CODEC_VERSION: u8 = 1;
@@ -37,6 +40,16 @@ const LEGACY_COMBINED_LOGICAL_SHARD_RECORD_MAX_VERSION: u8 = 3;
 const OWNER_SESSION_CODEC_VERSION: u8 = 1;
 #[cfg(unix)]
 const LOCAL_CONTROL_STATE_CODEC_VERSION: u8 = 1;
+#[cfg(any(feature = "etcd", test))]
+const TENANT_RECORD_CODEC_VERSION: u8 = 1;
+const PRINCIPAL_RECORD_CODEC_VERSION: u8 = 1;
+const CREDENTIAL_BINDING_CODEC_VERSION: u8 = 1;
+const ROLE_BINDING_CODEC_VERSION: u8 = 1;
+const ROOT_TENANT_BINDING_CODEC_VERSION: u8 = 1;
+#[cfg(any(feature = "etcd", test))]
+const TENANT_POLICY_COUNTER_CODEC_VERSION: u8 = 1;
+#[cfg(unix)]
+const LOCAL_IDENTITY_STATE_CODEC_VERSION: u8 = 1;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -981,6 +994,481 @@ impl TryFrom<RecoveryUploadIntentWire> for RecoveryUploadIntent {
     }
 }
 
+#[cfg(any(feature = "etcd", test))]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenantRecordWire {
+    version: u8,
+    tenant_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrincipalRecordWire {
+    version: u8,
+    tenant_id: String,
+    principal_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialBindingWire {
+    version: u8,
+    tenant_id: String,
+    principal_id: String,
+    fingerprint: String,
+    expires_at_unix_seconds: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoleBindingWire {
+    version: u8,
+    tenant_id: String,
+    principal_id: String,
+    role: u8,
+    /// `None` for a tenant-wide binding.
+    root_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootTenantBindingWire {
+    version: u8,
+    root_id: String,
+    tenant_id: String,
+}
+
+/// The etcd store's per-tenant revision and record counts, changed in the
+/// same transaction as every record they count.
+#[cfg(any(feature = "etcd", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TenantPolicyCounter {
+    pub(crate) tenant_id: TenantId,
+    pub(crate) revision: u64,
+    pub(crate) principals: u64,
+    pub(crate) credentials: u64,
+    pub(crate) role_bindings: u64,
+}
+
+#[cfg(any(feature = "etcd", test))]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenantPolicyCounterWire {
+    version: u8,
+    tenant_id: String,
+    revision: u64,
+    principals: u64,
+    credentials: u64,
+    role_bindings: u64,
+}
+
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalIdentityStateWire {
+    version: u8,
+    tenants: Vec<LocalTenantWire>,
+    root_tenants: Vec<RootTenantBindingWire>,
+}
+
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalTenantWire {
+    tenant_id: String,
+    revision: u64,
+    principals: Vec<PrincipalRecordWire>,
+    credentials: Vec<CredentialBindingWire>,
+    role_bindings: Vec<RoleBindingWire>,
+}
+
+/// Decode `bytes` and require that they are this codec's exact encoding.
+fn decode_canonical<T, W: for<'a> Deserialize<'a>>(
+    bytes: &[u8],
+    type_name: &'static str,
+    decode: impl FnOnce(W) -> Result<T, ControlError>,
+    encode: impl FnOnce(&T) -> Result<Vec<u8>, ControlError>,
+) -> Result<T, ControlError> {
+    let value = decode(serde_json::from_slice(bytes).map_err(codec_error)?)?;
+    if encode(&value)?.as_slice() != bytes {
+        return Err(ControlError::Codec(format!(
+            "{type_name} input is not canonical"
+        )));
+    }
+    Ok(value)
+}
+
+#[cfg(any(feature = "etcd", test))]
+fn tenant_record_wire(record: &TenantRecord) -> TenantRecordWire {
+    TenantRecordWire {
+        version: TENANT_RECORD_CODEC_VERSION,
+        tenant_id: encode_fixed_id(record.tenant_id.as_bytes()),
+    }
+}
+
+#[cfg(any(feature = "etcd", test))]
+fn tenant_record_from_wire(wire: TenantRecordWire) -> Result<TenantRecord, ControlError> {
+    require_version("tenant", wire.version, TENANT_RECORD_CODEC_VERSION)?;
+    Ok(TenantRecord {
+        tenant_id: TenantId::from_bytes(decode_fixed_id(&wire.tenant_id, "tenant id")?),
+    })
+}
+
+#[cfg(any(feature = "etcd", test))]
+pub(crate) fn encode_tenant_record(record: &TenantRecord) -> Result<Vec<u8>, ControlError> {
+    serde_json::to_vec(&tenant_record_wire(record)).map_err(codec_error)
+}
+
+#[cfg(any(feature = "etcd", test))]
+pub(crate) fn decode_tenant_record(bytes: &[u8]) -> Result<TenantRecord, ControlError> {
+    decode_canonical(
+        bytes,
+        "tenant",
+        tenant_record_from_wire,
+        encode_tenant_record,
+    )
+}
+
+fn principal_record_wire(record: &PrincipalRecord) -> PrincipalRecordWire {
+    PrincipalRecordWire {
+        version: PRINCIPAL_RECORD_CODEC_VERSION,
+        tenant_id: encode_fixed_id(record.tenant_id.as_bytes()),
+        principal_id: encode_fixed_id(record.principal_id.as_bytes()),
+    }
+}
+
+fn principal_record_from_wire(wire: PrincipalRecordWire) -> Result<PrincipalRecord, ControlError> {
+    require_version("principal", wire.version, PRINCIPAL_RECORD_CODEC_VERSION)?;
+    Ok(PrincipalRecord {
+        tenant_id: TenantId::from_bytes(decode_fixed_id(&wire.tenant_id, "tenant id")?),
+        principal_id: PrincipalId::from_bytes(decode_fixed_id(&wire.principal_id, "principal id")?),
+    })
+}
+
+#[cfg(any(feature = "etcd", test))]
+pub(crate) fn encode_principal_record(record: &PrincipalRecord) -> Result<Vec<u8>, ControlError> {
+    serde_json::to_vec(&principal_record_wire(record)).map_err(codec_error)
+}
+
+#[cfg(any(feature = "etcd", test))]
+pub(crate) fn decode_principal_record(bytes: &[u8]) -> Result<PrincipalRecord, ControlError> {
+    decode_canonical(
+        bytes,
+        "principal",
+        principal_record_from_wire,
+        encode_principal_record,
+    )
+}
+
+fn credential_binding_wire(binding: &CredentialBinding) -> CredentialBindingWire {
+    CredentialBindingWire {
+        version: CREDENTIAL_BINDING_CODEC_VERSION,
+        tenant_id: encode_fixed_id(binding.tenant_id.as_bytes()),
+        principal_id: encode_fixed_id(binding.principal_id.as_bytes()),
+        fingerprint: encode_fixed_id(binding.fingerprint.as_bytes()),
+        expires_at_unix_seconds: binding.expires_at_unix_seconds,
+    }
+}
+
+fn credential_binding_from_wire(
+    wire: CredentialBindingWire,
+) -> Result<CredentialBinding, ControlError> {
+    require_version("credential", wire.version, CREDENTIAL_BINDING_CODEC_VERSION)?;
+    let binding = CredentialBinding {
+        tenant_id: TenantId::from_bytes(decode_fixed_id(&wire.tenant_id, "tenant id")?),
+        principal_id: PrincipalId::from_bytes(decode_fixed_id(&wire.principal_id, "principal id")?),
+        fingerprint: CredentialFingerprint::from_bytes(decode_fixed_id(
+            &wire.fingerprint,
+            "credential fingerprint",
+        )?),
+        expires_at_unix_seconds: wire.expires_at_unix_seconds,
+    };
+    crate::identity::validate_credential(&binding)
+        .map_err(|_| ControlError::Codec("credential expiry must be non-zero".to_owned()))?;
+    Ok(binding)
+}
+
+#[cfg(any(feature = "etcd", test))]
+pub(crate) fn encode_credential_binding(
+    binding: &CredentialBinding,
+) -> Result<Vec<u8>, ControlError> {
+    serde_json::to_vec(&credential_binding_wire(binding)).map_err(codec_error)
+}
+
+#[cfg(any(feature = "etcd", test))]
+pub(crate) fn decode_credential_binding(bytes: &[u8]) -> Result<CredentialBinding, ControlError> {
+    decode_canonical(
+        bytes,
+        "credential",
+        credential_binding_from_wire,
+        encode_credential_binding,
+    )
+}
+
+fn role_binding_wire(binding: &RoleBinding) -> RoleBindingWire {
+    RoleBindingWire {
+        version: ROLE_BINDING_CODEC_VERSION,
+        tenant_id: encode_fixed_id(binding.tenant_id.as_bytes()),
+        principal_id: encode_fixed_id(binding.principal_id.as_bytes()),
+        role: u8::from(binding.role),
+        root_id: match binding.scope {
+            RoleScope::Tenant => None,
+            RoleScope::Root(root_id) => Some(encode_fixed_id(root_id.as_bytes())),
+        },
+    }
+}
+
+fn role_binding_from_wire(wire: RoleBindingWire) -> Result<RoleBinding, ControlError> {
+    require_version("role binding", wire.version, ROLE_BINDING_CODEC_VERSION)?;
+    Ok(RoleBinding {
+        tenant_id: TenantId::from_bytes(decode_fixed_id(&wire.tenant_id, "tenant id")?),
+        principal_id: PrincipalId::from_bytes(decode_fixed_id(&wire.principal_id, "principal id")?),
+        role: Role::try_from(wire.role).map_err(|error| ControlError::Codec(error.to_string()))?,
+        scope: match wire.root_id {
+            None => RoleScope::Tenant,
+            Some(root_id) => {
+                RoleScope::Root(RootId::from_bytes(decode_fixed_id(&root_id, "root id")?))
+            }
+        },
+    })
+}
+
+#[cfg(any(feature = "etcd", test))]
+pub(crate) fn encode_role_binding(binding: &RoleBinding) -> Result<Vec<u8>, ControlError> {
+    serde_json::to_vec(&role_binding_wire(binding)).map_err(codec_error)
+}
+
+#[cfg(any(feature = "etcd", test))]
+pub(crate) fn decode_role_binding(bytes: &[u8]) -> Result<RoleBinding, ControlError> {
+    decode_canonical(
+        bytes,
+        "role binding",
+        role_binding_from_wire,
+        encode_role_binding,
+    )
+}
+
+fn root_tenant_binding_wire(binding: &RootTenantBinding) -> RootTenantBindingWire {
+    RootTenantBindingWire {
+        version: ROOT_TENANT_BINDING_CODEC_VERSION,
+        root_id: encode_fixed_id(binding.root_id.as_bytes()),
+        tenant_id: encode_fixed_id(binding.tenant_id.as_bytes()),
+    }
+}
+
+fn root_tenant_binding_from_wire(
+    wire: RootTenantBindingWire,
+) -> Result<RootTenantBinding, ControlError> {
+    require_version(
+        "root tenant binding",
+        wire.version,
+        ROOT_TENANT_BINDING_CODEC_VERSION,
+    )?;
+    Ok(RootTenantBinding {
+        root_id: RootId::from_bytes(decode_fixed_id(&wire.root_id, "root id")?),
+        tenant_id: TenantId::from_bytes(decode_fixed_id(&wire.tenant_id, "tenant id")?),
+    })
+}
+
+#[cfg(any(feature = "etcd", test))]
+pub(crate) fn encode_root_tenant_binding(
+    binding: &RootTenantBinding,
+) -> Result<Vec<u8>, ControlError> {
+    serde_json::to_vec(&root_tenant_binding_wire(binding)).map_err(codec_error)
+}
+
+#[cfg(any(feature = "etcd", test))]
+pub(crate) fn decode_root_tenant_binding(bytes: &[u8]) -> Result<RootTenantBinding, ControlError> {
+    decode_canonical(
+        bytes,
+        "root tenant binding",
+        root_tenant_binding_from_wire,
+        encode_root_tenant_binding,
+    )
+}
+
+#[cfg(any(feature = "etcd", test))]
+pub(crate) fn encode_tenant_policy_counter(
+    counter: &TenantPolicyCounter,
+) -> Result<Vec<u8>, ControlError> {
+    serde_json::to_vec(&TenantPolicyCounterWire {
+        version: TENANT_POLICY_COUNTER_CODEC_VERSION,
+        tenant_id: encode_fixed_id(counter.tenant_id.as_bytes()),
+        revision: counter.revision,
+        principals: counter.principals,
+        credentials: counter.credentials,
+        role_bindings: counter.role_bindings,
+    })
+    .map_err(codec_error)
+}
+
+#[cfg(any(feature = "etcd", test))]
+pub(crate) fn decode_tenant_policy_counter(
+    bytes: &[u8],
+) -> Result<TenantPolicyCounter, ControlError> {
+    decode_canonical(
+        bytes,
+        "tenant policy counter",
+        |wire: TenantPolicyCounterWire| {
+            require_version(
+                "tenant policy counter",
+                wire.version,
+                TENANT_POLICY_COUNTER_CODEC_VERSION,
+            )?;
+            if wire.revision == 0 {
+                return Err(ControlError::Codec(
+                    "tenant policy revision must be non-zero".to_owned(),
+                ));
+            }
+            Ok(TenantPolicyCounter {
+                tenant_id: TenantId::from_bytes(decode_fixed_id(&wire.tenant_id, "tenant id")?),
+                revision: wire.revision,
+                principals: wire.principals,
+                credentials: wire.credentials,
+                role_bindings: wire.role_bindings,
+            })
+        },
+        encode_tenant_policy_counter,
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn encode_local_identity_state(state: &IdentityState) -> Result<Vec<u8>, ControlError> {
+    let tenants = state
+        .tenants
+        .iter()
+        .map(|(tenant_id, tenant)| LocalTenantWire {
+            tenant_id: encode_fixed_id(tenant_id.as_bytes()),
+            revision: tenant.revision,
+            principals: tenant
+                .principals
+                .iter()
+                .map(|principal_id| {
+                    principal_record_wire(&PrincipalRecord {
+                        tenant_id: *tenant_id,
+                        principal_id: *principal_id,
+                    })
+                })
+                .collect(),
+            credentials: tenant
+                .credentials
+                .values()
+                .map(credential_binding_wire)
+                .collect(),
+            role_bindings: tenant.role_bindings.iter().map(role_binding_wire).collect(),
+        })
+        .collect();
+    let root_tenants = state
+        .root_tenants
+        .iter()
+        .map(|(root_id, tenant_id)| {
+            root_tenant_binding_wire(&RootTenantBinding {
+                root_id: *root_id,
+                tenant_id: *tenant_id,
+            })
+        })
+        .collect();
+    serde_json::to_vec(&LocalIdentityStateWire {
+        version: LOCAL_IDENTITY_STATE_CODEC_VERSION,
+        tenants,
+        root_tenants,
+    })
+    .map_err(codec_error)
+}
+
+/// Decode the local identity file. Re-encoding must reproduce the input, so
+/// records are sorted and unique; each must also belong to its tenant, name a
+/// registered principal, and stay within the tenant limits.
+#[cfg(unix)]
+pub(crate) fn decode_local_identity_state(bytes: &[u8]) -> Result<IdentityState, ControlError> {
+    let invalid = |reason: &str| ControlError::Codec(format!("local identity state: {reason}"));
+    let limits = crate::IdentityLimits::DEFAULT;
+    decode_canonical(
+        bytes,
+        "local identity state",
+        |wire: LocalIdentityStateWire| {
+            require_version(
+                "local identity state",
+                wire.version,
+                LOCAL_IDENTITY_STATE_CODEC_VERSION,
+            )?;
+            let mut state = IdentityState::default();
+            for binding in wire.root_tenants {
+                let binding = root_tenant_binding_from_wire(binding)?;
+                state
+                    .root_tenants
+                    .insert(binding.root_id, binding.tenant_id);
+            }
+            for tenant_wire in wire.tenants {
+                let tenant_id =
+                    TenantId::from_bytes(decode_fixed_id(&tenant_wire.tenant_id, "tenant id")?);
+                if tenant_wire.revision == 0 {
+                    return Err(invalid("a tenant revision is zero"));
+                }
+                if tenant_wire.principals.len() > limits.principals
+                    || tenant_wire.credentials.len() > limits.credentials
+                    || tenant_wire.role_bindings.len() > limits.role_bindings
+                {
+                    return Err(invalid("a tenant exceeds its record limits"));
+                }
+                let mut tenant = TenantState {
+                    revision: tenant_wire.revision,
+                    principals: Default::default(),
+                    credentials: Default::default(),
+                    role_bindings: Default::default(),
+                };
+                for principal in tenant_wire.principals {
+                    let principal = principal_record_from_wire(principal)?;
+                    if principal.tenant_id != tenant_id {
+                        return Err(invalid("a principal is filed under another tenant"));
+                    }
+                    tenant.principals.insert(principal.principal_id);
+                }
+                for credential in tenant_wire.credentials {
+                    let credential = credential_binding_from_wire(credential)?;
+                    if credential.tenant_id != tenant_id
+                        || !tenant.principals.contains(&credential.principal_id)
+                    {
+                        return Err(invalid("a credential names no principal of its tenant"));
+                    }
+                    tenant
+                        .credentials
+                        .insert(credential.fingerprint, credential);
+                }
+                for binding in tenant_wire.role_bindings {
+                    let binding = role_binding_from_wire(binding)?;
+                    let root_owned = match binding.scope {
+                        RoleScope::Tenant => true,
+                        RoleScope::Root(root_id) => {
+                            state.root_tenants.get(&root_id) == Some(&tenant_id)
+                        }
+                    };
+                    if binding.tenant_id != tenant_id
+                        || !tenant.principals.contains(&binding.principal_id)
+                        || !root_owned
+                    {
+                        return Err(invalid(
+                            "a role binding names a principal or root outside its tenant",
+                        ));
+                    }
+                    tenant.role_bindings.insert(binding);
+                }
+                state.tenants.insert(tenant_id, tenant);
+            }
+            if state
+                .root_tenants
+                .values()
+                .any(|tenant_id| !state.tenants.contains_key(tenant_id))
+            {
+                return Err(invalid("a root is bound to an unknown tenant"));
+            }
+            Ok(state)
+        },
+        encode_local_identity_state,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1414,6 +1902,221 @@ mod tests {
             LogicalShardRecord::unassigned(shard_id(2)),
             "the explicit v2 decoder remains readable when no legacy checkpoint exists"
         );
+    }
+
+    fn tenant(value: u8) -> TenantId {
+        TenantId::from_bytes([value; 16])
+    }
+
+    fn principal_id(value: u8) -> PrincipalId {
+        PrincipalId::from_bytes([value; 16])
+    }
+
+    fn credential() -> CredentialBinding {
+        CredentialBinding {
+            tenant_id: tenant(5),
+            principal_id: principal_id(6),
+            fingerprint: CredentialFingerprint::from_bytes([7; 32]),
+            expires_at_unix_seconds: 1_800_000_000,
+        }
+    }
+
+    fn role(role: Role, scope: RoleScope) -> RoleBinding {
+        RoleBinding {
+            tenant_id: tenant(5),
+            principal_id: principal_id(6),
+            role,
+            scope,
+        }
+    }
+
+    #[test]
+    fn identity_golden_bytes_freeze_the_record_schema() {
+        let tenant_record = TenantRecord {
+            tenant_id: tenant(5),
+        };
+        let principal = PrincipalRecord {
+            tenant_id: tenant(5),
+            principal_id: principal_id(6),
+        };
+        let tenant_role = role(Role::Writer, RoleScope::Tenant);
+        let root_role = role(Role::Reader, RoleScope::Root(root_id(1)));
+        let root_tenant = RootTenantBinding {
+            root_id: root_id(1),
+            tenant_id: tenant(5),
+        };
+        let counter = TenantPolicyCounter {
+            tenant_id: tenant(5),
+            revision: 3,
+            principals: 1,
+            credentials: 1,
+            role_bindings: 1,
+        };
+        assert_eq!(
+            encode_tenant_record(&tenant_record).unwrap(),
+            br#"{"version":1,"tenant_id":"05050505050505050505050505050505"}"#
+        );
+        assert_eq!(
+            encode_principal_record(&principal).unwrap(),
+            br#"{"version":1,"tenant_id":"05050505050505050505050505050505","principal_id":"06060606060606060606060606060606"}"#
+        );
+        assert_eq!(
+            encode_credential_binding(&credential()).unwrap(),
+            br#"{"version":1,"tenant_id":"05050505050505050505050505050505","principal_id":"06060606060606060606060606060606","fingerprint":"0707070707070707070707070707070707070707070707070707070707070707","expires_at_unix_seconds":1800000000}"#
+        );
+        assert_eq!(
+            encode_role_binding(&tenant_role).unwrap(),
+            br#"{"version":1,"tenant_id":"05050505050505050505050505050505","principal_id":"06060606060606060606060606060606","role":2,"root_id":null}"#
+        );
+        assert_eq!(
+            encode_role_binding(&root_role).unwrap(),
+            br#"{"version":1,"tenant_id":"05050505050505050505050505050505","principal_id":"06060606060606060606060606060606","role":1,"root_id":"01010101010101010101010101010101"}"#
+        );
+        assert_eq!(
+            encode_root_tenant_binding(&root_tenant).unwrap(),
+            br#"{"version":1,"root_id":"01010101010101010101010101010101","tenant_id":"05050505050505050505050505050505"}"#
+        );
+        assert_eq!(
+            encode_tenant_policy_counter(&counter).unwrap(),
+            br#"{"version":1,"tenant_id":"05050505050505050505050505050505","revision":3,"principals":1,"credentials":1,"role_bindings":1}"#
+        );
+
+        let tenant_bytes = encode_tenant_record(&tenant_record).unwrap();
+        assert_eq!(decode_tenant_record(&tenant_bytes).unwrap(), tenant_record);
+        let principal_bytes = encode_principal_record(&principal).unwrap();
+        assert_eq!(
+            decode_principal_record(&principal_bytes).unwrap(),
+            principal
+        );
+        let credential_bytes = encode_credential_binding(&credential()).unwrap();
+        assert_eq!(
+            decode_credential_binding(&credential_bytes).unwrap(),
+            credential()
+        );
+        for binding in [tenant_role, root_role] {
+            let bytes = encode_role_binding(&binding).unwrap();
+            assert_eq!(decode_role_binding(&bytes).unwrap(), binding);
+        }
+        let root_tenant_bytes = encode_root_tenant_binding(&root_tenant).unwrap();
+        assert_eq!(
+            decode_root_tenant_binding(&root_tenant_bytes).unwrap(),
+            root_tenant
+        );
+        let counter_bytes = encode_tenant_policy_counter(&counter).unwrap();
+        assert_eq!(
+            decode_tenant_policy_counter(&counter_bytes).unwrap(),
+            counter
+        );
+    }
+
+    #[test]
+    fn identity_decoders_fail_closed_on_unknown_versions_fields_and_values() {
+        assert!(matches!(
+            decode_tenant_record(
+                br#"{"version":2,"tenant_id":"05050505050505050505050505050505"}"#
+            ),
+            Err(ControlError::UnsupportedRecordVersion {
+                record: "tenant",
+                version: 2,
+                supported: 1
+            })
+        ));
+        for bytes in [
+            // An unknown field, a role this reader does not know, uppercase
+            // hex, and non-canonical whitespace.
+            &br#"{"version":1,"tenant_id":"05050505050505050505050505050505","extra":1}"#[..],
+            br#"{"version":1,"tenant_id":"05050505050505050505050505050505","principal_id":"06060606060606060606060606060606","role":9,"root_id":null}"#,
+            br#"{"version":1,"tenant_id":"0505050505050505050505050505050A"}"#,
+            br#"{"version":1, "tenant_id":"05050505050505050505050505050505"}"#,
+        ] {
+            assert!(
+                matches!(
+                    decode_tenant_record(bytes).or_else(|_| decode_role_binding(bytes).map(|_| {
+                        TenantRecord {
+                            tenant_id: tenant(0),
+                        }
+                    })),
+                    Err(ControlError::Codec(_))
+                ),
+                "{}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        assert!(matches!(
+            decode_credential_binding(
+                br#"{"version":1,"tenant_id":"05050505050505050505050505050505","principal_id":"06060606060606060606060606060606","fingerprint":"0707070707070707070707070707070707070707070707070707070707070707","expires_at_unix_seconds":0}"#
+            ),
+            Err(ControlError::Codec(_))
+        ));
+        assert!(matches!(
+            decode_tenant_policy_counter(
+                br#"{"version":1,"tenant_id":"05050505050505050505050505050505","revision":0,"principals":0,"credentials":0,"role_bindings":0}"#
+            ),
+            Err(ControlError::Codec(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_identity_state_round_trips_and_rejects_records_outside_their_tenant() {
+        let limits = crate::IdentityLimits::DEFAULT;
+        let mut state = IdentityState::default();
+        state.create_tenant(TenantRecord {
+            tenant_id: tenant(5),
+        });
+        state
+            .create_principal(
+                PrincipalRecord {
+                    tenant_id: tenant(5),
+                    principal_id: principal_id(6),
+                },
+                limits,
+            )
+            .unwrap();
+        state
+            .bind_root_tenant(RootTenantBinding {
+                root_id: root_id(1),
+                tenant_id: tenant(5),
+            })
+            .unwrap();
+        state.add_credential(credential(), limits).unwrap();
+        state
+            .grant_role(role(Role::Reader, RoleScope::Root(root_id(1))), limits)
+            .unwrap();
+        let encoded = encode_local_identity_state(&state).unwrap();
+        assert_eq!(decode_local_identity_state(&encoded).unwrap(), state);
+        assert_eq!(
+            decode_local_identity_state(br#"{"version":1,"tenants":[],"root_tenants":[]}"#)
+                .unwrap(),
+            IdentityState::default()
+        );
+
+        let text = String::from_utf8(encoded).unwrap();
+        let tampered = [
+            // The root-scoped role names a root that the tenant does not own.
+            text.replace(
+                r#""root_tenants":[{"version":1,"root_id":"01010101010101010101010101010101","tenant_id":"05050505050505050505050505050505"}]"#,
+                r#""root_tenants":[]"#,
+            ),
+            // The credential names an unregistered principal.
+            text.replacen(
+                r#""principal_id":"06060606060606060606060606060606","fingerprint""#,
+                r#""principal_id":"09090909090909090909090909090909","fingerprint""#,
+                1,
+            ),
+            // A zero revision: four changes so far.
+            text.replace(r#""revision":4"#, r#""revision":0"#),
+        ];
+        for tampered in tampered {
+            assert_ne!(tampered, text);
+            assert!(
+                matches!(
+                    decode_local_identity_state(tampered.as_bytes()),
+                    Err(ControlError::Codec(_))
+                ),
+                "{tampered}"
+            );
+        }
     }
 
     #[test]

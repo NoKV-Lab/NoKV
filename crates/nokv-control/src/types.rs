@@ -2,8 +2,8 @@ use crate::ControlError;
 use std::fmt;
 
 pub use nokv_types::{
-    AgentId, LogicalShardId, ObjectNamespaceId, OwnerEpoch, PlacementGeneration, RootId,
-    RootPlacementLifecycle,
+    AgentId, CredentialFingerprint, LogicalShardId, ObjectNamespaceId, OwnerEpoch,
+    PlacementGeneration, PrincipalId, Role, RoleScope, RootId, RootPlacementLifecycle, TenantId,
 };
 
 /// Stable identity of one physical metadata-shard process.
@@ -122,6 +122,63 @@ pub struct RootObjectNamespaceBinding {
 pub struct RootAgentBinding {
     pub root_id: RootId,
     pub agent_id: AgentId,
+}
+
+/// One tenant: the isolation boundary that owns roots and principals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TenantRecord {
+    pub tenant_id: TenantId,
+}
+
+/// One principal registered in a tenant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PrincipalRecord {
+    pub tenant_id: TenantId,
+    pub principal_id: PrincipalId,
+}
+
+/// One client certificate that authenticates a principal until it expires.
+///
+/// A fingerprint names at most one principal within a tenant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CredentialBinding {
+    pub tenant_id: TenantId,
+    pub principal_id: PrincipalId,
+    pub fingerprint: CredentialFingerprint,
+    /// The credential authenticates nobody at or after this instant.
+    pub expires_at_unix_seconds: u64,
+}
+
+/// One role a principal holds on its tenant or on one root of its tenant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RoleBinding {
+    pub tenant_id: TenantId,
+    pub principal_id: PrincipalId,
+    pub role: Role,
+    pub scope: RoleScope,
+}
+
+/// Immutable binding from one root to the tenant that owns it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootTenantBinding {
+    pub root_id: RootId,
+    pub tenant_id: TenantId,
+}
+
+/// One consistent read of a tenant's principals, credentials, and roles.
+///
+/// `revision` advances by one with every change to these records, so a
+/// reader can poll it to learn when to reload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TenantPolicy {
+    pub tenant_id: TenantId,
+    pub revision: u64,
+    /// Sorted by principal id.
+    pub principals: Vec<PrincipalRecord>,
+    /// Sorted by fingerprint.
+    pub credentials: Vec<CredentialBinding>,
+    /// Sorted by principal, role, then scope.
+    pub role_bindings: Vec<RoleBinding>,
 }
 
 /// Durable ownership and recovery state for one logical metadata shard.

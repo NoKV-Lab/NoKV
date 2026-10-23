@@ -11,6 +11,11 @@ mod conformance;
 mod errors;
 #[cfg(feature = "etcd")]
 mod etcd;
+#[cfg(feature = "etcd")]
+mod etcd_identity;
+mod identity;
+#[cfg(test)]
+mod identity_conformance;
 #[cfg(unix)]
 mod local;
 mod options;
@@ -29,6 +34,7 @@ pub use codec::{
 pub use errors::ControlError;
 #[cfg(feature = "etcd")]
 pub use etcd::EtcdControlStore;
+pub use identity::{IdentityLimits, IdentityStore};
 #[cfg(unix)]
 pub use local::LocalControlStore;
 pub use options::EtcdControlStoreOptions;
@@ -37,9 +43,11 @@ pub use store::{
     MAX_RECOVERY_LOG_RECEIPT_BYTES, MAX_RECOVERY_LOG_SEGMENTS,
 };
 pub use types::{
-    AgentId, CheckpointRef, LogRef, LogSegmentRef, LogicalShardId, LogicalShardLease,
-    LogicalShardRecord, LogicalShardRecoveryState, LogicalShardState, NodeId, NodeIdError,
-    ObjectNamespaceId, OwnerEpoch, PlacementGeneration, RecoveryPublication, RecoveryUploadIntent,
-    RootAgentBinding, RootId, RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle,
+    AgentId, CheckpointRef, CredentialBinding, CredentialFingerprint, LogRef, LogSegmentRef,
+    LogicalShardId, LogicalShardLease, LogicalShardRecord, LogicalShardRecoveryState,
+    LogicalShardState, NodeId, NodeIdError, ObjectNamespaceId, OwnerEpoch, PlacementGeneration,
+    PrincipalId, PrincipalRecord, RecoveryPublication, RecoveryUploadIntent, Role, RoleBinding,
+    RoleScope, RootAgentBinding, RootId, RootObjectNamespaceBinding, RootPlacement,
+    RootPlacementLifecycle, RootTenantBinding, TenantId, TenantPolicy, TenantRecord,
     UnknownLogicalShardState,
 };
