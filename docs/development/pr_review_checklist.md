@@ -9,6 +9,25 @@ Findings come first, ordered by severity. Passing tests does not excuse weaker
 metadata atomicity, object publication, retention, ownership fencing, package
 boundaries, or Workbench behavior.
 
+## PR Description
+
+- Does the title use a concise English `<type>: <outcome>`?
+- Does the body follow the
+  [required format](../../CONTRIBUTING.md#pr-description-format): `TLDR`,
+  `Problem`, `Consequences`, `Example`, `Solution`, `Gain`, `Tradeoffs`, then
+  `Validation`?
+- Does it explain the concrete problem, user impact, and before/after behavior
+  in short, plain English paragraphs with minimal code details?
+- Are repeated explanations, file-by-file summaries, pasted diffs, and
+  conversational history omitted?
+- Is the related issue linked under `Problem`, or is a permitted exception
+  explained there?
+- Do the title and body describe the final scope, including relevant breaking
+  changes, limitations, and risks, with evidence for any quantified gains?
+- Are exact validation commands and key results included, with reasons for
+  relevant checks not run?
+- Do the required `pr-description` and `pr-description-tests` checks pass?
+
 ## Merge Governance
 
 - If additions plus deletions exceed 5,000 lines, does one core maintainer
@@ -164,6 +183,15 @@ boundaries, or Workbench behavior.
 - Are `run_manifest.json` and `restore_manifest.json` stable projections?
 - Are `inode`, `source_root`, `destination_root`, and `checkpoints.jsonl`
   absent from Workbench responses and contract state?
+
+## Claims And Evidence
+
+- Do public docs distinguish current, experimental, and planned capabilities?
+- Do security claims avoid treating a Workbench root or Agent scope as tenant
+  authentication or authorization?
+- Do performance claims state the topology, comparison boundary, cache state,
+  run count, and raw-evidence location?
+- Does benchmark-only behavior leave product semantics unchanged?
 
 ## Tests And Evidence
 

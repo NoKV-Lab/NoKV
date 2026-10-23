@@ -17,6 +17,7 @@ mod lifecycle;
 mod recovery_installer;
 mod recovery_publisher;
 mod registry;
+mod request_fingerprint;
 mod server;
 mod service;
 #[cfg(test)]
