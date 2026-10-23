@@ -64,6 +64,7 @@ jobs:
             scripts/workbench/restore_composition_gate.py \
             scripts/workbench/fork_restore_recovery_gate.py \
             scripts/workbench/cli_contract_gate.py \
+            scripts/workbench/python_contract_gate.py \
             scripts/workbench/loopx_stage2a_stack.py
           python3 scripts/workbench/pre423_contract_ledger.py
           python3 scripts/workbench/pre423_contract_ledger_test.py
@@ -594,6 +595,52 @@ jobs:
         with:
           name: cli-contract-${{ github.sha }}
           path: ${{ runner.temp }}/cli-contract
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Build and install the Python SDK wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_venv="$RUNNER_TEMP/maturin-venv"
+          wheel_dir="$RUNNER_TEMP/python-contract-wheel"
+          sdk_venv="$RUNNER_TEMP/python-contract-venv"
+          python3 -m venv "$build_venv"
+          "$build_venv/bin/python" -m pip install --quiet "maturin>=1,<2"
+          # Debug on purpose: a release build would recompile every cached
+          # dependency, and the Python SDK workflow covers the release wheel.
+          "$build_venv/bin/maturin" build --locked \
+            --manifest-path crates/nokv-python/Cargo.toml \
+            --out "$wheel_dir"
+          python3 -m venv "$sdk_venv"
+          "$sdk_venv/bin/python" -m pip install --quiet fsspec
+          "$sdk_venv/bin/python" -m pip install --quiet --no-index --find-links "$wheel_dir" nokv
+
+      - name: Qualify the direct Python SDK contract
+        id: python_contract
+        shell: bash
+        env:
+          PYTHON_CONTRACT_EVIDENCE_DIR: ${{ runner.temp }}/python-contract
+          AWS_ACCESS_KEY_ID: rustfsadmin
+          AWS_SECRET_ACCESS_KEY: rustfsadmin
+        run: |
+          set -euo pipefail
+          python3 scripts/workbench/python_contract_gate.py \
+            --nokv-bin target/debug/nokv \
+            --python-executable "$RUNNER_TEMP/python-contract-venv/bin/python" \
+            --evidence-dir "$PYTHON_CONTRACT_EVIDENCE_DIR" \
+            --object-endpoint http://127.0.0.1:9000 \
+            --object-bucket nokv-local-wal-recovery-gate \
+            --object-root "python-contract-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --timeout 45
+          jq -e '.overall_status == "PASS"' "$PYTHON_CONTRACT_EVIDENCE_DIR/qualification.json"
+
+      - name: Upload direct Python SDK contract evidence
+        if: ${{ always() && steps.python_contract.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: python-contract-${{ github.sha }}
+          path: ${{ runner.temp }}/python-contract
           if-no-files-found: error
           retention-days: 7
 
