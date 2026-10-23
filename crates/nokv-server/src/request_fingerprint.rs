@@ -22,7 +22,7 @@ use sha2::{Digest as _, Sha256};
 /// format: changing it requires a new format version.
 pub(crate) fn request_fingerprint(
     request: &protocol::WorkspaceRpcRequest,
-    principal: Option<types::AgentId>,
+    principal: Option<types::PrincipalId>,
 ) -> Result<[u8; types::SHA256_BYTES], rmp_serde::encode::Error> {
     let operation = rmp_serde::to_vec_named(&request.operation)?;
     let mut hasher = Sha256::new();
@@ -81,7 +81,7 @@ mod tests {
             hex(request_fingerprint(&rename(1), None).unwrap()),
             "f4b304074a74fa514c4b3acafce1df8263dd6f95af5cdd01ac51fa892e80c098"
         );
-        let principal = types::AgentId::from_bytes([7; types::FIXED_ID_BYTES]);
+        let principal = types::PrincipalId::from_bytes([7; types::FIXED_ID_BYTES]);
         assert_eq!(
             hex(request_fingerprint(&rename(1), Some(principal)).unwrap()),
             "b9a260415b7b27183a12bf092ae9d9ffdc256933a532972fe3057394315767f9"
@@ -130,7 +130,7 @@ mod tests {
         for variant in variants {
             assert_ne!(request_fingerprint(&variant, None).unwrap(), original);
         }
-        let principal = types::AgentId::from_bytes([7; types::FIXED_ID_BYTES]);
+        let principal = types::PrincipalId::from_bytes([7; types::FIXED_ID_BYTES]);
         assert_ne!(
             request_fingerprint(&rename(1), Some(principal)).unwrap(),
             original

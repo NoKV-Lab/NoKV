@@ -24,7 +24,7 @@ use crate::legacy_rejection::{legacy_rejection_response, MAX_LEGACY_FIRST_FRAME_
 use crate::rpc_tls::{
     accept_tls, drain_tls_record, opens_tls_record, DeadlineSocket, RpcServerTls, RpcStream,
 };
-use crate::{RootOwnerRegistry, ServerError, ShardOwner};
+use crate::{RequestAuthority, RootOwnerRegistry, ServerError, ShardOwner};
 
 static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -288,7 +288,9 @@ impl WorkspaceServer {
             ));
         }
         let request = decode_request(encoded)?;
-        let response = self.registry.dispatch_guarded(request)?;
+        let response = self
+            .registry
+            .dispatch_guarded(request, RequestAuthority::TRUSTED)?;
         encode_response(response.response()).map_err(ServerError::Protocol)
     }
 }
@@ -618,24 +620,33 @@ fn serve_connection(
     while let Some(request) = read_frame(&mut stream)? {
         let request = decode_request(&request)?;
         // Authorization comes before any route lookup, so a denied caller
-        // learns nothing about the root.
-        if let Some(tls) = tls {
-            let Some(principal) = &principal else {
-                return Ok(());
-            };
-            if let Err(denial) = tls.access.authorize(principal, &request, unix_now()) {
-                log_denial(peer, principal, &request, denial, &mut denials_logged);
-                write_frame(
-                    &mut stream,
-                    &encode_response(&denied_response(&request, denial))?,
-                )?;
-                if denial == AccessDenial::NotACurrentCredential {
+        // learns nothing about the root. The executor then records the
+        // authorized principal.
+        let authority = match tls {
+            Some(tls) => {
+                let Some(principal) = &principal else {
                     return Ok(());
+                };
+                match tls.access.authorize(principal, &request, unix_now()) {
+                    Ok(()) => RequestAuthority {
+                        principal: Some(principal.principal_id),
+                    },
+                    Err(denial) => {
+                        log_denial(peer, principal, &request, denial, &mut denials_logged);
+                        write_frame(
+                            &mut stream,
+                            &encode_response(&denied_response(&request, denial))?,
+                        )?;
+                        if denial == AccessDenial::NotACurrentCredential {
+                            return Ok(());
+                        }
+                        continue;
+                    }
                 }
-                continue;
             }
-        }
-        let response = registry.dispatch_guarded(request)?;
+            None => RequestAuthority::TRUSTED,
+        };
+        let response = registry.dispatch_guarded(request, authority)?;
         let encoded = encode_response_or_internal_failure(response.response())?;
         write_frame(&mut stream, &encoded)?;
         drop(response);
@@ -1021,11 +1032,17 @@ mod tests {
 
     struct CountingExecutor {
         calls: AtomicUsize,
+        last_authority: Mutex<Option<RequestAuthority>>,
     }
 
     impl WorkspaceRequestExecutor for CountingExecutor {
-        fn execute(&self, request: &WorkspaceRpcRequest) -> Result<ExecutedRequest, RpcFailure> {
+        fn execute(
+            &self,
+            request: &WorkspaceRpcRequest,
+            authority: RequestAuthority,
+        ) -> Result<ExecutedRequest, RpcFailure> {
             self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            *self.last_authority.lock().unwrap() = Some(authority);
             let WorkspaceRequest::CreateWorkspace(create) = &request.operation else {
                 panic!("test executor received an unexpected operation");
             };
@@ -1142,6 +1159,7 @@ mod tests {
         let registry = Arc::new(RootOwnerRegistry::new());
         let executor = Arc::new(CountingExecutor {
             calls: AtomicUsize::new(0),
+            last_authority: Mutex::new(None),
         });
         registry.install(route(), executor.clone()).unwrap();
         (registry, executor)
@@ -1694,6 +1712,32 @@ mod tests {
             panic!("expected a failure, got {:?}", response.outcome);
         };
         failure
+    }
+
+    #[test]
+    fn an_authorized_request_reaches_the_executor_with_its_principal() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (client, server) = streams();
+        let (registry, executor) = registry();
+        let serving =
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)));
+
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.registered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        assert!(matches!(
+            tls_exchange(&mut stream, &request()).outcome,
+            WorkspaceRpcOutcome::Success(_)
+        ));
+        stream.conn.send_close_notify();
+        stream.flush().unwrap();
+        serving.join().unwrap().unwrap();
+        assert_eq!(
+            *executor.last_authority.lock().unwrap(),
+            Some(RequestAuthority {
+                principal: Some(nokv_types::PrincipalId::from_bytes([6; 16])),
+            })
+        );
     }
 
     #[test]

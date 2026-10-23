@@ -13,7 +13,7 @@ use nokv_types as types;
 use sha2::{Digest as _, Sha256};
 
 use crate::request_fingerprint::request_fingerprint;
-use crate::{ExecutedRequest, WorkspaceRequestExecutor};
+use crate::{ExecutedRequest, RequestAuthority, WorkspaceRequestExecutor};
 
 const MANIFEST_SCAN_ROWS: usize = 256;
 const MANIFEST_PLAN_CURSOR_VERSION: u8 = 1;
@@ -229,7 +229,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn execute_request(
         &self,
-        request: &protocol::WorkspaceRpcRequest,
+        request: &AuthorizedRequest<'_>,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         request
             .validate()
@@ -326,7 +326,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn execute_request_with_internal_retry(
         &self,
-        request: &protocol::WorkspaceRpcRequest,
+        request: &AuthorizedRequest<'_>,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         if mutates_metadata(&request.operation) {
             // Plan and apply inside one sequenced session so an unrelated
@@ -347,7 +347,7 @@ impl MetadataWorkspaceRequestExecutor {
     }
 
     fn preflight(
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::WorkspacePreflightRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         if request.required_capabilities.iter().any(|required| {
@@ -374,12 +374,12 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn create_workspace(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::CreateWorkspaceRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         let step_id = derived_request_id(rpc.request_id, b"create-workspace", 0);
-        let context = self.write_context(rpc.route, step_id)?;
+        let context = self.write_context(rpc, step_id)?;
         let workbench = workbench_id(&request.workbench)?;
         let outcome = meta::create_visible_workspace(
             &self.meta,
@@ -403,7 +403,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn get_workspace(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::GetWorkspaceRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let route = route_parts(rpc.route)?;
@@ -433,7 +433,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn get_path(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::GetPathRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let workbench = workbench_id(&request.target.workbench)?;
@@ -582,7 +582,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn list_paths(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::ListPathsRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let workbench = workbench_id(&request.workbench)?;
@@ -672,7 +672,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn remove_path(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::RemovePathRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
@@ -680,7 +680,7 @@ impl MetadataWorkspaceRequestExecutor {
         let outcome = meta::remove_path(
             &self.meta,
             meta::RemovePathRequest {
-                context: self.write_context(rpc.route, step_id)?,
+                context: self.write_context(rpc, step_id)?,
                 workbench_id: workbench_id(&request.target.workbench)?,
                 path: relative_path(&request.target.path)?,
                 expected_generation: types::Generation::new(request.expected_generation)
@@ -701,7 +701,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn rename_path(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::RenamePathRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
@@ -710,7 +710,7 @@ impl MetadataWorkspaceRequestExecutor {
         let outcome = meta::rename_path(
             &self.meta,
             meta::RenamePathRequest {
-                context: self.write_context(rpc.route, step_id)?,
+                context: self.write_context(rpc, step_id)?,
                 workbench_id,
                 source: relative_path(&request.source.path)?,
                 destination: relative_path(&request.destination.path)?,
@@ -734,7 +734,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn get_snapshot(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::GetSnapshotRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let context = self.read_context(rpc.route)?;
@@ -765,12 +765,12 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn mint_snapshot(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::MintSnapshotRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         let step_id = derived_request_id(rpc.request_id, b"snapshot-mint", 0);
-        let context = self.write_context(rpc.route, step_id)?;
+        let context = self.write_context(rpc, step_id)?;
         let workbench_id = workbench_id(&request.workbench)?;
         let workspace = meta::get_visible_workspace_at(
             &self.meta,
@@ -820,12 +820,12 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn renew_snapshot(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::RenewSnapshotRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         let step_id = derived_request_id(rpc.request_id, b"snapshot-renew", 0);
-        let context = self.write_context(rpc.route, step_id)?;
+        let context = self.write_context(rpc, step_id)?;
         let workbench_id = workbench_id(&request.workbench)?;
         let workspace = meta::get_visible_workspace_at(
             &self.meta,
@@ -859,12 +859,12 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn retire_snapshot(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::RetireSnapshotRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         let step_id = derived_request_id(rpc.request_id, b"snapshot-retire", 0);
-        let context = self.write_context(rpc.route, step_id)?;
+        let context = self.write_context(rpc, step_id)?;
         let workbench_id = workbench_id(&request.workbench)?;
         let workspace = meta::get_visible_workspace_at(
             &self.meta,
@@ -898,7 +898,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn list_snapshots(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::ListSnapshotsRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let context = self.read_context(rpc.route)?;
@@ -935,7 +935,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn prepare_restore(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::PrepareRestoreRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let gate = self.restore_preparations.gate(RestorePreparationKey {
@@ -952,7 +952,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn prepare_restore_once(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::PrepareRestoreRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
@@ -993,7 +993,7 @@ impl MetadataWorkspaceRequestExecutor {
         let begin_id = derived_request_id(rpc.request_id, b"restore-begin", 0);
         let mut outcome = meta::begin_restore(
             &self.meta,
-            self.write_context(rpc.route, begin_id)?,
+            self.write_context(rpc, begin_id)?,
             &meta::BeginRestoreRequest {
                 operation_id: request.operation_id.into(),
                 source_workbench_id: source_workbench,
@@ -1016,7 +1016,7 @@ impl MetadataWorkspaceRequestExecutor {
         let durable = meta::get_restore(
             &self.meta,
             self.write_context(
-                rpc.route,
+                rpc,
                 derived_request_id(rpc.request_id, b"restore-prepare-load", 0),
             )?,
             outcome.operation.operation_id,
@@ -1033,7 +1033,7 @@ impl MetadataWorkspaceRequestExecutor {
             let started = meta::start_restore_copy(
                 &self.meta,
                 self.write_context(
-                    rpc.route,
+                    rpc,
                     derived_request_id(rpc.request_id, b"restore-start-copy", 0),
                 )?,
                 meta::RestoreOperationRequest {
@@ -1061,7 +1061,7 @@ impl MetadataWorkspaceRequestExecutor {
             let copied = meta::copy_restore_batch(
                 &self.meta,
                 self.write_context(
-                    rpc.route,
+                    rpc,
                     restore_copy_request_id(rpc.request_id, outcome.operation.next_member_sequence),
                 )?,
                 meta::CopyRestoreBatchRequest {
@@ -1098,7 +1098,7 @@ impl MetadataWorkspaceRequestExecutor {
             let sealed = meta::seal_restore_source(
                 &self.meta,
                 self.write_context(
-                    rpc.route,
+                    rpc,
                     derived_request_id(rpc.request_id, b"restore-seal-source", 0),
                 )?,
                 meta::RestoreOperationRequest {
@@ -1131,7 +1131,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn bind_restore_destination(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::BindRestoreDestinationRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
@@ -1139,7 +1139,7 @@ impl MetadataWorkspaceRequestExecutor {
         let outcome = meta::bind_restore_destination(
             &self.meta,
             self.write_context(
-                rpc.route,
+                rpc,
                 derived_request_id(rpc.request_id, b"restore-bind-destination", 0),
             )?,
             &meta::BindRestoreDestinationRequest {
@@ -1180,11 +1180,11 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn read_restore_source_run_manifest(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::ReadRestoreSourceRunManifestRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let context = self.write_context(
-            rpc.route,
+            rpc,
             derived_request_id(rpc.request_id, b"restore-read-source-run-manifest", 0),
         )?;
         let retained = meta::read_restore_source_run_manifest(
@@ -1257,13 +1257,13 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn finalize_restore(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::FinalizeRestoreRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         let operation_id: types::OperationId = request.operation_id.into();
         let load_context = self.write_context(
-            rpc.route,
+            rpc,
             derived_request_id(rpc.request_id, b"restore-finalize-load", 0),
         )?;
         #[cfg(feature = "restore-crash-test-support")]
@@ -1289,7 +1289,7 @@ impl MetadataWorkspaceRequestExecutor {
             let initialized = meta::apply_restore_initialization(
                 &self.meta,
                 self.write_context(
-                    rpc.route,
+                    rpc,
                     derived_request_id(rpc.request_id, b"restore-apply-initialization", 0),
                 )?,
                 meta::RestoreOperationRequest { operation_id },
@@ -1323,7 +1323,7 @@ impl MetadataWorkspaceRequestExecutor {
                         ))
                     })?;
                 let mut readback_context = self.write_context(
-                    rpc.route,
+                    rpc,
                     derived_request_id(rpc.request_id, b"restore-initialization-readback", 0),
                 )?;
                 readback_context.read_version = initialization_read_version;
@@ -1364,7 +1364,7 @@ impl MetadataWorkspaceRequestExecutor {
             let built = meta::build_restore_commit_members(
                 &self.meta,
                 self.write_context(
-                    rpc.route,
+                    rpc,
                     derived_request_id(rpc.request_id, b"restore-build-commit-members", batch),
                 )?,
                 meta::RestoreClosureBatchRequest {
@@ -1421,7 +1421,7 @@ impl MetadataWorkspaceRequestExecutor {
             let sealed = meta::seal_restore_commit_revisions(
                 &self.meta,
                 self.write_context(
-                    rpc.route,
+                    rpc,
                     derived_request_id(rpc.request_id, b"restore-seal-commit-revisions", batch),
                 )?,
                 meta::RestoreClosureBatchRequest {
@@ -1486,7 +1486,7 @@ impl MetadataWorkspaceRequestExecutor {
         let completed = match meta::complete_restore(
             &self.meta,
             self.write_context(
-                rpc.route,
+                rpc,
                 derived_request_id(rpc.request_id, b"restore-complete", 0),
             )?,
             meta::RestoreOperationRequest { operation_id },
@@ -1512,11 +1512,11 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn completed_restore_replay(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         operation_id: types::OperationId,
     ) -> Result<Option<ExecutedRequest>, protocol::RpcFailure> {
         let context = self.write_context(
-            rpc.route,
+            rpc,
             derived_request_id(rpc.request_id, b"restore-terminal-replay", 0),
         )?;
         let Some(operation) =
@@ -1532,14 +1532,14 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn begin_generic_index_registration(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::BeginGenericIndexRegistrationRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         let outcome = meta::GenericIndexRegistrationService::new(&self.meta)
             .begin(meta::BeginGenericIndexRegistrationRequest {
                 context: self.write_context(
-                    rpc.route,
+                    rpc,
                     derived_request_id(rpc.request_id, b"generic-index-begin", 0),
                 )?,
                 operation_id: request.operation_id.into(),
@@ -1565,14 +1565,14 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn append_generic_index_rows(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::AppendGenericIndexRowsRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         let outcome = meta::GenericIndexRegistrationService::new(&self.meta)
             .append(meta::AppendGenericIndexRowsRequest {
                 context: self.write_context(
-                    rpc.route,
+                    rpc,
                     derived_request_id(
                         rpc.request_id,
                         b"generic-index-append",
@@ -1611,14 +1611,14 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn finalize_generic_index_registration(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::FinalizeGenericIndexRegistrationRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         let outcome = meta::GenericIndexRegistrationService::new(&self.meta)
             .finalize(meta::FinalizeGenericIndexRegistrationRequest {
                 context: self.write_context(
-                    rpc.route,
+                    rpc,
                     derived_request_id(rpc.request_id, b"generic-index-finalize", 0),
                 )?,
                 operation_id: request.operation_id.into(),
@@ -1629,14 +1629,14 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn abort_generic_index_registration(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::AbortGenericIndexRegistrationRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         let outcome = meta::GenericIndexRegistrationService::new(&self.meta)
             .abort(meta::AbortGenericIndexRegistrationRequest {
                 context: self.write_context(
-                    rpc.route,
+                    rpc,
                     derived_request_id(rpc.request_id, b"generic-index-abort", 0),
                 )?,
                 operation_id: request.operation_id.into(),
@@ -1663,7 +1663,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn get_generic_index_registration(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::GetGenericIndexRegistrationRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let operation = meta::GenericIndexRegistrationService::new(&self.meta)
@@ -1681,7 +1681,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn search(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::SearchRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let context = self.read_context(rpc.route)?;
@@ -1804,7 +1804,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn aggregate(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::AggregateRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let context = self.read_context(rpc.route)?;
@@ -1849,7 +1849,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn catalog(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::CatalogRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let context = self.read_context(rpc.route)?;
@@ -1912,7 +1912,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn find_workspaces(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::FindWorkspacesRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let context = self.read_context(rpc.route)?;
@@ -1957,7 +1957,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn read_changes(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::ChangePageRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let context = self.read_context(rpc.route)?;
@@ -1996,7 +1996,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn begin_artifact_publish(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::BeginArtifactPublishRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         require_append_attempt_identities(rpc, request)?;
@@ -2008,7 +2008,7 @@ impl MetadataWorkspaceRequestExecutor {
     /// Its durable steps derive their request identities from `rpc`.
     fn begin_claimed_artifact_publish(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::BeginArtifactPublishRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let step_id = derived_request_id(rpc.request_id, b"publish-begin", 0);
@@ -2018,7 +2018,7 @@ impl MetadataWorkspaceRequestExecutor {
             // it necessarily carries the same fence as the recorded publish.
             return publish_operation_response(outcome);
         }
-        let context = self.publication_context(rpc.route, step_id)?;
+        let context = self.publication_context(rpc, step_id)?;
         let read = read_context_from_publication(context);
         // Stable append identity authenticates the original intent before any
         // live path or dependency read. A receipt describes historical success;
@@ -2239,6 +2239,7 @@ impl MetadataWorkspaceRequestExecutor {
             }
         };
         let mut operation = meta::PublishOperationRecord {
+            initiator: context.authority.initiator,
             append_attempt: request
                 .append_attempt
                 .map(|binding| meta::AppendAttemptBinding {
@@ -2297,7 +2298,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn stage_artifact_objects(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::StageArtifactObjectsRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
@@ -2306,7 +2307,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn stage_claimed_artifact_objects(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::StageArtifactObjectsRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let step_id = derived_request_id(rpc.request_id, b"publish-stage-objects", 0);
@@ -2318,7 +2319,7 @@ impl MetadataWorkspaceRequestExecutor {
             request.token,
             b"publish-heartbeat-stage-objects",
         )?;
-        let context = self.publication_context(rpc.route, step_id)?;
+        let context = self.publication_context(rpc, step_id)?;
         let staged_objects = request
             .objects
             .iter()
@@ -2345,7 +2346,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn mark_artifact_objects_uploaded(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::MarkArtifactObjectsUploadedRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
@@ -2354,7 +2355,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn mark_claimed_artifact_objects_uploaded(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::MarkArtifactObjectsUploadedRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let step_id = derived_request_id(rpc.request_id, b"publish-mark-uploaded", 0);
@@ -2366,7 +2367,7 @@ impl MetadataWorkspaceRequestExecutor {
             request.token,
             b"publish-heartbeat-mark-uploaded",
         )?;
-        let context = self.publication_context(rpc.route, step_id)?;
+        let context = self.publication_context(rpc, step_id)?;
         let mut updates = Vec::with_capacity(request.objects.len());
         for proof in &request.objects {
             let key = meta::staged_object_key(
@@ -2415,7 +2416,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn stage_artifact_manifest(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::StageArtifactManifestRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
@@ -2424,7 +2425,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn stage_claimed_artifact_manifest(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::StageArtifactManifestRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let step_id = derived_request_id(rpc.request_id, b"publish-stage-manifest", 0);
@@ -2436,7 +2437,7 @@ impl MetadataWorkspaceRequestExecutor {
             request.token,
             b"publish-heartbeat-stage-manifest",
         )?;
-        let context = self.publication_context(rpc.route, step_id)?;
+        let context = self.publication_context(rpc, step_id)?;
         let mut rows = Vec::with_capacity(request.rows.len());
         for row in &request.rows {
             rows.push(meta::ManifestRowInput {
@@ -2479,7 +2480,7 @@ impl MetadataWorkspaceRequestExecutor {
     /// of the stepwise protocol.
     fn prepare_artifact_publish(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::PrepareArtifactPublishRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         require_append_attempt_identities(rpc, &request.begin)?;
@@ -2515,7 +2516,7 @@ impl MetadataWorkspaceRequestExecutor {
     /// request.
     fn finish_artifact_publish(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::FinishArtifactPublishRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
@@ -2563,7 +2564,7 @@ impl MetadataWorkspaceRequestExecutor {
     /// that already reached a terminal state answers with its Begin status.
     fn publish_inline_artifact(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::PublishInlineArtifactRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         require_append_attempt_identities(rpc, &request.begin)?;
@@ -2591,7 +2592,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn complete_artifact_publish(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::CompleteArtifactPublishRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
@@ -2600,7 +2601,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn complete_claimed_artifact_publish(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::CompleteArtifactPublishRequest,
         inline_body: Option<Vec<u8>>,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
@@ -2616,7 +2617,7 @@ impl MetadataWorkspaceRequestExecutor {
                 )?;
                 match operation.phase {
                     types::PublishPhase::Uploading => {
-                        let context = self.publication_context(rpc.route, transition_id)?;
+                        let context = self.publication_context(rpc, transition_id)?;
                         meta::PublicationService::new(&self.meta)
                             .transition_publish(meta::TransitionPublishRequest {
                                 context,
@@ -2660,7 +2661,7 @@ impl MetadataWorkspaceRequestExecutor {
             finalizing_token,
             b"publish-heartbeat-complete-finalize",
         )?;
-        let context = self.publication_context(rpc.route, finalize_id)?;
+        let context = self.publication_context(rpc, finalize_id)?;
         let dependency_owner_revision_ids = self.manifest_dependency_owners(
             read_context_from_publication(context),
             &finalizing_operation,
@@ -2694,7 +2695,7 @@ impl MetadataWorkspaceRequestExecutor {
                     )
                 {
                     let cleanup_id = derived_request_id(rpc.request_id, b"append-path-conflict", 0);
-                    let cleanup_context = self.publication_context(rpc.route, cleanup_id)?;
+                    let cleanup_context = self.publication_context(rpc, cleanup_id)?;
                     // Only the same exact Finalizing state may become Aborting.
                     // A concurrent winner remains authoritative and is queried by
                     // the client; unknown finalization outcomes never enter here.
@@ -2716,7 +2717,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn abort_artifact_publish(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::AbortArtifactPublishRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
@@ -2724,7 +2725,7 @@ impl MetadataWorkspaceRequestExecutor {
         if let Some(outcome) = self.replayed_publish(rpc.route, step_id)? {
             return publish_operation_response(outcome);
         }
-        let context = self.publication_context(rpc.route, step_id)?;
+        let context = self.publication_context(rpc, step_id)?;
         let operation = self.load_publish_operation(
             rpc.route,
             context.read_version,
@@ -2753,7 +2754,7 @@ impl MetadataWorkspaceRequestExecutor {
     /// this adapter only drives the durable metadata sweep and resolution.
     fn reconcile_quarantined_artifact_publish(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::ReconcileQuarantinedArtifactPublishRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
@@ -2798,7 +2799,7 @@ impl MetadataWorkspaceRequestExecutor {
                 service
                     .reconcile_quarantined_publish_batch(
                         meta::ReconcileQuarantinedPublishBatchRequest {
-                            context: self.publication_context(rpc.route, step_id)?,
+                            context: self.publication_context(rpc, step_id)?,
                             expected_operation: operation,
                             resolution,
                             staged_object_rows,
@@ -2823,7 +2824,7 @@ impl MetadataWorkspaceRequestExecutor {
 
         let outcome = service
             .finish_reconcile_quarantined_publish(meta::FinishReconcileQuarantinedPublishRequest {
-                context: self.publication_context(rpc.route, finish_id)?,
+                context: self.publication_context(rpc, finish_id)?,
                 expected_operation: operation,
                 resolution,
                 reason: request.reason.clone(),
@@ -2879,7 +2880,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn commit(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::CommitRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
@@ -2889,7 +2890,7 @@ impl MetadataWorkspaceRequestExecutor {
         let mut outcome = if let Some(outcome) = self.replayed_build_commit(rpc.route, begin_id)? {
             outcome
         } else {
-            let context = self.write_context(rpc.route, begin_id)?;
+            let context = self.write_context(rpc, begin_id)?;
             let workbench = workbench_id(&request.workbench)?;
             service
                 .begin_build(meta::BeginBuildCommitRequest {
@@ -3055,7 +3056,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn inspect_append_cleanup(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::InspectAppendCleanupRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let context = self.read_context(rpc.route)?;
@@ -3200,14 +3201,14 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn retry_append_cleanup(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::RetryAppendCleanupRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         // The service derives its durable enqueue ID from the full logical token;
         // the outer request ID is only the ordinary exact-RPC fencing boundary.
         let context = self.publication_context(
-            rpc.route,
+            rpc,
             derived_request_id(rpc.request_id, b"append-cleanup-retry-context", 0),
         )?;
         let outcome = meta::PublicationService::new(&self.meta)
@@ -3234,7 +3235,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn get_operation(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         request: &protocol::GetOperationRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let context = self.read_context(rpc.route)?;
@@ -3583,12 +3584,14 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn claim_mutation(
         &self,
-        request: &protocol::WorkspaceRpcRequest,
+        request: &AuthorizedRequest<'_>,
     ) -> Result<bool, protocol::RpcFailure> {
         request
             .validate()
             .map_err(|error| invalid_argument(error.to_string()))?;
-        let request_digest = request_fingerprint(request, None)
+        // The authenticated principal is part of the fingerprint: another
+        // principal reusing this request id replays nothing.
+        let request_digest = request_fingerprint(request, request.authority.principal)
             .map_err(|error| invalid_argument(error.to_string()))?;
         let request_id: types::RequestId = request.request_id.into();
         if let Some(existing) = self.lookup_request(request.route, request_id)? {
@@ -3604,6 +3607,7 @@ impl MetadataWorkspaceRequestExecutor {
         }
         let route = route_parts(request.route)?;
         let command = meta::MetadataCommand {
+            initiator: request.authority.principal,
             schema_id: meta::SCHEMA_ID.to_owned(),
             root_id: route.root_id,
             logical_shard_id: route.logical_shard_id,
@@ -3678,10 +3682,10 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn write_context(
         &self,
-        route: protocol::RootRoute,
+        rpc: &AuthorizedRequest<'_>,
         request_id: types::RequestId,
     ) -> Result<meta::RootWriteContext, protocol::RpcFailure> {
-        let route = route_parts(route)?;
+        let route = route_parts(rpc.route)?;
         let read_version = match self.lookup_request(route.protocol, request_id)? {
             Some(replay) => types::ReadVersion::new(
                 replay
@@ -3694,6 +3698,7 @@ impl MetadataWorkspaceRequestExecutor {
             None => self.meta.current_read_version().map_err(meta_failure)?,
         };
         Ok(meta::RootWriteContext {
+            authority: rpc.authority.write_authority(),
             root_id: route.root_id,
             logical_shard_id: route.logical_shard_id,
             object_namespace_id: route.object_namespace_id,
@@ -3706,11 +3711,12 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn publication_context(
         &self,
-        route: protocol::RootRoute,
+        rpc: &AuthorizedRequest<'_>,
         request_id: types::RequestId,
     ) -> Result<meta::PublicationContext, protocol::RpcFailure> {
-        let context = self.write_context(route, request_id)?;
+        let context = self.write_context(rpc, request_id)?;
         Ok(meta::PublicationContext {
+            authority: context.authority,
             root_id: context.root_id,
             logical_shard_id: context.logical_shard_id,
             object_namespace_id: context.object_namespace_id,
@@ -3780,7 +3786,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn heartbeat_publish_operation(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         token: protocol::OperationToken,
         domain: &'static [u8],
     ) -> Result<meta::PublishOperationRecord, protocol::RpcFailure> {
@@ -3798,7 +3804,7 @@ impl MetadataWorkspaceRequestExecutor {
             }
             return Ok(outcome.operation);
         }
-        let heartbeat_context = self.publication_context(rpc.route, heartbeat_id)?;
+        let heartbeat_context = self.publication_context(rpc, heartbeat_id)?;
         let operation = self.load_publish_operation(
             rpc.route,
             heartbeat_context.read_version,
@@ -3872,7 +3878,7 @@ impl MetadataWorkspaceRequestExecutor {
 
     fn run_build_step(
         &self,
-        rpc: &protocol::WorkspaceRpcRequest,
+        rpc: &AuthorizedRequest<'_>,
         label: &[u8],
         sequence: u64,
         run: impl FnOnce(meta::RootWriteContext) -> Result<meta::BuildCommitOutcome, meta::CommitError>,
@@ -3881,7 +3887,22 @@ impl MetadataWorkspaceRequestExecutor {
         if let Some(outcome) = self.replayed_build_commit(rpc.route, request_id)? {
             return Ok(outcome);
         }
-        run(self.write_context(rpc.route, request_id)?).map_err(commit_failure)
+        run(self.write_context(rpc, request_id)?).map_err(commit_failure)
+    }
+}
+
+/// One request with the authority the server established for it. It reads as
+/// the request, and carries who may act and who is recorded.
+pub(crate) struct AuthorizedRequest<'a> {
+    pub(crate) request: &'a protocol::WorkspaceRpcRequest,
+    pub(crate) authority: RequestAuthority,
+}
+
+impl std::ops::Deref for AuthorizedRequest<'_> {
+    type Target = protocol::WorkspaceRpcRequest;
+
+    fn deref(&self) -> &Self::Target {
+        self.request
     }
 }
 
@@ -3889,8 +3910,9 @@ impl WorkspaceRequestExecutor for MetadataWorkspaceRequestExecutor {
     fn execute(
         &self,
         request: &protocol::WorkspaceRpcRequest,
+        authority: RequestAuthority,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
-        self.execute_request_with_internal_retry(request)
+        self.execute_request_with_internal_retry(&AuthorizedRequest { request, authority })
     }
 }
 
@@ -4610,6 +4632,7 @@ fn read_context_from_publication(context: meta::PublicationContext) -> meta::Roo
 
 fn write_context_from_publication(context: meta::PublicationContext) -> meta::RootWriteContext {
     meta::RootWriteContext {
+        authority: meta::WriteAuthority::TRUSTED,
         root_id: context.root_id,
         logical_shard_id: context.logical_shard_id,
         object_namespace_id: context.object_namespace_id,
@@ -4681,7 +4704,7 @@ fn require_publish_token(
 /// Reject an append publication whose identities do not derive from its
 /// logical operation and attempt, before any durable row exists.
 fn require_append_attempt_identities(
-    rpc: &protocol::WorkspaceRpcRequest,
+    rpc: &AuthorizedRequest<'_>,
     request: &protocol::BeginArtifactPublishRequest,
 ) -> Result<(), protocol::RpcFailure> {
     if let Some(binding) = request.append_attempt {
@@ -6675,6 +6698,25 @@ fn bounded_message(mut message: String) -> String {
 mod tests {
     use super::*;
 
+    /// A request as a trusted plaintext connection presents it.
+    fn trusted(request: &protocol::WorkspaceRpcRequest) -> AuthorizedRequest<'_> {
+        AuthorizedRequest {
+            request,
+            authority: RequestAuthority::TRUSTED,
+        }
+    }
+
+    /// A request that carries only its route, for building write contexts.
+    fn routed(route: protocol::RootRoute) -> protocol::WorkspaceRpcRequest {
+        protocol::WorkspaceRpcRequest {
+            route,
+            request_id: protocol::RequestIdentity([0; types::FIXED_ID_BYTES]),
+            operation: protocol::WorkspaceRequest::GetWorkspace(protocol::GetWorkspaceRequest {
+                workbench: protocol::WorkbenchName::new("routed").unwrap(),
+            }),
+        }
+    }
+
     #[test]
     fn stored_zero_byte_projection_yields_empty_index_fields() {
         assert!(decode_index_fields(&[]).unwrap().is_empty());
@@ -6730,6 +6772,7 @@ mod tests {
         owner_epoch: types::OwnerEpoch,
     ) -> meta::MetadataCommand {
         meta::MetadataCommand {
+            initiator: None,
             schema_id: meta::SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
@@ -6817,6 +6860,7 @@ mod tests {
         store
             .execute(
                 &meta::MetadataCommand {
+                    initiator: None,
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -6891,7 +6935,9 @@ mod tests {
             ),
         };
 
-        let outcome = executor.execute(&request).unwrap();
+        let outcome = executor
+            .execute(&request, RequestAuthority::TRUSTED)
+            .unwrap();
         assert_eq!(outcome.commit_version, None);
         assert!(!outcome.replayed);
         let protocol::WorkspaceResult::Preflight(preflight) = outcome.result else {
@@ -6910,7 +6956,10 @@ mod tests {
         let (_store, executor) = ready_executor();
         let workspace_incarnation_id = protocol::WorkspaceIdentity([0x31; types::FIXED_ID_BYTES]);
         executor
-            .execute(&create_request(0x30, "generic-index", 0x31, 1))
+            .execute(
+                &create_request(0x30, "generic-index", 0x31, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let operation_id = protocol::OperationIdentity([0x32; types::FIXED_ID_BYTES]);
         let begin = protocol::WorkspaceRpcRequest {
@@ -6939,8 +6988,8 @@ mod tests {
                 },
             ),
         };
-        let begun = executor.execute(&begin).unwrap();
-        let begun_replay = executor.execute(&begin).unwrap();
+        let begun = executor.execute(&begin, RequestAuthority::TRUSTED).unwrap();
+        let begun_replay = executor.execute(&begin, RequestAuthority::TRUSTED).unwrap();
         assert!(!begun.replayed);
         assert!(begun_replay.replayed);
         assert_eq!(begun_replay.commit_version, begun.commit_version);
@@ -6952,8 +7001,12 @@ mod tests {
                 protocol::FinalizeGenericIndexRegistrationRequest { operation_id },
             ),
         };
-        let finalized = executor.execute(&finalize).unwrap();
-        let finalized_replay = executor.execute(&finalize).unwrap();
+        let finalized = executor
+            .execute(&finalize, RequestAuthority::TRUSTED)
+            .unwrap();
+        let finalized_replay = executor
+            .execute(&finalize, RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(finalized_replay.replayed);
         assert_eq!(finalized_replay.commit_version, finalized.commit_version);
         let protocol::WorkspaceResult::GenericIndexRegistration(status) = finalized.result else {
@@ -6966,24 +7019,27 @@ mod tests {
         assert_eq!(status.published_pointer_generation, Some(1));
 
         let catalog = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0x36; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
-                    profile: generic_query_profile(),
-                    scope: protocol::QueryScope::Workspace {
-                        workbench: protocol::WorkbenchName::new("generic-index").unwrap(),
-                        path_prefix: None,
-                    },
-                    path_match: protocol::CatalogPathMatch::Prefix,
-                    field_prefix: Some("experiment".to_owned()),
-                    include_facets: false,
-                    page: protocol::PageRequest {
-                        cursor: None,
-                        limit: 10,
-                    },
-                }),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0x36; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
+                        profile: generic_query_profile(),
+                        scope: protocol::QueryScope::Workspace {
+                            workbench: protocol::WorkbenchName::new("generic-index").unwrap(),
+                            path_prefix: None,
+                        },
+                        path_match: protocol::CatalogPathMatch::Prefix,
+                        field_prefix: Some("experiment".to_owned()),
+                        include_facets: false,
+                        page: protocol::PageRequest {
+                            cursor: None,
+                            limit: 10,
+                        },
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Catalog(catalog) = catalog.result else {
             panic!("catalog returned the wrong result variant");
@@ -7011,33 +7067,39 @@ mod tests {
         let (_store, executor) = ready_executor();
         let workspace_incarnation_id = protocol::WorkspaceIdentity([0x41; types::FIXED_ID_BYTES]);
         executor
-            .execute(&create_request(0x40, "generic-values", 0x41, 1))
+            .execute(
+                &create_request(0x40, "generic-values", 0x41, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let operation_id = protocol::OperationIdentity([0x42; types::FIXED_ID_BYTES]);
         executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0x43; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::BeginGenericIndexRegistration(
-                    protocol::BeginGenericIndexRegistrationRequest {
-                        operation_id,
-                        generation_id: protocol::GenericIndexGenerationIdentity(
-                            [0x44; types::FIXED_ID_BYTES],
-                        ),
-                        workbench: protocol::WorkbenchName::new("generic-values").unwrap(),
-                        workspace_incarnation_id,
-                        index_path: None,
-                        expected_current_generation: None,
-                        capabilities: vec![protocol::GenericIndexFieldCapability {
-                            field_id: "experiment.labels".to_owned(),
-                            operators: vec![protocol::QueryOperator::Equal],
-                            sortable: true,
-                            facetable: true,
-                        }],
-                        declared_row_count: 1,
-                    },
-                ),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0x43; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::BeginGenericIndexRegistration(
+                        protocol::BeginGenericIndexRegistrationRequest {
+                            operation_id,
+                            generation_id: protocol::GenericIndexGenerationIdentity(
+                                [0x44; types::FIXED_ID_BYTES],
+                            ),
+                            workbench: protocol::WorkbenchName::new("generic-values").unwrap(),
+                            workspace_incarnation_id,
+                            index_path: None,
+                            expected_current_generation: None,
+                            capabilities: vec![protocol::GenericIndexFieldCapability {
+                                field_id: "experiment.labels".to_owned(),
+                                operators: vec![protocol::QueryOperator::Equal],
+                                sortable: true,
+                                facetable: true,
+                            }],
+                            declared_row_count: 1,
+                        },
+                    ),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let append = protocol::WorkspaceRpcRequest {
             route: route(1),
@@ -7060,46 +7122,56 @@ mod tests {
                 },
             ),
         };
-        let appended = executor.execute(&append).unwrap();
-        let appended_replay = executor.execute(&append).unwrap();
+        let appended = executor
+            .execute(&append, RequestAuthority::TRUSTED)
+            .unwrap();
+        let appended_replay = executor
+            .execute(&append, RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(appended_replay.replayed);
         assert_eq!(appended_replay.commit_version, appended.commit_version);
         executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0x46; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::FinalizeGenericIndexRegistration(
-                    protocol::FinalizeGenericIndexRegistrationRequest { operation_id },
-                ),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0x46; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::FinalizeGenericIndexRegistration(
+                        protocol::FinalizeGenericIndexRegistrationRequest { operation_id },
+                    ),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
 
         let searched = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0x47; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
-                    profile: generic_query_profile(),
-                    scope: protocol::QueryScope::Workspace {
-                        workbench: protocol::WorkbenchName::new("generic-values").unwrap(),
-                        path_prefix: None,
-                    },
-                    predicates: vec![protocol::QueryPredicate {
-                        field_id: "experiment.labels".to_owned(),
-                        operator: protocol::QueryOperator::Equal,
-                        operand: protocol::QueryOperand::Scalar(protocol::ScalarValue::String(
-                            "alpha".to_owned(),
-                        )),
-                    }],
-                    projection: vec!["experiment.labels".to_owned()],
-                    sort: Vec::new(),
-                    facets: Vec::new(),
-                    page: protocol::PageRequest {
-                        cursor: None,
-                        limit: 10,
-                    },
-                }),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0x47; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
+                        profile: generic_query_profile(),
+                        scope: protocol::QueryScope::Workspace {
+                            workbench: protocol::WorkbenchName::new("generic-values").unwrap(),
+                            path_prefix: None,
+                        },
+                        predicates: vec![protocol::QueryPredicate {
+                            field_id: "experiment.labels".to_owned(),
+                            operator: protocol::QueryOperator::Equal,
+                            operand: protocol::QueryOperand::Scalar(protocol::ScalarValue::String(
+                                "alpha".to_owned(),
+                            )),
+                        }],
+                        projection: vec!["experiment.labels".to_owned()],
+                        sort: Vec::new(),
+                        facets: Vec::new(),
+                        page: protocol::PageRequest {
+                            cursor: None,
+                            limit: 10,
+                        },
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Search(searched) = searched.result else {
             panic!("search returned the wrong result variant");
@@ -7180,6 +7252,7 @@ mod tests {
         phase: types::BuildCommitPhase,
     ) -> meta::BuildCommitOperationRecord {
         let mut operation = meta::BuildCommitOperationRecord {
+            initiator: None,
             operation_id: types::OperationId::from_bytes([0x71; types::FIXED_ID_BYTES]),
             identity_digest: [0; types::SHA256_BYTES],
             initialization_digest: [0; types::SHA256_BYTES],
@@ -7307,6 +7380,7 @@ mod tests {
         store
             .execute(
                 &meta::MetadataCommand {
+                    initiator: None,
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -7350,6 +7424,7 @@ mod tests {
         let tree_revision_id: types::ArtifactRevisionId = request.tree_manifest_revision_id.into();
         let member_path = types::NormalizedRelativePath::new(RUN_MANIFEST_PATH).unwrap();
         let mut operation = meta::BuildCommitOperationRecord {
+            initiator: None,
             operation_id,
             identity_digest: [0; types::SHA256_BYTES],
             initialization_digest: [0; types::SHA256_BYTES],
@@ -7423,6 +7498,7 @@ mod tests {
         store
             .execute(
                 &meta::MetadataCommand {
+                    initiator: None,
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -7520,6 +7596,7 @@ mod tests {
             &path,
         );
         let command = meta::MetadataCommand {
+            initiator: None,
             schema_id: meta::SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
@@ -7683,6 +7760,7 @@ mod tests {
         store
             .execute(
                 &meta::MetadataCommand {
+                    initiator: None,
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -7727,6 +7805,7 @@ mod tests {
         store
             .execute(
                 &meta::MetadataCommand {
+                    initiator: None,
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -7804,6 +7883,7 @@ mod tests {
         store
             .execute(
                 &meta::MetadataCommand {
+                    initiator: None,
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -7866,6 +7946,7 @@ mod tests {
         store
             .execute(
                 &meta::MetadataCommand {
+                    initiator: None,
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -7940,6 +8021,7 @@ mod tests {
             store
                 .execute(
                     &meta::MetadataCommand {
+                        initiator: None,
                         schema_id: meta::SCHEMA_ID.to_owned(),
                         root_id: root(),
                         logical_shard_id: shard(),
@@ -8104,6 +8186,7 @@ mod tests {
         identity_digest[..types::FIXED_ID_BYTES].fill(0x41);
         let source_commit_id = types::CommitId::from_bytes([0x61; types::SHA256_BYTES]);
         let operation = meta::RestoreOperationRecord {
+            initiator: None,
             operation_id: types::OperationId::from_bytes([0x41; types::FIXED_ID_BYTES]),
             identity_digest,
             initialization_digest: None,
@@ -8357,7 +8440,9 @@ mod tests {
             });
         let first_executor = executor.clone();
         let first_request = restore_rpc(0xe1, request.clone());
-        let first = std::thread::spawn(move || first_executor.execute(&first_request));
+        let first = std::thread::spawn(move || {
+            first_executor.execute(&first_request, RequestAuthority::TRUSTED)
+        });
         let (first_state, first_evidence) = arrival_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("first exact target must enter Firing");
@@ -8367,7 +8452,9 @@ mod tests {
         // the second request cannot reach the barrier while the first holds it.
         let second_executor = executor.clone();
         let second_request = restore_rpc(0xe2, request);
-        let second = std::thread::spawn(move || second_executor.execute(&second_request));
+        let second = std::thread::spawn(move || {
+            second_executor.execute(&second_request, RequestAuthority::TRUSTED)
+        });
         assert!(arrival_rx
             .recv_timeout(std::time::Duration::from_millis(300))
             .is_err());
@@ -8439,7 +8526,8 @@ mod tests {
                 operation_id: operation.operation_id.into(),
             }),
         );
-        let worker = std::thread::spawn(move || executor.execute(&request));
+        let worker =
+            std::thread::spawn(move || executor.execute(&request, RequestAuthority::TRUSTED));
         let failure = arrival_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("invalid exact target evidence must enter the barrier failure path");
@@ -8468,16 +8556,19 @@ mod tests {
         let source_workspace_incarnation_id =
             protocol::WorkspaceIdentity([0x91; types::FIXED_ID_BYTES]);
         executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0x80; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::CreateWorkspace(
-                    protocol::CreateWorkspaceRequest {
-                        workbench: source_workbench.clone(),
-                        workspace_incarnation_id: source_workspace_incarnation_id,
-                    },
-                ),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0x80; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::CreateWorkspace(
+                        protocol::CreateWorkspaceRequest {
+                            workbench: source_workbench.clone(),
+                            workspace_incarnation_id: source_workspace_incarnation_id,
+                        },
+                    ),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
 
         let commit_operation_id = protocol::OperationIdentity([0x92; types::FIXED_ID_BYTES]);
@@ -8506,7 +8597,10 @@ mod tests {
             lineage_projection: Vec::new(),
         });
         let first_commit = executor
-            .execute(&restore_rpc(0x81, commit_operation.clone()))
+            .execute(
+                &restore_rpc(0x81, commit_operation.clone()),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Operation(first_commit) = first_commit.result else {
             panic!("initial commit request returned the wrong result variant");
@@ -8525,7 +8619,10 @@ mod tests {
             0x7b,
         );
         let completed_commit = executor
-            .execute(&restore_rpc(0x87, commit_operation))
+            .execute(
+                &restore_rpc(0x87, commit_operation),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Operation(completed_commit) = completed_commit.result else {
             panic!("completed commit returned the wrong result variant");
@@ -8534,17 +8631,20 @@ mod tests {
 
         let snapshot_id = 7;
         executor
-            .execute(&restore_rpc(
-                0x88,
-                protocol::WorkspaceRequest::MintSnapshot(protocol::MintSnapshotRequest {
-                    workbench: source_workbench.clone(),
-                    workspace_incarnation_id: source_workspace_incarnation_id,
-                    snapshot_id,
-                    lease_deadline_ms: 1_000_000,
-                    alias: None,
-                    annotation: Vec::new(),
-                }),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x88,
+                    protocol::WorkspaceRequest::MintSnapshot(protocol::MintSnapshotRequest {
+                        workbench: source_workbench.clone(),
+                        workspace_incarnation_id: source_workspace_incarnation_id,
+                        snapshot_id,
+                        lease_deadline_ms: 1_000_000,
+                        alias: None,
+                        annotation: Vec::new(),
+                    }),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
 
         let destination_workbench =
@@ -8568,25 +8668,28 @@ mod tests {
         let restore_manifest_body =
             protocol::sha256_digest_uri(protocol::Digest(Sha256::digest([0x7d]).into()));
         executor
-            .execute(&restore_rpc(
-                0x89,
-                protocol::WorkspaceRequest::PrepareRestore(protocol::PrepareRestoreRequest {
-                    operation_id: restore_operation_id,
-                    source_workbench: source_workbench.clone(),
-                    source_workspace_incarnation_id,
-                    source: protocol::RestoreSource::Snapshot(protocol::SnapshotSelector::Id(
-                        snapshot_id,
-                    )),
-                    destination_workbench: destination_workbench.clone(),
-                    destination_workspace_incarnation_id,
-                    destination_restore_manifest_identity,
-                    restore_manifest: protocol::RestoreManifestDescriptor {
-                        body_digest: restore_manifest_body,
-                        logical_size: 1,
-                        content_type: protocol::ContentType::new("application/json").unwrap(),
-                    },
-                }),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x89,
+                    protocol::WorkspaceRequest::PrepareRestore(protocol::PrepareRestoreRequest {
+                        operation_id: restore_operation_id,
+                        source_workbench: source_workbench.clone(),
+                        source_workspace_incarnation_id,
+                        source: protocol::RestoreSource::Snapshot(protocol::SnapshotSelector::Id(
+                            snapshot_id,
+                        )),
+                        destination_workbench: destination_workbench.clone(),
+                        destination_workspace_incarnation_id,
+                        destination_restore_manifest_identity,
+                        restore_manifest: protocol::RestoreManifestDescriptor {
+                            body_digest: restore_manifest_body,
+                            logical_size: 1,
+                            content_type: protocol::ContentType::new("application/json").unwrap(),
+                        },
+                    }),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
 
         let destination_run_manifest_identity = protocol::RestoreManifestIdentity {
@@ -8604,10 +8707,13 @@ mod tests {
             destination_restore_manifest_identity,
         };
         executor
-            .execute(&restore_rpc(
-                0x8a,
-                protocol::WorkspaceRequest::BindRestoreDestination(bind_request.clone()),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x8a,
+                    protocol::WorkspaceRequest::BindRestoreDestination(bind_request.clone()),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         publish_one_byte_artifact(
             &executor,
@@ -8675,10 +8781,13 @@ mod tests {
         assert_eq!(replayed_run_manifest.logical_size, 1);
 
         let bind_replay = executor
-            .execute(&restore_rpc(
-                0xd1,
-                protocol::WorkspaceRequest::BindRestoreDestination(bind_request.clone()),
-            ))
+            .execute(
+                &restore_rpc(
+                    0xd1,
+                    protocol::WorkspaceRequest::BindRestoreDestination(bind_request.clone()),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .expect("exact bind replay must resume DestinationBuilding");
         assert!(bind_replay.replayed);
         let protocol::WorkspaceResult::RestorePrepared(replayed_preparation) = bind_replay.result
@@ -8696,10 +8805,13 @@ mod tests {
         mismatched_bind.destination_commit_id =
             protocol::CommitIdentity([0xfe; types::SHA256_BYTES]);
         let mismatch = executor
-            .execute(&restore_rpc(
-                0xd2,
-                protocol::WorkspaceRequest::BindRestoreDestination(mismatched_bind),
-            ))
+            .execute(
+                &restore_rpc(
+                    0xd2,
+                    protocol::WorkspaceRequest::BindRestoreDestination(mismatched_bind),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .expect_err("mismatched bind replay must fail closed");
         assert_eq!(mismatch.code, protocol::ErrorCode::RequestReplayMismatch);
 
@@ -8713,12 +8825,16 @@ mod tests {
                 operation_id: restore_operation_id,
             }),
         );
-        let first = executor.execute(&finalize).unwrap();
+        let first = executor
+            .execute(&finalize, RequestAuthority::TRUSTED)
+            .unwrap();
         let protocol::WorkspaceResult::Restored(first_result) = first.result else {
             panic!("non-target finalize returned the wrong result variant");
         };
         assert!(!first.replayed);
-        let replay = executor.execute(&finalize).unwrap();
+        let replay = executor
+            .execute(&finalize, RequestAuthority::TRUSTED)
+            .unwrap();
         let protocol::WorkspaceResult::Restored(replay_result) = replay.result else {
             panic!("non-target replay returned the wrong result variant");
         };
@@ -8884,6 +9000,7 @@ mod tests {
         store
             .execute(
                 &meta::MetadataCommand {
+                    initiator: None,
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -9026,15 +9143,18 @@ mod tests {
         let (store, executor) = ready_executor();
         let workbench = protocol::WorkbenchName::new(name).unwrap();
         executor
-            .execute(&restore_rpc(
-                fill,
-                protocol::WorkspaceRequest::CreateWorkspace(protocol::CreateWorkspaceRequest {
-                    workbench: workbench.clone(),
-                    workspace_incarnation_id: protocol::WorkspaceIdentity(
-                        [fill; types::FIXED_ID_BYTES],
-                    ),
-                }),
-            ))
+            .execute(
+                &restore_rpc(
+                    fill,
+                    protocol::WorkspaceRequest::CreateWorkspace(protocol::CreateWorkspaceRequest {
+                        workbench: workbench.clone(),
+                        workspace_incarnation_id: protocol::WorkspaceIdentity(
+                            [fill; types::FIXED_ID_BYTES],
+                        ),
+                    }),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let revision =
             protocol::ArtifactRevisionIdentity([fill.wrapping_add(1); types::FIXED_ID_BYTES]);
@@ -9090,39 +9210,50 @@ mod tests {
                 },
             ),
         );
-        let prepared = executor.execute(&prepare).unwrap();
+        let prepared = executor
+            .execute(&prepare, RequestAuthority::TRUSTED)
+            .unwrap();
         let status = executed_operation(&prepared);
         assert_eq!(status.state, protocol::OperationState::Running);
         // The complete object plan is staged in the same acknowledgement.
         assert_eq!(status.progress.completed_rows, 1);
         assert!(!prepared.replayed);
-        let replayed = executor.execute(&prepare).unwrap();
+        let replayed = executor
+            .execute(&prepare, RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(replayed.replayed);
         assert_eq!(executed_operation(&replayed), status);
 
         let finish = restore_rpc(0x44, finish_request(&plan, status.token));
-        let finished = executor.execute(&finish).unwrap();
+        let finished = executor
+            .execute(&finish, RequestAuthority::TRUSTED)
+            .unwrap();
         let published = executed_publication(&finished);
         assert!(!finished.replayed);
         assert_eq!(published.target, begin.target);
         assert_eq!(published.artifact_revision_id, begin.artifact_revision_id);
         assert_eq!(published.generation, 1);
-        let replayed = executor.execute(&finish).unwrap();
+        let replayed = executor
+            .execute(&finish, RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(replayed.replayed);
         assert_eq!(executed_publication(&replayed), published);
 
         let read = executor
-            .execute(&restore_rpc(
-                0x45,
-                protocol::WorkspaceRequest::GetPath(protocol::GetPathRequest {
-                    target: begin.target.clone(),
-                    view: protocol::WorkspaceReadView::Live,
-                    expected_read_version: None,
-                    range: None,
-                    plan_page: None,
-                    if_none_match: None,
-                }),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x45,
+                    protocol::WorkspaceRequest::GetPath(protocol::GetPathRequest {
+                        target: begin.target.clone(),
+                        view: protocol::WorkspaceReadView::Live,
+                        expected_read_version: None,
+                        range: None,
+                        plan_page: None,
+                        if_none_match: None,
+                    }),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Path(read) = read.result else {
             panic!("path read returned the wrong result variant");
@@ -9182,6 +9313,62 @@ mod tests {
         })
     }
 
+    fn principal(fill: u8) -> RequestAuthority {
+        RequestAuthority {
+            principal: Some(types::PrincipalId::from_bytes(
+                [fill; types::FIXED_ID_BYTES],
+            )),
+        }
+    }
+
+    #[test]
+    fn a_request_id_is_bound_to_the_principal_that_claimed_it() {
+        let (_store, executor) = ready_executor();
+        let request = create_request(0x70, "bound", 0x71, 1);
+        let created = executor.execute(&request, principal(0xa1)).unwrap();
+        assert!(!created.replayed);
+        // The same principal replays its own request.
+        assert!(
+            executor
+                .execute(&request, principal(0xa1))
+                .unwrap()
+                .replayed
+        );
+        // Any other identity, authenticated or not, reusing the id gets no
+        // replay: the fingerprint binds the principal.
+        for other in [principal(0xb2), RequestAuthority::TRUSTED] {
+            let refused = executor.execute(&request, other).unwrap_err();
+            assert_eq!(refused.code, protocol::ErrorCode::RequestReplayMismatch);
+            assert!(!refused.retryable);
+        }
+    }
+
+    #[test]
+    fn a_publication_records_the_principal_that_began_it() {
+        let (_store, executor, _plan, begin) = fused_publication_fixture("attributed", 0x72);
+        let request =
+            inline_publication(0x74, &begin, protocol::PublishCondition::CreateOnly, b"a");
+        let rpc = restore_rpc(
+            0x75,
+            protocol::WorkspaceRequest::PublishInlineArtifact(request.clone()),
+        );
+        executor.execute(&rpc, principal(0xa1)).unwrap();
+        let read_version = executor.meta.current_read_version().unwrap();
+        let operation = executor
+            .find_publish_operation(rpc.route, read_version, begin.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.initiator, principal(0xa1).principal);
+        // The initiator is sealed into the operation's identity: another
+        // principal presenting the same operation is a different intent.
+        let other = restore_rpc(
+            0x76,
+            protocol::WorkspaceRequest::PublishInlineArtifact(request),
+        );
+        let refused = executor.execute(&other, principal(0xb2)).unwrap_err();
+        assert_eq!(refused.code, protocol::ErrorCode::RequestReplayMismatch);
+    }
+
     #[test]
     fn inline_publication_completes_in_one_request_and_reads_back_without_blocks() {
         let (_store, executor, _plan, begin) = fused_publication_fixture("inline-publish", 0x60);
@@ -9192,22 +9379,25 @@ mod tests {
             0x63,
             protocol::WorkspaceRequest::PublishInlineArtifact(request.clone()),
         );
-        let published = executor.execute(&rpc).unwrap();
+        let published = executor.execute(&rpc, RequestAuthority::TRUSTED).unwrap();
         assert!(!published.replayed);
         let result = executed_publication(&published);
         assert_eq!(result.generation, 1);
         assert_eq!(result.artifact_revision_id, begin.artifact_revision_id);
 
         // The exact request replays its stored result.
-        let replayed = executor.execute(&rpc).unwrap();
+        let replayed = executor.execute(&rpc, RequestAuthority::TRUSTED).unwrap();
         assert!(replayed.replayed);
         assert_eq!(executed_publication(&replayed), result);
         // Another request for the same operation observes its terminal state.
         let retried = executor
-            .execute(&restore_rpc(
-                0x64,
-                protocol::WorkspaceRequest::PublishInlineArtifact(request.clone()),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x64,
+                    protocol::WorkspaceRequest::PublishInlineArtifact(request.clone()),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         assert_eq!(
             executed_operation(&retried).state,
@@ -9221,24 +9411,30 @@ mod tests {
             br#"{"turn":8,"role":"assistant"}"#,
         );
         let refused = executor
-            .execute(&restore_rpc(
-                0x65,
-                protocol::WorkspaceRequest::PublishInlineArtifact(forged),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x65,
+                    protocol::WorkspaceRequest::PublishInlineArtifact(forged),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(refused.code, protocol::ErrorCode::RequestReplayMismatch);
 
         let read = executor
-            .execute(&restore_rpc(
-                0x66,
-                ranged_read(
-                    &begin.target,
-                    protocol::ByteRange {
-                        offset: 2,
-                        length: 4,
-                    },
+            .execute(
+                &restore_rpc(
+                    0x66,
+                    ranged_read(
+                        &begin.target,
+                        protocol::ByteRange {
+                            offset: 2,
+                            length: 4,
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Path(read) = read.result else {
             panic!("path read returned the wrong result variant");
@@ -9264,15 +9460,18 @@ mod tests {
         let (store, executor) = ready_executor();
         let workbench = protocol::WorkbenchName::new("inline-log").unwrap();
         executor
-            .execute(&restore_rpc(
-                0x80,
-                protocol::WorkspaceRequest::CreateWorkspace(protocol::CreateWorkspaceRequest {
-                    workbench: workbench.clone(),
-                    workspace_incarnation_id: protocol::WorkspaceIdentity(
-                        [0x80; types::FIXED_ID_BYTES],
-                    ),
-                }),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x80,
+                    protocol::WorkspaceRequest::CreateWorkspace(protocol::CreateWorkspaceRequest {
+                        workbench: workbench.clone(),
+                        workspace_incarnation_id: protocol::WorkspaceIdentity(
+                            [0x80; types::FIXED_ID_BYTES],
+                        ),
+                    }),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         // The mean size of a Pi harness session record.
         let body = vec![b'j'; 1_100];
@@ -9291,21 +9490,27 @@ mod tests {
         );
         let before = store.recovery_state().unwrap().applied_recovery_lsn;
         let prepared = executor
-            .execute(&restore_rpc(
-                0x83,
-                protocol::WorkspaceRequest::PrepareArtifactPublish(
-                    protocol::PrepareArtifactPublishRequest {
-                        begin: begin.clone(),
-                        objects: plan.staged_objects.clone(),
-                    },
+            .execute(
+                &restore_rpc(
+                    0x83,
+                    protocol::WorkspaceRequest::PrepareArtifactPublish(
+                        protocol::PrepareArtifactPublishRequest {
+                            begin: begin.clone(),
+                            objects: plan.staged_objects.clone(),
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         executor
-            .execute(&restore_rpc(
-                0x84,
-                finish_request(&plan, executed_operation(&prepared).token),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x84,
+                    finish_request(&plan, executed_operation(&prepared).token),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let (object_records, object_bytes) = recovery_log_since(&store, before);
 
@@ -9321,10 +9526,13 @@ mod tests {
         );
         let before = store.recovery_state().unwrap().applied_recovery_lsn;
         executor
-            .execute(&restore_rpc(
-                0x87,
-                protocol::WorkspaceRequest::PublishInlineArtifact(inline),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x87,
+                    protocol::WorkspaceRequest::PublishInlineArtifact(inline),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let (inline_records, inline_bytes) = recovery_log_since(&store, before);
 
@@ -9350,10 +9558,13 @@ mod tests {
             b"first",
         );
         executor
-            .execute(&restore_rpc(
-                0x73,
-                protocol::WorkspaceRequest::PublishInlineArtifact(first),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x73,
+                    protocol::WorkspaceRequest::PublishInlineArtifact(first),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         // A second create-only publication of the path conflicts and leaves
         // the first revision current.
@@ -9366,10 +9577,13 @@ mod tests {
         duplicate.begin.artifact_revision_id =
             protocol::ArtifactRevisionIdentity([0x75; types::FIXED_ID_BYTES]);
         let conflict = executor
-            .execute(&restore_rpc(
-                0x76,
-                protocol::WorkspaceRequest::PublishInlineArtifact(duplicate),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x76,
+                    protocol::WorkspaceRequest::PublishInlineArtifact(duplicate),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(conflict.code, protocol::ErrorCode::AlreadyExists);
         // A generation-bound replacement publishes the successor.
@@ -9384,23 +9598,29 @@ mod tests {
         replace.begin.artifact_revision_id =
             protocol::ArtifactRevisionIdentity([0x78; types::FIXED_ID_BYTES]);
         let replaced = executor
-            .execute(&restore_rpc(
-                0x79,
-                protocol::WorkspaceRequest::PublishInlineArtifact(replace),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x79,
+                    protocol::WorkspaceRequest::PublishInlineArtifact(replace),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         assert_eq!(executed_publication(&replaced).generation, 2);
         let read = executor
-            .execute(&restore_rpc(
-                0x7a,
-                ranged_read(
-                    &begin.target,
-                    protocol::ByteRange {
-                        offset: 0,
-                        length: 6,
-                    },
+            .execute(
+                &restore_rpc(
+                    0x7a,
+                    ranged_read(
+                        &begin.target,
+                        protocol::ByteRange {
+                            offset: 0,
+                            length: 6,
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Path(read) = read.result else {
             panic!("path read returned the wrong result variant");
@@ -9412,36 +9632,45 @@ mod tests {
     fn prepare_returns_the_begin_status_of_a_publication_with_progress() {
         let (_store, executor, plan, begin) = fused_publication_fixture("fused-resume", 0x50);
         let begun = executor
-            .execute(&restore_rpc(
-                0x53,
-                protocol::WorkspaceRequest::BeginArtifactPublish(begin.clone()),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x53,
+                    protocol::WorkspaceRequest::BeginArtifactPublish(begin.clone()),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let staged = executor
-            .execute(&restore_rpc(
-                0x54,
-                protocol::WorkspaceRequest::StageArtifactObjects(
-                    protocol::StageArtifactObjectsRequest {
-                        token: executed_operation(&begun).token,
-                        objects: plan.staged_objects.clone(),
-                    },
+            .execute(
+                &restore_rpc(
+                    0x54,
+                    protocol::WorkspaceRequest::StageArtifactObjects(
+                        protocol::StageArtifactObjectsRequest {
+                            token: executed_operation(&begun).token,
+                            objects: plan.staged_objects.clone(),
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let staged = executed_operation(&staged);
 
         // A new attempt of the same publication observes its progress instead
         // of staging the plan again; it resumes with the stepwise protocol.
         let prepared = executor
-            .execute(&restore_rpc(
-                0x55,
-                protocol::WorkspaceRequest::PrepareArtifactPublish(
-                    protocol::PrepareArtifactPublishRequest {
-                        begin,
-                        objects: plan.staged_objects.clone(),
-                    },
+            .execute(
+                &restore_rpc(
+                    0x55,
+                    protocol::WorkspaceRequest::PrepareArtifactPublish(
+                        protocol::PrepareArtifactPublishRequest {
+                            begin,
+                            objects: plan.staged_objects.clone(),
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         assert!(prepared.replayed);
         let status = executed_operation(&prepared);
@@ -9449,7 +9678,10 @@ mod tests {
         assert_eq!(status.token, staged.token);
 
         let finished = executor
-            .execute(&restore_rpc(0x56, finish_request(&plan, status.token)))
+            .execute(
+                &restore_rpc(0x56, finish_request(&plan, status.token)),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         assert_eq!(executed_publication(&finished).generation, 1);
     }
@@ -9468,19 +9700,24 @@ mod tests {
         );
         // The durable prefix a crash can leave: the composite claim and its
         // Begin step, without the staging step.
-        assert!(!executor.claim_mutation(&prepare).unwrap());
+        assert!(!executor.claim_mutation(&trusted(&prepare)).unwrap());
         let begun = executor
-            .begin_claimed_artifact_publish(&prepare, &begin)
+            .begin_claimed_artifact_publish(&trusted(&prepare), &begin)
             .unwrap();
         assert_eq!(executed_operation(&begun).progress.completed_rows, 0);
 
-        let resumed = executor.execute(&prepare).unwrap();
+        let resumed = executor
+            .execute(&prepare, RequestAuthority::TRUSTED)
+            .unwrap();
         let status = executed_operation(&resumed);
         assert_eq!(status.state, protocol::OperationState::Running);
         assert_eq!(status.progress.completed_rows, 1);
         assert!(resumed.replayed);
         let finished = executor
-            .execute(&restore_rpc(0x64, finish_request(&plan, status.token)))
+            .execute(
+                &restore_rpc(0x64, finish_request(&plan, status.token)),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         assert_eq!(executed_publication(&finished).generation, 1);
     }
@@ -9489,15 +9726,18 @@ mod tests {
     fn finish_replay_completes_a_composite_cut_after_marking_uploads() {
         let (_store, executor, plan, begin) = fused_publication_fixture("fused-finish-cut", 0x68);
         let prepared = executor
-            .execute(&restore_rpc(
-                0x6b,
-                protocol::WorkspaceRequest::PrepareArtifactPublish(
-                    protocol::PrepareArtifactPublishRequest {
-                        begin,
-                        objects: plan.staged_objects.clone(),
-                    },
+            .execute(
+                &restore_rpc(
+                    0x6b,
+                    protocol::WorkspaceRequest::PrepareArtifactPublish(
+                        protocol::PrepareArtifactPublishRequest {
+                            begin,
+                            objects: plan.staged_objects.clone(),
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let finish = restore_rpc(
             0x6c,
@@ -9505,13 +9745,13 @@ mod tests {
         );
         // The durable prefix a crash can leave: the composite claim and the
         // upload proofs, without the manifest or the completion.
-        assert!(!executor.claim_mutation(&finish).unwrap());
+        assert!(!executor.claim_mutation(&trusted(&finish)).unwrap());
         let protocol::WorkspaceRequest::FinishArtifactPublish(request) = &finish.operation else {
             unreachable!();
         };
         executor
             .mark_claimed_artifact_objects_uploaded(
-                &finish,
+                &trusted(&finish),
                 &protocol::MarkArtifactObjectsUploadedRequest {
                     token: request.token,
                     objects: request.uploaded_objects.clone(),
@@ -9519,7 +9759,9 @@ mod tests {
             )
             .unwrap();
 
-        let resumed = executor.execute(&finish).unwrap();
+        let resumed = executor
+            .execute(&finish, RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(resumed.replayed);
         assert_eq!(executed_publication(&resumed).generation, 1);
     }
@@ -9536,12 +9778,16 @@ mod tests {
                 },
             ),
         );
-        let prepared = executor.execute(&prepare).unwrap();
+        let prepared = executor
+            .execute(&prepare, RequestAuthority::TRUSTED)
+            .unwrap();
         let finish = restore_rpc(
             0xc4,
             finish_request(&plan, executed_operation(&prepared).token),
         );
-        let finished = executor.execute(&finish).unwrap();
+        let finished = executor
+            .execute(&finish, RequestAuthority::TRUSTED)
+            .unwrap();
         let inline_begin = protocol::BeginArtifactPublishRequest {
             artifact_revision_id: protocol::ArtifactRevisionIdentity([0xc5; types::FIXED_ID_BYTES]),
             target: protocol::WorkspacePath {
@@ -9559,16 +9805,21 @@ mod tests {
                 br#"{"turn":1}"#,
             )),
         );
-        let published = executor.execute(&inline).unwrap();
+        let published = executor
+            .execute(&inline, RequestAuthority::TRUSTED)
+            .unwrap();
 
         // The owner restarts, so every retry arrives under a new owner epoch.
         store.advance_owner_epoch(Some(owner(1)), owner(2)).unwrap();
         for (request, original) in [(prepare, prepared), (finish, finished), (inline, published)] {
             let retried = executor
-                .execute(&protocol::WorkspaceRpcRequest {
-                    route: route(2),
-                    ..request
-                })
+                .execute(
+                    &protocol::WorkspaceRpcRequest {
+                        route: route(2),
+                        ..request
+                    },
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap();
             assert!(retried.replayed);
             assert_eq!(retried.result, original.result);
@@ -9590,17 +9841,20 @@ mod tests {
         );
         // The durable prefix a crash can leave: the composite claim and its
         // Begin step, without the staging step.
-        assert!(!executor.claim_mutation(&prepare).unwrap());
+        assert!(!executor.claim_mutation(&trusted(&prepare)).unwrap());
         executor
-            .begin_claimed_artifact_publish(&prepare, &begin)
+            .begin_claimed_artifact_publish(&trusted(&prepare), &begin)
             .unwrap();
 
         store.advance_owner_epoch(Some(owner(1)), owner(2)).unwrap();
         let failure = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(2),
-                ..prepare
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(2),
+                    ..prepare
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(
             failure.code,
@@ -9613,15 +9867,18 @@ mod tests {
     fn initiating_owner_activity_coalesces_within_a_bounded_window() {
         let (_store, executor, plan, begin) = fused_publication_fixture("fused-activity", 0x78);
         executor
-            .execute(&restore_rpc(
-                0x7b,
-                protocol::WorkspaceRequest::PrepareArtifactPublish(
-                    protocol::PrepareArtifactPublishRequest {
-                        begin: begin.clone(),
-                        objects: plan.staged_objects.clone(),
-                    },
+            .execute(
+                &restore_rpc(
+                    0x7b,
+                    protocol::WorkspaceRequest::PrepareArtifactPublish(
+                        protocol::PrepareArtifactPublishRequest {
+                            begin: begin.clone(),
+                            objects: plan.staged_objects.clone(),
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let operation = executor
             .find_publish_operation(
@@ -9685,12 +9942,17 @@ mod tests {
                 ),
             )
         };
-        let prepared = executor.execute(&prepare(0x80, begin.clone())).unwrap();
+        let prepared = executor
+            .execute(&prepare(0x80, begin.clone()), RequestAuthority::TRUSTED)
+            .unwrap();
         executor
-            .execute(&restore_rpc(
-                0x81,
-                finish_request(&plan, executed_operation(&prepared).token),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x81,
+                    finish_request(&plan, executed_operation(&prepared).token),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
 
         let fresh = |operation: u8, revision: u8, condition| {
@@ -9708,12 +9970,14 @@ mod tests {
                 expected_generation: 7,
             },
         );
-        let refused = executor.execute(&prepare(0x84, stale.clone())).unwrap_err();
+        let refused = executor
+            .execute(&prepare(0x84, stale.clone()), RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert_eq!(refused.code, protocol::ErrorCode::Conflict);
         assert_eq!(refused.current_generation, Some(1));
         let duplicate = fresh(0x85, 0x86, protocol::PublishCondition::CreateOnly);
         let refused = executor
-            .execute(&prepare(0x87, duplicate.clone()))
+            .execute(&prepare(0x87, duplicate.clone()), RequestAuthority::TRUSTED)
             .unwrap_err();
         assert_eq!(refused.code, protocol::ErrorCode::AlreadyExists);
         // The refusal names the generation a replace would have to pin.
@@ -9731,7 +9995,9 @@ mod tests {
         }
 
         // The admitted create still replays exactly although its path exists.
-        let replayed = executor.execute(&prepare(0x88, begin)).unwrap();
+        let replayed = executor
+            .execute(&prepare(0x88, begin), RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(replayed.replayed);
         assert_eq!(
             executed_operation(&replayed).state,
@@ -9743,26 +10009,32 @@ mod tests {
     fn finish_carries_only_the_steps_that_remain() {
         let (_store, executor, plan, begin) = fused_publication_fixture("fused-remaining", 0x70);
         let prepared = executor
-            .execute(&restore_rpc(
-                0x73,
-                protocol::WorkspaceRequest::PrepareArtifactPublish(
-                    protocol::PrepareArtifactPublishRequest {
-                        begin,
-                        objects: plan.staged_objects.clone(),
-                    },
+            .execute(
+                &restore_rpc(
+                    0x73,
+                    protocol::WorkspaceRequest::PrepareArtifactPublish(
+                        protocol::PrepareArtifactPublishRequest {
+                            begin,
+                            objects: plan.staged_objects.clone(),
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let marked = executor
-            .execute(&restore_rpc(
-                0x74,
-                protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
-                    protocol::MarkArtifactObjectsUploadedRequest {
-                        token: executed_operation(&prepared).token,
-                        objects: plan.upload_proofs.clone(),
-                    },
+            .execute(
+                &restore_rpc(
+                    0x74,
+                    protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
+                        protocol::MarkArtifactObjectsUploadedRequest {
+                            token: executed_operation(&prepared).token,
+                            objects: plan.upload_proofs.clone(),
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let finish = protocol::WorkspaceRequest::FinishArtifactPublish(
             protocol::FinishArtifactPublishRequest {
@@ -9773,15 +10045,20 @@ mod tests {
                 artifact: plan.artifact.clone(),
             },
         );
-        let finished = executor.execute(&restore_rpc(0x75, finish)).unwrap();
+        let finished = executor
+            .execute(&restore_rpc(0x75, finish), RequestAuthority::TRUSTED)
+            .unwrap();
         assert_eq!(executed_publication(&finished).generation, 1);
 
         // A stale token fails like the stepwise step it replaces.
         let stale = executor
-            .execute(&restore_rpc(
-                0x76,
-                finish_request(&plan, executed_operation(&prepared).token),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x76,
+                    finish_request(&plan, executed_operation(&prepared).token),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(stale.code, protocol::ErrorCode::Conflict);
     }
@@ -9810,15 +10087,18 @@ mod tests {
         };
         let status = operation_status(
             executor
-                .execute(&restore_rpc(
-                    first_request_fill,
-                    protocol::WorkspaceRequest::BeginArtifactPublish(plan.begin(
-                        operation_id,
-                        artifact_revision_id,
-                        target.clone(),
-                        authority,
-                    )),
-                ))
+                .execute(
+                    &restore_rpc(
+                        first_request_fill,
+                        protocol::WorkspaceRequest::BeginArtifactPublish(plan.begin(
+                            operation_id,
+                            artifact_revision_id,
+                            target.clone(),
+                            authority,
+                        )),
+                    ),
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap(),
         );
         if status.state == protocol::OperationState::Succeeded {
@@ -9835,54 +10115,66 @@ mod tests {
         assert_eq!(status.state, protocol::OperationState::Running);
         let status = operation_status(
             executor
-                .execute(&restore_rpc(
-                    first_request_fill.wrapping_add(1),
-                    protocol::WorkspaceRequest::StageArtifactObjects(
-                        protocol::StageArtifactObjectsRequest {
-                            token: status.token,
-                            objects: plan.staged_objects.clone(),
-                        },
+                .execute(
+                    &restore_rpc(
+                        first_request_fill.wrapping_add(1),
+                        protocol::WorkspaceRequest::StageArtifactObjects(
+                            protocol::StageArtifactObjectsRequest {
+                                token: status.token,
+                                objects: plan.staged_objects.clone(),
+                            },
+                        ),
                     ),
-                ))
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap(),
         );
         let status = operation_status(
             executor
-                .execute(&restore_rpc(
-                    first_request_fill.wrapping_add(2),
-                    protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
-                        protocol::MarkArtifactObjectsUploadedRequest {
-                            token: status.token,
-                            objects: plan.upload_proofs.clone(),
-                        },
+                .execute(
+                    &restore_rpc(
+                        first_request_fill.wrapping_add(2),
+                        protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
+                            protocol::MarkArtifactObjectsUploadedRequest {
+                                token: status.token,
+                                objects: plan.upload_proofs.clone(),
+                            },
+                        ),
                     ),
-                ))
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap(),
         );
         let status = operation_status(
             executor
-                .execute(&restore_rpc(
-                    first_request_fill.wrapping_add(3),
-                    protocol::WorkspaceRequest::StageArtifactManifest(
-                        protocol::StageArtifactManifestRequest {
-                            token: status.token,
-                            rows: plan.manifest_rows.clone(),
-                            dependency_owner_revision_ids: Vec::new(),
-                        },
+                .execute(
+                    &restore_rpc(
+                        first_request_fill.wrapping_add(3),
+                        protocol::WorkspaceRequest::StageArtifactManifest(
+                            protocol::StageArtifactManifestRequest {
+                                token: status.token,
+                                rows: plan.manifest_rows.clone(),
+                                dependency_owner_revision_ids: Vec::new(),
+                            },
+                        ),
                     ),
-                ))
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap(),
         );
         let completed = executor
-            .execute(&restore_rpc(
-                first_request_fill.wrapping_add(4),
-                protocol::WorkspaceRequest::CompleteArtifactPublish(
-                    protocol::CompleteArtifactPublishRequest {
-                        token: status.token,
-                        artifact: plan.artifact.clone(),
-                    },
+            .execute(
+                &restore_rpc(
+                    first_request_fill.wrapping_add(4),
+                    protocol::WorkspaceRequest::CompleteArtifactPublish(
+                        protocol::CompleteArtifactPublishRequest {
+                            token: status.token,
+                            artifact: plan.artifact.clone(),
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Published(published) = completed.result else {
             panic!("artifact finalization returned the wrong result variant");
@@ -10066,32 +10358,40 @@ mod tests {
     fn restore_dispatcher_rejects_missing_and_wrong_phase_held_reads() {
         let (store, executor) = ready_executor();
         let missing = executor
-            .execute(&restore_rpc(
-                0xd0,
-                protocol::WorkspaceRequest::ReadRestoreSourceRunManifest(
-                    protocol::ReadRestoreSourceRunManifestRequest {
-                        operation_id: protocol::OperationIdentity([0xd1; types::FIXED_ID_BYTES]),
-                        range: None,
-                        plan_page: None,
-                    },
+            .execute(
+                &restore_rpc(
+                    0xd0,
+                    protocol::WorkspaceRequest::ReadRestoreSourceRunManifest(
+                        protocol::ReadRestoreSourceRunManifestRequest {
+                            operation_id: protocol::OperationIdentity(
+                                [0xd1; types::FIXED_ID_BYTES],
+                            ),
+                            range: None,
+                            plan_page: None,
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(missing.code, protocol::ErrorCode::NotFound);
 
         let copying = copying_restore_operation(1, 1, false, 0x81);
         install_restore_operation(&store, &copying, 0xd2, None);
         let wrong_phase = executor
-            .execute(&restore_rpc(
-                0xd3,
-                protocol::WorkspaceRequest::ReadRestoreSourceRunManifest(
-                    protocol::ReadRestoreSourceRunManifestRequest {
-                        operation_id: copying.operation_id.into(),
-                        range: None,
-                        plan_page: None,
-                    },
+            .execute(
+                &restore_rpc(
+                    0xd3,
+                    protocol::WorkspaceRequest::ReadRestoreSourceRunManifest(
+                        protocol::ReadRestoreSourceRunManifestRequest {
+                            operation_id: copying.operation_id.into(),
+                            range: None,
+                            plan_page: None,
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(wrong_phase.code, protocol::ErrorCode::PreconditionFailed);
         assert_eq!(
@@ -10116,7 +10416,9 @@ mod tests {
             }),
         );
         for _ in 0..2 {
-            let response = executor.execute(&finalize).unwrap();
+            let response = executor
+                .execute(&finalize, RequestAuthority::TRUSTED)
+                .unwrap();
             assert!(response.replayed);
             let protocol::WorkspaceResult::Restored(restored) = response.result else {
                 panic!("finalize returned the wrong result variant");
@@ -10148,12 +10450,15 @@ mod tests {
             .unwrap();
         install_restore_operation(&store, &aborting, 0xd6, None);
         let failure = executor
-            .execute(&restore_rpc(
-                0xd7,
-                protocol::WorkspaceRequest::FinalizeRestore(protocol::FinalizeRestoreRequest {
-                    operation_id: aborting.operation_id.into(),
-                }),
-            ))
+            .execute(
+                &restore_rpc(
+                    0xd7,
+                    protocol::WorkspaceRequest::FinalizeRestore(protocol::FinalizeRestoreRequest {
+                        operation_id: aborting.operation_id.into(),
+                    }),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::OperationFailed);
         assert_eq!(failure.message, "restore was aborted concurrently");
@@ -10286,16 +10591,22 @@ mod tests {
     fn create_crosses_real_fence_and_replays_exact_request() {
         let (_store, executor) = ready_executor();
         let request = create_request(10, "run-a", 11, 1);
-        let created = executor.execute(&request).unwrap();
+        let created = executor
+            .execute(&request, RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(!created.replayed);
         assert!(created.commit_version.is_some());
 
-        let replayed = executor.execute(&request).unwrap();
+        let replayed = executor
+            .execute(&request, RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(replayed.replayed);
         assert_eq!(replayed.result, created.result);
 
         let reused = create_request(10, "run-b", 12, 1);
-        let failure = executor.execute(&reused).unwrap_err();
+        let failure = executor
+            .execute(&reused, RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::RequestReplayMismatch);
     }
 
@@ -10303,10 +10614,15 @@ mod tests {
     fn create_incarnation_conflict_keeps_rpc_identity_and_message_provenance() {
         let (_store, executor) = ready_executor();
         executor
-            .execute(&create_request(10, "run-a", 11, 1))
+            .execute(
+                &create_request(10, "run-a", 11, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let claimed_incarnation = create_request(11, "run-b", 11, 1);
-        let failure = executor.execute(&claimed_incarnation).unwrap_err();
+        let failure = executor
+            .execute(&claimed_incarnation, RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::AlreadyExists);
         assert_eq!(failure.conflict, Some(protocol::ConflictKind::Workspace));
         assert!(!failure.retryable);
@@ -10320,10 +10636,15 @@ mod tests {
     fn commit_prepare_replays_first_durable_time_after_clock_moves_forward() {
         let (store, executor) = ready_executor();
         executor
-            .execute(&create_request(40, "commit-time-test", 0x42, 1))
+            .execute(
+                &create_request(40, "commit-time-test", 0x42, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
 
-        let first = executor.execute(&commit_request(41)).unwrap();
+        let first = executor
+            .execute(&commit_request(41), RequestAuthority::TRUSTED)
+            .unwrap();
         let protocol::WorkspaceResult::Operation(first_status) = first.result else {
             panic!("commit prepare returned the wrong result variant");
         };
@@ -10347,7 +10668,9 @@ mod tests {
             )
             .unwrap();
 
-        let replay = executor.execute(&commit_request(42)).unwrap();
+        let replay = executor
+            .execute(&commit_request(42), RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(replay.replayed);
         let protocol::WorkspaceResult::Operation(replay_status) = replay.result else {
             panic!("commit replay returned the wrong result variant");
@@ -10360,9 +10683,14 @@ mod tests {
     fn commit_prepare_rejects_a_changed_projection_input_digest() {
         let (_store, executor) = ready_executor();
         executor
-            .execute(&create_request(70, "commit-time-test", 0x42, 1))
+            .execute(
+                &create_request(70, "commit-time-test", 0x42, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
-        let first = executor.execute(&commit_request(71)).unwrap();
+        let first = executor
+            .execute(&commit_request(71), RequestAuthority::TRUSTED)
+            .unwrap();
         let protocol::WorkspaceResult::Operation(first_status) = first.result else {
             panic!("commit prepare returned the wrong result variant");
         };
@@ -10375,20 +10703,25 @@ mod tests {
             unreachable!("commit_request always creates a commit request");
         };
         request.projection_input_digest.0[0] ^= 0xff;
-        let failure = executor.execute(&mismatch).unwrap_err();
+        let failure = executor
+            .execute(&mismatch, RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::RequestReplayMismatch);
         assert!(!failure.retryable);
 
         let status = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([73; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::GetOperation(
-                    protocol::GetOperationRequest {
-                        operation_id: first_preparation.request.operation_id,
-                    },
-                ),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([73; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::GetOperation(
+                        protocol::GetOperationRequest {
+                            operation_id: first_preparation.request.operation_id,
+                        },
+                    ),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Operation(status) = status.result else {
             panic!("get operation returned the wrong result variant");
@@ -10402,7 +10735,10 @@ mod tests {
         for replace in [false, true] {
             let (store, executor) = ready_executor();
             executor
-                .execute(&create_request(60, "commit-time-test", 0x42, 1))
+                .execute(
+                    &create_request(60, "commit-time-test", 0x42, 1),
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap();
             let mut replay = commit_request(61);
             let exact_request = match &mut replay.operation {
@@ -10414,7 +10750,9 @@ mod tests {
             };
             install_terminal_commit_and_newer_head(&store, &exact_request);
 
-            let outcome = executor.execute(&replay).unwrap();
+            let outcome = executor
+                .execute(&replay, RequestAuthority::TRUSTED)
+                .unwrap();
             assert!(outcome.replayed);
             let protocol::WorkspaceResult::Operation(status) = outcome.result else {
                 panic!("terminal commit replay returned the wrong result variant");
@@ -10443,10 +10781,15 @@ mod tests {
         let replacement_incarnation =
             types::WorkspaceIncarnationId::from_bytes([0x52; types::FIXED_ID_BYTES]);
         executor
-            .execute(&create_request(50, "commit-time-test", 0x42, 1))
+            .execute(
+                &create_request(50, "commit-time-test", 0x42, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
 
-        let first = executor.execute(&commit_request(51)).unwrap();
+        let first = executor
+            .execute(&commit_request(51), RequestAuthority::TRUSTED)
+            .unwrap();
         let protocol::WorkspaceResult::Operation(first_status) = first.result else {
             panic!("commit prepare returned the wrong result variant");
         };
@@ -10471,20 +10814,27 @@ mod tests {
         };
         commit.workspace_incarnation_id = replacement_incarnation.into();
 
-        let failure = executor.execute(&replay).unwrap_err();
+        let failure = executor
+            .execute(&replay, RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::RequestReplayMismatch);
         assert!(!failure.retryable);
 
         let status = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([53; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::GetOperation(
-                    protocol::GetOperationRequest {
-                        operation_id: protocol::OperationIdentity([0x41; types::FIXED_ID_BYTES]),
-                    },
-                ),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([53; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::GetOperation(
+                        protocol::GetOperationRequest {
+                            operation_id: protocol::OperationIdentity(
+                                [0x41; types::FIXED_ID_BYTES],
+                            ),
+                        },
+                    ),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Operation(status) = status.result else {
             panic!("get operation returned the wrong result variant");
@@ -10499,7 +10849,10 @@ mod tests {
         store.advance_owner_epoch(Some(owner(1)), owner(2)).unwrap();
 
         let failure = executor
-            .execute(&create_request(20, "stale-owner", 21, 1))
+            .execute(
+                &create_request(20, "stale-owner", 21, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::NotOwner);
         assert!(failure.retryable);
@@ -10523,7 +10876,10 @@ mod tests {
         let (store, executor) = ready_executor();
         let incarnation = types::WorkspaceIncarnationId::from_bytes([31; types::FIXED_ID_BYTES]);
         executor
-            .execute(&create_request(30, "read-test", 31, 1))
+            .execute(
+                &create_request(30, "read-test", 31, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         put_visible_path(&store, incarnation);
         // Metadata-only reads are authoritative from PathCurrent. Corrupting
@@ -10547,7 +10903,7 @@ mod tests {
                 if_none_match: None,
             }),
         };
-        let read = executor.execute(&get).unwrap();
+        let read = executor.execute(&get, RequestAuthority::TRUSTED).unwrap();
         let protocol::WorkspaceResult::Path(path) = read.result else {
             panic!("get_path returned the wrong result variant");
         };
@@ -10584,7 +10940,7 @@ mod tests {
                 },
             }),
         };
-        let listed = executor.execute(&list).unwrap();
+        let listed = executor.execute(&list, RequestAuthority::TRUSTED).unwrap();
         let protocol::WorkspaceResult::Paths(paths) = listed.result else {
             panic!("list_paths returned the wrong result variant");
         };
@@ -10606,7 +10962,9 @@ mod tests {
                 if_none_match: None,
             }),
         };
-        let failure = executor.execute(&stale_get).unwrap_err();
+        let failure = executor
+            .execute(&stale_get, RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::PreconditionFailed);
         assert_eq!(failure.conflict, Some(protocol::ConflictKind::ReadVersion));
 
@@ -10626,7 +10984,9 @@ mod tests {
                 },
             }),
         };
-        let failure = executor.execute(&stale_list).unwrap_err();
+        let failure = executor
+            .execute(&stale_list, RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::PreconditionFailed);
         assert_eq!(failure.conflict, Some(protocol::ConflictKind::ReadVersion));
     }
@@ -10636,7 +10996,10 @@ mod tests {
         let (store, executor) = ready_executor();
         let incarnation = types::WorkspaceIncarnationId::from_bytes([35; types::FIXED_ID_BYTES]);
         executor
-            .execute(&create_request(35, "prefix-test", 35, 1))
+            .execute(
+                &create_request(35, "prefix-test", 35, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         put_path_projection_rows(
             &store,
@@ -10650,27 +11013,31 @@ mod tests {
             ],
         );
 
-        let list = |request_fill: u8,
-                    cursor: Option<Vec<u8>>,
-                    expected_read_version,
-                    limit,
-                    recursive| {
-            executor
-                .execute(&protocol::WorkspaceRpcRequest {
-                    route: route(1),
-                    request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
-                    operation: protocol::WorkspaceRequest::ListPaths(protocol::ListPathsRequest {
-                        workbench: protocol::WorkbenchName::new("prefix-test").unwrap(),
-                        prefix: Some(protocol::RelativePath::new("outputs").unwrap()),
-                        recursive,
-                        view: protocol::WorkspaceReadView::Live,
-                        expected_read_version,
-                        workspace_continuation_fence: None,
-                        page: protocol::PageRequest { cursor, limit },
-                    }),
-                })
-                .unwrap()
-        };
+        let list =
+            |request_fill: u8, cursor: Option<Vec<u8>>, expected_read_version, limit, recursive| {
+                executor
+                    .execute(
+                        &protocol::WorkspaceRpcRequest {
+                            route: route(1),
+                            request_id: protocol::RequestIdentity(
+                                [request_fill; types::FIXED_ID_BYTES],
+                            ),
+                            operation: protocol::WorkspaceRequest::ListPaths(
+                                protocol::ListPathsRequest {
+                                    workbench: protocol::WorkbenchName::new("prefix-test").unwrap(),
+                                    prefix: Some(protocol::RelativePath::new("outputs").unwrap()),
+                                    recursive,
+                                    view: protocol::WorkspaceReadView::Live,
+                                    expected_read_version,
+                                    workspace_continuation_fence: None,
+                                    page: protocol::PageRequest { cursor, limit },
+                                },
+                            ),
+                        },
+                        RequestAuthority::TRUSTED,
+                    )
+                    .unwrap()
+            };
         let paths = |result: ExecutedRequest| {
             let protocol::WorkspaceResult::Paths(page) = result.result else {
                 panic!("list_paths returned the wrong result variant");
@@ -10688,22 +11055,25 @@ mod tests {
             ["outputs/a/deep.bin", "outputs/a"]
         );
         let unfenced_continuation = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0xf0; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::ListPaths(protocol::ListPathsRequest {
-                    workbench: protocol::WorkbenchName::new("prefix-test").unwrap(),
-                    prefix: Some(protocol::RelativePath::new("outputs").unwrap()),
-                    recursive: true,
-                    view: protocol::WorkspaceReadView::Live,
-                    expected_read_version: None,
-                    workspace_continuation_fence: None,
-                    page: protocol::PageRequest {
-                        cursor: first.next_cursor.clone(),
-                        limit: 2,
-                    },
-                }),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0xf0; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::ListPaths(protocol::ListPathsRequest {
+                        workbench: protocol::WorkbenchName::new("prefix-test").unwrap(),
+                        prefix: Some(protocol::RelativePath::new("outputs").unwrap()),
+                        recursive: true,
+                        view: protocol::WorkspaceReadView::Live,
+                        expected_read_version: None,
+                        workspace_continuation_fence: None,
+                        page: protocol::PageRequest {
+                            cursor: first.next_cursor.clone(),
+                            limit: 2,
+                        },
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(
             unfenced_continuation.code,
@@ -10743,22 +11113,25 @@ mod tests {
         assert!(non_recursive.next_cursor.is_none());
 
         let invalid_level = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([39; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::ListPaths(protocol::ListPathsRequest {
-                    workbench: protocol::WorkbenchName::new("prefix-test").unwrap(),
-                    prefix: Some(protocol::RelativePath::new("outputs").unwrap()),
-                    recursive: false,
-                    view: protocol::WorkspaceReadView::Live,
-                    expected_read_version: Some(first.read_version),
-                    workspace_continuation_fence: None,
-                    page: protocol::PageRequest {
-                        cursor: Some(b"outputs/a/deep.bin".to_vec()),
-                        limit: 2,
-                    },
-                }),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([39; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::ListPaths(protocol::ListPathsRequest {
+                        workbench: protocol::WorkbenchName::new("prefix-test").unwrap(),
+                        prefix: Some(protocol::RelativePath::new("outputs").unwrap()),
+                        recursive: false,
+                        view: protocol::WorkspaceReadView::Live,
+                        expected_read_version: Some(first.read_version),
+                        workspace_continuation_fence: None,
+                        page: protocol::PageRequest {
+                            cursor: Some(b"outputs/a/deep.bin".to_vec()),
+                            limit: 2,
+                        },
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(invalid_level.code, protocol::ErrorCode::InvalidArgument);
         assert_eq!(
@@ -10772,7 +11145,10 @@ mod tests {
         let (store, executor) = ready_executor();
         let incarnation = types::WorkspaceIncarnationId::from_bytes([0x35; types::FIXED_ID_BYTES]);
         executor
-            .execute(&create_request(0x35, "fenced-list", 0x35, 1))
+            .execute(
+                &create_request(0x35, "fenced-list", 0x35, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         put_path_projection_rows(&store, incarnation, &["outputs/a", "outputs/b"]);
         let fence = protocol::WorkspaceContinuationFence {
@@ -10782,19 +11158,22 @@ mod tests {
         let list = |request_fill: u8,
                     cursor: Option<Vec<u8>>,
                     fence: protocol::WorkspaceContinuationFence| {
-            executor.execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::ListPaths(protocol::ListPathsRequest {
-                    workbench: protocol::WorkbenchName::new("fenced-list").unwrap(),
-                    prefix: Some(protocol::RelativePath::new("outputs").unwrap()),
-                    recursive: true,
-                    view: protocol::WorkspaceReadView::Live,
-                    expected_read_version: None,
-                    workspace_continuation_fence: Some(fence),
-                    page: protocol::PageRequest { cursor, limit: 1 },
-                }),
-            })
+            executor.execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::ListPaths(protocol::ListPathsRequest {
+                        workbench: protocol::WorkbenchName::new("fenced-list").unwrap(),
+                        prefix: Some(protocol::RelativePath::new("outputs").unwrap()),
+                        recursive: true,
+                        view: protocol::WorkspaceReadView::Live,
+                        expected_read_version: None,
+                        workspace_continuation_fence: Some(fence),
+                        page: protocol::PageRequest { cursor, limit: 1 },
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
         };
 
         let first = list(0x36, None, fence.clone()).unwrap();
@@ -10803,7 +11182,10 @@ mod tests {
         };
         let first_cursor = first.next_cursor.clone();
         executor
-            .execute(&create_request(0x37, "unrelated", 0x37, 1))
+            .execute(
+                &create_request(0x37, "unrelated", 0x37, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let second = list(0x38, first_cursor.clone(), fence.clone()).unwrap();
         let protocol::WorkspaceResult::Paths(second) = second.result else {
@@ -10848,7 +11230,10 @@ mod tests {
         let (store, executor) = ready_executor();
         let incarnation = types::WorkspaceIncarnationId::from_bytes([36; types::FIXED_ID_BYTES]);
         executor
-            .execute(&create_request(60, "direct-page-test", 36, 1))
+            .execute(
+                &create_request(60, "direct-page-test", 36, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         put_path_projection_rows(
             &store,
@@ -10868,19 +11253,27 @@ mod tests {
         let mut read_version = None;
         for request_fill in 61..=64 {
             let result = executor
-                .execute(&protocol::WorkspaceRpcRequest {
-                    route: route(1),
-                    request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
-                    operation: protocol::WorkspaceRequest::ListPaths(protocol::ListPathsRequest {
-                        workbench: protocol::WorkbenchName::new("direct-page-test").unwrap(),
-                        prefix: Some(protocol::RelativePath::new("parent").unwrap()),
-                        recursive: false,
-                        view: protocol::WorkspaceReadView::Live,
-                        expected_read_version: read_version,
-                        workspace_continuation_fence: None,
-                        page: protocol::PageRequest { cursor, limit: 1 },
-                    }),
-                })
+                .execute(
+                    &protocol::WorkspaceRpcRequest {
+                        route: route(1),
+                        request_id: protocol::RequestIdentity(
+                            [request_fill; types::FIXED_ID_BYTES],
+                        ),
+                        operation: protocol::WorkspaceRequest::ListPaths(
+                            protocol::ListPathsRequest {
+                                workbench: protocol::WorkbenchName::new("direct-page-test")
+                                    .unwrap(),
+                                prefix: Some(protocol::RelativePath::new("parent").unwrap()),
+                                recursive: false,
+                                view: protocol::WorkspaceReadView::Live,
+                                expected_read_version: read_version,
+                                workspace_continuation_fence: None,
+                                page: protocol::PageRequest { cursor, limit: 1 },
+                            },
+                        ),
+                    },
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap();
             let protocol::WorkspaceResult::Paths(page) = result.result else {
                 panic!("list_paths returned the wrong result variant");
@@ -10904,28 +11297,38 @@ mod tests {
         let (store, executor) = ready_executor();
         let incarnation = types::WorkspaceIncarnationId::from_bytes([39; types::FIXED_ID_BYTES]);
         executor
-            .execute(&create_request(39, "root-list-test", 39, 1))
+            .execute(
+                &create_request(39, "root-list-test", 39, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         put_path_projection_rows(&store, incarnation, &["alpha", "nested/value", "omega"]);
 
         let list = |request_fill: u8, recursive| {
             executor
-                .execute(&protocol::WorkspaceRpcRequest {
-                    route: route(1),
-                    request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
-                    operation: protocol::WorkspaceRequest::ListPaths(protocol::ListPathsRequest {
-                        workbench: protocol::WorkbenchName::new("root-list-test").unwrap(),
-                        prefix: None,
-                        recursive,
-                        view: protocol::WorkspaceReadView::Live,
-                        expected_read_version: None,
-                        workspace_continuation_fence: None,
-                        page: protocol::PageRequest {
-                            cursor: None,
-                            limit: 10,
-                        },
-                    }),
-                })
+                .execute(
+                    &protocol::WorkspaceRpcRequest {
+                        route: route(1),
+                        request_id: protocol::RequestIdentity(
+                            [request_fill; types::FIXED_ID_BYTES],
+                        ),
+                        operation: protocol::WorkspaceRequest::ListPaths(
+                            protocol::ListPathsRequest {
+                                workbench: protocol::WorkbenchName::new("root-list-test").unwrap(),
+                                prefix: None,
+                                recursive,
+                                view: protocol::WorkspaceReadView::Live,
+                                expected_read_version: None,
+                                workspace_continuation_fence: None,
+                                page: protocol::PageRequest {
+                                    cursor: None,
+                                    limit: 10,
+                                },
+                            },
+                        ),
+                    },
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap()
         };
         let paths = |result: ExecutedRequest| {
@@ -10966,7 +11369,10 @@ mod tests {
     fn published_index_fields_cross_workspace_rpc_and_query_facade() {
         let (_store, executor) = ready_executor();
         executor
-            .execute(&create_request(40, "query-test", 41, 1))
+            .execute(
+                &create_request(40, "query-test", 41, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let operation_id = protocol::OperationIdentity([0x51; types::FIXED_ID_BYTES]);
         let artifact_revision_id =
@@ -10981,28 +11387,31 @@ mod tests {
         }];
         let seals = protocol::seal_artifact_publish_plan(artifact_revision_id, &[], &[]).unwrap();
         let begun = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0x53; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::BeginArtifactPublish(
-                    protocol::BeginArtifactPublishRequest {
-                        append_attempt: None,
-                        append_intent_digest: None,
-                        operation_id,
-                        artifact_revision_id,
-                        target: target.clone(),
-                        authority: protocol::PublicationAuthority::Visible,
-                        condition: protocol::PublishCondition::CreateOnly,
-                        expected_workspace_incarnation_id: None,
-                        staged_object_count: seals.staged_object_count,
-                        staged_object_seal: seals.staged_object_seal,
-                        manifest_row_count: seals.manifest_row_count,
-                        manifest_seal: seals.manifest_seal,
-                        dependency_owner_revision_ids: Vec::new(),
-                        inline_body_digest: None,
-                    },
-                ),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0x53; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::BeginArtifactPublish(
+                        protocol::BeginArtifactPublishRequest {
+                            append_attempt: None,
+                            append_intent_digest: None,
+                            operation_id,
+                            artifact_revision_id,
+                            target: target.clone(),
+                            authority: protocol::PublicationAuthority::Visible,
+                            condition: protocol::PublishCondition::CreateOnly,
+                            expected_workspace_incarnation_id: None,
+                            staged_object_count: seals.staged_object_count,
+                            staged_object_seal: seals.staged_object_seal,
+                            manifest_row_count: seals.manifest_row_count,
+                            manifest_seal: seals.manifest_seal,
+                            dependency_owner_revision_ids: Vec::new(),
+                            inline_body_digest: None,
+                        },
+                    ),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Operation(status) = begun.result else {
             panic!("begin artifact publication returned the wrong result variant");
@@ -11012,27 +11421,32 @@ mod tests {
         assert_eq!(status.progress.total_rows, Some(0));
 
         let completed = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0x54; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::CompleteArtifactPublish(
-                    protocol::CompleteArtifactPublishRequest {
-                        token: status.token,
-                        artifact: protocol::ArtifactDescriptor {
-                            logical_size: 0,
-                            body_digest: protocol::sha256_digest_uri(protocol::Digest(
-                                Sha256::digest([]).into(),
-                            )),
-                            manifest_digest: protocol::sha256_digest_uri(seals.manifest_seal),
-                            content_type: protocol::ContentType::new("application/octet-stream")
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0x54; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::CompleteArtifactPublish(
+                        protocol::CompleteArtifactPublishRequest {
+                            token: status.token,
+                            artifact: protocol::ArtifactDescriptor {
+                                logical_size: 0,
+                                body_digest: protocol::sha256_digest_uri(protocol::Digest(
+                                    Sha256::digest([]).into(),
+                                )),
+                                manifest_digest: protocol::sha256_digest_uri(seals.manifest_seal),
+                                content_type: protocol::ContentType::new(
+                                    "application/octet-stream",
+                                )
                                 .unwrap(),
-                            producer: Some("executor-test".to_owned()),
-                            manifest_identity: Some("manifest-1".to_owned()),
-                            index_fields: index_fields.clone(),
+                                producer: Some("executor-test".to_owned()),
+                                manifest_identity: Some("manifest-1".to_owned()),
+                                index_fields: index_fields.clone(),
+                            },
                         },
-                    },
-                ),
-            })
+                    ),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Published(published) = completed.result else {
             panic!("complete artifact publication returned the wrong result variant");
@@ -11062,7 +11476,9 @@ mod tests {
                 },
             }),
         };
-        let searched = executor.execute(&search).unwrap();
+        let searched = executor
+            .execute(&search, RequestAuthority::TRUSTED)
+            .unwrap();
         let protocol::WorkspaceResult::Search(result) = searched.result else {
             panic!("search returned the wrong result variant");
         };
@@ -11103,7 +11519,9 @@ mod tests {
                 },
             }),
         };
-        let generic = executor.execute(&generic_search).unwrap();
+        let generic = executor
+            .execute(&generic_search, RequestAuthority::TRUSTED)
+            .unwrap();
         let protocol::WorkspaceResult::Search(generic) = generic.result else {
             panic!("generic search returned the wrong result variant");
         };
@@ -11197,28 +11615,31 @@ mod tests {
                            field_id: &str,
                            operator: protocol::QueryOperator,
                            value: &str| {
-            executor.execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
-                    profile,
-                    scope: protocol::QueryScope::Root { path_prefix: None },
-                    predicates: vec![protocol::QueryPredicate {
-                        field_id: field_id.to_owned(),
-                        operator,
-                        operand: protocol::QueryOperand::Scalar(protocol::ScalarValue::String(
-                            value.to_owned(),
-                        )),
-                    }],
-                    projection: vec!["path".to_owned()],
-                    sort: Vec::new(),
-                    facets: Vec::new(),
-                    page: protocol::PageRequest {
-                        cursor: None,
-                        limit: 100,
-                    },
-                }),
-            })
+            executor.execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
+                        profile,
+                        scope: protocol::QueryScope::Root { path_prefix: None },
+                        predicates: vec![protocol::QueryPredicate {
+                            field_id: field_id.to_owned(),
+                            operator,
+                            operand: protocol::QueryOperand::Scalar(protocol::ScalarValue::String(
+                                value.to_owned(),
+                            )),
+                        }],
+                        projection: vec!["path".to_owned()],
+                        sort: Vec::new(),
+                        facets: Vec::new(),
+                        page: protocol::PageRequest {
+                            cursor: None,
+                            limit: 100,
+                        },
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
         };
         for (request_fill, operator, value, expected_matches) in [
             (0x9d, protocol::QueryOperator::Prefix, "/agents", 8),
@@ -11292,26 +11713,29 @@ mod tests {
         );
 
         let generic_count = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0x5b; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::Aggregate(protocol::AggregateRequest {
-                    profile: generic_query_profile(),
-                    scope: protocol::QueryScope::Root { path_prefix: None },
-                    predicates: Vec::new(),
-                    group_by: Vec::new(),
-                    aggregates: vec![protocol::AggregateSpec {
-                        function: protocol::AggregateFunction::Count,
-                        field_id: None,
-                        result_id: "rows".to_owned(),
-                    }],
-                    sort: Vec::new(),
-                    page: protocol::PageRequest {
-                        cursor: None,
-                        limit: 100,
-                    },
-                }),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0x5b; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::Aggregate(protocol::AggregateRequest {
+                        profile: generic_query_profile(),
+                        scope: protocol::QueryScope::Root { path_prefix: None },
+                        predicates: Vec::new(),
+                        group_by: Vec::new(),
+                        aggregates: vec![protocol::AggregateSpec {
+                            function: protocol::AggregateFunction::Count,
+                            field_id: None,
+                            result_id: "rows".to_owned(),
+                        }],
+                        sort: Vec::new(),
+                        page: protocol::PageRequest {
+                            cursor: None,
+                            limit: 100,
+                        },
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Aggregate(generic_count) = generic_count.result else {
             panic!("generic aggregate returned the wrong result variant");
@@ -11328,33 +11752,36 @@ mod tests {
         );
 
         let grouped = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0x5e; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::Aggregate(protocol::AggregateRequest {
-                    profile: generic_query_profile(),
-                    scope: protocol::QueryScope::Root { path_prefix: None },
-                    predicates: Vec::new(),
-                    group_by: vec!["body.producer".to_owned()],
-                    aggregates: vec![
-                        protocol::AggregateSpec {
-                            function: protocol::AggregateFunction::Count,
-                            field_id: None,
-                            result_id: "rows".to_owned(),
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0x5e; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::Aggregate(protocol::AggregateRequest {
+                        profile: generic_query_profile(),
+                        scope: protocol::QueryScope::Root { path_prefix: None },
+                        predicates: Vec::new(),
+                        group_by: vec!["body.producer".to_owned()],
+                        aggregates: vec![
+                            protocol::AggregateSpec {
+                                function: protocol::AggregateFunction::Count,
+                                field_id: None,
+                                result_id: "rows".to_owned(),
+                            },
+                            protocol::AggregateSpec {
+                                function: protocol::AggregateFunction::Sum,
+                                field_id: Some("size_bytes".to_owned()),
+                                result_id: "bytes".to_owned(),
+                            },
+                        ],
+                        sort: Vec::new(),
+                        page: protocol::PageRequest {
+                            cursor: None,
+                            limit: 100,
                         },
-                        protocol::AggregateSpec {
-                            function: protocol::AggregateFunction::Sum,
-                            field_id: Some("size_bytes".to_owned()),
-                            result_id: "bytes".to_owned(),
-                        },
-                    ],
-                    sort: Vec::new(),
-                    page: protocol::PageRequest {
-                        cursor: None,
-                        limit: 100,
-                    },
-                }),
-            })
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Aggregate(grouped) = grouped.result else {
             panic!("grouped generic aggregate returned the wrong result variant");
@@ -11376,26 +11803,29 @@ mod tests {
                 && matches!(field.value, protocol::ScalarValue::Decimal(_))));
 
         let grouped_paths = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0xa8; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::Aggregate(protocol::AggregateRequest {
-                    profile: generic_query_profile(),
-                    scope: protocol::QueryScope::Root { path_prefix: None },
-                    predicates: Vec::new(),
-                    group_by: vec!["path".to_owned()],
-                    aggregates: vec![protocol::AggregateSpec {
-                        function: protocol::AggregateFunction::Count,
-                        field_id: None,
-                        result_id: "rows".to_owned(),
-                    }],
-                    sort: Vec::new(),
-                    page: protocol::PageRequest {
-                        cursor: None,
-                        limit: 100,
-                    },
-                }),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0xa8; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::Aggregate(protocol::AggregateRequest {
+                        profile: generic_query_profile(),
+                        scope: protocol::QueryScope::Root { path_prefix: None },
+                        predicates: Vec::new(),
+                        group_by: vec!["path".to_owned()],
+                        aggregates: vec![protocol::AggregateSpec {
+                            function: protocol::AggregateFunction::Count,
+                            field_id: None,
+                            result_id: "rows".to_owned(),
+                        }],
+                        sort: Vec::new(),
+                        page: protocol::PageRequest {
+                            cursor: None,
+                            limit: 100,
+                        },
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Aggregate(grouped_paths) = grouped_paths.result else {
             panic!("path-grouped generic aggregate returned the wrong result variant");
@@ -11414,21 +11844,24 @@ mod tests {
         }));
 
         let generic_catalog = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0x5c; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
-                    profile: generic_query_profile(),
-                    scope: protocol::QueryScope::Root { path_prefix: None },
-                    path_match: protocol::CatalogPathMatch::Prefix,
-                    field_prefix: None,
-                    include_facets: true,
-                    page: protocol::PageRequest {
-                        cursor: None,
-                        limit: 100,
-                    },
-                }),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0x5c; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
+                        profile: generic_query_profile(),
+                        scope: protocol::QueryScope::Root { path_prefix: None },
+                        path_match: protocol::CatalogPathMatch::Prefix,
+                        field_prefix: None,
+                        include_facets: true,
+                        page: protocol::PageRequest {
+                            cursor: None,
+                            limit: 100,
+                        },
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Catalog(generic_catalog) = generic_catalog.result else {
             panic!("generic catalog returned the wrong result variant");
@@ -11465,21 +11898,24 @@ mod tests {
         }
 
         let empty_prefix_catalog = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0xa9; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
-                    profile: generic_query_profile(),
-                    scope: protocol::QueryScope::Root { path_prefix: None },
-                    path_match: protocol::CatalogPathMatch::Prefix,
-                    field_prefix: Some(String::new()),
-                    include_facets: true,
-                    page: protocol::PageRequest {
-                        cursor: None,
-                        limit: 100,
-                    },
-                }),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0xa9; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
+                        profile: generic_query_profile(),
+                        scope: protocol::QueryScope::Root { path_prefix: None },
+                        path_match: protocol::CatalogPathMatch::Prefix,
+                        field_prefix: Some(String::new()),
+                        include_facets: true,
+                        page: protocol::PageRequest {
+                            cursor: None,
+                            limit: 100,
+                        },
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Catalog(empty_prefix_catalog) = empty_prefix_catalog.result
         else {
@@ -11489,26 +11925,29 @@ mod tests {
         assert_eq!(empty_prefix_catalog.facets, generic_catalog.facets);
 
         let exact_catalog = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0x5d; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
-                    profile: generic_query_profile(),
-                    scope: protocol::QueryScope::Workspace {
-                        workbench: protocol::WorkbenchName::new("query-test").unwrap(),
-                        path_prefix: Some(
-                            protocol::RelativePath::new("outputs/dir/result.bin").unwrap(),
-                        ),
-                    },
-                    path_match: protocol::CatalogPathMatch::Exact,
-                    field_prefix: None,
-                    include_facets: true,
-                    page: protocol::PageRequest {
-                        cursor: None,
-                        limit: 100,
-                    },
-                }),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0x5d; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
+                        profile: generic_query_profile(),
+                        scope: protocol::QueryScope::Workspace {
+                            workbench: protocol::WorkbenchName::new("query-test").unwrap(),
+                            path_prefix: Some(
+                                protocol::RelativePath::new("outputs/dir/result.bin").unwrap(),
+                            ),
+                        },
+                        path_match: protocol::CatalogPathMatch::Exact,
+                        field_prefix: None,
+                        include_facets: true,
+                        page: protocol::PageRequest {
+                            cursor: None,
+                            limit: 100,
+                        },
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Catalog(exact_catalog) = exact_catalog.result else {
             panic!("exact generic catalog returned the wrong result variant");
@@ -11517,25 +11956,28 @@ mod tests {
         assert!(exact_catalog.facets.is_empty());
 
         let cursor_seed = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0x5f; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
-                    profile: generic_query_profile(),
-                    scope: protocol::QueryScope::Root { path_prefix: None },
-                    predicates: Vec::new(),
-                    projection: vec!["path".to_owned()],
-                    sort: vec![protocol::SortField {
-                        field_id: "path".to_owned(),
-                        direction: protocol::SortDirection::Ascending,
-                    }],
-                    facets: Vec::new(),
-                    page: protocol::PageRequest {
-                        cursor: None,
-                        limit: 1,
-                    },
-                }),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0x5f; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
+                        profile: generic_query_profile(),
+                        scope: protocol::QueryScope::Root { path_prefix: None },
+                        predicates: Vec::new(),
+                        projection: vec!["path".to_owned()],
+                        sort: vec![protocol::SortField {
+                            field_id: "path".to_owned(),
+                            direction: protocol::SortDirection::Ascending,
+                        }],
+                        facets: Vec::new(),
+                        page: protocol::PageRequest {
+                            cursor: None,
+                            limit: 1,
+                        },
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Search(cursor_seed) = cursor_seed.result else {
             panic!("cursor seed returned the wrong result variant");
@@ -11544,27 +11986,30 @@ mod tests {
             .next_cursor
             .expect("one-row generic search must return a continuation");
         let presentation_root_drift = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0xaa; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
-                    profile: protocol::QueryProfile::GenericCustomIndexV1 {
-                        presentation_path_root: "/other-agents".to_owned(),
-                    },
-                    scope: protocol::QueryScope::Root { path_prefix: None },
-                    predicates: Vec::new(),
-                    projection: vec!["path".to_owned()],
-                    sort: vec![protocol::SortField {
-                        field_id: "path".to_owned(),
-                        direction: protocol::SortDirection::Ascending,
-                    }],
-                    facets: Vec::new(),
-                    page: protocol::PageRequest {
-                        cursor: Some(cursor.clone()),
-                        limit: 1,
-                    },
-                }),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0xaa; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
+                        profile: protocol::QueryProfile::GenericCustomIndexV1 {
+                            presentation_path_root: "/other-agents".to_owned(),
+                        },
+                        scope: protocol::QueryScope::Root { path_prefix: None },
+                        predicates: Vec::new(),
+                        projection: vec!["path".to_owned()],
+                        sort: vec![protocol::SortField {
+                            field_id: "path".to_owned(),
+                            direction: protocol::SortDirection::Ascending,
+                        }],
+                        facets: Vec::new(),
+                        page: protocol::PageRequest {
+                            cursor: Some(cursor.clone()),
+                            limit: 1,
+                        },
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(
             presentation_root_drift.code,
@@ -11573,25 +12018,28 @@ mod tests {
         assert_eq!(presentation_root_drift.conflict, None);
 
         let profile_drift = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0x60; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
-                    profile: protocol::QueryProfile::ArtifactV1,
-                    scope: protocol::QueryScope::Root { path_prefix: None },
-                    predicates: Vec::new(),
-                    projection: vec!["path".to_owned()],
-                    sort: vec![protocol::SortField {
-                        field_id: "path".to_owned(),
-                        direction: protocol::SortDirection::Ascending,
-                    }],
-                    facets: Vec::new(),
-                    page: protocol::PageRequest {
-                        cursor: Some(cursor),
-                        limit: 1,
-                    },
-                }),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0x60; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
+                        profile: protocol::QueryProfile::ArtifactV1,
+                        scope: protocol::QueryScope::Root { path_prefix: None },
+                        predicates: Vec::new(),
+                        projection: vec!["path".to_owned()],
+                        sort: vec![protocol::SortField {
+                            field_id: "path".to_owned(),
+                            direction: protocol::SortDirection::Ascending,
+                        }],
+                        facets: Vec::new(),
+                        page: protocol::PageRequest {
+                            cursor: Some(cursor),
+                            limit: 1,
+                        },
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(profile_drift.code, protocol::ErrorCode::PreconditionFailed);
         assert_eq!(profile_drift.conflict, None);
@@ -11614,7 +12062,9 @@ mod tests {
                 },
             }),
         };
-        let first = executor.execute(&catalog).unwrap();
+        let first = executor
+            .execute(&catalog, RequestAuthority::TRUSTED)
+            .unwrap();
         let protocol::WorkspaceResult::Catalog(first_page) = first.result else {
             panic!("catalog returned the wrong result variant");
         };
@@ -11627,24 +12077,27 @@ mod tests {
         // wire-encodable: only Generic custom fields carry a per-field
         // scalar-type list, so built-in and ArtifactV1 fields project none.
         let full_catalog = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0x5b; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
-                    profile: protocol::QueryProfile::ArtifactV1,
-                    scope: protocol::QueryScope::Workspace {
-                        workbench: protocol::WorkbenchName::new("query-test").unwrap(),
-                        path_prefix: None,
-                    },
-                    path_match: protocol::CatalogPathMatch::Prefix,
-                    field_prefix: None,
-                    include_facets: false,
-                    page: protocol::PageRequest {
-                        cursor: None,
-                        limit: 100,
-                    },
-                }),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0x5b; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
+                        profile: protocol::QueryProfile::ArtifactV1,
+                        scope: protocol::QueryScope::Workspace {
+                            workbench: protocol::WorkbenchName::new("query-test").unwrap(),
+                            path_prefix: None,
+                        },
+                        path_match: protocol::CatalogPathMatch::Prefix,
+                        field_prefix: None,
+                        include_facets: false,
+                        page: protocol::PageRequest {
+                            cursor: None,
+                            limit: 100,
+                        },
+                    }),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Catalog(full_page) = full_catalog.result else {
             panic!("full catalog returned the wrong result variant");
@@ -11669,7 +12122,10 @@ mod tests {
         .expect("ArtifactV1 catalog with custom index fields must encode on the wire");
 
         executor
-            .execute(&create_request(0x57, "query-version-advance", 0x58, 1))
+            .execute(
+                &create_request(0x57, "query-version-advance", 0x58, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let stale_catalog = protocol::WorkspaceRpcRequest {
             route: route(1),
@@ -11689,7 +12145,9 @@ mod tests {
                 },
             }),
         };
-        let failure = executor.execute(&stale_catalog).unwrap_err();
+        let failure = executor
+            .execute(&stale_catalog, RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::PreconditionFailed);
         assert_eq!(failure.conflict, Some(protocol::ConflictKind::ReadVersion));
     }
@@ -11698,7 +12156,10 @@ mod tests {
     fn publish_incarnation_fence_refuses_before_any_durable_row() {
         let (_store, executor) = ready_executor();
         executor
-            .execute(&create_request(0x71, "fenced-publish", 0x72, 1))
+            .execute(
+                &create_request(0x71, "fenced-publish", 0x72, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let operation_id = protocol::OperationIdentity([0x73; types::FIXED_ID_BYTES]);
         let artifact_revision_id =
@@ -11771,41 +12232,45 @@ mod tests {
         // A stale fence is refused atomically, before the durable operation row
         // or the revision claim exists, and ahead of the generation claim.
         let stale = executor
-            .execute(&begin(
-                0x75,
-                Some(0x99),
-                protocol::PublishCondition::CreateOnly,
-            ))
+            .execute(
+                &begin(0x75, Some(0x99), protocol::PublishCondition::CreateOnly),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_fence_conflict(stale);
         let stale_replace = executor
-            .execute(&begin(
-                0x76,
-                Some(0x99),
-                protocol::PublishCondition::ReplaceOnly {
-                    expected_generation: 1,
-                },
-            ))
+            .execute(
+                &begin(
+                    0x76,
+                    Some(0x99),
+                    protocol::PublishCondition::ReplaceOnly {
+                        expected_generation: 1,
+                    },
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_fence_conflict(stale_replace);
         let missing = executor
-            .execute(&restore_rpc(
-                0x77,
-                protocol::WorkspaceRequest::GetOperation(protocol::GetOperationRequest {
-                    operation_id,
-                }),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x77,
+                    protocol::WorkspaceRequest::GetOperation(protocol::GetOperationRequest {
+                        operation_id,
+                    }),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(missing.code, protocol::ErrorCode::NotFound);
 
         // The same operation and revision identities are still free: a publish
         // with the current incarnation begins normally.
         let begun = executor
-            .execute(&begin(
-                0x78,
-                Some(0x72),
-                protocol::PublishCondition::CreateOnly,
-            ))
+            .execute(
+                &begin(0x78, Some(0x72), protocol::PublishCondition::CreateOnly),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Operation(status) = begun.result else {
             panic!("begin publish returned the wrong result variant");
@@ -11819,18 +12284,19 @@ mod tests {
         // publish logic runs, so a replay is never evaluated against a
         // different fence than the one that was recorded.
         let replayed = executor
-            .execute(&begin(
-                0x78,
-                Some(0x72),
-                protocol::PublishCondition::CreateOnly,
-            ))
+            .execute(
+                &begin(0x78, Some(0x72), protocol::PublishCondition::CreateOnly),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         assert!(replayed.replayed);
         for reused in [
             begin(0x78, Some(0x99), protocol::PublishCondition::CreateOnly),
             begin(0x78, None, protocol::PublishCondition::CreateOnly),
         ] {
-            let mismatch = executor.execute(&reused).unwrap_err();
+            let mismatch = executor
+                .execute(&reused, RequestAuthority::TRUSTED)
+                .unwrap_err();
             assert_eq!(mismatch.code, protocol::ErrorCode::RequestReplayMismatch);
         }
 
@@ -11838,19 +12304,17 @@ mod tests {
         // stale fence is refused by the fence ahead of the operation replay;
         // with the current fence it replays the recorded operation.
         let stale_operation_replay = executor
-            .execute(&begin(
-                0x79,
-                Some(0x99),
-                protocol::PublishCondition::CreateOnly,
-            ))
+            .execute(
+                &begin(0x79, Some(0x99), protocol::PublishCondition::CreateOnly),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_fence_conflict(stale_operation_replay);
         let same_operation_current_fence = executor
-            .execute(&begin(
-                0x7A,
-                Some(0x72),
-                protocol::PublishCondition::CreateOnly,
-            ))
+            .execute(
+                &begin(0x7A, Some(0x72), protocol::PublishCondition::CreateOnly),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         assert!(same_operation_current_fence.replayed);
     }
@@ -11894,7 +12358,10 @@ mod tests {
         for publish_first in [true, false] {
             let (_store, executor) = ready_executor();
             executor
-                .execute(&create_request(0x81, "stable-append", 0x82, 1))
+                .execute(
+                    &create_request(0x81, "stable-append", 0x82, 1),
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap();
             let begin = stable_append_begin_request();
             let publish = restore_rpc(
@@ -11915,21 +12382,23 @@ mod tests {
                 }),
             );
             let expected_kind = if publish_first {
-                executor.execute(&publish).unwrap();
+                executor
+                    .execute(&publish, RequestAuthority::TRUSTED)
+                    .unwrap();
                 // Commit may stop after admission because this fixture has no
                 // canonical run manifest; its admitted row is what must fence.
-                let _ = executor.execute(&commit);
+                let _ = executor.execute(&commit, RequestAuthority::TRUSTED);
                 protocol::OperationKind::ArtifactPublish
             } else {
-                let _ = executor.execute(&commit);
-                let before = executor.execute(&query).unwrap();
+                let _ = executor.execute(&commit, RequestAuthority::TRUSTED);
+                let before = executor.execute(&query, RequestAuthority::TRUSTED).unwrap();
                 assert!(
                     matches!(before.result, protocol::WorkspaceResult::Operation(ref status) if status.kind == protocol::OperationKind::Commit)
                 );
-                let _ = executor.execute(&publish);
+                let _ = executor.execute(&publish, RequestAuthority::TRUSTED);
                 protocol::OperationKind::Commit
             };
-            let observed = executor.execute(&query).expect(
+            let observed = executor.execute(&query, RequestAuthority::TRUSTED).expect(
                 "cross-kind admission must preserve the first operation's queryable receipt",
             );
             assert!(
@@ -11942,7 +12411,10 @@ mod tests {
     fn append_cleanup_inspection_pages_only_retained_rows_and_retry_is_token_idempotent() {
         let (store, executor) = ready_executor();
         executor
-            .execute(&create_request(0x81, "stable-append", 0x82, 1))
+            .execute(
+                &create_request(0x81, "stable-append", 0x82, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let mut begin = stable_append_begin_request();
         let logical = begin.append_attempt.unwrap().operation_id;
@@ -11968,33 +12440,42 @@ mod tests {
         begin.staged_object_count = seals.staged_object_count;
         begin.staged_object_seal = seals.staged_object_seal;
         let begun = executor
-            .execute(&restore_rpc(
-                0x86,
-                protocol::WorkspaceRequest::BeginArtifactPublish(begin.clone()),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x86,
+                    protocol::WorkspaceRequest::BeginArtifactPublish(begin.clone()),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Operation(begun) = begun.result else {
             panic!("expected publication status")
         };
         executor
-            .execute(&restore_rpc(
-                0x87,
-                protocol::WorkspaceRequest::StageArtifactObjects(
-                    protocol::StageArtifactObjectsRequest {
-                        token: begun.token,
-                        objects: staged.clone(),
-                    },
+            .execute(
+                &restore_rpc(
+                    0x87,
+                    protocol::WorkspaceRequest::StageArtifactObjects(
+                        protocol::StageArtifactObjectsRequest {
+                            token: begun.token,
+                            objects: staged.clone(),
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let query = || {
             let result = executor
-                .execute(&restore_rpc(
-                    0x88,
-                    protocol::WorkspaceRequest::GetOperation(protocol::GetOperationRequest {
-                        operation_id: logical,
-                    }),
-                ))
+                .execute(
+                    &restore_rpc(
+                        0x88,
+                        protocol::WorkspaceRequest::GetOperation(protocol::GetOperationRequest {
+                            operation_id: logical,
+                        }),
+                    ),
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap();
             let protocol::WorkspaceResult::Operation(status) = result.result else {
                 panic!("expected logical status")
@@ -12003,14 +12484,17 @@ mod tests {
         };
         let active = query();
         let active_failure = executor
-            .execute(&restore_rpc(
-                0x89,
-                protocol::WorkspaceRequest::RetryAppendCleanup(
-                    protocol::RetryAppendCleanupRequest {
-                        token: active.token,
-                    },
+            .execute(
+                &restore_rpc(
+                    0x89,
+                    protocol::WorkspaceRequest::RetryAppendCleanup(
+                        protocol::RetryAppendCleanupRequest {
+                            token: active.token,
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(
             active_failure.conflict,
@@ -12041,7 +12525,10 @@ mod tests {
             child = service
                 .transition_publish(meta::TransitionPublishRequest {
                     context: executor
-                        .publication_context(route(1), types::RequestId::from_bytes([id; 16]))
+                        .publication_context(
+                            &trusted(&routed(route(1))),
+                            types::RequestId::from_bytes([id; 16]),
+                        )
                         .unwrap(),
                     expected_operation: child,
                     transition,
@@ -12055,7 +12542,10 @@ mod tests {
         child = service
             .cleanup_publish_batch(meta::CleanupPublishBatchRequest {
                 context: executor
-                    .publication_context(route(1), types::RequestId::from_bytes([0x92; 16]))
+                    .publication_context(
+                        &trusted(&routed(route(1))),
+                        types::RequestId::from_bytes([0x92; 16]),
+                    )
                     .unwrap(),
                 expected_operation: child,
                 staged_object_updates: rows[..32]
@@ -12081,7 +12571,10 @@ mod tests {
         child = service
             .transition_publish(meta::TransitionPublishRequest {
                 context: executor
-                    .publication_context(route(1), types::RequestId::from_bytes([0x94; 16]))
+                    .publication_context(
+                        &trusted(&routed(route(1))),
+                        types::RequestId::from_bytes([0x94; 16]),
+                    )
                     .unwrap(),
                 expected_operation: child,
                 transition: meta::PublishTransition::Quarantine {
@@ -12104,7 +12597,9 @@ mod tests {
             )
         };
         let version = store.current_read_version().unwrap();
-        let first = executor.execute(&inspect(None)).unwrap();
+        let first = executor
+            .execute(&inspect(None), RequestAuthority::TRUSTED)
+            .unwrap();
         let protocol::WorkspaceResult::AppendCleanupInspection(first) = first.result else {
             panic!("expected inspection")
         };
@@ -12120,7 +12615,9 @@ mod tests {
         assert_eq!(first.next_after, Some(63));
         assert_eq!(first.operation.token, token);
         assert_eq!(first.publication_token.operation_id, begin.operation_id);
-        let last = executor.execute(&inspect(first.next_after)).unwrap();
+        let last = executor
+            .execute(&inspect(first.next_after), RequestAuthority::TRUSTED)
+            .unwrap();
         let protocol::WorkspaceResult::AppendCleanupInspection(last) = last.result else {
             panic!("expected inspection")
         };
@@ -12138,21 +12635,27 @@ mod tests {
         };
         request.limit = 193;
         assert_eq!(
-            executor.execute(&invalid).unwrap_err().code,
+            executor
+                .execute(&invalid, RequestAuthority::TRUSTED)
+                .unwrap_err()
+                .code,
             protocol::ErrorCode::InvalidArgument
         );
         let old_verdict = executor
-            .execute(&restore_rpc(
-                0x96,
-                protocol::WorkspaceRequest::ReconcileQuarantinedArtifactPublish(
-                    protocol::ReconcileQuarantinedArtifactPublishRequest {
-                        token: first.publication_token,
-                        resolution: protocol::QuarantineResolution::ProviderObjectsAbsent,
-                        reason: "external claim is not owner sealing".to_owned(),
-                        evidence_digest: protocol::Digest([0x97; 32]),
-                    },
+            .execute(
+                &restore_rpc(
+                    0x96,
+                    protocol::WorkspaceRequest::ReconcileQuarantinedArtifactPublish(
+                        protocol::ReconcileQuarantinedArtifactPublishRequest {
+                            token: first.publication_token,
+                            resolution: protocol::QuarantineResolution::ProviderObjectsAbsent,
+                            reason: "external claim is not owner sealing".to_owned(),
+                            evidence_digest: protocol::Digest([0x97; 32]),
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(old_verdict.code, protocol::ErrorCode::PreconditionFailed);
         assert_eq!(query().token, token);
@@ -12165,8 +12668,8 @@ mod tests {
         let mut redelivery = retry.clone();
         redelivery.request_id = protocol::RequestIdentity([0x99; 16]);
         let (left, right) = std::thread::scope(|scope| {
-            let left = scope.spawn(|| executor.execute(&retry));
-            let right = scope.spawn(|| executor.execute(&redelivery));
+            let left = scope.spawn(|| executor.execute(&retry, RequestAuthority::TRUSTED));
+            let right = scope.spawn(|| executor.execute(&redelivery, RequestAuthority::TRUSTED));
             (
                 left.join().unwrap().unwrap(),
                 right.join().unwrap().unwrap(),
@@ -12180,11 +12683,15 @@ mod tests {
         assert_eq!(left.commit_version, right.commit_version);
         let accepted = if left.replayed { right } else { left };
         assert!(accepted.commit_version.is_some());
-        let replay = executor.execute(&redelivery).unwrap();
+        let replay = executor
+            .execute(&redelivery, RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.result, accepted.result);
         assert_eq!(replay.commit_version, accepted.commit_version);
-        let stale = executor.execute(&inspect(first.next_after)).unwrap_err();
+        let stale = executor
+            .execute(&inspect(first.next_after), RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert_eq!(stale.code, protocol::ErrorCode::Conflict);
         assert_eq!(stale.conflict, Some(protocol::ConflictKind::OperationState));
         let current = executor
@@ -12199,7 +12706,10 @@ mod tests {
         service
             .transition_publish(meta::TransitionPublishRequest {
                 context: executor
-                    .publication_context(route(1), types::RequestId::from_bytes([0x9a; 16]))
+                    .publication_context(
+                        &trusted(&routed(route(1))),
+                        types::RequestId::from_bytes([0x9a; 16]),
+                    )
                     .unwrap(),
                 expected_operation: current,
                 transition: meta::PublishTransition::Quarantine {
@@ -12208,7 +12718,12 @@ mod tests {
             })
             .unwrap();
         assert_ne!(query().token, token);
-        assert!(executor.execute(&redelivery).unwrap().replayed);
+        assert!(
+            executor
+                .execute(&redelivery, RequestAuthority::TRUSTED)
+                .unwrap()
+                .replayed
+        );
         assert_eq!(
             query().state,
             protocol::OperationState::Quarantined,
@@ -12220,7 +12735,10 @@ mod tests {
         };
         request.token = query().token;
         assert_eq!(
-            executor.execute(&misuse).unwrap_err().code,
+            executor
+                .execute(&misuse, RequestAuthority::TRUSTED)
+                .unwrap_err()
+                .code,
             protocol::ErrorCode::RequestReplayMismatch
         );
 
@@ -12250,6 +12768,7 @@ mod tests {
         store
             .execute(
                 &meta::MetadataCommand {
+                    initiator: None,
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -12289,7 +12808,9 @@ mod tests {
             unreachable!()
         };
         request.token = before_corruption.token;
-        let failure = executor.execute(&corrupted_inspection).unwrap_err();
+        let failure = executor
+            .execute(&corrupted_inspection, RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::Internal);
         assert_eq!(
             store.current_read_version().unwrap(),
@@ -12303,14 +12824,19 @@ mod tests {
     fn stable_append_rejects_pending_replans_and_intent_reuse_without_cleanup() {
         let (store, executor) = ready_executor();
         executor
-            .execute(&create_request(0x81, "stable-append", 0x82, 1))
+            .execute(
+                &create_request(0x81, "stable-append", 0x82, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let begin = stable_append_begin_request();
         let request = restore_rpc(
             0x86,
             protocol::WorkspaceRequest::BeginArtifactPublish(begin.clone()),
         );
-        let begun = executor.execute(&request).unwrap();
+        let begun = executor
+            .execute(&request, RequestAuthority::TRUSTED)
+            .unwrap();
         let protocol::WorkspaceResult::Operation(status) = begun.result else {
             panic!("missing status")
         };
@@ -12322,15 +12848,23 @@ mod tests {
                 .append_intent_digest,
             begin.append_intent_digest
         );
-        assert!(executor.execute(&request).unwrap().replayed);
+        assert!(
+            executor
+                .execute(&request, RequestAuthority::TRUSTED)
+                .unwrap()
+                .replayed
+        );
 
         let mut changed = begin.clone();
         changed.manifest_seal = protocol::Digest([0x91; types::SHA256_BYTES]);
         let conflict = executor
-            .execute(&restore_rpc(
-                0x87,
-                protocol::WorkspaceRequest::BeginArtifactPublish(changed),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x87,
+                    protocol::WorkspaceRequest::BeginArtifactPublish(changed),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(
             conflict.conflict,
@@ -12346,29 +12880,38 @@ mod tests {
                 changed.append_attempt = None;
             }
             let mismatch = executor
-                .execute(&restore_rpc(
-                    0x88 + index as u8,
-                    protocol::WorkspaceRequest::BeginArtifactPublish(changed),
-                ))
+                .execute(
+                    &restore_rpc(
+                        0x88 + index as u8,
+                        protocol::WorkspaceRequest::BeginArtifactPublish(changed),
+                    ),
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap_err();
             assert_eq!(mismatch.code, protocol::ErrorCode::RequestReplayMismatch);
         }
         let mut changed = begin.clone();
         changed.append_intent_digest = Some(protocol::Digest([0x93; types::SHA256_BYTES]));
         let mismatch = executor
-            .execute(&restore_rpc(
-                0x86,
-                protocol::WorkspaceRequest::BeginArtifactPublish(changed),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x86,
+                    protocol::WorkspaceRequest::BeginArtifactPublish(changed),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(mismatch.code, protocol::ErrorCode::RequestReplayMismatch);
         let observed = executor
-            .execute(&restore_rpc(
-                0x8a,
-                protocol::WorkspaceRequest::GetOperation(protocol::GetOperationRequest {
-                    operation_id: begin.operation_id,
-                }),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x8a,
+                    protocol::WorkspaceRequest::GetOperation(protocol::GetOperationRequest {
+                        operation_id: begin.operation_id,
+                    }),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         assert_eq!(
             observed.result,
@@ -12376,10 +12919,13 @@ mod tests {
         );
         store.advance_owner_epoch(Some(owner(1)), owner(2)).unwrap();
         let stale = executor
-            .execute(&restore_rpc(
-                0x8b,
-                protocol::WorkspaceRequest::BeginArtifactPublish(begin),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x8b,
+                    protocol::WorkspaceRequest::BeginArtifactPublish(begin),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(stale.code, protocol::ErrorCode::NotOwner);
     }
@@ -12388,50 +12934,62 @@ mod tests {
     fn stable_append_terminal_replay_is_independent_of_live_head_and_plan() {
         let (store, executor) = ready_executor();
         executor
-            .execute(&create_request(0x81, "stable-append", 0x82, 1))
+            .execute(
+                &create_request(0x81, "stable-append", 0x82, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let begin = stable_append_begin_request();
         let begun = executor
-            .execute(&restore_rpc(
-                0x86,
-                protocol::WorkspaceRequest::BeginArtifactPublish(begin.clone()),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x86,
+                    protocol::WorkspaceRequest::BeginArtifactPublish(begin.clone()),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Operation(status) = begun.result else {
             panic!("missing status")
         };
         let completed = executor
-            .execute(&restore_rpc(
-                0x87,
-                protocol::WorkspaceRequest::CompleteArtifactPublish(
-                    protocol::CompleteArtifactPublishRequest {
-                        token: status.token,
-                        artifact: protocol::ArtifactDescriptor {
-                            logical_size: 0,
-                            body_digest: protocol::sha256_digest_uri(protocol::Digest(
-                                Sha256::digest([]).into(),
-                            )),
-                            manifest_digest: protocol::sha256_digest_uri(begin.manifest_seal),
-                            content_type: protocol::ContentType::new("text/plain").unwrap(),
-                            producer: None,
-                            manifest_identity: None,
-                            index_fields: Vec::new(),
+            .execute(
+                &restore_rpc(
+                    0x87,
+                    protocol::WorkspaceRequest::CompleteArtifactPublish(
+                        protocol::CompleteArtifactPublishRequest {
+                            token: status.token,
+                            artifact: protocol::ArtifactDescriptor {
+                                logical_size: 0,
+                                body_digest: protocol::sha256_digest_uri(protocol::Digest(
+                                    Sha256::digest([]).into(),
+                                )),
+                                manifest_digest: protocol::sha256_digest_uri(begin.manifest_seal),
+                                content_type: protocol::ContentType::new("text/plain").unwrap(),
+                                producer: None,
+                                manifest_identity: None,
+                                index_fields: Vec::new(),
+                            },
                         },
-                    },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Published(original) = completed.result else {
             panic!("missing receipt")
         };
         executor
-            .execute(&restore_rpc(
-                0x88,
-                protocol::WorkspaceRequest::RemovePath(protocol::RemovePathRequest {
-                    target: begin.target.clone(),
-                    expected_generation: original.generation,
-                }),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x88,
+                    protocol::WorkspaceRequest::RemovePath(protocol::RemovePathRequest {
+                        target: begin.target.clone(),
+                        expected_generation: original.generation,
+                    }),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         publish_one_byte_artifact(
             &executor,
@@ -12454,10 +13012,13 @@ mod tests {
             [0x95; types::FIXED_ID_BYTES],
         )];
         let replayed = executor
-            .execute(&restore_rpc(
-                0x89,
-                protocol::WorkspaceRequest::BeginArtifactPublish(replanned),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x89,
+                    protocol::WorkspaceRequest::BeginArtifactPublish(replanned),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         assert!(replayed.replayed);
         let protocol::WorkspaceResult::Operation(replayed) = replayed.result else {
@@ -12472,10 +13033,13 @@ mod tests {
         wrong_incarnation.expected_workspace_incarnation_id =
             Some(protocol::WorkspaceIdentity([0x96; types::FIXED_ID_BYTES]));
         let mismatch = executor
-            .execute(&restore_rpc(
-                0x8a,
-                protocol::WorkspaceRequest::BeginArtifactPublish(wrong_incarnation),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x8a,
+                    protocol::WorkspaceRequest::BeginArtifactPublish(wrong_incarnation),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(mismatch.code, protocol::ErrorCode::RequestReplayMismatch);
 
@@ -12485,7 +13049,9 @@ mod tests {
             protocol::WorkspaceRequest::BeginArtifactPublish(begin),
         );
         successor_request.route = route(2);
-        let successor = executor.execute(&successor_request).unwrap();
+        let successor = executor
+            .execute(&successor_request, RequestAuthority::TRUSTED)
+            .unwrap();
         let protocol::WorkspaceResult::Operation(successor) = successor.result else {
             panic!("missing successor receipt")
         };
@@ -12499,38 +13065,44 @@ mod tests {
     fn exact_publish_stage_retry_resumes_after_its_heartbeat_committed() {
         let (store, executor) = ready_executor();
         executor
-            .execute(&create_request(0x60, "heartbeat-retry", 0x61, 1))
+            .execute(
+                &create_request(0x60, "heartbeat-retry", 0x61, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let operation_id = protocol::OperationIdentity([0x62; types::FIXED_ID_BYTES]);
         let artifact_revision_id =
             protocol::ArtifactRevisionIdentity([0x63; types::FIXED_ID_BYTES]);
         let seals = protocol::seal_artifact_publish_plan(artifact_revision_id, &[], &[]).unwrap();
         let begun = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([0x64; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::BeginArtifactPublish(
-                    protocol::BeginArtifactPublishRequest {
-                        append_attempt: None,
-                        append_intent_digest: None,
-                        operation_id,
-                        artifact_revision_id,
-                        target: protocol::WorkspacePath {
-                            workbench: protocol::WorkbenchName::new("heartbeat-retry").unwrap(),
-                            path: protocol::RelativePath::new("outputs/result.bin").unwrap(),
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([0x64; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::BeginArtifactPublish(
+                        protocol::BeginArtifactPublishRequest {
+                            append_attempt: None,
+                            append_intent_digest: None,
+                            operation_id,
+                            artifact_revision_id,
+                            target: protocol::WorkspacePath {
+                                workbench: protocol::WorkbenchName::new("heartbeat-retry").unwrap(),
+                                path: protocol::RelativePath::new("outputs/result.bin").unwrap(),
+                            },
+                            authority: protocol::PublicationAuthority::Visible,
+                            condition: protocol::PublishCondition::CreateOnly,
+                            expected_workspace_incarnation_id: None,
+                            staged_object_count: seals.staged_object_count,
+                            staged_object_seal: seals.staged_object_seal,
+                            manifest_row_count: seals.manifest_row_count,
+                            manifest_seal: seals.manifest_seal,
+                            dependency_owner_revision_ids: Vec::new(),
+                            inline_body_digest: None,
                         },
-                        authority: protocol::PublicationAuthority::Visible,
-                        condition: protocol::PublishCondition::CreateOnly,
-                        expected_workspace_incarnation_id: None,
-                        staged_object_count: seals.staged_object_count,
-                        staged_object_seal: seals.staged_object_seal,
-                        manifest_row_count: seals.manifest_row_count,
-                        manifest_seal: seals.manifest_seal,
-                        dependency_owner_revision_ids: Vec::new(),
-                        inline_body_digest: None,
-                    },
-                ),
-            })
+                    ),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Operation(status) = begun.result else {
             panic!("begin artifact publication returned the wrong result variant");
@@ -12557,7 +13129,7 @@ mod tests {
                 },
             ),
         };
-        assert!(!executor.claim_mutation(&complete).unwrap());
+        assert!(!executor.claim_mutation(&trusted(&complete)).unwrap());
 
         // Model a response-safe partial attempt: the internal heartbeat is
         // durable, but the following publication transition lost an unrelated
@@ -12578,7 +13150,7 @@ mod tests {
         let heartbeated = meta::PublicationService::new(&store)
             .heartbeat_publish(meta::HeartbeatPublishRequest {
                 context: executor
-                    .publication_context(complete.route, heartbeat_id)
+                    .publication_context(&trusted(&complete), heartbeat_id)
                     .unwrap(),
                 expected_operation: before.clone(),
                 activity_deadline_ms: before.activity_deadline_ms.checked_add(1).unwrap(),
@@ -12599,13 +13171,13 @@ mod tests {
             unreachable!();
         };
         request.token.state_digest = protocol::Digest([0x66; types::SHA256_BYTES]);
-        let mismatch = executor.claim_mutation(&mismatched).unwrap_err();
+        let mismatch = executor.claim_mutation(&trusted(&mismatched)).unwrap_err();
         assert_eq!(mismatch.code, protocol::ErrorCode::RequestReplayMismatch);
 
-        assert!(executor.claim_mutation(&complete).unwrap());
+        assert!(executor.claim_mutation(&trusted(&complete)).unwrap());
         let resumed = executor
             .heartbeat_publish_operation(
-                &complete,
+                &trusted(&complete),
                 status.token,
                 b"publish-heartbeat-complete-transition",
             )
@@ -12743,7 +13315,10 @@ mod tests {
     fn reconcile_quarantined_publish_rpc_resolves_operation_and_frees_revision() {
         let (store, executor) = ready_executor();
         executor
-            .execute(&create_request(0x70, "reconcile-test", 0x71, 1))
+            .execute(
+                &create_request(0x70, "reconcile-test", 0x71, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let operation_identity = protocol::OperationIdentity([0x72; types::FIXED_ID_BYTES]);
         let revision_identity = protocol::ArtifactRevisionIdentity([0x73; types::FIXED_ID_BYTES]);
@@ -12788,88 +13363,104 @@ mod tests {
         };
         let status = operation_status(
             executor
-                .execute(&rpc(
-                    0x74,
-                    protocol::WorkspaceRequest::BeginArtifactPublish(
-                        protocol::BeginArtifactPublishRequest {
-                            append_attempt: None,
-                            append_intent_digest: None,
-                            operation_id: operation_identity,
-                            artifact_revision_id: revision_identity,
-                            target: protocol::WorkspacePath {
-                                workbench: protocol::WorkbenchName::new("reconcile-test").unwrap(),
-                                path: protocol::RelativePath::new("outputs/quarantine.bin")
-                                    .unwrap(),
+                .execute(
+                    &rpc(
+                        0x74,
+                        protocol::WorkspaceRequest::BeginArtifactPublish(
+                            protocol::BeginArtifactPublishRequest {
+                                append_attempt: None,
+                                append_intent_digest: None,
+                                operation_id: operation_identity,
+                                artifact_revision_id: revision_identity,
+                                target: protocol::WorkspacePath {
+                                    workbench: protocol::WorkbenchName::new("reconcile-test")
+                                        .unwrap(),
+                                    path: protocol::RelativePath::new("outputs/quarantine.bin")
+                                        .unwrap(),
+                                },
+                                authority: protocol::PublicationAuthority::Visible,
+                                condition: protocol::PublishCondition::CreateOnly,
+                                expected_workspace_incarnation_id: None,
+                                staged_object_count: seals.staged_object_count,
+                                staged_object_seal: seals.staged_object_seal,
+                                manifest_row_count: seals.manifest_row_count,
+                                manifest_seal: seals.manifest_seal,
+                                dependency_owner_revision_ids: Vec::new(),
+                                inline_body_digest: None,
                             },
-                            authority: protocol::PublicationAuthority::Visible,
-                            condition: protocol::PublishCondition::CreateOnly,
-                            expected_workspace_incarnation_id: None,
-                            staged_object_count: seals.staged_object_count,
-                            staged_object_seal: seals.staged_object_seal,
-                            manifest_row_count: seals.manifest_row_count,
-                            manifest_seal: seals.manifest_seal,
-                            dependency_owner_revision_ids: Vec::new(),
-                            inline_body_digest: None,
-                        },
+                        ),
                     ),
-                ))
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap(),
         );
         let status = operation_status(
             executor
-                .execute(&rpc(
-                    0x75,
-                    protocol::WorkspaceRequest::StageArtifactObjects(
-                        protocol::StageArtifactObjectsRequest {
-                            token: status.token,
-                            objects: staged_objects,
-                        },
+                .execute(
+                    &rpc(
+                        0x75,
+                        protocol::WorkspaceRequest::StageArtifactObjects(
+                            protocol::StageArtifactObjectsRequest {
+                                token: status.token,
+                                objects: staged_objects,
+                            },
+                        ),
                     ),
-                ))
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap(),
         );
         let status = operation_status(
             executor
-                .execute(&rpc(
-                    0x76,
-                    protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
-                        protocol::MarkArtifactObjectsUploadedRequest {
-                            token: status.token,
-                            objects: vec![protocol::ObjectUploadProof {
-                                sequence: 0,
-                                observed_length: 1,
-                                observed_digest: body_digest,
-                            }],
-                        },
+                .execute(
+                    &rpc(
+                        0x76,
+                        protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
+                            protocol::MarkArtifactObjectsUploadedRequest {
+                                token: status.token,
+                                objects: vec![protocol::ObjectUploadProof {
+                                    sequence: 0,
+                                    observed_length: 1,
+                                    observed_digest: body_digest,
+                                }],
+                            },
+                        ),
                     ),
-                ))
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap(),
         );
         let status = operation_status(
             executor
-                .execute(&rpc(
-                    0x77,
-                    protocol::WorkspaceRequest::StageArtifactManifest(
-                        protocol::StageArtifactManifestRequest {
-                            token: status.token,
-                            rows: manifest_rows,
-                            dependency_owner_revision_ids: Vec::new(),
-                        },
+                .execute(
+                    &rpc(
+                        0x77,
+                        protocol::WorkspaceRequest::StageArtifactManifest(
+                            protocol::StageArtifactManifestRequest {
+                                token: status.token,
+                                rows: manifest_rows,
+                                dependency_owner_revision_ids: Vec::new(),
+                            },
+                        ),
                     ),
-                ))
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap(),
         );
         let aborting_status = operation_status(
             executor
-                .execute(&rpc(
-                    0x78,
-                    protocol::WorkspaceRequest::AbortArtifactPublish(
-                        protocol::AbortArtifactPublishRequest {
-                            token: status.token,
-                            reason: "orchestrator cancelled the publication".to_owned(),
-                        },
+                .execute(
+                    &rpc(
+                        0x78,
+                        protocol::WorkspaceRequest::AbortArtifactPublish(
+                            protocol::AbortArtifactPublishRequest {
+                                token: status.token,
+                                reason: "orchestrator cancelled the publication".to_owned(),
+                            },
+                        ),
                     ),
-                ))
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap(),
         );
         assert_eq!(aborting_status.state, protocol::OperationState::Aborting);
@@ -12878,6 +13469,7 @@ mod tests {
         // cleanup does when the provider deletion outcome is ambiguous.
         let service = meta::PublicationService::new(&store);
         let meta_context = |fill: u8| meta::PublicationContext {
+            authority: meta::WriteAuthority::TRUSTED,
             root_id: root(),
             logical_shard_id: shard(),
             object_namespace_id: types::ObjectNamespaceId::from_bytes([10; types::FIXED_ID_BYTES]),
@@ -12942,28 +13534,34 @@ mod tests {
         // The verdict binds to the exact quarantined payload: a token that
         // digests any earlier operation state is refused.
         let stale = executor
-            .execute(&rpc(
-                0x79,
-                protocol::WorkspaceRequest::ReconcileQuarantinedArtifactPublish(
-                    protocol::ReconcileQuarantinedArtifactPublishRequest {
-                        token: aborting_status.token,
-                        resolution: protocol::QuarantineResolution::ProviderObjectsAbsent,
-                        reason: "stale operator view".to_owned(),
-                        evidence_digest: protocol::Digest([3; types::SHA256_BYTES]),
-                    },
+            .execute(
+                &rpc(
+                    0x79,
+                    protocol::WorkspaceRequest::ReconcileQuarantinedArtifactPublish(
+                        protocol::ReconcileQuarantinedArtifactPublishRequest {
+                            token: aborting_status.token,
+                            resolution: protocol::QuarantineResolution::ProviderObjectsAbsent,
+                            reason: "stale operator view".to_owned(),
+                            evidence_digest: protocol::Digest([3; types::SHA256_BYTES]),
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap_err();
         assert_eq!(stale.code, protocol::ErrorCode::Conflict);
 
         let quarantined_status = operation_status(
             executor
-                .execute(&rpc(
-                    0x7A,
-                    protocol::WorkspaceRequest::GetOperation(protocol::GetOperationRequest {
-                        operation_id: operation_identity,
-                    }),
-                ))
+                .execute(
+                    &rpc(
+                        0x7A,
+                        protocol::WorkspaceRequest::GetOperation(protocol::GetOperationRequest {
+                            operation_id: operation_identity,
+                        }),
+                    ),
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap(),
         );
         assert_eq!(
@@ -12982,7 +13580,9 @@ mod tests {
                 },
             ),
         );
-        let resolved = executor.execute(&reconcile).unwrap();
+        let resolved = executor
+            .execute(&reconcile, RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(!resolved.replayed);
         let resolved_status = operation_status(resolved);
         assert_eq!(resolved_status.state, protocol::OperationState::Failed);
@@ -13017,40 +13617,48 @@ mod tests {
         );
 
         // An exact response-loss retry replays the stored resolution.
-        let replayed = executor.execute(&reconcile).unwrap();
+        let replayed = executor
+            .execute(&reconcile, RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(replayed.replayed);
         assert_eq!(operation_status(replayed).token, resolved_status.token);
 
         // The revision identity is claimable again through the normal path.
         let retry_status = operation_status(
             executor
-                .execute(&rpc(
-                    0x7C,
-                    protocol::WorkspaceRequest::BeginArtifactPublish(
-                        protocol::BeginArtifactPublishRequest {
-                            append_attempt: None,
-                            append_intent_digest: None,
-                            operation_id: protocol::OperationIdentity(
-                                [0x7D; types::FIXED_ID_BYTES],
-                            ),
-                            artifact_revision_id: revision_identity,
-                            target: protocol::WorkspacePath {
-                                workbench: protocol::WorkbenchName::new("reconcile-test").unwrap(),
-                                path: protocol::RelativePath::new("outputs/quarantine-retry.bin")
+                .execute(
+                    &rpc(
+                        0x7C,
+                        protocol::WorkspaceRequest::BeginArtifactPublish(
+                            protocol::BeginArtifactPublishRequest {
+                                append_attempt: None,
+                                append_intent_digest: None,
+                                operation_id: protocol::OperationIdentity(
+                                    [0x7D; types::FIXED_ID_BYTES],
+                                ),
+                                artifact_revision_id: revision_identity,
+                                target: protocol::WorkspacePath {
+                                    workbench: protocol::WorkbenchName::new("reconcile-test")
+                                        .unwrap(),
+                                    path: protocol::RelativePath::new(
+                                        "outputs/quarantine-retry.bin",
+                                    )
                                     .unwrap(),
+                                },
+                                authority: protocol::PublicationAuthority::Visible,
+                                condition: protocol::PublishCondition::CreateOnly,
+                                expected_workspace_incarnation_id: None,
+                                staged_object_count: seals.staged_object_count,
+                                staged_object_seal: seals.staged_object_seal,
+                                manifest_row_count: seals.manifest_row_count,
+                                manifest_seal: seals.manifest_seal,
+                                dependency_owner_revision_ids: Vec::new(),
+                                inline_body_digest: None,
                             },
-                            authority: protocol::PublicationAuthority::Visible,
-                            condition: protocol::PublishCondition::CreateOnly,
-                            expected_workspace_incarnation_id: None,
-                            staged_object_count: seals.staged_object_count,
-                            staged_object_seal: seals.staged_object_seal,
-                            manifest_row_count: seals.manifest_row_count,
-                            manifest_seal: seals.manifest_seal,
-                            dependency_owner_revision_ids: Vec::new(),
-                            inline_body_digest: None,
-                        },
+                        ),
                     ),
-                ))
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap(),
         );
         assert_eq!(retry_status.state, protocol::OperationState::Running);
@@ -13061,7 +13669,10 @@ mod tests {
         let (store, executor) = ready_executor();
         let incarnation = types::WorkspaceIncarnationId::from_bytes([61; types::FIXED_ID_BYTES]);
         executor
-            .execute(&create_request(60, "remove-test", 61, 1))
+            .execute(
+                &create_request(60, "remove-test", 61, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         put_visible_path(&store, incarnation);
         let request = protocol::WorkspaceRpcRequest {
@@ -13076,7 +13687,9 @@ mod tests {
             }),
         };
 
-        let removed = executor.execute(&request).unwrap();
+        let removed = executor
+            .execute(&request, RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(!removed.replayed);
         assert!(removed.commit_version.is_some());
         let protocol::WorkspaceResult::Removed(result) = &removed.result else {
@@ -13089,7 +13702,9 @@ mod tests {
             Some(types::ArtifactRevisionId::from_bytes([9; types::FIXED_ID_BYTES]).into())
         );
 
-        let replayed = executor.execute(&request).unwrap();
+        let replayed = executor
+            .execute(&request, RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(replayed.replayed);
         assert_eq!(replayed.result, removed.result);
         assert_eq!(replayed.commit_version, removed.commit_version);
@@ -13104,7 +13719,9 @@ mod tests {
             }),
             ..request
         };
-        let failure = executor.execute(&reused).unwrap_err();
+        let failure = executor
+            .execute(&reused, RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::RequestReplayMismatch);
     }
 
@@ -13113,7 +13730,10 @@ mod tests {
         let (store, executor) = ready_executor();
         let incarnation = types::WorkspaceIncarnationId::from_bytes([63; types::FIXED_ID_BYTES]);
         executor
-            .execute(&create_request(63, "rename-test", 63, 1))
+            .execute(
+                &create_request(63, "rename-test", 63, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         put_visible_path(&store, incarnation);
         let source = protocol::WorkspacePath {
@@ -13134,7 +13754,9 @@ mod tests {
             }),
         };
 
-        let renamed = executor.execute(&request).unwrap();
+        let renamed = executor
+            .execute(&request, RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(!renamed.replayed);
         let protocol::WorkspaceResult::Renamed(result) = &renamed.result else {
             panic!("rename returned the wrong result variant");
@@ -13148,7 +13770,9 @@ mod tests {
             types::ArtifactRevisionId::from_bytes([9; types::FIXED_ID_BYTES]).into()
         );
 
-        let replayed = executor.execute(&request).unwrap();
+        let replayed = executor
+            .execute(&request, RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(replayed.replayed);
         assert_eq!(replayed.result, renamed.result);
         assert_eq!(replayed.commit_version, renamed.commit_version);
@@ -13185,7 +13809,9 @@ mod tests {
             }),
             ..request
         };
-        let failure = executor.execute(&reused).unwrap_err();
+        let failure = executor
+            .execute(&reused, RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::RequestReplayMismatch);
     }
 
@@ -13195,7 +13821,10 @@ mod tests {
     ) -> (Arc<meta::MetaShard>, MetadataWorkspaceRequestExecutor) {
         let (store, executor) = ready_executor();
         executor
-            .execute(&create_request(fill, name, fill.wrapping_add(1), 1))
+            .execute(
+                &create_request(fill, name, fill.wrapping_add(1), 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         put_visible_path(
             &store,
@@ -13225,7 +13854,9 @@ mod tests {
                 expected_generation: 1,
             }),
         };
-        let renamed = executor.execute(&rename).unwrap();
+        let renamed = executor
+            .execute(&rename, RequestAuthority::TRUSTED)
+            .unwrap();
         let remove = protocol::WorkspaceRpcRequest {
             route: route(1),
             request_id: protocol::RequestIdentity([0xa3; types::FIXED_ID_BYTES]),
@@ -13234,16 +13865,21 @@ mod tests {
                 expected_generation: 1,
             }),
         };
-        let removed = executor.execute(&remove).unwrap();
+        let removed = executor
+            .execute(&remove, RequestAuthority::TRUSTED)
+            .unwrap();
 
         // The owner restarts, so every retry arrives under a new owner epoch.
         store.advance_owner_epoch(Some(owner(1)), owner(2)).unwrap();
         for (request, original) in [(rename, renamed), (remove, removed)] {
             let retried = executor
-                .execute(&protocol::WorkspaceRpcRequest {
-                    route: route(2),
-                    ..request
-                })
+                .execute(
+                    &protocol::WorkspaceRpcRequest {
+                        route: route(2),
+                        ..request
+                    },
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap();
             assert!(retried.replayed);
             assert_eq!(retried.result, original.result);
@@ -13264,16 +13900,16 @@ mod tests {
             }),
         };
         // The durable prefix a crash can leave: the claim without its step.
-        assert!(!executor.claim_mutation(&rename).unwrap());
+        assert!(!executor.claim_mutation(&trusted(&rename)).unwrap());
 
         store.advance_owner_epoch(Some(owner(1)), owner(2)).unwrap();
         let retry = protocol::WorkspaceRpcRequest {
             route: route(2),
             ..rename
         };
-        let applied = executor.execute(&retry).unwrap();
+        let applied = executor.execute(&retry, RequestAuthority::TRUSTED).unwrap();
         assert!(!applied.replayed);
-        let replayed = executor.execute(&retry).unwrap();
+        let replayed = executor.execute(&retry, RequestAuthority::TRUSTED).unwrap();
         assert!(replayed.replayed);
         assert_eq!(replayed.result, applied.result);
     }
@@ -13293,7 +13929,10 @@ mod tests {
     fn snapshot_lifecycle_uses_visible_incarnation_and_lists_terminal_states() {
         let (store, executor) = ready_executor();
         executor
-            .execute(&create_request(70, "snapshot-test", 71, 1))
+            .execute(
+                &create_request(70, "snapshot-test", 71, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         install_snapshot_committed_head(
             &store,
@@ -13316,7 +13955,7 @@ mod tests {
             }),
         };
 
-        let minted = executor.execute(&mint).unwrap();
+        let minted = executor.execute(&mint, RequestAuthority::TRUSTED).unwrap();
         assert!(!minted.replayed);
         let protocol::WorkspaceResult::Snapshot(minted_snapshot) = &minted.result else {
             panic!("mint returned the wrong result variant");
@@ -13335,7 +13974,7 @@ mod tests {
                 selector: protocol::SnapshotSelector::Alias(alias.clone()),
             }),
         };
-        let pointed = executor.execute(&point).unwrap();
+        let pointed = executor.execute(&point, RequestAuthority::TRUSTED).unwrap();
         assert_eq!(pointed.commit_version, None);
         assert!(!pointed.replayed);
         let protocol::WorkspaceResult::Snapshot(pointed_snapshot) = pointed.result else {
@@ -13343,7 +13982,7 @@ mod tests {
         };
         assert_eq!(pointed_snapshot.snapshot_id, 7);
 
-        let replayed = executor.execute(&mint).unwrap();
+        let replayed = executor.execute(&mint, RequestAuthority::TRUSTED).unwrap();
         assert!(replayed.replayed);
         assert_eq!(replayed.result, minted.result);
         assert_eq!(replayed.commit_version, minted.commit_version);
@@ -13357,7 +13996,7 @@ mod tests {
                 lease_deadline_ms: 2_000,
             }),
         };
-        let renewed = executor.execute(&renew).unwrap();
+        let renewed = executor.execute(&renew, RequestAuthority::TRUSTED).unwrap();
         let protocol::WorkspaceResult::Snapshot(renewed_snapshot) = renewed.result else {
             panic!("renew returned the wrong result variant");
         };
@@ -13375,7 +14014,9 @@ mod tests {
                 },
             ),
         };
-        let retired = executor.execute(&retire).unwrap();
+        let retired = executor
+            .execute(&retire, RequestAuthority::TRUSTED)
+            .unwrap();
         let protocol::WorkspaceResult::Snapshot(retired_snapshot) = retired.result else {
             panic!("retire returned the wrong result variant");
         };
@@ -13396,7 +14037,7 @@ mod tests {
                 },
             }),
         };
-        let listed = executor.execute(&list).unwrap();
+        let listed = executor.execute(&list, RequestAuthority::TRUSTED).unwrap();
         let protocol::WorkspaceResult::Snapshots(page) = listed.result else {
             panic!("list snapshots returned the wrong result variant");
         };
@@ -13417,7 +14058,9 @@ mod tests {
                 annotation: Vec::new(),
             }),
         };
-        let failure = executor.execute(&wrong_incarnation).unwrap_err();
+        let failure = executor
+            .execute(&wrong_incarnation, RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::Conflict);
         assert_eq!(failure.conflict, Some(protocol::ConflictKind::Workspace));
     }
@@ -13443,13 +14086,16 @@ mod tests {
         let workbench = protocol::WorkbenchName::new(name).unwrap();
         let workspace_incarnation_id = protocol::WorkspaceIdentity([fill; types::FIXED_ID_BYTES]);
         executor
-            .execute(&restore_rpc(
-                fill,
-                protocol::WorkspaceRequest::CreateWorkspace(protocol::CreateWorkspaceRequest {
-                    workbench: workbench.clone(),
-                    workspace_incarnation_id,
-                }),
-            ))
+            .execute(
+                &restore_rpc(
+                    fill,
+                    protocol::WorkspaceRequest::CreateWorkspace(protocol::CreateWorkspaceRequest {
+                        workbench: workbench.clone(),
+                        workspace_incarnation_id,
+                    }),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let commit_operation_id =
             protocol::OperationIdentity([fill.wrapping_add(1); types::FIXED_ID_BYTES]);
@@ -13478,7 +14124,10 @@ mod tests {
             lineage_projection: Vec::new(),
         });
         let begun = executor
-            .execute(&restore_rpc(fill.wrapping_add(1), commit_operation.clone()))
+            .execute(
+                &restore_rpc(fill.wrapping_add(1), commit_operation.clone()),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Operation(begun) = begun.result else {
             panic!("initial commit request returned the wrong result variant");
@@ -13497,7 +14146,10 @@ mod tests {
             0x7b,
         );
         let committed = executor
-            .execute(&restore_rpc(fill.wrapping_add(10), commit_operation))
+            .execute(
+                &restore_rpc(fill.wrapping_add(10), commit_operation),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Operation(committed) = committed.result else {
             panic!("completed commit returned the wrong result variant");
@@ -13507,17 +14159,20 @@ mod tests {
             put_shared_revision_paths(store, workspace_incarnation_id.into(), shared_paths);
         }
         executor
-            .execute(&restore_rpc(
-                fill.wrapping_add(11),
-                protocol::WorkspaceRequest::MintSnapshot(protocol::MintSnapshotRequest {
-                    workbench: workbench.clone(),
-                    workspace_incarnation_id,
-                    snapshot_id,
-                    lease_deadline_ms: 10_000,
-                    alias: None,
-                    annotation: Vec::new(),
-                }),
-            ))
+            .execute(
+                &restore_rpc(
+                    fill.wrapping_add(11),
+                    protocol::WorkspaceRequest::MintSnapshot(protocol::MintSnapshotRequest {
+                        workbench: workbench.clone(),
+                        workspace_incarnation_id,
+                        snapshot_id,
+                        lease_deadline_ms: 10_000,
+                        alias: None,
+                        annotation: Vec::new(),
+                    }),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         CommittedSnapshotSource {
             workbench,
@@ -13648,7 +14303,7 @@ mod tests {
                     let barrier = Arc::clone(&barrier);
                     scope.spawn(move || {
                         barrier.wait();
-                        executor.execute(&request)
+                        executor.execute(&request, RequestAuthority::TRUSTED)
                     })
                 })
                 .collect::<Vec<_>>();
@@ -13662,7 +14317,9 @@ mod tests {
         for outcome in outcomes {
             assert_eq!(first_outcome.result, outcome.result);
         }
-        let exact_replay = executor.execute(&prepare(request_fills[0])).unwrap();
+        let exact_replay = executor
+            .execute(&prepare(request_fills[0]), RequestAuthority::TRUSTED)
+            .unwrap();
         assert_eq!(exact_replay.result, first_outcome.result);
         assert!(exact_replay.replayed);
         let protocol::WorkspaceResult::RestorePrepared(prepared) = first_outcome.result else {
@@ -13676,13 +14333,16 @@ mod tests {
         assert!(prepared.destination_binding.is_none());
 
         let snapshot = executor
-            .execute(&restore_rpc(
-                0xc0,
-                protocol::WorkspaceRequest::GetSnapshot(protocol::GetSnapshotRequest {
-                    workbench: source.workbench,
-                    selector: protocol::SnapshotSelector::Id(source.snapshot_id),
-                }),
-            ))
+            .execute(
+                &restore_rpc(
+                    0xc0,
+                    protocol::WorkspaceRequest::GetSnapshot(protocol::GetSnapshotRequest {
+                        workbench: source.workbench,
+                        selector: protocol::SnapshotSelector::Id(source.snapshot_id),
+                    }),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Snapshot(snapshot) = snapshot.result else {
             panic!("snapshot lookup returned the wrong result variant");
@@ -13716,10 +14376,10 @@ mod tests {
         let restore_operation_id = request.operation_id;
         let destination = request.destination_workbench.clone();
         let prepared = executor
-            .execute(&restore_rpc(
-                0x60,
-                protocol::WorkspaceRequest::PrepareRestore(request),
-            ))
+            .execute(
+                &restore_rpc(0x60, protocol::WorkspaceRequest::PrepareRestore(request)),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::RestorePrepared(prepared) = prepared.result else {
             panic!("prepare restore returned the wrong result variant");
@@ -13748,10 +14408,13 @@ mod tests {
             destination_restore_manifest_identity,
         };
         executor
-            .execute(&restore_rpc(
-                0x65,
-                protocol::WorkspaceRequest::BindRestoreDestination(bind_request),
-            ))
+            .execute(
+                &restore_rpc(
+                    0x65,
+                    protocol::WorkspaceRequest::BindRestoreDestination(bind_request),
+                ),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let publish_manifests = |first_fill: u8| {
             publish_one_byte_artifact(
@@ -13800,7 +14463,7 @@ mod tests {
                     let request = finalize(*fill);
                     scope.spawn(move || {
                         barrier.wait();
-                        executor.execute(&request)
+                        executor.execute(&request, RequestAuthority::TRUSTED)
                     })
                 })
                 .collect::<Vec<_>>();
@@ -13827,10 +14490,14 @@ mod tests {
         // restore is Complete without disturbing the terminal state.
         let replayed_manifest = publish_manifests(0x70);
         assert_eq!(replayed_manifest.logical_size, 1);
-        let replay = executor.execute(&finalize(0xb0)).unwrap();
+        let replay = executor
+            .execute(&finalize(0xb0), RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.result, outcomes[0].result);
-        let fresh_finalizer = executor.execute(&finalize(0xb9)).unwrap();
+        let fresh_finalizer = executor
+            .execute(&finalize(0xb9), RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(fresh_finalizer.replayed);
         assert_eq!(fresh_finalizer.result, outcomes[0].result);
     }
@@ -13863,37 +14530,40 @@ mod tests {
         let restore_operation_id = request.operation_id;
         let destination = request.destination_workbench.clone();
         executor
-            .execute(&restore_rpc(
-                0x68,
-                protocol::WorkspaceRequest::PrepareRestore(request),
-            ))
+            .execute(
+                &restore_rpc(0x68, protocol::WorkspaceRequest::PrepareRestore(request)),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let destination_run_manifest_identity = protocol::RestoreManifestIdentity {
             publication_operation_id: protocol::OperationIdentity([0x69; types::FIXED_ID_BYTES]),
             artifact_revision_id: protocol::ArtifactRevisionIdentity([0x6a; types::FIXED_ID_BYTES]),
         };
         executor
-            .execute(&restore_rpc(
-                0x6b,
-                protocol::WorkspaceRequest::BindRestoreDestination(
-                    protocol::BindRestoreDestinationRequest {
-                        operation_id: restore_operation_id,
-                        destination_commit_id: protocol::CommitIdentity(
-                            [0x6c; types::SHA256_BYTES],
-                        ),
-                        effective_content_digest: protocol::DigestUri::new(format!(
-                            "sha256:{}",
-                            "cc".repeat(types::SHA256_BYTES)
-                        ))
-                        .unwrap(),
-                        destination_run_manifest_projection_input_digest: protocol::Digest(
-                            [0x6d; types::SHA256_BYTES],
-                        ),
-                        destination_run_manifest_identity,
-                        destination_restore_manifest_identity,
-                    },
+            .execute(
+                &restore_rpc(
+                    0x6b,
+                    protocol::WorkspaceRequest::BindRestoreDestination(
+                        protocol::BindRestoreDestinationRequest {
+                            operation_id: restore_operation_id,
+                            destination_commit_id: protocol::CommitIdentity(
+                                [0x6c; types::SHA256_BYTES],
+                            ),
+                            effective_content_digest: protocol::DigestUri::new(format!(
+                                "sha256:{}",
+                                "cc".repeat(types::SHA256_BYTES)
+                            ))
+                            .unwrap(),
+                            destination_run_manifest_projection_input_digest: protocol::Digest(
+                                [0x6d; types::SHA256_BYTES],
+                            ),
+                            destination_run_manifest_identity,
+                            destination_restore_manifest_identity,
+                        },
+                    ),
                 ),
-            ))
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         // The restore manifest body is sealed by the prepare request
         // (`fork_prepare_request` seals sha256([0x7d])); the run manifest body is
@@ -13943,7 +14613,8 @@ mod tests {
                 release: Arc::clone(&release),
             }),
         );
-        let holder = std::thread::spawn(move || held.execute(&finalize(0xc1)));
+        let holder =
+            std::thread::spawn(move || held.execute(&finalize(0xc1), RequestAuthority::TRUSTED));
         assert_eq!(
             loaded_rx
                 .recv_timeout(std::time::Duration::from_secs(5))
@@ -13954,7 +14625,9 @@ mod tests {
         // A peer finalizer queues behind the holder's write session instead of
         // interleaving with the phase the holder already loaded.
         let peer_executor = executor.clone();
-        let peer = std::thread::spawn(move || peer_executor.execute(&finalize(0xc2)));
+        let peer = std::thread::spawn(move || {
+            peer_executor.execute(&finalize(0xc2), RequestAuthority::TRUSTED)
+        });
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(!peer.is_finished());
 
@@ -13978,7 +14651,9 @@ mod tests {
         assert_eq!(converged.result, completed.result);
 
         // The terminal row is unchanged and a fresh finalizer still replays it.
-        let fresh = executor.execute(&finalize(0xc3)).unwrap();
+        let fresh = executor
+            .execute(&finalize(0xc3), RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(fresh.replayed);
         assert_eq!(fresh.result, completed.result);
     }
@@ -13987,7 +14662,10 @@ mod tests {
     fn snapshot_alias_point_get_uses_alias_generation_not_numeric_id_order() {
         let (store, executor) = ready_executor();
         executor
-            .execute(&create_request(80, "snapshot-alias-test", 81, 1))
+            .execute(
+                &create_request(80, "snapshot-alias-test", 81, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         install_snapshot_committed_head(
             &store,
@@ -14000,20 +14678,25 @@ mod tests {
 
         for (request_fill, snapshot_id) in [(82, 900), (83, 1)] {
             executor
-                .execute(&protocol::WorkspaceRpcRequest {
-                    route: route(1),
-                    request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
-                    operation: protocol::WorkspaceRequest::MintSnapshot(
-                        protocol::MintSnapshotRequest {
-                            workbench: workbench.clone(),
-                            workspace_incarnation_id: incarnation,
-                            snapshot_id,
-                            lease_deadline_ms: 1_000,
-                            alias: Some(alias.clone()),
-                            annotation: Vec::new(),
-                        },
-                    ),
-                })
+                .execute(
+                    &protocol::WorkspaceRpcRequest {
+                        route: route(1),
+                        request_id: protocol::RequestIdentity(
+                            [request_fill; types::FIXED_ID_BYTES],
+                        ),
+                        operation: protocol::WorkspaceRequest::MintSnapshot(
+                            protocol::MintSnapshotRequest {
+                                workbench: workbench.clone(),
+                                workspace_incarnation_id: incarnation,
+                                snapshot_id,
+                                lease_deadline_ms: 1_000,
+                                alias: Some(alias.clone()),
+                                annotation: Vec::new(),
+                            },
+                        ),
+                    },
+                    RequestAuthority::TRUSTED,
+                )
                 .unwrap();
         }
 
@@ -14027,7 +14710,10 @@ mod tests {
         };
         let version_before = store.current_read_version().unwrap();
         let current = executor
-            .execute(&point(84, protocol::SnapshotSelector::Alias(alias.clone())))
+            .execute(
+                &point(84, protocol::SnapshotSelector::Alias(alias.clone())),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         assert_eq!(current.commit_version, None);
         assert_eq!(store.current_read_version().unwrap(), version_before);
@@ -14037,7 +14723,10 @@ mod tests {
         assert_eq!(current.snapshot_id, 1);
 
         let old = executor
-            .execute(&point(85, protocol::SnapshotSelector::Id(900)))
+            .execute(
+                &point(85, protocol::SnapshotSelector::Id(900)),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Snapshot(old) = old.result else {
             panic!("id point get returned the wrong result variant");
@@ -14048,7 +14737,10 @@ mod tests {
             .observe_lease_clock(root(), placement(), owner(1), 1_500)
             .unwrap();
         let expired = executor
-            .execute(&point(86, protocol::SnapshotSelector::Alias(alias.clone())))
+            .execute(
+                &point(86, protocol::SnapshotSelector::Alias(alias.clone())),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Snapshot(expired) = expired.result else {
             panic!("expired point get returned the wrong result variant");
@@ -14057,17 +14749,20 @@ mod tests {
         assert_eq!(expired.status, protocol::SnapshotStatus::Expired);
 
         let revived = executor
-            .execute(&protocol::WorkspaceRpcRequest {
-                route: route(1),
-                request_id: protocol::RequestIdentity([87; types::FIXED_ID_BYTES]),
-                operation: protocol::WorkspaceRequest::RenewSnapshot(
-                    protocol::RenewSnapshotRequest {
-                        workbench,
-                        selector: protocol::SnapshotSelector::Alias(alias),
-                        lease_deadline_ms: 2_000,
-                    },
-                ),
-            })
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([87; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::RenewSnapshot(
+                        protocol::RenewSnapshotRequest {
+                            workbench,
+                            selector: protocol::SnapshotSelector::Alias(alias),
+                            lease_deadline_ms: 2_000,
+                        },
+                    ),
+                },
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let protocol::WorkspaceResult::Snapshot(revived) = revived.result else {
             panic!("renew returned the wrong result variant");
@@ -14159,7 +14854,10 @@ mod tests {
         let (store, executor) = ready_executor();
         let incarnation = types::WorkspaceIncarnationId::from_bytes([51; types::FIXED_ID_BYTES]);
         executor
-            .execute(&create_request(50, "range-test", 51, 1))
+            .execute(
+                &create_request(50, "range-test", 51, 1),
+                RequestAuthority::TRUSTED,
+            )
             .unwrap();
         let target = put_ranged_path(&store, incarnation, 513);
 
@@ -14175,7 +14873,9 @@ mod tests {
                 if_none_match: None,
             }),
         };
-        let metadata_only = executor.execute(&metadata_only).unwrap();
+        let metadata_only = executor
+            .execute(&metadata_only, RequestAuthority::TRUSTED)
+            .unwrap();
         let protocol::WorkspaceResult::Path(metadata_only) = metadata_only.result else {
             panic!("metadata get returned the wrong result variant");
         };
@@ -14202,7 +14902,7 @@ mod tests {
                 if_none_match: None,
             }),
         };
-        let first = executor.execute(&first).unwrap();
+        let first = executor.execute(&first, RequestAuthority::TRUSTED).unwrap();
         let protocol::WorkspaceResult::Path(first) = first.result else {
             panic!("first range page returned the wrong result variant");
         };
@@ -14226,7 +14926,9 @@ mod tests {
                 if_none_match: None,
             }),
         };
-        let second = executor.execute(&second).unwrap();
+        let second = executor
+            .execute(&second, RequestAuthority::TRUSTED)
+            .unwrap();
         let protocol::WorkspaceResult::Path(second) = second.result else {
             panic!("second range page returned the wrong result variant");
         };
@@ -14253,7 +14955,9 @@ mod tests {
                 if_none_match: None,
             }),
         };
-        let failure = executor.execute(&mismatched).unwrap_err();
+        let failure = executor
+            .execute(&mismatched, RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::InvalidArgument);
     }
 }

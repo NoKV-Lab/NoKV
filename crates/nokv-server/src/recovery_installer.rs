@@ -1396,6 +1396,7 @@ mod tests {
         source
             .execute(
                 &MetadataCommand {
+                    initiator: None,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: root(7),
                     logical_shard_id: shard(1),
