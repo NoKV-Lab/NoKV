@@ -24,6 +24,7 @@ nokv-server.workspace = true
 nokv-agent.workspace = true
 nokv-workbench-projection.workspace = true
 nokv-types.workspace = true
+rustls.workspace = true
 sha2.workspace = true
 signal-hook = { workspace = true, optional = true }
 serde.workspace = true
@@ -37,4 +38,5 @@ name = "nokv"
 path = "src/main.rs"
 
 [dev-dependencies]
+rcgen.workspace = true
 tempfile.workspace = true

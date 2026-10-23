@@ -57,7 +57,7 @@ pub use sdk::{ClientCall, ClientOptions, WorkspaceClient};
 pub use snapshot_workflow::{
     SnapshotMintOptions, SnapshotRenewOptions, SnapshotRetireOptions, SnapshotRetireOutcome,
 };
-pub use transport::{FramedTcpOptions, FramedTcpTransport, RpcTransport};
+pub use transport::{FramedTcpOptions, FramedTcpTransport, RpcClientTls, RpcTransport};
 pub use workbench_lifecycle::{
     RestoreManifestProjectionContext, RestoredRunManifestProjectionContext,
     RunManifestProjectionContext, VerifiedWorkbenchRestoreManifest, VerifiedWorkbenchRunManifest,

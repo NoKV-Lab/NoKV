@@ -159,7 +159,8 @@ continuations retain one exact root read version. Live continuations may move
 to a newer root read version only while the target workspace incarnation and
 revision remain unchanged; target drift fails closed, and an initial bounded
 collection may restart in full but never merges workspace revisions. This
-contract is gated by operation schema `nokv.workspace.rpc.v14`; v14 adds the
+contract is gated by operation schema `nokv.workspace.rpc.v15`; v15 adds the
+TLS and authentication answers of the handshake described below. V14 added the
 `PublishInlineArtifact` request, which admits and completes a publication whose
 body travels with it and is stored inline, and the inline body of a ranged
 `GetPath` result. V13 added the fused `PrepareArtifactPublish` and
@@ -176,15 +177,33 @@ added the provider-neutral object namespace identity to every root route.
 
 Each TCP connection starts with the fixed-width, schema-neutral transport
 handshake v1. The client offers one exact operation schema, and the server
-accepts only `nokv.workspace.rpc.v14`; the handshake version remains stable when
+accepts only `nokv.workspace.rpc.v15`; the handshake version remains stable when
 the operation schema changes. For upgrade diagnostics, the server recognizes
 only operation-first envelopes from the public v2 client and the post-tag v3
 client. It parses a bounded route/request header, ignores the operation, emits
 one schema-readable failure, and closes without dispatch. The v2 client gets
-its exact v2 failure envelope; the v3 client gets a v14 failure envelope so its
-decoder reports the v14/v3 schema mismatch. Unknown legacy schemas, malformed
+its exact v2 failure envelope; the v3 client gets a v15 failure envelope so its
+decoder reports the v15/v3 schema mismatch. Unknown legacy schemas, malformed
 envelopes, and malformed handshakes fail closed. This is a read-only rejection
 path, not a legacy response decoder or operation fallback.
+
+An owner configured with a certificate serves TLS 1.3 only: no resumption, no
+early data, and no plaintext fallback. The TLS handshake and the protocol
+handshake inside it share one absolute deadline, enforced below the TLS layer
+so a peer that trickles bytes cannot extend it. The owner requires a client
+certificate and checks at the TLS layer only that the client holds its key.
+After TLS, the SHA-256 of the certificate must be a current credential of the
+tenant bound to every root the owner serves; the credential names the
+connection's principal. A current-schema hello from any other certificate gets
+`Unauthenticated`, a plaintext current-schema hello gets `TlsRequired`, and an
+owner without TLS answers a TLS client hello with a plaintext `TlsUnavailable`
+frame that the client reads before parsing TLS records. The owner reads the
+tenant's records on every handshake, so a revoked or expired credential opens
+no new connection; a failure to read them closes the connection unanswered,
+which the client retries. Clients fix the trusted owner name and roots in
+their configuration rather than taking them from routes, and a transport
+reuses a pooled connection only under the identity it was opened with.
+Authenticated principals are not yet authorized per request.
 
 Secondary-index queries run at one read version and filter every result by the
 matching visible incarnation. `ArtifactV1` remains the default Workbench query

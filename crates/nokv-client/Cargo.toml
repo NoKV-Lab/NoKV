@@ -19,7 +19,9 @@ nokv-control = { workspace = true, optional = true }
 nokv-object.workspace = true
 nokv-protocol.workspace = true
 nokv-types.workspace = true
+rustls.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 tempfile.workspace = true

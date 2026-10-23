@@ -9,16 +9,20 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nokv_protocol::{
-    decode_handshake_payload, decode_request, encode_handshake_frame, encode_response,
-    has_handshake_magic, ErrorCode, HandshakeKind, ProtocolError, RpcFailure, WorkspaceHandshake,
-    WorkspaceRpcOutcome, WorkspaceRpcResponse, HANDSHAKE_PAYLOAD_BYTES, MAX_FRAME_BYTES,
-    WORKSPACE_PROTOCOL_SCHEMA,
+    decode_handshake_frame, decode_handshake_payload, decode_request, encode_handshake_frame,
+    encode_response, has_handshake_magic, ErrorCode, HandshakeKind, ProtocolError, RpcFailure,
+    WorkspaceHandshake, WorkspaceRpcOutcome, WorkspaceRpcResponse, HANDSHAKE_FRAME_BYTES,
+    HANDSHAKE_PAYLOAD_BYTES, MAX_FRAME_BYTES, WORKSPACE_PROTOCOL_SCHEMA,
 };
 
 use crate::legacy_rejection::{legacy_rejection_response, MAX_LEGACY_FIRST_FRAME_BYTES};
+use crate::rpc_tls::{
+    accept_tls, drain_tls_record, opens_tls_record, AuthenticationError, DeadlineSocket,
+    RpcServerTls, RpcStream,
+};
 use crate::{RootOwnerRegistry, ServerError, ShardOwner};
 
 static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -168,6 +172,7 @@ pub struct WorkspaceServer {
     registry: Arc<RootOwnerRegistry>,
     ownership: Vec<ShardOwner>,
     owner_loss: OwnerLossSignal,
+    tls: Option<Arc<RpcServerTls>>,
 }
 
 impl WorkspaceServer {
@@ -191,7 +196,17 @@ impl WorkspaceServer {
             registry,
             ownership,
             owner_loss,
+            tls: None,
         })
+    }
+
+    /// Serve every connection over TLS and authenticate each client; a
+    /// plaintext client is refused.
+    pub fn with_rpc_tls(self, tls: RpcServerTls) -> Self {
+        Self {
+            tls: Some(Arc::new(tls)),
+            ..self
+        }
     }
 
     pub fn health(&self) -> Result<ServerHealth, ServerError> {
@@ -254,13 +269,23 @@ impl WorkspaceServer {
             listener,
             self.options,
             Arc::clone(&self.registry),
+            self.tls.clone(),
             self.owner_loss.clone(),
             shutdown,
             || self.renew_ownership(),
         )
     }
 
+    /// Dispatch one encoded request in process. No client identity comes with
+    /// the frame, so a server that authenticates its clients refuses it.
     pub fn dispatch_frame(&self, encoded: &[u8]) -> Result<Vec<u8>, ServerError> {
+        if self.tls.is_some() {
+            return Err(ServerError::InvalidOptions(
+                "direct frame dispatch carries no client identity; this server authenticates \
+                 every client over TLS"
+                    .to_owned(),
+            ));
+        }
         let request = decode_request(encoded)?;
         let response = self.registry.dispatch_guarded(request)?;
         encode_response(response.response()).map_err(ServerError::Protocol)
@@ -271,6 +296,7 @@ fn serve_socket_loop(
     listener: TcpListener,
     options: ServerOptions,
     registry: Arc<RootOwnerRegistry>,
+    tls: Option<Arc<RpcServerTls>>,
     owner_loss: OwnerLossSignal,
     shutdown: &AtomicBool,
     mut renew_ownership: impl FnMut() -> Result<(), ServerError>,
@@ -309,11 +335,12 @@ fn serve_socket_loop(
                     .set_nonblocking(false)
                     .map_err(ServerError::Connection)?;
                 let registry = Arc::clone(&registry);
+                let tls = tls.clone();
                 thread::Builder::new()
                     .name("nokv-workspace-rpc".to_owned())
                     .spawn(move || {
                         let _permit = permit;
-                        let _ = serve_connection(stream, registry, options);
+                        let _ = serve_connection(stream, registry, options, tls.as_deref());
                     })
                     .map_err(ServerError::Connection)?;
             }
@@ -486,22 +513,20 @@ fn release_ownership(ownership: Vec<ShardOwner>) -> Result<(), ServerError> {
 }
 
 fn serve_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     registry: Arc<RootOwnerRegistry>,
     options: ServerOptions,
+    tls: Option<&RpcServerTls>,
 ) -> Result<(), ServerError> {
     // A response must not wait for the client's delayed ACK of an earlier
     // segment. This runs per connection, not in the accept loop, so a failure
     // closes only this connection.
     stream.set_nodelay(true).map_err(ServerError::Connection)?;
-    if !admit_current_protocol(&mut stream, options.handshake_timeout)? {
+    let Some(mut stream) = admit(stream, options.handshake_timeout, tls)? else {
         return Ok(());
-    }
+    };
     stream
-        .set_read_timeout(Some(options.read_timeout))
-        .map_err(ServerError::Connection)?;
-    stream
-        .set_write_timeout(Some(options.write_timeout))
+        .finish_admission(options.read_timeout, options.write_timeout)
         .map_err(ServerError::Connection)?;
     while let Some(request) = read_frame(&mut stream)? {
         let request = decode_request(&request)?;
@@ -551,12 +576,45 @@ fn encode_response_or_internal_failure(
     }
 }
 
-fn admit_current_protocol(stream: &mut TcpStream, timeout: Duration) -> Result<bool, ServerError> {
+/// Admit one connection, or answer it with a refusal and return `None`. TLS
+/// and the protocol handshake share one deadline.
+fn admit(
+    stream: TcpStream,
+    timeout: Duration,
+    tls: Option<&RpcServerTls>,
+) -> Result<Option<RpcStream>, ServerError> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| ServerError::InvalidOptions("handshake deadline overflows".to_owned()))?;
+    let mut socket = DeadlineSocket {
+        socket: stream,
+        deadline: Some(deadline),
+    };
+    let Some(first) = socket.peek_first_byte().map_err(ServerError::Connection)? else {
+        return Ok(None);
+    };
+    match (tls, opens_tls_record(first)) {
+        (Some(tls), true) => admit_tls(socket, tls),
+        (None, true) => {
+            // A TLS client reads this plaintext answer before parsing records.
+            drain_tls_record(&mut socket).map_err(ServerError::Connection)?;
+            write_handshake(&mut socket, HandshakeKind::TlsUnavailable)?;
+            Ok(None)
+        }
+        (tls, false) => {
+            Ok(admit_plaintext(&mut socket, tls.is_some())?.then_some(RpcStream::Plain(socket)))
+        }
+    }
+}
+
+/// Answer a plaintext first frame. A hello for the current schema is accepted
+/// only when the owner does not require TLS; an older protocol gets its
+/// readable rejection.
+fn admit_plaintext(socket: &mut DeadlineSocket, tls_required: bool) -> Result<bool, ServerError> {
     let mut length = [0_u8; 4];
-    read_exact_until(stream, &mut length, deadline).map_err(ServerError::Connection)?;
+    socket
+        .read_exact(&mut length)
+        .map_err(ServerError::Connection)?;
     let length = usize::try_from(u32::from_be_bytes(length))
         .map_err(|_| ServerError::InvalidOptions("frame length does not fit usize".to_owned()))?;
     if length > MAX_FRAME_BYTES {
@@ -571,104 +629,93 @@ fn admit_current_protocol(stream: &mut TcpStream, timeout: Duration) -> Result<b
 
     if length == HANDSHAKE_PAYLOAD_BYTES {
         let mut payload = [0_u8; HANDSHAKE_PAYLOAD_BYTES];
-        read_exact_until(stream, &mut payload, deadline).map_err(ServerError::Connection)?;
+        socket
+            .read_exact(&mut payload)
+            .map_err(ServerError::Connection)?;
         if has_handshake_magic(&payload) {
             let hello = decode_handshake_payload(&payload)?;
             if hello.kind() != HandshakeKind::ClientHello {
                 return Ok(false);
             }
-            let accepted = hello.operation_schema() == WORKSPACE_PROTOCOL_SCHEMA;
-            let response = WorkspaceHandshake::new(
-                if accepted {
-                    HandshakeKind::Accepted
-                } else {
-                    HandshakeKind::Incompatible
-                },
-                WORKSPACE_PROTOCOL_SCHEMA,
-            )
-            .expect("the compiled workspace protocol schema fits the handshake");
-            write_all_until(stream, &encode_handshake_frame(&response)?, deadline)
-                .map_err(ServerError::Connection)?;
-            return Ok(accepted);
+            let verdict = if hello.operation_schema() != WORKSPACE_PROTOCOL_SCHEMA {
+                HandshakeKind::Incompatible
+            } else if tls_required {
+                HandshakeKind::TlsRequired
+            } else {
+                HandshakeKind::Accepted
+            };
+            write_handshake(socket, verdict)?;
+            return Ok(verdict == HandshakeKind::Accepted);
         }
-        write_legacy_rejection_until(stream, &payload, deadline)?;
+        write_legacy_rejection(socket, &payload)?;
         return Ok(false);
     }
 
     let mut first_frame = vec![0_u8; length];
-    read_exact_until(stream, &mut first_frame, deadline).map_err(ServerError::Connection)?;
-    write_legacy_rejection_until(stream, &first_frame, deadline)?;
+    socket
+        .read_exact(&mut first_frame)
+        .map_err(ServerError::Connection)?;
+    write_legacy_rejection(socket, &first_frame)?;
     Ok(false)
 }
 
-fn write_legacy_rejection_until(
-    stream: &mut TcpStream,
-    first_frame: &[u8],
-    deadline: Instant,
-) -> Result<(), ServerError> {
-    let Some(response) = legacy_rejection_response(first_frame) else {
-        return Ok(());
+/// Complete TLS, then the protocol handshake inside it. A current schema from
+/// a client whose certificate is not a current credential of the tenant gets
+/// `Unauthenticated`. A failure to read the tenant's records closes the
+/// connection unanswered, and the client retries it.
+fn admit_tls(socket: DeadlineSocket, tls: &RpcServerTls) -> Result<Option<RpcStream>, ServerError> {
+    let (mut stream, certificate) = accept_tls(socket, tls)?;
+    let mut hello = [0_u8; HANDSHAKE_FRAME_BYTES];
+    stream
+        .read_exact(&mut hello)
+        .map_err(ServerError::Connection)?;
+    let hello = decode_handshake_frame(&hello)?;
+    if hello.kind() != HandshakeKind::ClientHello {
+        return Ok(None);
+    }
+    let verdict = if hello.operation_schema() != WORKSPACE_PROTOCOL_SCHEMA {
+        HandshakeKind::Incompatible
+    } else {
+        match tls.authenticator.authenticate(&certificate, unix_now()) {
+            Ok(_) => HandshakeKind::Accepted,
+            Err(AuthenticationError::NotACurrentCredential) => HandshakeKind::Unauthenticated,
+            Err(AuthenticationError::Unavailable(error)) => {
+                return Err(ServerError::Control(error))
+            }
+        }
     };
-    write_all_until(stream, &length_prefixed_frame(&response)?, deadline)
+    write_handshake(&mut stream, verdict)?;
+    if verdict != HandshakeKind::Accepted {
+        stream.conn.send_close_notify();
+        stream.flush().map_err(ServerError::Connection)?;
+        return Ok(None);
+    }
+    Ok(Some(RpcStream::Tls(Box::new(stream))))
+}
+
+/// Seconds since the Unix epoch; a clock before it expires every credential.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(u64::MAX, |elapsed| elapsed.as_secs())
+}
+
+fn write_handshake(stream: &mut impl Write, kind: HandshakeKind) -> Result<(), ServerError> {
+    let answer = WorkspaceHandshake::new(kind, WORKSPACE_PROTOCOL_SCHEMA)
+        .expect("the compiled workspace protocol schema fits the handshake");
+    stream
+        .write_all(&encode_handshake_frame(&answer)?)
+        .and_then(|()| stream.flush())
         .map_err(ServerError::Connection)
 }
 
-fn read_exact_until(
-    stream: &mut TcpStream,
-    mut buffer: &mut [u8],
-    deadline: Instant,
-) -> std::io::Result<()> {
-    while !buffer.is_empty() {
-        let remaining = remaining(deadline)?;
-        stream.set_read_timeout(Some(remaining))?;
-        match stream.read(buffer) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "workspace RPC first frame ended early",
-                ));
-            }
-            Ok(read) => buffer = &mut buffer[read..],
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    remaining(deadline).map(|_| ())
-}
-
-fn write_all_until(
-    stream: &mut TcpStream,
-    mut buffer: &[u8],
-    deadline: Instant,
-) -> std::io::Result<()> {
-    while !buffer.is_empty() {
-        let remaining = remaining(deadline)?;
-        stream.set_write_timeout(Some(remaining))?;
-        match stream.write(buffer) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "workspace RPC handshake write made no progress",
-                ));
-            }
-            Ok(written) => buffer = &buffer[written..],
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    remaining(deadline).map(|_| ())
-}
-
-fn remaining(deadline: Instant) -> std::io::Result<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "workspace RPC handshake deadline expired",
-            )
-        })
+fn write_legacy_rejection(stream: &mut impl Write, first_frame: &[u8]) -> Result<(), ServerError> {
+    let Some(response) = legacy_rejection_response(first_frame) else {
+        return Ok(());
+    };
+    stream
+        .write_all(&length_prefixed_frame(&response)?)
+        .map_err(ServerError::Connection)
 }
 
 fn read_frame(reader: &mut impl Read) -> Result<Option<Vec<u8>>, ServerError> {
@@ -927,7 +974,7 @@ mod tests {
         let accepted = server.try_clone().unwrap();
         assert!(!accepted.nodelay().unwrap());
         let (registry, executor) = registry();
-        let serving = thread::spawn(move || serve_connection(server, registry, options()));
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
 
         let hello =
             WorkspaceHandshake::new(HandshakeKind::ClientHello, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
@@ -963,7 +1010,7 @@ mod tests {
     fn exact_handshake_preserves_multiple_operation_frames_on_one_connection() {
         let (mut client, server) = streams();
         let (registry, executor) = registry();
-        let serving = thread::spawn(move || serve_connection(server, registry, options()));
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
 
         let hello =
             WorkspaceHandshake::new(HandshakeKind::ClientHello, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
@@ -997,7 +1044,7 @@ mod tests {
 
         let (mut client, server) = streams();
         let (registry, executor) = registry();
-        let serving = thread::spawn(move || serve_connection(server, registry, options()));
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
 
         let legacy = rmp_serde::to_vec_named(&V3Frame {
             schema: crate::legacy_rejection::LEGACY_V3_SCHEMA,
@@ -1049,7 +1096,7 @@ mod tests {
 
         let (mut client, server) = streams();
         let (registry, executor) = registry();
-        let serving = thread::spawn(move || serve_connection(server, registry, options()));
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
         let operation = request().operation;
         let encoded = rmp_serde::to_vec_named(&V2Frame {
             schema: crate::legacy_rejection::LEGACY_V2_SCHEMA,
@@ -1082,7 +1129,7 @@ mod tests {
     fn v7_hello_gets_v10_incompatible_and_zero_dispatch() {
         let (mut client, server) = streams();
         let (registry, executor) = registry();
-        let serving = thread::spawn(move || serve_connection(server, registry, options()));
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
 
         let hello =
             WorkspaceHandshake::new(HandshakeKind::ClientHello, "nokv.workspace.rpc.v7").unwrap();
@@ -1103,7 +1150,7 @@ mod tests {
     fn matched_but_corrupt_handshake_magic_never_enters_legacy_classification() {
         let (mut client, server) = streams();
         let (registry, executor) = registry();
-        let serving = thread::spawn(move || serve_connection(server, registry, options()));
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
 
         let mut corrupt = [0_u8; HANDSHAKE_PAYLOAD_BYTES];
         corrupt[..8].copy_from_slice(b"NOKVHS1\0");
@@ -1127,7 +1174,7 @@ mod tests {
         let (registry, executor) = registry();
         let (completed_tx, completed_rx) = mpsc::channel();
         let serving = thread::spawn(move || {
-            let result = serve_connection(server, registry, options());
+            let result = serve_connection(server, registry, options(), None);
             completed_tx.send(()).unwrap();
             result
         });
@@ -1158,10 +1205,18 @@ mod tests {
         let (registry, _) = registry();
         let renewals = AtomicUsize::new(0);
 
-        serve_socket_loop(listener, options(), registry, owner_loss, &shutdown, || {
-            renewals.fetch_add(1, AtomicOrdering::SeqCst);
-            Ok(())
-        })
+        serve_socket_loop(
+            listener,
+            options(),
+            registry,
+            None,
+            owner_loss,
+            &shutdown,
+            || {
+                renewals.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            },
+        )
         .unwrap();
 
         assert_eq!(renewals.load(AtomicOrdering::SeqCst), 0);
@@ -1187,6 +1242,7 @@ mod tests {
                 listener,
                 runtime_options,
                 registry,
+                None,
                 owner_loss,
                 worker_shutdown.as_ref(),
                 || {
@@ -1230,9 +1286,15 @@ mod tests {
         owner_loss.fail_closed();
         let (registry, _) = registry();
 
-        let error = serve_socket_loop(listener, options(), registry, owner_loss, &shutdown, || {
-            Ok(())
-        })
+        let error = serve_socket_loop(
+            listener,
+            options(),
+            registry,
+            None,
+            owner_loss,
+            &shutdown,
+            || Ok(()),
+        )
         .unwrap_err();
 
         assert!(error.to_string().contains("owner was lost"));
@@ -1242,7 +1304,7 @@ mod tests {
     fn oversized_legacy_first_frame_closes_before_reading_or_dispatching_its_body() {
         let (mut client, server) = streams();
         let (registry, executor) = registry();
-        let serving = thread::spawn(move || serve_connection(server, registry, options()));
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
 
         client
             .write_all(
@@ -1253,6 +1315,193 @@ mod tests {
             .unwrap();
         assert_eq!(client.read(&mut [0_u8; 1]).unwrap(), 0);
         serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// Open TLS over `client` and offer the current schema; the owner's
+    /// answer, or the TLS or I/O failure that came first.
+    fn tls_hello(
+        client: TcpStream,
+        config: Arc<rustls::ClientConfig>,
+    ) -> (
+        rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+        std::io::Result<HandshakeKind>,
+    ) {
+        let connection =
+            rustls::ClientConnection::new(config, crate::rpc_tls::test_pki::server_name()).unwrap();
+        let mut stream = rustls::StreamOwned::new(connection, client);
+        let hello =
+            WorkspaceHandshake::new(HandshakeKind::ClientHello, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
+        let answer = stream
+            .write_all(&encode_handshake_frame(&hello).unwrap())
+            .and_then(|()| stream.flush())
+            .and_then(|()| {
+                let mut answer = [0_u8; HANDSHAKE_FRAME_BYTES];
+                stream.read_exact(&mut answer)?;
+                Ok(decode_handshake_frame(&answer).unwrap().kind())
+            });
+        (stream, answer)
+    }
+
+    fn tls_options() -> ServerOptions {
+        // Debug-build key exchange alone can exceed the 100 ms test default.
+        ServerOptions {
+            handshake_timeout: Duration::from_secs(5),
+            ..options()
+        }
+    }
+
+    #[test]
+    fn an_authenticated_tls_client_reaches_dispatch() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (client, server) = streams();
+        let (registry, executor) = registry();
+        let serving =
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)));
+
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.registered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        write_frame(&mut stream, &encode_request(&request()).unwrap()).unwrap();
+        let response = decode_response(&read_frame(&mut stream).unwrap().unwrap()).unwrap();
+        assert!(matches!(response.outcome, WorkspaceRpcOutcome::Success(_)));
+        stream.conn.send_close_notify();
+        stream.flush().unwrap();
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_unregistered_certificate_is_unauthenticated_with_zero_dispatch() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (client, server) = streams();
+        let (registry, executor) = registry();
+        let serving =
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)));
+
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.unregistered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Unauthenticated);
+        // The owner ends TLS after its answer and reads nothing more.
+        let mut rest = Vec::new();
+        assert_eq!(stream.read_to_end(&mut rest).unwrap(), 0);
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_tls_client_without_a_certificate_never_reaches_the_protocol() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (client, server) = streams();
+        let (registry, executor) = registry();
+        let serving =
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)));
+
+        let (_, answer) = tls_hello(client, pki.client_config(None));
+        assert!(answer.is_err(), "{answer:?}");
+        assert!(serving.join().unwrap().is_err());
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_plaintext_hello_to_a_tls_owner_is_answered_tls_required() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (mut client, server) = streams();
+        let (registry, executor) = registry();
+        let serving =
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)));
+
+        let hello =
+            WorkspaceHandshake::new(HandshakeKind::ClientHello, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
+        client
+            .write_all(&encode_handshake_frame(&hello).unwrap())
+            .unwrap();
+        let mut answer = [0_u8; HANDSHAKE_FRAME_BYTES];
+        client.read_exact(&mut answer).unwrap();
+        assert_eq!(
+            decode_handshake_frame(&answer).unwrap().kind(),
+            HandshakeKind::TlsRequired
+        );
+        client.shutdown(Shutdown::Write).unwrap();
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn an_older_schema_learns_it_is_incompatible_before_it_learns_about_tls() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (mut client, server) = streams();
+        let (registry, executor) = registry();
+        let serving =
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)));
+
+        let hello =
+            WorkspaceHandshake::new(HandshakeKind::ClientHello, "nokv.workspace.rpc.v14").unwrap();
+        client
+            .write_all(&encode_handshake_frame(&hello).unwrap())
+            .unwrap();
+        let mut answer = [0_u8; HANDSHAKE_FRAME_BYTES];
+        client.read_exact(&mut answer).unwrap();
+        let answer = decode_handshake_frame(&answer).unwrap();
+        assert_eq!(answer.kind(), HandshakeKind::Incompatible);
+        assert_eq!(answer.operation_schema(), WORKSPACE_PROTOCOL_SCHEMA);
+        client.shutdown(Shutdown::Write).unwrap();
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_tls_hello_to_a_plaintext_owner_is_answered_in_plaintext() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let (mut client, server) = streams();
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
+
+        let mut connection = rustls::ClientConnection::new(
+            pki.client_config(Some(&pki.registered)),
+            crate::rpc_tls::test_pki::server_name(),
+        )
+        .unwrap();
+        while connection.wants_write() {
+            connection.write_tls(&mut client).unwrap();
+        }
+        let mut answer = [0_u8; HANDSHAKE_FRAME_BYTES];
+        client.read_exact(&mut answer).unwrap();
+        assert_eq!(
+            decode_handshake_frame(&answer).unwrap().kind(),
+            HandshakeKind::TlsUnavailable
+        );
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_trickling_tls_client_cannot_hold_admission_open() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (mut client, server) = streams();
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || {
+            let started = Instant::now();
+            let result = serve_connection(server, registry, options(), Some(&tls));
+            (result, started.elapsed())
+        });
+
+        // A TLS record header that promises a long record, then one byte at a
+        // time: each read makes progress, the record never completes.
+        client.write_all(&[22, 3, 1, 0x40, 0x00]).unwrap();
+        for _ in 0..100 {
+            thread::sleep(Duration::from_millis(20));
+            if client.write_all(&[0]).is_err() {
+                break;
+            }
+        }
+        let (result, elapsed) = serving.join().unwrap();
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
         assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
     }
 }

@@ -18,6 +18,7 @@ mod recovery_installer;
 mod recovery_publisher;
 mod registry;
 mod request_fingerprint;
+mod rpc_tls;
 mod server;
 mod service;
 #[cfg(test)]
@@ -47,5 +48,6 @@ pub use recovery_publisher::{
     RecoveryPublicationMode, RecoveryPublisher, RecoveryPublisherError, RecoveryPublishingExecutor,
 };
 pub use registry::RootOwnerRegistry;
+pub use rpc_tls::{AuthenticationError, CredentialAuthenticator, RpcServerTls};
 pub use server::{OwnerLossSignal, ServerHealth, ServerOptions, WorkspaceServer};
 pub use service::{ExecutedRequest, WorkspaceRequestExecutor};
