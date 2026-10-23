@@ -32,6 +32,25 @@ pub struct ClientConfig {
     pub max_attempts: u32,
     pub max_artifact_bytes: usize,
     pub object: ObjectConfig,
+    pub tls: Option<ClientTlsConfig>,
+}
+
+/// Workspace RPC over TLS for a command that connects to an owner: PEM
+/// files, and the name the owner's certificate must carry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientTlsConfig {
+    pub server_roots: PathBuf,
+    pub certificate: PathBuf,
+    pub key: PathBuf,
+    pub server_name: String,
+}
+
+/// Workspace RPC over TLS for `serve`: the owner's certificate chain and
+/// private key as PEM files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerTlsConfig {
+    pub certificate: PathBuf,
+    pub key: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +108,7 @@ pub struct ServerConfig {
     pub lifecycle_interval_millis: u64,
     pub append_activity_lease_ms: u64,
     pub recovery_publication: RecoveryPublicationConfig,
+    pub tls: Option<ServerTlsConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -238,6 +258,28 @@ pub(crate) fn role_name(role: Role) -> &'static str {
 }
 
 impl Command {
+    /// Whether this command sends workspace RPC to an owner.
+    pub fn connects_to_owner(&self) -> bool {
+        match self {
+            Self::Workbench { .. }
+            | Self::WorkbenchSession
+            | Self::Mcp { .. }
+            | Self::Materialize { .. }
+            | Self::Collect { .. }
+            | Self::WorkspacePath(_)
+            | Self::OperationStatus { .. }
+            | Self::CommitStatus { .. }
+            | Self::OperationInspect { .. }
+            | Self::OperationRecover { .. } => true,
+            Self::Provision { .. }
+            | Self::Serve
+            | Self::Identity(_)
+            | Self::Schema
+            | Self::Version { .. }
+            | Self::Help => false,
+        }
+    }
+
     /// Whether this invocation may create artifact objects.
     ///
     /// Provider admission proves create semantics with several block-sized
@@ -426,6 +468,7 @@ impl Default for ClientConfig {
             max_attempts: 3,
             max_artifact_bytes: DEFAULT_MAX_ARTIFACT_BYTES,
             object: ObjectConfig::default(),
+            tls: None,
         }
     }
 }
@@ -486,6 +529,7 @@ impl Default for ServerConfig {
             lifecycle_interval_millis: DEFAULT_LIFECYCLE_INTERVAL_MILLIS,
             append_activity_lease_ms: DEFAULT_APPEND_ACTIVITY_LEASE_MS,
             recovery_publication: RecoveryPublicationConfig::LocalOnly,
+            tls: None,
         }
     }
 }
@@ -502,6 +546,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     let mut routing_kind = None;
     let mut agent_id = None;
     let mut workbench_root = None;
+    let mut rpc_tls = RpcTlsArguments::default();
     let command = loop {
         let Some(argument) = arguments.next() else {
             break Command::Help;
@@ -680,6 +725,18 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
                     }
                 };
             }
+            "--rpc-tls-ca" => {
+                rpc_tls.server_roots = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
+            }
+            "--rpc-tls-cert" => {
+                rpc_tls.certificate = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
+            }
+            "--rpc-tls-key" => {
+                rpc_tls.key = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
+            }
+            "--rpc-tls-server-name" => {
+                rpc_tls.server_name = Some(next_value(&mut arguments, &argument)?);
+            }
             "--help" => break Command::Help,
             "--version" => break Command::Version { json: false },
             _ => return Err(CliError::UnknownOption(argument)),
@@ -709,6 +766,11 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     };
     if let Some(argument) = arguments.next() {
         return Err(CliError::UnexpectedArgument(argument));
+    }
+    match rpc_tls.for_command(&command)? {
+        RpcTlsRole::None => {}
+        RpcTlsRole::Client(tls) => client.tls = Some(tls),
+        RpcTlsRole::Server(tls) => server.tls = Some(tls),
     }
     if append_activity_lease_explicit && !matches!(command, Command::Serve) {
         return Err(CliError::UnexpectedArgument(
@@ -781,6 +843,72 @@ fn select_metadata_store(
     }
     *selected = Some(requested);
     Ok(())
+}
+
+/// `--rpc-tls-*` options as given, before the command decides their role.
+#[derive(Default)]
+struct RpcTlsArguments {
+    server_roots: Option<PathBuf>,
+    certificate: Option<PathBuf>,
+    key: Option<PathBuf>,
+    server_name: Option<String>,
+}
+
+enum RpcTlsRole {
+    None,
+    Client(ClientTlsConfig),
+    Server(ServerTlsConfig),
+}
+
+impl RpcTlsArguments {
+    /// A command that connects to an owner needs all four options, `serve`
+    /// its certificate and key only, and any other command none.
+    fn for_command(self, command: &Command) -> Result<RpcTlsRole, CliError> {
+        let given = self.server_roots.is_some()
+            || self.certificate.is_some()
+            || self.key.is_some()
+            || self.server_name.is_some();
+        if !given {
+            return Ok(RpcTlsRole::None);
+        }
+        if matches!(command, Command::Serve) {
+            for (unused, option) in [
+                (self.server_roots.is_some(), "--rpc-tls-ca"),
+                (self.server_name.is_some(), "--rpc-tls-server-name"),
+            ] {
+                if unused {
+                    return Err(CliError::UnexpectedArgument(format!(
+                        "{option} is only valid with commands that connect to an owner"
+                    )));
+                }
+            }
+            return Ok(RpcTlsRole::Server(ServerTlsConfig {
+                certificate: self
+                    .certificate
+                    .ok_or(CliError::MissingOption("--rpc-tls-cert"))?,
+                key: self.key.ok_or(CliError::MissingOption("--rpc-tls-key"))?,
+            }));
+        }
+        if !command.connects_to_owner() {
+            return Err(CliError::UnexpectedArgument(
+                "--rpc-tls-* options are only valid with serve and commands that connect to an \
+                 owner"
+                    .to_owned(),
+            ));
+        }
+        Ok(RpcTlsRole::Client(ClientTlsConfig {
+            server_roots: self
+                .server_roots
+                .ok_or(CliError::MissingOption("--rpc-tls-ca"))?,
+            certificate: self
+                .certificate
+                .ok_or(CliError::MissingOption("--rpc-tls-cert"))?,
+            key: self.key.ok_or(CliError::MissingOption("--rpc-tls-key"))?,
+            server_name: self
+                .server_name
+                .ok_or(CliError::MissingOption("--rpc-tls-server-name"))?,
+        }))
+    }
 }
 
 fn parse_command(
@@ -2319,6 +2447,107 @@ mod tests {
             }
         );
         assert!(matches!(parsed.client.routing, RoutingConfig::Etcd(_)));
+    }
+
+    #[test]
+    fn rpc_tls_options_take_the_role_of_their_command() {
+        let tls = [
+            "--rpc-tls-ca",
+            "ca.pem",
+            "--rpc-tls-cert",
+            "agent.pem",
+            "--rpc-tls-key",
+            "agent.key",
+            "--rpc-tls-server-name",
+            "owner.test",
+        ];
+        let route = ["--agent-id", "44444444444444444444444444444444"];
+        let mut line = route.to_vec();
+        line.extend_from_slice(&tls);
+        line.extend_from_slice(&["operation", "status", "11111111111111111111111111111111"]);
+        let parsed = parse(args(&line)).unwrap();
+        assert_eq!(
+            parsed.client.tls,
+            Some(ClientTlsConfig {
+                server_roots: PathBuf::from("ca.pem"),
+                certificate: PathBuf::from("agent.pem"),
+                key: PathBuf::from("agent.key"),
+                server_name: "owner.test".to_owned(),
+            })
+        );
+        assert_eq!(parsed.server.tls, None);
+
+        let parsed = parse(args(&[
+            "--rpc-tls-cert",
+            "owner.pem",
+            "--rpc-tls-key",
+            "owner.key",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.server.tls,
+            Some(ServerTlsConfig {
+                certificate: PathBuf::from("owner.pem"),
+                key: PathBuf::from("owner.key"),
+            })
+        );
+        assert_eq!(parsed.client.tls, None);
+    }
+
+    #[test]
+    fn rpc_tls_options_must_be_complete_for_their_role() {
+        let route = ["--agent-id", "44444444444444444444444444444444"];
+        let status = ["operation", "status", "11111111111111111111111111111111"];
+        let client = |tls: &[&str]| {
+            let mut line = route.to_vec();
+            line.extend_from_slice(tls);
+            line.extend_from_slice(&status);
+            parse(args(&line)).map(|parsed| parsed.client.tls)
+        };
+        assert_eq!(
+            client(&["--rpc-tls-cert", "agent.pem", "--rpc-tls-key", "agent.key"]),
+            Err(CliError::MissingOption("--rpc-tls-ca"))
+        );
+        assert_eq!(
+            client(&[
+                "--rpc-tls-ca",
+                "ca.pem",
+                "--rpc-tls-cert",
+                "agent.pem",
+                "--rpc-tls-key",
+                "agent.key",
+            ]),
+            Err(CliError::MissingOption("--rpc-tls-server-name"))
+        );
+        assert_eq!(
+            parse(args(&["--rpc-tls-cert", "owner.pem", "serve"])).map(|parsed| parsed.server.tls),
+            Err(CliError::MissingOption("--rpc-tls-key"))
+        );
+        assert!(matches!(
+            parse(args(&[
+                "--rpc-tls-cert",
+                "owner.pem",
+                "--rpc-tls-key",
+                "owner.key",
+                "--rpc-tls-ca",
+                "ca.pem",
+                "serve",
+            ])),
+            Err(CliError::UnexpectedArgument(message)) if message.starts_with("--rpc-tls-ca")
+        ));
+        assert!(matches!(
+            parse(args(&[
+                "--control-dir",
+                "/tmp/nokv-control",
+                "--rpc-tls-cert",
+                "owner.pem",
+                "identity",
+                "show",
+                &"05".repeat(16),
+            ])),
+            Err(CliError::UnexpectedArgument(message)) if message.contains("--rpc-tls-*")
+        ));
     }
 
     #[test]

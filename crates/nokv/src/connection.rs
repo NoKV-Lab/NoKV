@@ -43,6 +43,8 @@ pub enum ConnectionError {
         feature: &'static str,
     },
     StaticControl,
+    /// An `--rpc-tls-*` file or name cannot be used.
+    RpcTls(String),
     Control(nokv_control::ControlError),
     Transport(TransportError),
     Client(ClientError),
@@ -53,14 +55,14 @@ impl ConnectionError {
     /// control state and performs the handshake; it changes nothing.
     pub fn class(&self) -> ErrorClass {
         match self {
-            Self::MissingOption(_) | Self::InvalidIdentity { .. } | Self::StaticControl => {
-                ErrorClass::InvalidInput
-            }
+            Self::MissingOption(_)
+            | Self::InvalidIdentity { .. }
+            | Self::StaticControl
+            | Self::RpcTls(_) => ErrorClass::InvalidInput,
             #[cfg(not(feature = "etcd"))]
             Self::FeatureDisabled { .. } => ErrorClass::InvalidInput,
             Self::Control(error) => error.class(),
-            Self::Transport(error) if error.is_incompatible() => ErrorClass::Incompatible,
-            Self::Transport(_) => ErrorClass::Transient,
+            Self::Transport(error) => error.refusal_class().unwrap_or(ErrorClass::Transient),
             Self::Client(error) => error.class().for_read(),
         }
     }
@@ -82,6 +84,7 @@ impl fmt::Display for ConnectionError {
             Self::StaticControl => formatter.write_str(
                 "static routes have no durable control store; use --etcd-endpoint or --control-dir",
             ),
+            Self::RpcTls(message) => write!(formatter, "cannot configure RPC TLS: {message}"),
             Self::Control(error) => write!(formatter, "cannot open control store: {error}"),
             Self::Transport(error) => write!(formatter, "cannot configure RPC transport: {error}"),
             Self::Client(error) => write!(formatter, "cannot configure workspace client: {error}"),
@@ -95,7 +98,10 @@ impl Error for ConnectionError {
             Self::Control(error) => Some(error),
             Self::Transport(error) => Some(error),
             Self::Client(error) => Some(error),
-            Self::MissingOption(_) | Self::InvalidIdentity { .. } | Self::StaticControl => None,
+            Self::MissingOption(_)
+            | Self::InvalidIdentity { .. }
+            | Self::StaticControl
+            | Self::RpcTls(_) => None,
             #[cfg(not(feature = "etcd"))]
             Self::FeatureDisabled { .. } => None,
         }
@@ -154,7 +160,11 @@ fn workspace_client(
     root_id: RootIdentity,
     routes: Arc<dyn RouteResolver>,
 ) -> Result<CliWorkspaceClient, ConnectionError> {
-    let transport = FramedTcpTransport::new(FramedTcpOptions::default())?;
+    let mut transport = FramedTcpTransport::new(FramedTcpOptions::default())?;
+    if let Some(tls) = &config.tls {
+        transport =
+            transport.with_tls(crate::rpc_tls::client_tls(tls).map_err(ConnectionError::RpcTls)?);
+    }
     WorkspaceClient::new(
         root_id,
         transport,

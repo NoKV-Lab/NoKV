@@ -22,9 +22,11 @@ are explicitly named in a security advisory or release note.
 ## Current Security Boundary
 
 NoKV's metadata service and control-plane endpoints currently assume a trusted
-deployment environment. The current `main` branch does not enforce tenant
-identity, role-based access control, or a live workspace-freeze policy at the
-service boundary. Workbench-root and Agent-scope checks constrain namespace
+deployment environment. The current `main` branch can require TLS 1.3 clients
+whose certificate is a current credential of the owner's tenant, but it does not
+authorize requests by role, does not authenticate control-plane or object-store
+access, and does not enforce a live workspace-freeze policy at the service
+boundary. Workbench-root and Agent-scope checks constrain namespace
 access; they are not a substitute for tenant authentication or authorization.
 
 Deployments must provide network isolation and transport security, protect

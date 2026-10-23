@@ -593,6 +593,14 @@ Credentials use the provider's normal chain or
 `--object-access-key-id`, `--object-secret-access-key`, and optional
 `--object-session-token`; never embed them in Workbench content or manifests.
 
+To carry workspace RPC over TLS 1.3, start the owner with `--rpc-tls-cert` and
+`--rpc-tls-key`, and give each client `--rpc-tls-ca`, `--rpc-tls-cert`,
+`--rpc-tls-key`, and `--rpc-tls-server-name`. The owner then admits only
+clients whose certificate is a current credential of the tenant bound to its
+roots (`nokv identity`). An authenticated client is not yet limited by its
+roles, and the control plane and object store still need a trusted network.
+The Python SDK cannot yet connect to an owner that requires TLS.
+
 ## Architecture and Ownership
 
 ```text
