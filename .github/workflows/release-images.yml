@@ -15,7 +15,7 @@ on:
       rust_version:
         description: "Rust toolchain image version"
         required: true
-        default: "1.88"
+        default: "1.91"
       debian_version:
         description: "Debian image version"
         required: true
