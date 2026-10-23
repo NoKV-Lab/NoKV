@@ -12,6 +12,7 @@
 mod client;
 mod local_adapter;
 mod object_store;
+mod python_error;
 mod python_value;
 mod routing;
 
@@ -56,6 +57,9 @@ mod tests {
                 "rename",
                 "publish_bytes",
                 "publish_file",
+                "put_bytes",
+                "append_bytes",
+                "operation_status",
                 "read",
                 "read_range",
                 "read_ranges_batch",
