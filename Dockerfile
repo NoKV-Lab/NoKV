@@ -3,7 +3,7 @@
 
 # syntax=docker/dockerfile:1
 
-ARG RUST_VERSION=1.88
+ARG RUST_VERSION=1.91
 ARG DEBIAN_VERSION=bookworm
 ARG NOKV_PACKAGE=nokv
 ARG NOKV_BINARY=nokv
