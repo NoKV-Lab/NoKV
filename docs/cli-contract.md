@@ -119,7 +119,8 @@ or the append states) with its `next_action`, and a succeeded operation
 carries its stored `receipt`: the original result, not a re-evaluation of
 current state. Over RPC TLS a result also names `initiator`, the principal
 that began the operation, as 32 lowercase hex characters; it is `null` on a
-plaintext deployment. An absent operation is `not_found` with `resubmit_same`: absence
+plaintext deployment. The Python SDK's `operation_status` reports the same
+fields. An absent operation is `not_found` with `resubmit_same`: absence
 is a point-in-time observation, and resubmitting the same command admits it at
 most once.
 
