@@ -17,7 +17,7 @@ use nokv_meta_store::{
 };
 use nokv_types::{
     CommandDigest, CommitVersion, LogicalShardId, ObjectNamespaceId, OwnerEpoch,
-    PlacementGeneration, ReadVersion, RequestId, RootActivationState, RootId,
+    PlacementGeneration, PrincipalId, ReadVersion, RequestId, RootActivationState, RootId,
 };
 use sha2::{Digest, Sha256};
 
@@ -199,6 +199,9 @@ pub struct MetadataCommand {
     pub placement_generation: PlacementGeneration,
     pub owner_epoch: OwnerEpoch,
     pub request_id: RequestId,
+    /// The principal whose request produced this command, when one was
+    /// authenticated; recorded for audit and bound by the digest.
+    pub initiator: Option<PrincipalId>,
     pub command_digest: CommandDigest,
     pub read_version: ReadVersion,
     pub root_fence_action: RootFenceAction,
@@ -217,7 +220,7 @@ impl MetadataCommand {
 
     pub fn canonical_digest(&self) -> CommandDigest {
         let mut hasher = Sha256::new();
-        hasher.update(b"nokv.metadata.command.v1\0");
+        hasher.update(b"nokv.metadata.command.v2\0");
         hash_bytes(&mut hasher, self.schema_id.as_bytes());
         hasher.update(self.root_id.as_bytes());
         hasher.update(self.logical_shard_id.as_bytes());
@@ -227,6 +230,13 @@ impl MetadataCommand {
         hasher.update(self.placement_generation.get().to_be_bytes());
         hasher.update(self.owner_epoch.get().to_be_bytes());
         hasher.update(self.request_id.as_bytes());
+        match self.initiator {
+            None => hasher.update([0]),
+            Some(initiator) => {
+                hasher.update([1]);
+                hasher.update(initiator.as_bytes());
+            }
+        }
         hasher.update(self.read_version.get().to_be_bytes());
         match self.root_fence_action {
             RootFenceAction::Install => hasher.update([1]),
@@ -4570,6 +4580,7 @@ mod tests {
         action: RootFenceAction,
     ) -> MetadataCommand {
         MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(2),
             logical_shard_id: shard(1),
@@ -4650,6 +4661,7 @@ mod tests {
         command.deterministic_result = b"created".to_vec();
         command.event_projection.push(EventProjection {
             payload: ChangeEventRecord {
+                initiator: None,
                 workbench_id: nokv_types::WorkbenchId::new("engine-event").unwrap(),
                 workspace_incarnation_id: nokv_types::WorkspaceIncarnationId::from_bytes([3; 16]),
                 kind: ChangeEventKind::WorkspaceCreated,
@@ -6131,6 +6143,17 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(results[0].commit_version, results[1].commit_version);
         assert_eq!(results.iter().filter(|result| result.replayed).count(), 1);
+    }
+
+    #[test]
+    fn the_command_digest_binds_the_initiator() {
+        let store = ready_store();
+        let anonymous = base_command(&store, request(1), RootFenceAction::RequireActive);
+        let mut attributed = anonymous.clone();
+        attributed.initiator = Some(nokv_types::PrincipalId::from_bytes([0xa1; 16]));
+        assert_ne!(anonymous.canonical_digest(), attributed.canonical_digest());
+        let sealed = attributed.clone().seal();
+        assert_eq!(sealed.command_digest, attributed.canonical_digest());
     }
 
     #[test]

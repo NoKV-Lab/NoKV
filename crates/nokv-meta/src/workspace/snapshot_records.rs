@@ -8,14 +8,16 @@
 use std::fmt;
 
 use nokv_types::{
-    CommitId, ConsumerEpoch, Generation, HistoryHoldState, ReadVersion, SnapshotAliasName,
-    SnapshotId, SnapshotState,
+    CommitId, ConsumerEpoch, Generation, HistoryHoldState, PrincipalId, ReadVersion,
+    SnapshotAliasName, SnapshotId, SnapshotState,
 };
 
-/// Current value format for snapshot refs. Version 1 remains readable so
+/// Current value format for snapshot refs. Version 3 records the minting
+/// principal; version 2 added the source commit. Version 1 remains readable so
 /// legacy leased snapshots can be renewed or retired without inventing commit
 /// provenance.
-pub const SNAPSHOT_VALUE_FORMAT_VERSION: u8 = 2;
+pub const SNAPSHOT_VALUE_FORMAT_VERSION: u8 = 3;
+const PREVIOUS_SNAPSHOT_REF_VALUE_FORMAT_VERSION: u8 = 2;
 const LEGACY_SNAPSHOT_REF_VALUE_FORMAT_VERSION: u8 = 1;
 const SNAPSHOT_AUXILIARY_VALUE_FORMAT_VERSION: u8 = 1;
 
@@ -44,6 +46,8 @@ pub struct SnapshotRefRecord {
     /// Canonical, typed facade annotation supplied by an explicit retire.
     /// Automatic expiry/reaping never manufactures this presentation data.
     pub retire_annotation: Option<Vec<u8>>,
+    /// The authenticated principal that minted the snapshot.
+    pub initiator: Option<PrincipalId>,
 }
 
 /// Latest-mint-wins resolution for one exact snapshot alias.
@@ -198,6 +202,7 @@ impl SnapshotRefRecord {
             self.retire_annotation.as_deref(),
             MAX_SNAPSHOT_RETIRE_ANNOTATION_BYTES,
         )?;
+        put_optional_principal(&mut encoded, self.initiator);
         Ok(encoded)
     }
 
@@ -206,7 +211,9 @@ impl SnapshotRefRecord {
         let value_version = decoder.u8("value_format_version")?;
         if !matches!(
             value_version,
-            LEGACY_SNAPSHOT_REF_VALUE_FORMAT_VERSION | SNAPSHOT_VALUE_FORMAT_VERSION
+            LEGACY_SNAPSHOT_REF_VALUE_FORMAT_VERSION
+                | PREVIOUS_SNAPSHOT_REF_VALUE_FORMAT_VERSION
+                | SNAPSHOT_VALUE_FORMAT_VERSION
         ) {
             return Err(SnapshotRecordError::UnsupportedValueVersion {
                 actual: value_version,
@@ -214,7 +221,7 @@ impl SnapshotRefRecord {
             });
         }
         let read_version = decoder.read_version("read_version")?;
-        let source_commit_id = if value_version == SNAPSHOT_VALUE_FORMAT_VERSION {
+        let source_commit_id = if value_version >= PREVIOUS_SNAPSHOT_REF_VALUE_FORMAT_VERSION {
             decoder.optional_commit_id("source_commit_id")?
         } else {
             None
@@ -227,6 +234,11 @@ impl SnapshotRefRecord {
         let annotation = decoder.bounded_bytes("annotation", MAX_SNAPSHOT_ANNOTATION_BYTES)?;
         let retire_annotation = decoder
             .optional_bounded_bytes("retire_annotation", MAX_SNAPSHOT_RETIRE_ANNOTATION_BYTES)?;
+        let initiator = if value_version == SNAPSHOT_VALUE_FORMAT_VERSION {
+            decoder.optional_principal("initiator")?
+        } else {
+            None
+        };
         decoder.finish()?;
         let record = Self {
             read_version,
@@ -238,6 +250,7 @@ impl SnapshotRefRecord {
             consumer_epoch,
             annotation,
             retire_annotation,
+            initiator,
         };
         record.validate()?;
         Ok(record)
@@ -354,6 +367,16 @@ fn put_optional_alias(encoded: &mut Vec<u8>, alias: Option<&SnapshotAliasName>) 
     }
 }
 
+fn put_optional_principal(encoded: &mut Vec<u8>, principal: Option<PrincipalId>) {
+    match principal {
+        None => encoded.push(0),
+        Some(principal) => {
+            encoded.push(1);
+            encoded.extend_from_slice(principal.as_bytes());
+        }
+    }
+}
+
 fn put_optional_commit_id(encoded: &mut Vec<u8>, commit_id: Option<CommitId>) {
     match commit_id {
         None => encoded.push(0),
@@ -422,6 +445,17 @@ impl<'a> Decoder<'a> {
             Ok(())
         } else {
             Err(SnapshotRecordError::UnsupportedValueVersion { actual, expected })
+        }
+    }
+
+    fn optional_principal(
+        &mut self,
+        field: &'static str,
+    ) -> Result<Option<PrincipalId>, SnapshotRecordError> {
+        match self.u8(field)? {
+            0 => Ok(None),
+            1 => Ok(Some(PrincipalId::from_bytes(self.fixed(field)?))),
+            value => Err(SnapshotRecordError::InvalidOptionalTag { field, value }),
         }
     }
 
@@ -550,6 +584,7 @@ mod tests {
     #[test]
     fn snapshot_ref_round_trip_and_strict_envelope() {
         let record = SnapshotRefRecord {
+            initiator: None,
             read_version: read_version(9),
             source_commit_id: Some(nokv_types::CommitId::from_bytes([0x5a; 32])),
             alias: Some(SnapshotAliasName::new("handoff").unwrap()),
@@ -628,6 +663,7 @@ mod tests {
     #[test]
     fn terminal_snapshot_cannot_retain_consumers() {
         let record = SnapshotRefRecord {
+            initiator: None,
             read_version: read_version(1),
             source_commit_id: Some(nokv_types::CommitId::from_bytes([0x11; 32])),
             alias: None,
@@ -650,6 +686,7 @@ mod tests {
     fn retire_annotation_is_durable_only_for_explicit_retirement() {
         let annotation = br#"{"metadata":null,"reason":"done"}"#.to_vec();
         let retired = SnapshotRefRecord {
+            initiator: None,
             read_version: read_version(1),
             source_commit_id: Some(nokv_types::CommitId::from_bytes([0x22; 32])),
             alias: None,
@@ -694,7 +731,7 @@ mod tests {
         assert_eq!(decoded.read_version, read_version(9));
         assert_eq!(decoded.source_commit_id, None);
         let mut current = decoded.encode().unwrap();
-        assert_eq!(current[0], 2);
+        assert_eq!(current[0], 3);
         current[1 + 8 + 1 + 1 + 8] = 0xff;
         assert_eq!(
             SnapshotRefRecord::decode(&current),
@@ -705,12 +742,12 @@ mod tests {
         );
 
         let mut unknown = encoded;
-        unknown[0] = 3;
+        unknown[0] = 4;
         assert_eq!(
             SnapshotRefRecord::decode(&unknown),
             Err(SnapshotRecordError::UnsupportedValueVersion {
-                actual: 3,
-                expected: 2,
+                actual: 4,
+                expected: 3,
             })
         );
     }

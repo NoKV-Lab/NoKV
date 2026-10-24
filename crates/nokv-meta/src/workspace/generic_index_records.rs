@@ -10,7 +10,7 @@ use std::fmt;
 use nokv_types::{
     ArtifactRevisionId, CommandDigest, CommitId, CommitVersion, Generation,
     GenericIndexGenerationId, GenericIndexGenerationState, GenericIndexReferenceKind,
-    GenericIndexRegistrationPhase, NormalizedRelativePath, OperationId, ReadVersion,
+    GenericIndexRegistrationPhase, NormalizedRelativePath, OperationId, PrincipalId, ReadVersion,
     ReferenceEpoch, WorkspaceIncarnationId, FIXED_ID_BYTES, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
@@ -21,6 +21,9 @@ use super::query_records::{
 
 /// Only supported value format for Generic index records.
 pub const GENERIC_INDEX_VALUE_FORMAT_VERSION: u8 = 1;
+/// Only supported value format for the registration operation record.
+/// Version 2 records the initiating principal.
+pub const GENERIC_INDEX_REGISTRATION_OPERATION_VALUE_FORMAT_VERSION: u8 = 2;
 /// Maximum fields declared by one Generic index catalog.
 pub const MAX_GENERIC_INDEX_FIELDS: usize = 60;
 /// Maximum values retained for one field in one row.
@@ -216,6 +219,9 @@ pub struct GenericIndexRegistrationOperationRecord {
     pub phase: GenericIndexRegistrationPhase,
     pub published_pointer_generation: Option<Generation>,
     pub terminal_error: Option<String>,
+    /// The authenticated principal that began the registration; part of its
+    /// request digest, so another principal cannot replay or continue it.
+    pub initiator: Option<PrincipalId>,
 }
 
 /// Commit-owned strong reference to one exact Generic index generation.
@@ -863,7 +869,7 @@ impl GenericIndexRegistrationOperationRecord {
 
     pub fn encode(&self) -> Result<Vec<u8>, GenericIndexRecordError> {
         self.validate()?;
-        let mut encoded = vec![GENERIC_INDEX_VALUE_FORMAT_VERSION];
+        let mut encoded = vec![GENERIC_INDEX_REGISTRATION_OPERATION_VALUE_FORMAT_VERSION];
         encoded.extend_from_slice(self.workspace_incarnation_id.as_bytes());
         put_optional_path(&mut encoded, self.index_path.as_ref())?;
         encoded.extend_from_slice(self.generation_id.as_bytes());
@@ -883,12 +889,13 @@ impl GenericIndexRegistrationOperationRecord {
             self.terminal_error.as_deref(),
             MAX_GENERIC_INDEX_TERMINAL_ERROR_BYTES,
         )?;
+        put_optional_principal(&mut encoded, self.initiator);
         Ok(encoded)
     }
 
     pub fn decode(encoded: &[u8]) -> Result<Self, GenericIndexRecordError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_version()?;
+        decoder.require_version_of(GENERIC_INDEX_REGISTRATION_OPERATION_VALUE_FORMAT_VERSION)?;
         let workspace_incarnation_id =
             WorkspaceIncarnationId::from_bytes(decoder.fixed("workspace_incarnation_id")?);
         let index_path = decoder.optional_path()?;
@@ -918,6 +925,7 @@ impl GenericIndexRegistrationOperationRecord {
             decoder.optional_generation("published_pointer_generation")?;
         let terminal_error =
             decoder.optional_string("terminal_error", MAX_GENERIC_INDEX_TERMINAL_ERROR_BYTES)?;
+        let initiator = decoder.optional_principal("initiator")?;
         decoder.finish()?;
         let record = Self {
             workspace_incarnation_id,
@@ -934,6 +942,7 @@ impl GenericIndexRegistrationOperationRecord {
             phase,
             published_pointer_generation,
             terminal_error,
+            initiator,
         };
         record.validate()?;
         ensure_canonical(encoded, record.encode()?)?;
@@ -1407,6 +1416,16 @@ fn put_optional_path(
     Ok(())
 }
 
+fn put_optional_principal(encoded: &mut Vec<u8>, principal: Option<PrincipalId>) {
+    match principal {
+        None => encoded.push(0),
+        Some(principal) => {
+            encoded.push(1);
+            encoded.extend_from_slice(principal.as_bytes());
+        }
+    }
+}
+
 fn put_optional_generation(encoded: &mut Vec<u8>, generation: Option<Generation>) {
     match generation {
         None => encoded.push(0),
@@ -1585,14 +1604,26 @@ impl<'a> Decoder<'a> {
     }
 
     fn require_version(&mut self) -> Result<(), GenericIndexRecordError> {
+        self.require_version_of(GENERIC_INDEX_VALUE_FORMAT_VERSION)
+    }
+
+    fn require_version_of(&mut self, expected: u8) -> Result<(), GenericIndexRecordError> {
         let actual = self.u8("value_format_version")?;
-        if actual == GENERIC_INDEX_VALUE_FORMAT_VERSION {
+        if actual == expected {
             Ok(())
         } else {
-            Err(GenericIndexRecordError::UnsupportedValueVersion {
-                actual,
-                expected: GENERIC_INDEX_VALUE_FORMAT_VERSION,
-            })
+            Err(GenericIndexRecordError::UnsupportedValueVersion { actual, expected })
+        }
+    }
+
+    fn optional_principal(
+        &mut self,
+        field: &'static str,
+    ) -> Result<Option<PrincipalId>, GenericIndexRecordError> {
+        match self.u8(field)? {
+            0 => Ok(None),
+            1 => Ok(Some(PrincipalId::from_bytes(self.fixed(field)?))),
+            value => Err(GenericIndexRecordError::InvalidOptionalTag { field, value }),
         }
     }
 
@@ -1907,6 +1938,7 @@ mod tests {
 
     fn operation() -> GenericIndexRegistrationOperationRecord {
         GenericIndexRegistrationOperationRecord {
+            initiator: None,
             workspace_incarnation_id: WorkspaceIncarnationId::from_bytes([1; FIXED_ID_BYTES]),
             index_path: Some(NormalizedRelativePath::new("outputs/runs").unwrap()),
             generation_id: GenericIndexGenerationId::from_bytes([2; FIXED_ID_BYTES]),
@@ -1929,7 +1961,7 @@ mod tests {
         decode: fn(&[u8]) -> Result<T, GenericIndexRecordError>,
     ) {
         let mut future = encoded.clone();
-        future[0] = GENERIC_INDEX_VALUE_FORMAT_VERSION + 1;
+        future[0] = encoded[0] + 1;
         assert!(matches!(
             decode(&future),
             Err(GenericIndexRecordError::UnsupportedValueVersion { .. })
@@ -2396,7 +2428,7 @@ mod tests {
         appending.phase = GenericIndexRegistrationPhase::Appending;
         appending.published_pointer_generation = None;
         let mut unknown_registration_phase = appending.encode().unwrap();
-        let phase_offset = unknown_registration_phase.len() - 3;
+        let phase_offset = unknown_registration_phase.len() - 4;
         unknown_registration_phase[phase_offset] = 0xff;
         assert!(matches!(
             GenericIndexRegistrationOperationRecord::decode(&unknown_registration_phase),

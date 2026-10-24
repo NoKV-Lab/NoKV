@@ -15,16 +15,17 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use nokv_types::{
-    ArtifactRevisionId, CommitId, Generation, NormalizedRelativePath, OperationId, RootId,
-    WorkbenchId, WorkspaceIncarnationId, FIXED_ID_BYTES, SHA256_BYTES,
+    ArtifactRevisionId, CommitId, Generation, NormalizedRelativePath, OperationId, PrincipalId,
+    RootId, WorkbenchId, WorkspaceIncarnationId, FIXED_ID_BYTES, SHA256_BYTES,
 };
 
 use super::codec::{push_ordered_path_components, PATH_EXACT_TERMINATOR};
 
 /// Only supported typed-query payload format.
 pub const QUERY_RECORD_VALUE_FORMAT_VERSION: u8 = 1;
-/// Only supported durable change-event payload format.
-pub const CHANGE_EVENT_VALUE_FORMAT_VERSION: u8 = 2;
+/// Only supported durable change-event payload format. Version 3 records the
+/// principal whose request produced the event.
+pub const CHANGE_EVENT_VALUE_FORMAT_VERSION: u8 = 3;
 /// Maximum number of fields in one path projection.
 pub const MAX_TYPED_PROJECTION_FIELDS: usize = 60;
 /// Maximum encoded path projection size.
@@ -441,6 +442,9 @@ pub struct ChangeEventRecord {
     pub path: Option<NormalizedRelativePath>,
     pub before: TypedProjection,
     pub after: TypedProjection,
+    /// The authenticated principal whose request produced the event; none on
+    /// a trusted deployment or for the owner's own work.
+    pub initiator: Option<PrincipalId>,
 }
 
 impl ChangeEventRecord {
@@ -475,6 +479,10 @@ impl ChangeEventRecord {
         }
         put_bytes(&mut encoded, "before", &before)?;
         put_bytes(&mut encoded, "after", &after)?;
+        put_optional_fixed(
+            &mut encoded,
+            self.initiator.as_ref().map(PrincipalId::as_bytes),
+        );
         Ok(encoded)
     }
 
@@ -526,6 +534,9 @@ impl ChangeEventRecord {
         };
         let before = TypedProjection::decode(decoder.bytes("before", MAX_TYPED_PROJECTION_BYTES)?)?;
         let after = TypedProjection::decode(decoder.bytes("after", MAX_TYPED_PROJECTION_BYTES)?)?;
+        let initiator = decoder
+            .optional_fixed::<FIXED_ID_BYTES>("initiator")?
+            .map(PrincipalId::from_bytes);
         decoder.finish()?;
         let record = Self {
             workbench_id,
@@ -537,6 +548,7 @@ impl ChangeEventRecord {
             path,
             before,
             after,
+            initiator,
         };
         if record.encode()? != encoded {
             return Err(QueryRecordError::NonCanonicalEncoding);
@@ -1163,6 +1175,7 @@ mod tests {
         assert_eq!(SecondaryIndexRecord::decode(&index_bytes).unwrap(), index);
 
         let golden_event = ChangeEventRecord {
+            initiator: None,
             workbench_id: WorkbenchId::new("wb").unwrap(),
             workspace_incarnation_id: WorkspaceIncarnationId::from_bytes([7; FIXED_ID_BYTES]),
             kind: ChangeEventKind::WorkspaceCreated,
@@ -1183,6 +1196,7 @@ mod tests {
             &[QUERY_RECORD_VALUE_FORMAT_VERSION, 0, 0],
             &3_u32.to_be_bytes(),
             &[QUERY_RECORD_VALUE_FORMAT_VERSION, 0, 0],
+            &[0],
         ]
         .concat();
         assert_eq!(golden_event.encode().unwrap(), golden);
@@ -1204,6 +1218,7 @@ mod tests {
         ));
 
         let event = ChangeEventRecord {
+            initiator: None,
             workbench_id: WorkbenchId::new("agent-run").unwrap(),
             workspace_incarnation_id: WorkspaceIncarnationId::from_bytes([7; FIXED_ID_BYTES]),
             kind: ChangeEventKind::ArtifactPublished,

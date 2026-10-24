@@ -4,7 +4,7 @@
  */
 
 use nokv_protocol::{ArtifactRevisionIdentity, WorkspaceResult, WorkspaceRpcRequest};
-use nokv_server::WorkspaceRequestExecutor;
+use nokv_server::{RequestAuthority, WorkspaceRequestExecutor};
 use serde::Serialize;
 
 use super::fixture::{fixed_id, is_direct_fixture_path, Harness, EMPTY_SHA256_URI};
@@ -84,7 +84,7 @@ impl Harness {
     ) -> Result<serde_json::Value, String> {
         let outcome = self
             .executor
-            .execute(request)
+            .execute(request, RequestAuthority::TRUSTED)
             .map_err(|failure| format!("existing exact get failed: {failure:?}"))?;
         let WorkspaceResult::Path(path) = outcome.result else {
             return Err("existing exact get returned the wrong result variant".to_owned());

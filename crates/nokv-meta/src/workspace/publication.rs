@@ -14,8 +14,8 @@ use std::fmt;
 use nokv_types::{
     ArtifactRevisionId, BuildCommitPhase, CommandDigest, CommitVersion, GcClaimState, Generation,
     LogicalShardId, ObjectNamespaceId, OperationId, OperationKind, OwnerEpoch, PlacementGeneration,
-    PublishPhase, ReadVersion, ReferenceEpoch, RequestId, RestorePhase, RevisionState, RootId,
-    StagedCleanupState, StagedProviderState, WorkspaceRevision, WorkspaceState,
+    PrincipalId, PublishPhase, ReadVersion, ReferenceEpoch, RequestId, RestorePhase, RevisionState,
+    RootId, StagedCleanupState, StagedProviderState, WorkspaceRevision, WorkspaceState,
     MAX_INLINE_ARTIFACT_BODY_BYTES, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
@@ -38,6 +38,7 @@ use super::engine::{
 };
 use super::event_projection::change_event_projection;
 use super::keyspace::MetadataFamily;
+use super::namespace::WriteAuthority;
 use super::publication_records::{
     ArtifactInlineBodyRecord, ArtifactRevisionClaimRecord, ArtifactRevisionRecord,
     GcCandidateRecord, PathEntry, PublicationRecordCodecError, RevisionRefRecord, WorkspaceRecord,
@@ -114,6 +115,7 @@ pub struct PublicationContext {
     pub request_id: RequestId,
     /// Exact current metadata clock observed before command construction.
     pub read_version: ReadVersion,
+    pub authority: WriteAuthority,
 }
 
 /// Atomic creation of one empty publish operation.
@@ -1335,10 +1337,21 @@ fn next_generation(
     .map_err(|_| PublicationError::PathGenerationOverflow)
 }
 
+fn hash_initiator(hasher: &mut Sha256, initiator: Option<PrincipalId>) {
+    match initiator {
+        None => hasher.update([0]),
+        Some(initiator) => {
+            hasher.update([1]);
+            hasher.update(initiator.as_bytes());
+        }
+    }
+}
+
 fn publish_identity_digest(operation: &PublishOperationRecord) -> [u8; SHA256_BYTES] {
     let mut hasher = Sha256::new();
-    hasher.update(b"nokv.publish.operation.identity.v5\0");
+    hasher.update(b"nokv.publish.operation.identity.v6\0");
     hasher.update(operation.operation_id.as_bytes());
+    hash_initiator(&mut hasher, operation.initiator);
     match operation.append_intent_digest {
         Some(digest) => {
             hasher.update([1]);
@@ -1409,7 +1422,8 @@ fn publish_identity_digest(operation: &PublishOperationRecord) -> [u8; SHA256_BY
 
 fn publish_initialization_digest(operation: &PublishOperationRecord) -> [u8; SHA256_BYTES] {
     let mut hasher = Sha256::new();
-    hasher.update(b"nokv.publish.operation.initialization.v6\0");
+    hasher.update(b"nokv.publish.operation.initialization.v7\0");
+    hash_initiator(&mut hasher, operation.initiator);
     match operation.append_intent_digest {
         Some(digest) => {
             hasher.update([1]);
@@ -3307,6 +3321,7 @@ impl PublicationService<'_> {
         self.synchronize_active_publication(context, &operation, &mut plan)?;
         plan.validate_bounds()?;
         let command = MetadataCommand {
+            initiator: context.authority.initiator,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: context.root_id,
             logical_shard_id: context.logical_shard_id,
@@ -3926,6 +3941,7 @@ impl PublicationService<'_> {
             publication_operation_id: operation.operation_id,
             artifact_revision_id: operation.artifact_revision_id,
             result: None,
+            initiator: operation.initiator,
         };
         match self.read_payload(context, MetadataFamily::Operation, &key)? {
             None => {
@@ -4121,6 +4137,7 @@ impl PublicationService<'_> {
         }
         plan.validate_bounds()?;
         Ok(MetadataCommand {
+            initiator: context.authority.initiator,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: context.root_id,
             logical_shard_id: context.logical_shard_id,
@@ -4708,6 +4725,7 @@ impl PublicationService<'_> {
         ) {
             plan.events
                 .push(change_event_projection(&ChangeEventRecord {
+                    initiator: request.context.authority.initiator,
                     workbench_id: request.expected_operation.workbench_id.clone(),
                     workspace_incarnation_id: request.expected_operation.workspace_incarnation_id,
                     kind: ChangeEventKind::ArtifactPublished,
@@ -5129,6 +5147,7 @@ mod tests {
         action: RootFenceAction,
     ) -> MetadataCommand {
         MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
@@ -5247,6 +5266,7 @@ mod tests {
         owner_epoch: OwnerEpoch,
     ) -> PublicationContext {
         PublicationContext {
+            authority: WriteAuthority::TRUSTED,
             root_id: root(),
             logical_shard_id: shard(),
             object_namespace_id: ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
@@ -5263,6 +5283,7 @@ mod tests {
         read_version: ReadVersion,
     ) -> PublicationContext {
         PublicationContext {
+            authority: WriteAuthority::TRUSTED,
             root_id: root(),
             logical_shard_id: shard(),
             object_namespace_id: ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
@@ -5346,6 +5367,7 @@ mod tests {
     ) -> PublishOperationRecord {
         let dependencies = Vec::new();
         let mut operation = PublishOperationRecord {
+            initiator: None,
             append_attempt: None,
             append_intent_digest: None,
             operation_id,
@@ -5439,6 +5461,7 @@ mod tests {
         identity_digest[..OperationId::BYTE_WIDTH].copy_from_slice(restore_operation_id.as_bytes());
         let binding = restore_destination_binding();
         let record = RestoreOperationRecord {
+            initiator: None,
             operation_id: restore_operation_id,
             identity_digest,
             initialization_digest: None,
@@ -5562,6 +5585,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: None,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -5602,6 +5626,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: None,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -5636,6 +5661,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: None,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -5676,6 +5702,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: None,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -5717,6 +5744,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: None,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -7925,6 +7953,7 @@ mod tests {
             store
                 .execute(
                     &MetadataCommand {
+                        initiator: None,
                         schema_id: SCHEMA_ID.to_owned(),
                         root_id: root(),
                         logical_shard_id: shard(),
@@ -9079,7 +9108,7 @@ mod tests {
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
         // The 8-byte retry epoch occurs in the operation check, mutation,
         // history value and dedupe result, plus their recovery-command copies.
-        assert_eq!(replace_bytes, 11_799_855);
+        assert_eq!(replace_bytes, 11_799_866);
         assert!(replace_bytes < super::super::store_limits().max_transaction_bytes);
 
         let removed = remove_path(
@@ -9104,7 +9133,7 @@ mod tests {
         assert_eq!(removed.removed_artifact_revision_id, revision(216));
         let remove_bytes =
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
-        assert_eq!(remove_bytes, 11_793_075);
+        assert_eq!(remove_bytes, 11_793_078);
     }
 
     #[test]
@@ -9282,6 +9311,7 @@ mod tests {
             .keys()
             .all(|field| !next_projection.fields().contains_key(field)));
         let event = ChangeEventRecord {
+            initiator: None,
             workbench_id: workbench(),
             workspace_incarnation_id: incarnation(9),
             kind: ChangeEventKind::ArtifactPublished,
@@ -9294,10 +9324,11 @@ mod tests {
         }
         .encode()
         .unwrap();
-        assert_eq!(event.len(), 61_323);
+        assert_eq!(event.len(), 61_324);
         let oversized_before = budget_projection_with_prefix("oldmax", 489);
         let oversized_after = budget_projection_with_prefix("newmax", 489);
         let oversized_event = ChangeEventRecord {
+            initiator: None,
             workbench_id: workbench(),
             workspace_incarnation_id: incarnation(9),
             kind: ChangeEventKind::ArtifactPublished,
@@ -9310,7 +9341,7 @@ mod tests {
         }
         .encode()
         .unwrap();
-        assert_eq!(oversized_event.len(), 61_443);
+        assert_eq!(oversized_event.len(), 61_444);
         assert!(event.len() <= 60 * 1024);
         assert!(oversized_event.len() > 60 * 1024);
         publish_full_with_projection(
@@ -9341,7 +9372,7 @@ mod tests {
 
         assert_eq!(
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes),
-            9_861_128
+            9_861_139
         );
     }
 
@@ -10416,6 +10447,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: None,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -10628,6 +10660,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: None,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),

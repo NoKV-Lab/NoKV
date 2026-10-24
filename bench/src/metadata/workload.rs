@@ -9,7 +9,7 @@ use nokv_protocol::{
     ErrorCode, GetPathRequest, ListPathsRequest, PageRequest, RelativePath, RequestIdentity,
     WorkspacePath, WorkspaceReadView, WorkspaceRequest, WorkspaceResult, WorkspaceRpcRequest,
 };
-use nokv_server::WorkspaceRequestExecutor;
+use nokv_server::{RequestAuthority, WorkspaceRequestExecutor};
 
 pub(super) struct PreparedPages {
     pub(super) first: WorkspaceRpcRequest,
@@ -130,7 +130,7 @@ impl Harness {
     ) -> Result<u64, String> {
         let outcome = self
             .executor
-            .execute(request)
+            .execute(request, RequestAuthority::TRUSTED)
             .map_err(|failure| format!("existing exact get failed: {failure:?}"))?;
         let WorkspaceResult::Path(path) = outcome.result else {
             return Err("existing exact get returned the wrong result variant".to_owned());
@@ -158,7 +158,7 @@ impl Harness {
         &self,
         request: &WorkspaceRpcRequest,
     ) -> Result<u64, String> {
-        match self.executor.execute(request) {
+        match self.executor.execute(request, RequestAuthority::TRUSTED) {
             Err(failure) if failure.code == ErrorCode::NotFound => Ok(0x4e4f_5446_4f55_4e44),
             Err(failure) => Err(format!("missing exact get returned {failure:?}")),
             Ok(_) => Err("missing exact get unexpectedly succeeded".to_owned()),
@@ -180,7 +180,7 @@ impl Harness {
     ) -> Result<(usize, Option<Vec<u8>>, u64), String> {
         let outcome = self
             .executor
-            .execute(request)
+            .execute(request, RequestAuthority::TRUSTED)
             .map_err(|failure| format!("list request failed: {failure:?}"))?;
         let WorkspaceResult::Paths(page) = outcome.result else {
             return Err("list request returned the wrong result variant".to_owned());
@@ -194,7 +194,7 @@ impl Harness {
     ) -> Result<SemanticPage, String> {
         let outcome = self
             .executor
-            .execute(request)
+            .execute(request, RequestAuthority::TRUSTED)
             .map_err(|failure| format!("list request failed: {failure:?}"))?;
         let WorkspaceResult::Paths(page) = outcome.result else {
             return Err("list request returned the wrong result variant".to_owned());

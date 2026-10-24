@@ -22,7 +22,7 @@ use nokv_object::{
 use nokv_protocol::{ConflictKind, ErrorCode, RpcFailure, WorkspaceRpcRequest};
 use sha2::{Digest, Sha256};
 
-use crate::{ExecutedRequest, WorkspaceRequestExecutor};
+use crate::{ExecutedRequest, RequestAuthority, WorkspaceRequestExecutor};
 
 const MAX_SEGMENTS_PER_PUBLISH: usize = 16;
 
@@ -517,7 +517,11 @@ impl RecoveryPublishingExecutor {
 }
 
 impl WorkspaceRequestExecutor for RecoveryPublishingExecutor {
-    fn execute(&self, request: &WorkspaceRpcRequest) -> Result<ExecutedRequest, RpcFailure> {
+    fn execute(
+        &self,
+        request: &WorkspaceRpcRequest,
+        authority: RequestAuthority,
+    ) -> Result<ExecutedRequest, RpcFailure> {
         // Shared publication first repairs an earlier interrupted upload. A
         // local-only owner has nothing to repair, and the barrier below proves
         // liveness after everything this request observed or wrote, so a
@@ -528,7 +532,7 @@ impl WorkspaceRequestExecutor for RecoveryPublishingExecutor {
                 .publish_current()
                 .map_err(RecoveryPublisherError::rpc_failure)?;
         }
-        let outcome = self.inner.execute(request);
+        let outcome = self.inner.execute(request, authority);
         self.publisher
             .publish_current()
             .map_err(RecoveryPublisherError::rpc_failure)?;

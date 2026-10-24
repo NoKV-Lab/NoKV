@@ -52,4 +52,4 @@ pub use recovery_publisher::{
 pub use registry::RootOwnerRegistry;
 pub use rpc_tls::RpcServerTls;
 pub use server::{OwnerLossSignal, ServerHealth, ServerOptions, WorkspaceServer};
-pub use service::{ExecutedRequest, WorkspaceRequestExecutor};
+pub use service::{ExecutedRequest, RequestAuthority, WorkspaceRequestExecutor};

@@ -13,16 +13,17 @@
 use std::fmt;
 
 use nokv_types::{
-    ArtifactRevisionId, Generation, NormalizedRelativePath, OperationId, OwnerEpoch, PublishPhase,
-    StagedCleanupState, StagedProviderState, WorkbenchId, WorkspaceIncarnationId,
-    WorkspaceRevision, SHA256_BYTES,
+    ArtifactRevisionId, Generation, NormalizedRelativePath, OperationId, OwnerEpoch, PrincipalId,
+    PublishPhase, StagedCleanupState, StagedProviderState, WorkbenchId, WorkspaceIncarnationId,
+    WorkspaceRevision, FIXED_ID_BYTES, SHA256_BYTES,
 };
 
 /// Durable value format for publication-owned payloads.
 pub const PUBLISH_VALUE_FORMAT_VERSION: u8 = 7;
-/// Durable value format for the publish operation record. Version 8 adds the
-/// sealed digest of a body published inline.
-pub const PUBLISH_OPERATION_VALUE_FORMAT_VERSION: u8 = 8;
+/// Durable value format for the publish operation record. Version 9 records
+/// the initiating principal; version 8 added the sealed digest of a body
+/// published inline.
+pub const PUBLISH_OPERATION_VALUE_FORMAT_VERSION: u8 = 9;
 
 /// Hard safety bound for one publish operation's staged-object ledger.
 pub const MAX_STAGED_OBJECTS: u32 = 1_048_576;
@@ -204,6 +205,9 @@ pub struct PublishOperationRecord {
     pub result: Option<PublishResult>,
     /// Present throughout `Aborting`/`Cleaning` and their terminal states.
     pub terminal_error: Option<PublishTerminalError>,
+    /// The authenticated principal that began the operation; sealed into the
+    /// identity digest, so another principal cannot replay or continue it.
+    pub initiator: Option<PrincipalId>,
 }
 
 /// A publication attempt belongs permanently to one logical append.
@@ -226,7 +230,13 @@ pub struct AppendOperationRecord {
     pub publication_operation_id: OperationId,
     pub artifact_revision_id: ArtifactRevisionId,
     pub result: Option<PublishResult>,
+    /// The authenticated principal that started the logical append.
+    pub initiator: Option<PrincipalId>,
 }
+
+/// Durable value format of the append operation record. Version 2 records
+/// the initiating principal.
+pub const APPEND_OPERATION_VALUE_FORMAT_VERSION: u8 = 2;
 
 impl AppendOperationRecord {
     pub fn matches_publication(&self, publication: &PublishOperationRecord) -> bool {
@@ -254,7 +264,7 @@ impl AppendOperationRecord {
         if let Some(result) = &self.result {
             validate_publish_result(result)?;
         }
-        let mut encoded = vec![1];
+        let mut encoded = vec![APPEND_OPERATION_VALUE_FORMAT_VERSION];
         encoded.extend_from_slice(self.operation_id.as_bytes());
         encoded.extend_from_slice(&self.intent_digest);
         push_bytes(&mut encoded, "workbench_id", self.workbench_id.as_bytes())?;
@@ -264,6 +274,10 @@ impl AppendOperationRecord {
         encoded.extend_from_slice(self.publication_operation_id.as_bytes());
         encoded.extend_from_slice(self.artifact_revision_id.as_bytes());
         push_optional_result(&mut encoded, self.result.as_ref())?;
+        push_optional_fixed(
+            &mut encoded,
+            &self.initiator.map(|initiator| *initiator.as_bytes()),
+        );
         require_record_size(
             "AppendOperationRecord",
             encoded.len(),
@@ -280,10 +294,10 @@ impl AppendOperationRecord {
         )?;
         let mut decoder = Decoder::new(encoded);
         let actual = decoder.u8("append.value_format_version")?;
-        if actual != 1 {
+        if actual != APPEND_OPERATION_VALUE_FORMAT_VERSION {
             return Err(PublishRecordError::UnsupportedValueVersion {
                 actual,
-                expected: 1,
+                expected: APPEND_OPERATION_VALUE_FORMAT_VERSION,
             });
         }
         let operation_id = OperationId::from_bytes(decoder.fixed("operation_id")?);
@@ -315,6 +329,9 @@ impl AppendOperationRecord {
                 decoder.fixed("artifact_revision_id")?,
             ),
             result: decode_optional_result(&mut decoder)?,
+            initiator: decoder
+                .optional_fixed::<FIXED_ID_BYTES>("initiator")?
+                .map(PrincipalId::from_bytes),
         };
         decoder.finish()?;
         record.encode()?;
@@ -922,6 +939,10 @@ impl PublishOperationRecord {
         push_optional_fixed(&mut encoded, &self.publication_absence_proof);
         push_optional_result(&mut encoded, self.result.as_ref())?;
         push_optional_terminal_error(&mut encoded, self.terminal_error.as_ref())?;
+        push_optional_fixed(
+            &mut encoded,
+            &self.initiator.map(|initiator| *initiator.as_bytes()),
+        );
         require_record_size(
             "PublishOperationRecord",
             encoded.len(),
@@ -1037,6 +1058,9 @@ impl PublishOperationRecord {
         let publication_absence_proof = decoder.optional_fixed("publication_absence_proof")?;
         let result = decode_optional_result(&mut decoder)?;
         let terminal_error = decode_optional_terminal_error(&mut decoder)?;
+        let initiator = decoder
+            .optional_fixed::<FIXED_ID_BYTES>("initiator")?
+            .map(PrincipalId::from_bytes);
         decoder.finish()?;
 
         let record = Self {
@@ -1075,6 +1099,7 @@ impl PublishOperationRecord {
             publication_absence_proof,
             result,
             terminal_error,
+            initiator,
         };
         record.validate()?;
         Ok(record)
@@ -2094,6 +2119,7 @@ mod tests {
 
     fn uploading_operation() -> PublishOperationRecord {
         PublishOperationRecord {
+            initiator: None,
             append_attempt: None,
             append_intent_digest: None,
             operation_id: OperationId::from_bytes([0x10; 16]),
@@ -2226,6 +2252,7 @@ mod tests {
             &8_192_u64.to_be_bytes(),
             &10_u32.to_be_bytes(),
             b"sha256:abc",
+            &[0],
             &[0],
         ]
         .concat();
@@ -2795,7 +2822,8 @@ mod tests {
         aborting.phase = PublishPhase::Aborting;
         aborting.terminal_error = Some(terminal_error());
         let mut encoded = aborting.encode().unwrap();
-        let terminal_kind_offset = encoded.len() - (1 + 4 + terminal_error().message.len() + 1);
+        let terminal_kind_offset =
+            encoded.len() - (1 + 4 + terminal_error().message.len() + 1 + 1/* initiator */);
         encoded[terminal_kind_offset] = 0xff;
         assert_eq!(
             PublishOperationRecord::decode(&encoded).unwrap_err(),

@@ -173,6 +173,7 @@ fn execute_fence(
     store
         .execute(
             &MetadataCommand {
+                initiator: None,
                 schema_id: SCHEMA_ID.to_owned(),
                 root_id: identity.root,
                 logical_shard_id: identity.shard,
@@ -225,6 +226,7 @@ fn finish_fixture_workspace(
     store
         .execute(
             &MetadataCommand {
+                initiator: None,
                 schema_id: SCHEMA_ID.to_owned(),
                 root_id: context.root_id,
                 logical_shard_id: context.logical_shard_id,
@@ -362,6 +364,7 @@ fn seed_paths(
         store
             .execute(
                 &MetadataCommand {
+                    initiator: None,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: context.root_id,
                     logical_shard_id: context.logical_shard_id,

@@ -10,8 +10,8 @@ use std::fmt;
 
 use nokv_types::{
     CommandDigest, CommitId, CommitState, CommitVersion, ConsumerEpoch, Generation,
-    HistoryHoldState, OperationId, SnapshotAliasName, SnapshotId, SnapshotState, WorkbenchId,
-    WorkspaceIncarnationId, WorkspaceState, SHA256_BYTES,
+    HistoryHoldState, OperationId, PrincipalId, SnapshotAliasName, SnapshotId, SnapshotState,
+    WorkbenchId, WorkspaceIncarnationId, WorkspaceState, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
 
@@ -415,6 +415,7 @@ pub fn mint_snapshot(
         consumer_epoch: ConsumerEpoch::ZERO,
         annotation: request.annotation.clone(),
         retire_annotation: None,
+        initiator: context.authority.initiator,
     };
     let record_payload = record.encode()?;
     let hold_payload = HistoryHoldRecord {
@@ -494,6 +495,7 @@ pub fn mint_snapshot(
         None,
         &resolved,
         None,
+        context.authority.initiator,
     )?);
     execute_snapshot_command(
         store,
@@ -567,6 +569,7 @@ pub fn renew_snapshot(
         Some(&loaded.resolved),
         &next,
         None,
+        context.authority.initiator,
     )?);
     execute_snapshot_command(
         store,
@@ -707,6 +710,7 @@ pub fn finish_snapshot_reap(
         Some(&loaded.resolved),
         &next,
         None,
+        context.authority.initiator,
     )?);
     execute_snapshot_command(store, command.seal(), input_digest, None)
 }
@@ -777,6 +781,7 @@ pub fn attach_snapshot_consumer(
         Some(&loaded.resolved),
         &next,
         Some(request.restore_operation_id),
+        context.authority.initiator,
     )?);
     execute_snapshot_command(
         store,
@@ -849,6 +854,7 @@ pub fn release_snapshot_consumer(
         Some(&loaded.resolved),
         &next,
         Some(request.restore_operation_id),
+        context.authority.initiator,
     )?);
     execute_snapshot_command(store, command.seal(), input_digest, None)
 }
@@ -924,6 +930,7 @@ fn terminalize_snapshot(
         Some(&loaded.resolved),
         &next,
         None,
+        context.authority.initiator,
     )?);
     execute_snapshot_command(store, command.seal(), input_digest, None)
 }
@@ -1491,6 +1498,7 @@ fn apply_alias_replacement(
 
 fn base_command(context: RootWriteContext, deterministic_result: Vec<u8>) -> MetadataCommand {
     MetadataCommand {
+        initiator: context.authority.initiator,
         schema_id: SCHEMA_ID.to_owned(),
         root_id: context.root_id,
         logical_shard_id: context.logical_shard_id,
@@ -1825,8 +1833,10 @@ fn snapshot_change_event(
     before: Option<&ResolvedSnapshot>,
     after: &ResolvedSnapshot,
     restore_operation_id: Option<OperationId>,
+    initiator: Option<PrincipalId>,
 ) -> Result<EventProjection, SnapshotError> {
     Ok(change_event_projection(&ChangeEventRecord {
+        initiator,
         workbench_id: workbench_id.clone(),
         workspace_incarnation_id,
         kind,
@@ -1951,6 +1961,7 @@ mod tests {
         action: RootFenceAction,
     ) -> MetadataCommand {
         MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
@@ -2490,7 +2501,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(renewed.snapshot.record.source_commit_id, None);
-        assert_eq!(renewed.snapshot.record.encode().unwrap()[0], 2);
+        assert_eq!(renewed.snapshot.record.encode().unwrap()[0], 3);
         let retired = retire_snapshot(
             &store,
             write_context(&store, 7),

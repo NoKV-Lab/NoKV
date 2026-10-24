@@ -2409,6 +2409,7 @@ fn hex_nibble(value: u8) -> Result<u8, GcError> {
 
 fn base_command(context: RootWriteContext, deterministic_result: Vec<u8>) -> MetadataCommand {
     MetadataCommand {
+        initiator: context.authority.initiator,
         schema_id: SCHEMA_ID.to_owned(),
         root_id: context.root_id,
         logical_shard_id: context.logical_shard_id,
@@ -3011,6 +3012,7 @@ mod tests {
         action: RootFenceAction,
     ) -> MetadataCommand {
         MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),

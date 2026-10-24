@@ -139,7 +139,7 @@ pub use namespace::{
     get_visible_path_at, get_visible_workspace_at, get_visible_workspace_path_at,
     list_paths_at_visible_workspace, CreateVisibleWorkspaceResult, NamespaceError, RootReadContext,
     RootWriteContext, VisiblePathChild, VisiblePathListPage, VisibleWorkspacePathRead,
-    MAX_VISIBLE_PATH_LIST_PAGE_SIZE,
+    WriteAuthority, MAX_VISIBLE_PATH_LIST_PAGE_SIZE,
 };
 pub use publication::{
     advance_manifest_rolling_digest, advance_staged_object_rolling_digest,

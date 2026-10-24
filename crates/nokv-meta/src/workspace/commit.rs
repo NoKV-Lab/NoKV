@@ -481,6 +481,7 @@ impl<'a> CommitService<'a> {
         }
 
         let mut operation = BuildCommitOperationRecord {
+            initiator: request.context.authority.initiator,
             operation_id: request.operation_id,
             identity_digest: [0; SHA256_BYTES],
             initialization_digest: [0; SHA256_BYTES],
@@ -1818,6 +1819,7 @@ impl<'a> CommitService<'a> {
 
         plan.events
             .push(change_event_projection(&ChangeEventRecord {
+                initiator: context.authority.initiator,
                 workbench_id: operation.workbench_id.clone(),
                 workspace_incarnation_id: operation.source_workspace_incarnation_id,
                 kind: ChangeEventKind::CommitAdvanced,
@@ -3043,6 +3045,7 @@ fn build_command(
     deterministic_result: Vec<u8>,
 ) -> MetadataCommand {
     MetadataCommand {
+        initiator: context.authority.initiator,
         schema_id: SCHEMA_ID.to_owned(),
         root_id: context.root_id,
         logical_shard_id: context.logical_shard_id,
@@ -3584,6 +3587,7 @@ mod tests {
         action: RootFenceAction,
     ) -> MetadataCommand {
         MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
@@ -3660,6 +3664,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: context.authority.initiator,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: context.root_id,
                     logical_shard_id: context.logical_shard_id,
@@ -4983,6 +4988,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: None,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),

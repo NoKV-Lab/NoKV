@@ -11,7 +11,9 @@ use nokv_protocol::{
     WorkspaceRpcRequest, WorkspaceRpcResponse,
 };
 
-use crate::{ExecutedRequest, OwnerLossSignal, ServerError, WorkspaceRequestExecutor};
+use crate::{
+    ExecutedRequest, OwnerLossSignal, RequestAuthority, ServerError, WorkspaceRequestExecutor,
+};
 
 #[derive(Default)]
 struct ShardRuntimeState {
@@ -316,13 +318,14 @@ impl RootOwnerRegistry {
         &self,
         request: WorkspaceRpcRequest,
     ) -> Result<WorkspaceRpcResponse, ServerError> {
-        self.dispatch_guarded(request)
+        self.dispatch_guarded(request, RequestAuthority::TRUSTED)
             .map(GuardedResponse::into_response)
     }
 
     pub(crate) fn dispatch_guarded(
         &self,
         request: WorkspaceRpcRequest,
+        authority: RequestAuthority,
     ) -> Result<GuardedResponse, ServerError> {
         if self.owner_loss.is_lost() {
             return Ok(GuardedResponse {
@@ -373,7 +376,7 @@ impl RootOwnerRegistry {
         };
         let request_id = request.request_id;
         drop(owners);
-        let outcome = executor.execute(&request);
+        let outcome = executor.execute(&request, authority);
         let fail_closed = matches!(
             &outcome,
             Err(RpcFailure {
@@ -460,7 +463,11 @@ mod tests {
     struct EchoExecutor;
 
     impl WorkspaceRequestExecutor for EchoExecutor {
-        fn execute(&self, request: &WorkspaceRpcRequest) -> Result<ExecutedRequest, RpcFailure> {
+        fn execute(
+            &self,
+            request: &WorkspaceRpcRequest,
+            _authority: RequestAuthority,
+        ) -> Result<ExecutedRequest, RpcFailure> {
             match &request.operation {
                 WorkspaceRequest::CreateWorkspace(create) => Ok(ExecutedRequest {
                     result: WorkspaceResult::Workspace(WorkspaceSummary {
@@ -498,9 +505,13 @@ mod tests {
     }
 
     impl WorkspaceRequestExecutor for SignalledPoisonExecutor {
-        fn execute(&self, request: &WorkspaceRpcRequest) -> Result<ExecutedRequest, RpcFailure> {
+        fn execute(
+            &self,
+            request: &WorkspaceRpcRequest,
+            _authority: RequestAuthority,
+        ) -> Result<ExecutedRequest, RpcFailure> {
             match self.calls.fetch_add(1, Ordering::SeqCst) {
-                0 => EchoExecutor.execute(request),
+                0 => EchoExecutor.execute(request, _authority),
                 1 => {
                     self.poison_started.lock().unwrap().send(()).unwrap();
                     Err(RpcFailure {
@@ -549,7 +560,11 @@ mod tests {
     }
 
     impl WorkspaceRequestExecutor for PoisonOnceExecutor {
-        fn execute(&self, request: &WorkspaceRpcRequest) -> Result<ExecutedRequest, RpcFailure> {
+        fn execute(
+            &self,
+            request: &WorkspaceRpcRequest,
+            _authority: RequestAuthority,
+        ) -> Result<ExecutedRequest, RpcFailure> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
                 return Err(RpcFailure {
@@ -562,7 +577,7 @@ mod tests {
                     route_hint: None,
                 });
             }
-            EchoExecutor.execute(request)
+            EchoExecutor.execute(request, _authority)
         }
     }
 
@@ -631,6 +646,7 @@ mod tests {
             initializing
                 .execute(
                     &meta::MetadataCommand {
+                        initiator: None,
                         schema_id: meta::SCHEMA_ID.to_owned(),
                         root_id: installed.root_id.into(),
                         logical_shard_id: shard_id,
@@ -874,7 +890,9 @@ mod tests {
         let installed = route(8);
         registry.install(installed, executor.clone()).unwrap();
 
-        let admitted = registry.dispatch_guarded(request(installed)).unwrap();
+        let admitted = registry
+            .dispatch_guarded(request(installed), RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(matches!(
             admitted.response().outcome,
             WorkspaceRpcOutcome::Success(_)

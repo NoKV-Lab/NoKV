@@ -14,8 +14,8 @@ use std::fmt;
 
 use nokv_types::{
     ArtifactRevisionId, BuildCommitPhase, CommitId, CommitRetirePhase, ConsumerEpoch, Generation,
-    NormalizedRelativePath, OperationId, ReadVersion, WorkbenchId, WorkspaceIncarnationId,
-    SHA256_BYTES,
+    NormalizedRelativePath, OperationId, PrincipalId, ReadVersion, WorkbenchId,
+    WorkspaceIncarnationId, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
 
@@ -25,8 +25,10 @@ use super::commit_records::{
 };
 use super::publication_records::MAX_CONTENT_TYPE_BYTES;
 
-/// Current value format for build-commit operations.
-pub const BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION: u8 = 6;
+/// Current value format for build-commit operations. Version 7 records the
+/// initiating principal; version 6 added the Generic index closure.
+pub const BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION: u8 = 7;
+const PREVIOUS_BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION: u8 = 6;
 /// Current value format for commit-retirement operations.
 pub const COMMIT_RETIRE_OPERATION_VALUE_FORMAT_VERSION: u8 = 6;
 const LEGACY_COMMIT_OPERATION_VALUE_FORMAT_VERSION: u8 = 5;
@@ -174,6 +176,10 @@ pub struct BuildCommitOperationRecord {
     pub history_hold_released: bool,
     pub result: Option<BuildCommitResult>,
     pub terminal_error: Option<CommitOperationTerminalError>,
+    /// The authenticated principal that began the commit. It is not part of
+    /// the identity digests: a commit's operation id derives from content, so
+    /// another principal replaying the same content observes this one.
+    pub initiator: Option<PrincipalId>,
 }
 
 /// Recoverable release progress after the exact zero-consumer retirement claim.
@@ -762,6 +768,7 @@ impl BuildCommitOperationRecord {
         out.push(u8::from(self.history_hold_released));
         put_optional_result(&mut out, self.result);
         put_terminal_error(&mut out, self.terminal_error.as_ref());
+        put_optional_principal(&mut out, self.initiator);
         Ok(out)
     }
 
@@ -769,6 +776,7 @@ impl BuildCommitOperationRecord {
         let mut decoder = Decoder::new(encoded);
         let value_version = decoder.require_version(&[
             LEGACY_COMMIT_OPERATION_VALUE_FORMAT_VERSION,
+            PREVIOUS_BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION,
             BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION,
         ])?;
         let operation_id = OperationId::from_bytes(decoder.fixed("operation_id")?);
@@ -815,7 +823,7 @@ impl BuildCommitOperationRecord {
             generic_index_ref_count,
             generic_index_ref_digest,
             generic_index_refs_complete,
-        ) = if value_version == BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION {
+        ) = if value_version >= PREVIOUS_BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION {
             (
                 decoder.boolean("path_members_complete")?,
                 decoder.optional_path()?,
@@ -861,7 +869,7 @@ impl BuildCommitOperationRecord {
         let parents_complete = decoder.boolean("parents_complete")?;
         let cleanup_member_count = decoder.u64("cleanup_member_count")?;
         let cleanup_generic_index_count =
-            if value_version == BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION {
+            if value_version >= PREVIOUS_BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION {
                 decoder.u64("cleanup_generic_index_count")?
             } else {
                 0
@@ -871,6 +879,11 @@ impl BuildCommitOperationRecord {
         let history_hold_released = decoder.boolean("history_hold_released")?;
         let result = decoder.optional_result()?;
         let terminal_error = decoder.terminal_error()?;
+        let initiator = if value_version == BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION {
+            decoder.optional_principal()?
+        } else {
+            None
+        };
         decoder.finish()?;
         let record = Self {
             operation_id,
@@ -921,6 +934,7 @@ impl BuildCommitOperationRecord {
             history_hold_released,
             result,
             terminal_error,
+            initiator,
         };
         record.validate()?;
         Ok(record)
@@ -1424,6 +1438,16 @@ fn put_optional_path(out: &mut Vec<u8>, path: Option<&NormalizedRelativePath>) {
     put_optional_bytes(out, path.map(|path| path.as_str().as_bytes()));
 }
 
+fn put_optional_principal(out: &mut Vec<u8>, principal: Option<PrincipalId>) {
+    match principal {
+        None => out.push(0),
+        Some(principal) => {
+            out.push(1);
+            out.extend_from_slice(principal.as_bytes());
+        }
+    }
+}
+
 fn put_optional_revision(out: &mut Vec<u8>, revision: Option<ArtifactRevisionId>) {
     match revision {
         None => out.push(0),
@@ -1643,6 +1667,17 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    fn optional_principal(&mut self) -> Result<Option<PrincipalId>, CommitOperationRecordError> {
+        match self.u8("initiator")? {
+            0 => Ok(None),
+            1 => Ok(Some(PrincipalId::from_bytes(self.fixed("initiator")?))),
+            value => Err(CommitOperationRecordError::InvalidOptionalTag {
+                field: "initiator",
+                value,
+            }),
+        }
+    }
+
     fn optional_revision(
         &mut self,
     ) -> Result<Option<ArtifactRevisionId>, CommitOperationRecordError> {
@@ -1786,6 +1821,10 @@ mod tests {
         let cleanup_start = decoder.offset;
         decoder.u64("cleanup_generic_index_count").unwrap();
         let cleanup_end = decoder.offset;
+        let initiator_start = decoder.offset;
+        decoder.optional_principal().unwrap();
+        let initiator_end = decoder.offset;
+        encoded.drain(initiator_start..initiator_end);
         encoded.drain(cleanup_start..cleanup_end);
         encoded.drain(generic_start..generic_end);
         encoded[0] = LEGACY_COMMIT_OPERATION_VALUE_FORMAT_VERSION;
@@ -1829,6 +1868,7 @@ mod tests {
 
     fn build_record() -> BuildCommitOperationRecord {
         let mut record = BuildCommitOperationRecord {
+            initiator: None,
             operation_id: OperationId::from_bytes([1; 16]),
             identity_digest: [0; SHA256_BYTES],
             initialization_digest: [0; SHA256_BYTES],

@@ -1648,6 +1648,7 @@ impl LifecycleRunner {
         let read_version = self.meta.current_read_version()?;
         let request_id = derived_request_id(domain, read_version.get(), inputs);
         Ok(meta::RootWriteContext {
+            authority: meta::WriteAuthority::TRUSTED,
             root_id: self.root_id(),
             logical_shard_id: self.logical_shard_id(),
             object_namespace_id: self.object_namespace_id(),
@@ -1665,6 +1666,7 @@ impl LifecycleRunner {
     ) -> Result<meta::PublicationContext, LifecycleError> {
         let context = self.write_context(domain, &[input])?;
         Ok(meta::PublicationContext {
+            authority: meta::WriteAuthority::TRUSTED,
             root_id: context.root_id,
             logical_shard_id: context.logical_shard_id,
             object_namespace_id: context.object_namespace_id,
@@ -1869,12 +1871,16 @@ mod tests {
     };
 
     use super::*;
-    use crate::{ExecutedRequest, WorkspaceRequestExecutor};
+    use crate::{ExecutedRequest, RequestAuthority, WorkspaceRequestExecutor};
 
     struct UnusedExecutor;
 
     impl WorkspaceRequestExecutor for UnusedExecutor {
-        fn execute(&self, _request: &WorkspaceRpcRequest) -> Result<ExecutedRequest, RpcFailure> {
+        fn execute(
+            &self,
+            _request: &WorkspaceRpcRequest,
+            _authority: RequestAuthority,
+        ) -> Result<ExecutedRequest, RpcFailure> {
             panic!("lifecycle test never dispatches RPC")
         }
     }
@@ -2247,6 +2253,7 @@ mod tests {
             })
             .collect();
         meta::MetadataCommand {
+            initiator: None,
             schema_id: meta::SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
@@ -2616,6 +2623,7 @@ mod tests {
         let tree_revision = ArtifactRevisionId::from_bytes([0x83; FIXED_ID_BYTES]);
         let source_read_version = store.current_read_version().unwrap();
         let mut operation = meta::BuildCommitOperationRecord {
+            initiator: None,
             operation_id,
             identity_digest: [0; SHA256_BYTES],
             initialization_digest: [0; SHA256_BYTES],
@@ -3109,6 +3117,7 @@ mod tests {
             cleanup_state: StagedCleanupState::Owned,
         }];
         let mut operation = meta::PublishOperationRecord {
+            initiator: None,
             append_attempt: None,
             append_intent_digest: None,
             operation_id: OperationId::from_bytes([0x74; FIXED_ID_BYTES]),
@@ -3149,6 +3158,7 @@ mod tests {
 
         let service = meta::PublicationService::new(&store);
         let publication_context = |request: u8| meta::PublicationContext {
+            authority: meta::WriteAuthority::TRUSTED,
             root_id: root(),
             logical_shard_id: shard(),
             object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
@@ -3422,6 +3432,7 @@ mod tests {
 
         let operation_id = OperationId::from_bytes([0x44; FIXED_ID_BYTES]);
         let mut operation = meta::PublishOperationRecord {
+            initiator: None,
             append_attempt: None,
             append_intent_digest: None,
             operation_id,
@@ -3469,6 +3480,7 @@ mod tests {
         meta::PublicationService::new(&store)
             .begin_publish(meta::BeginPublishRequest {
                 context: meta::PublicationContext {
+                    authority: meta::WriteAuthority::TRUSTED,
                     root_id: root(),
                     logical_shard_id: shard(),
                     object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes(
@@ -3485,6 +3497,7 @@ mod tests {
         meta::PublicationService::new(&store)
             .begin_publish(meta::BeginPublishRequest {
                 context: meta::PublicationContext {
+                    authority: meta::WriteAuthority::TRUSTED,
                     root_id: root(),
                     logical_shard_id: shard(),
                     object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes(
@@ -3525,6 +3538,7 @@ mod tests {
         meta::PublicationService::new(&store)
             .heartbeat_publish(meta::HeartbeatPublishRequest {
                 context: meta::PublicationContext {
+                    authority: meta::WriteAuthority::TRUSTED,
                     root_id: root(),
                     logical_shard_id: shard(),
                     object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes(
@@ -3631,6 +3645,7 @@ mod tests {
             let request = *counter;
             *counter += 1;
             meta::PublicationContext {
+                authority: meta::WriteAuthority::TRUSTED,
                 root_id: root(),
                 logical_shard_id: shard(),
                 object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes(
@@ -3711,6 +3726,7 @@ mod tests {
         }];
         let template = |operation_id_byte: u8| {
             let mut operation = meta::PublishOperationRecord {
+                initiator: None,
                 append_attempt: None,
                 append_intent_digest: None,
                 operation_id: OperationId::from_bytes([operation_id_byte; FIXED_ID_BYTES]),
@@ -3932,6 +3948,7 @@ mod tests {
             let request = *counter;
             *counter += 1;
             meta::PublicationContext {
+                authority: meta::WriteAuthority::TRUSTED,
                 root_id: root(),
                 logical_shard_id: shard(),
                 object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes(
@@ -4012,6 +4029,7 @@ mod tests {
         }];
         let template = |operation_id_byte: u8| {
             let mut operation = meta::PublishOperationRecord {
+                initiator: None,
                 append_attempt: None,
                 append_intent_digest: None,
                 operation_id: OperationId::from_bytes([operation_id_byte; FIXED_ID_BYTES]),
@@ -4106,6 +4124,7 @@ mod tests {
         store
             .execute(
                 &meta::MetadataCommand {
+                    initiator: None,
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),

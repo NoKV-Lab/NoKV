@@ -62,6 +62,8 @@ use super::generic_index_records::{
 };
 use super::keyspace::MetadataFamily;
 use super::namespace::RootWriteContext;
+#[cfg(test)]
+use super::namespace::WriteAuthority;
 use super::publication_records::{
     ArtifactRevisionRecord, GcCandidateRecord, PathEntry, PublicationRecordCodecError,
     RevisionRefRecord, WorkspaceIncarnationClaimRecord, WorkspaceRecord,
@@ -1107,6 +1109,7 @@ pub fn begin_restore(
     let parent_digest =
         advance_commit_parent_rolling_digest([0; SHA256_BYTES], 0, source_commit_id);
     let operation = RestoreOperationRecord {
+        initiator: context.authority.initiator,
         operation_id,
         identity_digest,
         initialization_digest: None,
@@ -3137,6 +3140,7 @@ pub fn complete_restore(
     restore_publication.add_predicates(&mut plan)?;
     plan.events
         .push(change_event_projection(&ChangeEventRecord {
+            initiator: context.authority.initiator,
             workbench_id: next.destination_workbench_id.clone(),
             workspace_incarnation_id: result.destination_workspace_incarnation_id,
             kind: ChangeEventKind::WorkspaceRestored,
@@ -6250,6 +6254,7 @@ fn build_restore_command(
     let deterministic_result =
         encode_restore_outcome(input_digest, &operation_payload, affected_members);
     MetadataCommand {
+        initiator: context.authority.initiator,
         schema_id: SCHEMA_ID.to_owned(),
         root_id: context.root_id,
         logical_shard_id: context.logical_shard_id,
@@ -6781,6 +6786,7 @@ mod tests {
         action: RootFenceAction,
     ) -> MetadataCommand {
         MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
@@ -6842,6 +6848,7 @@ mod tests {
             mutations.push(CommandMutation::Put { family, key, value });
         }
         let command = MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
@@ -6877,6 +6884,7 @@ mod tests {
             .unwrap()
             .expect("test row exists");
         let command = MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
@@ -6919,6 +6927,7 @@ mod tests {
             .unwrap()
             .expect("test row exists");
         let command = MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
@@ -7288,6 +7297,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: None,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -7355,6 +7365,7 @@ mod tests {
             next.typed_index_projection = encoded_projection.clone();
             let key = path_current_key(root(), source.source_incarnation, path);
             let command = MetadataCommand {
+                initiator: None,
                 schema_id: SCHEMA_ID.to_owned(),
                 root_id: root(),
                 logical_shard_id: shard(),
@@ -7715,6 +7726,7 @@ mod tests {
         store
             .execute(
                 &MetadataCommand {
+                    initiator: None,
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
@@ -10673,6 +10685,7 @@ mod tests {
         owner_epoch: OwnerEpoch,
     ) -> PublicationContext {
         PublicationContext {
+            authority: WriteAuthority::TRUSTED,
             root_id: root(),
             logical_shard_id: shard(),
             object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
@@ -10769,6 +10782,7 @@ mod tests {
         manifest: &[ManifestRowInput],
     ) -> PublishOperationRecord {
         let mut operation = PublishOperationRecord {
+            initiator: None,
             append_attempt: None,
             append_intent_digest: None,
             operation_id,
@@ -12465,6 +12479,7 @@ mod tests {
         bad_entry.typed_index_projection = vec![0xff, 0xff];
         let key = path_current_key(root(), source_incarnation, &bad_path);
         let command = MetadataCommand {
+            initiator: None,
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),

@@ -1357,6 +1357,7 @@ fn execute_fence_command(
     deterministic_result: Vec<u8>,
 ) -> Result<(), ServerError> {
     let command = meta::MetadataCommand {
+        initiator: None,
         schema_id: meta::SCHEMA_ID.to_owned(),
         root_id: placement.root_id,
         logical_shard_id: placement.logical_shard_id,
@@ -1481,6 +1482,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::RequestAuthority;
     use crate::{ServerOptions, WorkspaceServer};
 
     #[derive(Clone)]
@@ -2065,6 +2067,7 @@ mod tests {
         fn execute(
             &self,
             request: &nokv_protocol::WorkspaceRpcRequest,
+            _authority: crate::RequestAuthority,
         ) -> Result<crate::ExecutedRequest, nokv_protocol::RpcFailure> {
             self.meta
                 .observe_lease_clock(
@@ -2320,7 +2323,9 @@ mod tests {
         };
 
         objects.fail_next_create();
-        let failure = executor.execute(&request).unwrap_err();
+        let failure = executor
+            .execute(&request, RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert_eq!(failure.code, nokv_protocol::ErrorCode::ObjectUnavailable);
         assert!(failure.retryable);
         let interrupted = control.get_logical_shard(&shard()).unwrap().unwrap();
@@ -2330,7 +2335,9 @@ mod tests {
             "an inner metadata success must not advance control after object creation failed"
         );
 
-        let result = executor.execute(&request).unwrap();
+        let result = executor
+            .execute(&request, RequestAuthority::TRUSTED)
+            .unwrap();
         assert!(matches!(
             result.result,
             nokv_protocol::WorkspaceResult::Preflight(_)
@@ -2387,7 +2394,9 @@ mod tests {
                     nokv_protocol::WorkspacePreflightRequest::new([]),
                 ),
             };
-            let result = executor.execute(&request).unwrap();
+            let result = executor
+                .execute(&request, RequestAuthority::TRUSTED)
+                .unwrap();
             assert!(matches!(
                 result.result,
                 nokv_protocol::WorkspaceResult::Preflight(_)
@@ -2452,14 +2461,20 @@ mod tests {
                 nokv_protocol::WorkspacePreflightRequest::new([]),
             ),
         };
-        executor.execute(&preflight(0x81)).unwrap();
-        executor.execute(&preflight(0x82)).unwrap();
+        executor
+            .execute(&preflight(0x81), RequestAuthority::TRUSTED)
+            .unwrap();
+        executor
+            .execute(&preflight(0x82), RequestAuthority::TRUSTED)
+            .unwrap();
 
         // A frontier that moved past the local state since the last round
         // must be validated again, not served from the earlier validation.
         let local = owner.meta().recovery_state().unwrap().applied_recovery_lsn;
         control.shift_renewed_frontier(local + 1_000);
-        let failure = executor.execute(&preflight(0x83)).unwrap_err();
+        let failure = executor
+            .execute(&preflight(0x83), RequestAuthority::TRUSTED)
+            .unwrap_err();
         assert!(
             failure.message.contains("ahead of local"),
             "unexpected failure: {failure:?}"
