@@ -9,7 +9,8 @@ and serves the root over TLS. Before the root is bound to that tenant, the
 owner must refuse to serve at all. The gate then drives the native `nokv`
 binary as a registered writer, with an unregistered certificate, without TLS,
 with a mismatched owner name, with a revoked credential, as a reader, as a
-second writer of the same root, and in a session whose role is revoked. Each
+second writer of the same root, and in a session whose role is revoked. Once
+the root is bound to its tenant, an owner without TLS must refuse to serve it. Each
 refusal must be exactly one `operator_required` failure line, and a read-back
 by a writer must show that the refused write changed nothing. Certificates come
 from the `openssl` command.
@@ -132,11 +133,13 @@ class TlsStack(Stack):
             self.principals[principal], "--role", role, *scope,
         )
 
-    def spawn_owner(self, log: str, *, reopen: bool) -> subprocess.Popen:
-        argv = [
-            str(self.binary), *self.route, *self.objects,
+    def spawn_owner(self, log: str, *, reopen: bool, tls: bool = True) -> subprocess.Popen:
+        tls_options = [
             "--rpc-tls-cert", str(self.pki.directory / "owner.pem"),
             "--rpc-tls-key", str(self.pki.directory / "owner.key"),
+        ] if tls else []
+        argv = [
+            str(self.binary), *self.route, *self.objects, *tls_options,
             "--bind", f"127.0.0.1:{self.owner_port}",
             "--advertise-endpoint", f"127.0.0.1:{self.owner_port}",
             "--node-id", "rpc-tls-owner",
@@ -188,6 +191,21 @@ def owner_refuses_an_unbound_root(stack: TlsStack) -> dict[str, Any]:
     log = (stack.evidence / "owner-unbound.log").read_text(errors="replace")
     require(code != 0 and "is not bound to a tenant" in log,
             "t0: the owner names the unbound root and exits", [code, log[-600:]])
+    return {"exit": code, "log": log[-600:]}
+
+
+def plaintext_owner_refuses_a_tenant_root(stack: TlsStack) -> dict[str, Any]:
+    """T0b: once a tenant owns the root, an owner without TLS does not serve it."""
+    owner = stack.spawn_owner("owner-plaintext.log", reopen=False, tls=False)
+    try:
+        code = owner.wait(timeout=stack.timeout)
+    except subprocess.TimeoutExpired:
+        owner.kill()
+        owner.wait(timeout=stack.timeout)
+        raise ContractFailure("t0b: a plaintext owner served a tenant-bound root")
+    log = (stack.evidence / "owner-plaintext.log").read_text(errors="replace")
+    require(code != 0 and "served only over RPC TLS" in log,
+            "t0b: the plaintext owner names the tenant-bound root and exits", [code, log[-600:]])
     return {"exit": code, "log": log[-600:]}
 
 
@@ -356,6 +374,9 @@ def main() -> int:
         stack.role("grant", "session", "writer", ["--tenant-wide"])
         report["scenarios"]["t0_owner_refuses_an_unbound_root"] = run_scenario(stack, owner_refuses_an_unbound_root)
         stack.identity("root", "root", "bind", stack.ids["root"], stack.tenant)
+        report["scenarios"]["t0b_plaintext_owner_refuses_a_tenant_root"] = run_scenario(
+            stack, plaintext_owner_refuses_a_tenant_root
+        )
         # A root-scoped grant needs the root bound first.
         stack.role("grant", "peer", "writer", ["--root", stack.ids["root"]])
         stack.start_owner()

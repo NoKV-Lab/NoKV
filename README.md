@@ -633,8 +633,8 @@ To carry workspace RPC over TLS 1.3, start the owner with `--rpc-tls-cert` and
 clients whose certificate is a current credential of the tenant bound to its
 roots (`nokv identity`). Every request then needs a role on its root:
 reader, writer, or operator. Over TLS the CLI needs no `--agent-id`, so many
-agents can share a root. The control plane and object store still need a
-trusted network.
+agents can share a root, and once a root is bound to a tenant only a TLS owner
+serves it. The control plane and object store still need a trusted network.
 The Python SDK cannot yet connect to an owner that requires TLS.
 
 ## Architecture and Ownership

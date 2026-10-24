@@ -1664,6 +1664,7 @@ OWNER:
   --adopt-legacy-agent-binding is a one-time explicit migration for a verified legacy root
   --adopt-legacy-object-namespace is a one-time explicit migration after verifying bucket/prefix
   serve validates every active root's Agent binding; it does not require or compare one shard-wide AgentId
+  a root bound to a tenant is served only over RPC TLS: a plaintext serve refuses to start
   --root-id HEX32 (--etcd-endpoint URL | --control-dir PATH) --node-id ID
   --append-activity-lease-ms N: serve only, range 1000..=86400000, default 1800000; clock-skew grace is additional
   --advertise-endpoint HOST:PORT --bind HOST:PORT
@@ -1922,6 +1923,29 @@ fn served_tenant(
     tenant.ok_or_else(|| "serving over TLS requires at least one root".to_owned())
 }
 
+/// A plaintext owner authenticates nobody, so it refuses every root a tenant
+/// owns: once a root is bound to a tenant, only a TLS owner serves it.
+#[cfg(feature = "control")]
+fn refuse_plaintext_for_tenant_roots(
+    identity: &dyn nokv_control::IdentityStore,
+    placements: &[nokv_control::RootPlacement],
+) -> Result<(), String> {
+    for placement in placements {
+        if let Some(binding) = identity
+            .get_root_tenant(&placement.root_id)
+            .map_err(|error| error.to_string())?
+        {
+            return Err(format!(
+                "root {} is bound to tenant {}; a tenant-bound root is served only over RPC TLS, \
+                 so start serve with --rpc-tls-cert and --rpc-tls-key",
+                encode_lowercase_hex(placement.root_id.as_bytes()),
+                encode_lowercase_hex(binding.tenant_id.as_bytes())
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "control")]
 fn join_lifecycle_workers(
     workers: Vec<std::thread::JoinHandle<Result<(), nokv_server::LifecycleError>>>,
@@ -1946,6 +1970,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         bootstrap_shard, ArtifactLifecycleCleaner, LeaseMode, LifecycleObjectCleaner,
         LifecycleRunner, LifecycleRunnerOptions, OpenMode, RecoveryPublicationMode, RootAttach,
         RootOwnerRegistry, RpcServerTls, ServerOptions, ShardBoot, TenantAccess, WorkspaceServer,
+        DEFAULT_MAX_POLICY_AGE,
     };
     use nokv_types::RequestId;
     use sha2::{Digest, Sha256};
@@ -2013,16 +2038,19 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     let root_id = RootId::from(
         connection::configured_root_id(&invocation.client).map_err(|error| error.to_string())?,
     );
-    let control = open_control(invocation).map_err(|failure| failure.message())?;
+    let connection::ControlPlane { control, identity } =
+        open_control_plane(invocation).map_err(|failure| failure.message())?;
     let placement = control
         .get_root_placement(&root_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "root placement does not exist; provision it before serve".to_owned())?;
     let placements = active_shard_placements(control.as_ref(), &placement)?;
     // Over TLS the owner authorizes principals by role; the plaintext
-    // AgentId binding is not consulted.
+    // AgentId binding is not consulted. Without TLS nobody is authenticated,
+    // so a root a tenant owns is not served at all.
     if invocation.server.tls.is_none() {
         validate_served_root_agent_bindings(control.as_ref(), &placements)?;
+        refuse_plaintext_for_tenant_roots(identity.as_ref(), &placements)?;
     }
     let object_namespace = control
         .get_root_object_namespace_binding(&root_id)
@@ -2079,11 +2107,17 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     let rpc_tls = match &invocation.server.tls {
         None => None,
         Some(tls) => {
-            let identity = connection::open_identity(&invocation.client.routing)
-                .map_err(|error| error.to_string())?;
             let tenant_id = served_tenant(identity.as_ref(), &placements)?;
-            let access =
-                TenantAccess::load(identity, tenant_id).map_err(|error| error.to_string())?;
+            // On etcd the copy may serve as long as the owner's lease would;
+            // past that the owner has lost the right to serve anyway.
+            let max_policy_age = match &invocation.client.routing {
+                cli::RoutingConfig::Etcd(config) => std::time::Duration::from_secs(
+                    u64::try_from(config.lease_ttl_seconds).unwrap_or(1).max(1),
+                ),
+                _ => DEFAULT_MAX_POLICY_AGE,
+            };
+            let access = TenantAccess::load(identity, tenant_id, max_policy_age)
+                .map_err(|error| error.to_string())?;
             let (chain, key) = rpc_tls::server_identity(tls)?;
             Some(RpcServerTls::new(chain, key, access).map_err(|error| error.to_string())?)
         }
@@ -2889,5 +2923,38 @@ mod tests {
 
         let provisioning = control.get_root_placement(&root(4)).unwrap().unwrap();
         assert!(active_shard_placements(&control, &provisioning).is_err());
+    }
+
+    #[test]
+    fn a_plaintext_owner_refuses_a_root_that_a_tenant_owns() {
+        use nokv_control::{
+            ControlStore, IdentityStore, InMemoryControlStore, RootTenantBinding, TenantRecord,
+        };
+        use nokv_types::{LogicalShardId, ObjectNamespaceId, RootId, TenantId};
+
+        let root = |fill| RootId::from_bytes([fill; nokv_types::FIXED_ID_BYTES]);
+        let shard = |fill| LogicalShardId::from_bytes([fill; nokv_types::FIXED_ID_BYTES]);
+        let control = InMemoryControlStore::new();
+        let namespace = ObjectNamespaceId::from_bytes([3; nokv_types::FIXED_ID_BYTES]);
+        provision::provision_and_activate(&control, root(1), shard(9), namespace).unwrap();
+        provision::provision_and_activate(&control, root(2), shard(9), namespace).unwrap();
+        let seed = control.get_root_placement(&root(1)).unwrap().unwrap();
+        let placements = active_shard_placements(&control, &seed).unwrap();
+        refuse_plaintext_for_tenant_roots(&control, &placements).unwrap();
+
+        let tenant_id = TenantId::from_bytes([5; nokv_types::FIXED_ID_BYTES]);
+        control.create_tenant(TenantRecord { tenant_id }).unwrap();
+        control
+            .bind_root_tenant(RootTenantBinding {
+                root_id: root(2),
+                tenant_id,
+            })
+            .unwrap();
+        let error = refuse_plaintext_for_tenant_roots(&control, &placements).unwrap_err();
+        assert!(
+            error.contains(&encode_lowercase_hex(root(2).as_bytes())),
+            "{error}"
+        );
+        assert!(error.contains("--rpc-tls-cert"), "{error}");
     }
 }

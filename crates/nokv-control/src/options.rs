@@ -58,6 +58,22 @@ impl EtcdControlStoreOptions {
         ))
     }
 
+    /// Bound on one etcd call. A call that outlives the renewal interval
+    /// cannot renew the owner's lease in time anyway, so waiting longer only
+    /// stalls the caller.
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn request_timeout(&self) -> std::time::Duration {
+        self.owner_lease_renew_interval()
+            .unwrap_or(std::time::Duration::from_secs(1))
+    }
+
+    /// Bound on establishing the etcd connection: one lease TTL, so an owner
+    /// that cannot reach etcd learns it before its lease would have lapsed.
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn connect_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::try_from(self.lease_ttl_seconds).unwrap_or(1).max(1))
+    }
+
     pub fn validate(&self) -> Result<(), ControlError> {
         if self.endpoints.is_empty() {
             return Err(ControlError::InvalidOptions(
@@ -383,6 +399,20 @@ mod tests {
             key(options.root_presentation_key(&root_id(0x01))),
             "/nokv/test/root-presentations/01010101010101010101010101010101"
         );
+    }
+
+    #[test]
+    fn etcd_call_bounds_follow_the_lease_ttl() {
+        let endpoint = ["http://127.0.0.1:2379"];
+        let options = EtcdControlStoreOptions::new(endpoint);
+        assert_eq!(options.request_timeout(), std::time::Duration::from_secs(3));
+        assert_eq!(
+            options.connect_timeout(),
+            std::time::Duration::from_secs(10)
+        );
+        let short = EtcdControlStoreOptions::new(endpoint).with_lease_ttl_seconds(1);
+        assert_eq!(short.request_timeout(), std::time::Duration::from_secs(1));
+        assert_eq!(short.connect_timeout(), std::time::Duration::from_secs(1));
     }
 
     #[test]
