@@ -873,6 +873,111 @@ durable_enum! {
     }
 }
 
+/// The absolute path under which an Agent presents one root's Workbenches:
+/// `{root}/{workbench}/{section}/{path}`.
+///
+/// It is durable per root, because canonical manifests carry paths under it,
+/// and it never names storage: `RootId` stays the only storage and routing
+/// identity. Repeated and trailing separators are normalized away; `.`,
+/// `..`, backslashes, and NUL are refused.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WorkbenchRoot(String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkbenchRootError {
+    Relative,
+    /// Only `/`, which would present Workbenches at the top level.
+    Bare,
+    DotComponent,
+    ParentComponent,
+    ContainsBackslash,
+    ContainsNul,
+    TooLong {
+        bytes: usize,
+        max: usize,
+    },
+    TooManyComponents {
+        components: usize,
+        max: usize,
+    },
+}
+
+impl WorkbenchRoot {
+    pub const MAX_BYTES: usize = 4096;
+    pub const MAX_COMPONENTS: usize = 64;
+
+    pub fn new(raw: &str) -> Result<Self, WorkbenchRootError> {
+        if !raw.starts_with('/') {
+            return Err(WorkbenchRootError::Relative);
+        }
+        if raw.contains('\\') {
+            return Err(WorkbenchRootError::ContainsBackslash);
+        }
+        if raw.contains('\0') {
+            return Err(WorkbenchRootError::ContainsNul);
+        }
+        let mut components = Vec::new();
+        for component in raw.split('/') {
+            match component {
+                "" => continue,
+                "." => return Err(WorkbenchRootError::DotComponent),
+                ".." => return Err(WorkbenchRootError::ParentComponent),
+                _ => components.push(component),
+            }
+        }
+        if components.is_empty() {
+            return Err(WorkbenchRootError::Bare);
+        }
+        if components.len() > Self::MAX_COMPONENTS {
+            return Err(WorkbenchRootError::TooManyComponents {
+                components: components.len(),
+                max: Self::MAX_COMPONENTS,
+            });
+        }
+        let normalized = format!("/{}", components.join("/"));
+        if normalized.len() > Self::MAX_BYTES {
+            return Err(WorkbenchRootError::TooLong {
+                bytes: normalized.len(),
+                max: Self::MAX_BYTES,
+            });
+        }
+        Ok(Self(normalized))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl core::fmt::Display for WorkbenchRootError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Relative => formatter.write_str("the Workbench root must be absolute"),
+            Self::Bare => formatter.write_str("the Workbench root must not be /"),
+            Self::DotComponent | Self::ParentComponent => {
+                formatter.write_str("the Workbench root must not contain '.' or '..' components")
+            }
+            Self::ContainsBackslash | Self::ContainsNul => {
+                formatter.write_str("the Workbench root must not contain backslashes or NUL")
+            }
+            Self::TooLong { bytes, max } => write!(
+                formatter,
+                "the Workbench root is {bytes} bytes, maximum is {max}"
+            ),
+            Self::TooManyComponents { components, max } => write!(
+                formatter,
+                "the Workbench root has {components} components, maximum is {max}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WorkbenchRootError {}
+
 /// Validated, case-sensitive, slash-joined relative Agent path.
 ///
 /// The stored string preserves its exact UTF-8 bytes. `/` is only a component
@@ -1454,6 +1559,51 @@ mod tests {
         assert_eq!(
             NormalizedRelativePath::new("input/\0file"),
             Err(NormalizedRelativePathError::ContainsNul { component: 1 })
+        );
+    }
+
+    #[test]
+    fn workbench_root_normalizes_separators_and_refuses_escapes() {
+        for (raw, normalized) in [
+            ("/agents/one/wb", "/agents/one/wb"),
+            ("/agents/two/wb/", "/agents/two/wb"),
+            ("//agents///three//wb", "/agents/three/wb"),
+        ] {
+            assert_eq!(
+                WorkbenchRoot::new(raw).unwrap().as_str(),
+                normalized,
+                "{raw}"
+            );
+        }
+        for (raw, error) in [
+            ("agents/wb", WorkbenchRootError::Relative),
+            ("/", WorkbenchRootError::Bare),
+            ("///", WorkbenchRootError::Bare),
+            ("/agents/./wb", WorkbenchRootError::DotComponent),
+            ("/agents/../wb", WorkbenchRootError::ParentComponent),
+            (r"/agents\wb", WorkbenchRootError::ContainsBackslash),
+            ("/agents/\0wb", WorkbenchRootError::ContainsNul),
+        ] {
+            assert_eq!(WorkbenchRoot::new(raw), Err(error), "{raw:?}");
+        }
+        let deep = format!(
+            "/{}",
+            vec!["a"; WorkbenchRoot::MAX_COMPONENTS + 1].join("/")
+        );
+        assert_eq!(
+            WorkbenchRoot::new(&deep),
+            Err(WorkbenchRootError::TooManyComponents {
+                components: WorkbenchRoot::MAX_COMPONENTS + 1,
+                max: WorkbenchRoot::MAX_COMPONENTS,
+            })
+        );
+        let long = format!("/{}", "x".repeat(WorkbenchRoot::MAX_BYTES));
+        assert_eq!(
+            WorkbenchRoot::new(&long),
+            Err(WorkbenchRootError::TooLong {
+                bytes: WorkbenchRoot::MAX_BYTES + 1,
+                max: WorkbenchRoot::MAX_BYTES,
+            })
         );
     }
 

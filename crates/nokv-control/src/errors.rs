@@ -86,6 +86,10 @@ pub enum ControlError {
     RootTenantAlreadyBound {
         root_id: RootId,
     },
+    /// The root already presents under another Workbench root.
+    RootPresentationAlreadyBound {
+        root_id: RootId,
+    },
     /// A root-scoped role names a root that the tenant does not own.
     RootNotInTenant {
         root_id: RootId,
@@ -120,6 +124,7 @@ impl ControlError {
             Self::RootPlacementAlreadyExists(_)
             | Self::CredentialAlreadyBound { .. }
             | Self::RootTenantAlreadyBound { .. }
+            | Self::RootPresentationAlreadyBound { .. }
             | Self::RootNotInTenant { .. }
             | Self::RootAgentAlreadyBound { .. }
             | Self::RootObjectNamespaceAlreadyBound { .. }
@@ -285,6 +290,10 @@ impl fmt::Display for ControlError {
             Self::RootTenantAlreadyBound { root_id } => {
                 write!(formatter, "root {root_id:?} is already bound to another tenant")
             }
+            Self::RootPresentationAlreadyBound { root_id } => write!(
+                formatter,
+                "root {root_id:?} is already bound to another Workbench root"
+            ),
             Self::RootNotInTenant { root_id, tenant_id } => write!(
                 formatter,
                 "root {root_id:?} is not owned by tenant {tenant_id:?}"

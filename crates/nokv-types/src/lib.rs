@@ -20,7 +20,7 @@ pub use workspace::{
     RequestId, RestorePhase, RestoreSourceKind, RevisionState, Role, RoleScope,
     RootActivationState, RootId, RootPlacementLifecycle, SnapshotAliasName, SnapshotId,
     SnapshotState, StagedCleanupState, StagedProviderState, TagName, TenantId,
-    UnknownDurableDiscriminant, WorkbenchId, WorkbenchIdError, WorkspaceIncarnationId,
-    WorkspaceRevision, WorkspaceState, ZeroValueError, FIXED_ID_BYTES,
+    UnknownDurableDiscriminant, WorkbenchId, WorkbenchIdError, WorkbenchRoot, WorkbenchRootError,
+    WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState, ZeroValueError, FIXED_ID_BYTES,
     MAX_INLINE_ARTIFACT_BODY_BYTES, SHA256_BYTES, TIME_ORDERED_PREFIX_BYTES,
 };

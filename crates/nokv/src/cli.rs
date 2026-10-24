@@ -138,7 +138,6 @@ pub struct Invocation {
     pub client: ClientConfig,
     pub server: ServerConfig,
     pub agent_id: Option<String>,
-    pub workbench_root: Option<String>,
     pub command: Command,
 }
 
@@ -191,6 +190,8 @@ pub enum Command {
     },
     Provision {
         logical_shard_id: String,
+        /// The Workbench root every Agent of the root presents it under.
+        workbench_root: String,
         adopt_legacy_object_namespace: bool,
         adopt_legacy_agent_binding: bool,
     },
@@ -510,7 +511,6 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     let mut control_directory = None;
     let mut routing_kind = None;
     let mut agent_id = None;
-    let mut workbench_root = None;
     let mut rpc_tls = RpcTlsArguments::default();
     let command = loop {
         let Some(argument) = arguments.next() else {
@@ -527,9 +527,6 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             }
             "--root-id" => client.root_id = Some(next_value(&mut arguments, &argument)?),
             "--agent-id" => agent_id = Some(next_value(&mut arguments, &argument)?),
-            "--workbench-root" => {
-                workbench_root = Some(next_value(&mut arguments, &argument)?);
-            }
             "--logical-shard-id" => {
                 select_routing(&mut routing_kind, RoutingKind::Static)?;
                 static_routing.logical_shard_id = Some(next_value(&mut arguments, &argument)?);
@@ -747,16 +744,6 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
         Command::Workbench { .. }
             | Command::WorkbenchSession
             | Command::Mcp { .. }
-            | Command::Collect { .. }
-    ) && workbench_root.is_none()
-    {
-        return Err(CliError::MissingOption("--workbench-root"));
-    }
-    if matches!(
-        &command,
-        Command::Workbench { .. }
-            | Command::WorkbenchSession
-            | Command::Mcp { .. }
             | Command::Materialize { .. }
             | Command::Collect { .. }
             | Command::WorkspacePath(_)
@@ -775,7 +762,6 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
         client,
         server,
         agent_id,
-        workbench_root,
         command,
     })
 }
@@ -1492,10 +1478,12 @@ fn parse_provision(arguments: &mut impl Iterator<Item = String>) -> Result<Comma
     let logical_shard_id = arguments
         .next()
         .ok_or(CliError::MissingArgument("logical shard id"))?;
+    let mut workbench_root = None;
     let mut adopt_legacy_object_namespace = false;
     let mut adopt_legacy_agent_binding = false;
-    for argument in arguments.by_ref() {
+    while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--workbench-root" => workbench_root = Some(next_value(arguments, &argument)?),
             "--adopt-legacy-object-namespace" => adopt_legacy_object_namespace = true,
             "--adopt-legacy-agent-binding" => adopt_legacy_agent_binding = true,
             _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
@@ -1504,6 +1492,7 @@ fn parse_provision(arguments: &mut impl Iterator<Item = String>) -> Result<Comma
     }
     Ok(Command::Provision {
         logical_shard_id,
+        workbench_root: workbench_root.ok_or(CliError::MissingOption("--workbench-root"))?,
         adopt_legacy_object_namespace,
         adopt_legacy_agent_binding,
     })
@@ -1659,22 +1648,12 @@ mod tests {
     }
 
     #[test]
-    fn workbench_session_requires_the_same_identity_and_presentation_root() {
+    fn workbench_session_requires_the_same_identity() {
         assert_eq!(
             parse(args(&["workbench-session"])),
-            Err(CliError::MissingOption("--workbench-root"))
-        );
-        assert_eq!(
-            parse(args(&[
-                "--workbench-root",
-                "/agents/test/wb",
-                "workbench-session"
-            ])),
             Err(CliError::MissingOption("--agent-id"))
         );
         let parsed = parse(args(&[
-            "--workbench-root",
-            "/agents/test/wb",
             "--agent-id",
             "44444444444444444444444444444444",
             "workbench-session",
@@ -1690,8 +1669,6 @@ mod tests {
             "01",
             "--agent-id",
             "44444444444444444444444444444444",
-            "--workbench-root",
-            "/agents/test/wb",
             "--logical-shard-id",
             "02",
             "--placement-generation",
@@ -1710,7 +1687,6 @@ mod tests {
             parsed.agent_id.as_deref(),
             Some("44444444444444444444444444444444")
         );
-        assert_eq!(parsed.workbench_root.as_deref(), Some("/agents/test/wb"));
         let RoutingConfig::Static(route) = parsed.client.routing else {
             panic!("static route expected");
         };
@@ -1731,8 +1707,6 @@ mod tests {
         let parsed = parse(args(&[
             "--agent-id",
             "44444444444444444444444444444444",
-            "--workbench-root",
-            "/agents/test/wb",
             "collect",
             "run-1",
             "outputs",
@@ -1760,12 +1734,7 @@ mod tests {
     }
 
     fn agent_args(rest: &[&str]) -> Vec<String> {
-        let mut all = vec![
-            "--agent-id",
-            "44444444444444444444444444444444",
-            "--workbench-root",
-            "/agents/test/wb",
-        ];
+        let mut all = vec!["--agent-id", "44444444444444444444444444444444"];
         all.extend_from_slice(rest);
         args(&all)
     }
@@ -1916,8 +1885,6 @@ mod tests {
         let parsed = parse(args(&[
             "--agent-id",
             "44444444444444444444444444444444",
-            "--workbench-root",
-            "/agents/test/wb",
             "collect",
             "run-1",
             "outputs",
@@ -1946,8 +1913,6 @@ mod tests {
         let unpinned = parse(args(&[
             "--agent-id",
             "44444444444444444444444444444444",
-            "--workbench-root",
-            "/agents/test/wb",
             "collect",
             "run-1",
             "outputs",
@@ -2000,7 +1965,6 @@ mod tests {
                 operation_id: [0xaa; 16],
             }
         );
-        assert!(parsed.workbench_root.is_none());
         assert!(parsed.client.object.bucket.is_none());
         assert!(parse(args(&["operation", "status", "aa"])).is_err());
         assert!(parse(args(&["operation", "status"])).is_err());
@@ -2038,7 +2002,6 @@ mod tests {
             }
         );
         assert!(inspected.client.object.bucket.is_none());
-        assert!(inspected.workbench_root.is_none());
         assert_eq!(
             parse_command(&["inspect", identity, "--limit", "192", "--cursor", "AQID"])
                 .unwrap()
@@ -2274,8 +2237,6 @@ mod tests {
             "01",
             "--agent-id",
             "44444444444444444444444444444444",
-            "--workbench-root",
-            "/agents/test/wb",
             "--etcd-endpoint",
             "http://127.0.0.1:2379",
             "--etcd-endpoint",
@@ -2304,12 +2265,7 @@ mod tests {
 
     #[test]
     fn mcp_profile_is_explicit_and_defaults_to_workbench() {
-        let prefix = [
-            "--agent-id",
-            "44444444444444444444444444444444",
-            "--workbench-root",
-            "/agents/test/wb",
-        ];
+        let prefix = ["--agent-id", "44444444444444444444444444444444"];
         for (suffix, expected) in [
             (&["mcp"][..], McpProfile::Workbench),
             (
@@ -2360,12 +2316,15 @@ mod tests {
             "http://127.0.0.1:2379",
             "provision",
             "22222222222222222222222222222222",
+            "--workbench-root",
+            "/agents/test/wb",
         ]))
         .unwrap();
         assert_eq!(
             parsed.command,
             Command::Provision {
                 logical_shard_id: "22222222222222222222222222222222".to_owned(),
+                workbench_root: "/agents/test/wb".to_owned(),
                 adopt_legacy_object_namespace: false,
                 adopt_legacy_agent_binding: false,
             }
@@ -2691,6 +2650,8 @@ mod tests {
             "http://127.0.0.1:2379",
             "provision",
             "22222222222222222222222222222222",
+            "--workbench-root",
+            "/agents/test/wb",
             "--adopt-legacy-object-namespace",
         ]))
         .unwrap();
@@ -2714,6 +2675,8 @@ mod tests {
             "http://127.0.0.1:2379",
             "provision",
             "22222222222222222222222222222222",
+            "--workbench-root",
+            "/agents/test/wb",
             "--adopt-legacy-object-namespace",
             "unexpected",
         ]))
@@ -2728,8 +2691,6 @@ mod tests {
             parse(args(&[
                 "--metadata-address",
                 "127.0.0.1:7750",
-                "--workbench-root",
-                "/agents/test/wb",
                 "--etcd-endpoint",
                 "http://127.0.0.1:2379",
                 "mcp",
@@ -2749,6 +2710,8 @@ mod tests {
             "/var/lib/nokv/control",
             "provision",
             "22222222222222222222222222222222",
+            "--workbench-root",
+            "/agents/test/wb",
         ]))
         .unwrap();
         assert_eq!(
@@ -2954,38 +2917,51 @@ mod tests {
     }
 
     #[test]
-    fn agent_commands_require_an_explicit_presentation_root() {
+    fn provision_binds_the_workbench_root_and_agent_commands_take_none() {
         assert_eq!(
             parse(args(&[
+                "--root-id",
+                "11",
                 "--agent-id",
                 "44444444444444444444444444444444",
-                "mcp",
+                "--etcd-endpoint",
+                "http://127.0.0.1:2379",
+                "provision",
+                "22222222222222222222222222222222",
             ])),
             Err(CliError::MissingOption("--workbench-root"))
         );
-        assert_eq!(
-            parse(args(&[
+        // The root's presentation comes from the control plane, not from
+        // each Agent's command line.
+        for arguments in [
+            args(&[
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "--workbench-root",
+                "/agents/test/wb",
+                "mcp",
+            ]),
+            args(&[
+                "--workbench-root",
+                "/agents/test/wb",
                 "--agent-id",
                 "44444444444444444444444444444444",
                 "workbench",
                 "workbench_create",
                 r#"{"id":"run-1"}"#,
-            ])),
-            Err(CliError::MissingOption("--workbench-root"))
-        );
+            ]),
+        ] {
+            assert!(
+                matches!(parse(arguments), Err(CliError::UnknownOption(option)) if option == "--workbench-root")
+            );
+        }
     }
 
     #[test]
     fn agent_commands_and_provision_require_an_explicit_agent_id() {
         for arguments in [
-            args(&["--workbench-root", "/agents/test/wb", "mcp"]),
-            args(&[
-                "--workbench-root",
-                "/agents/test/wb",
-                "workbench",
-                "workbench_create",
-                r#"{"id":"run-1"}"#,
-            ]),
+            args(&["mcp"]),
+            args(&["workbench", "workbench_create", r#"{"id":"run-1"}"#]),
             args(&[
                 "materialize",
                 "run-1",
@@ -2994,8 +2970,6 @@ mod tests {
                 "/tmp/result.bin",
             ]),
             args(&[
-                "--workbench-root",
-                "/agents/test/wb",
                 "collect",
                 "run-1",
                 "outputs",
@@ -3024,6 +2998,8 @@ mod tests {
                 "http://127.0.0.1:2379",
                 "provision",
                 "22222222222222222222222222222222",
+                "--workbench-root",
+                "/agents/test/wb",
             ]),
         ] {
             assert_eq!(parse(arguments), Err(CliError::MissingOption("--agent-id")));
@@ -3052,6 +3028,8 @@ mod tests {
             "http://127.0.0.1:2379",
             "provision",
             "22222222222222222222222222222222",
+            "--workbench-root",
+            "/agents/test/wb",
             "--adopt-legacy-agent-binding",
             "--adopt-legacy-object-namespace",
         ]))
@@ -3069,8 +3047,6 @@ mod tests {
             parse(args(&[
                 "--agent-id",
                 "44444444444444444444444444444444",
-                "--workbench-root",
-                "/agents/test/wb",
                 "mcp",
                 "--adopt-legacy-agent-binding",
             ])),

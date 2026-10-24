@@ -165,6 +165,15 @@ pub struct RootTenantBinding {
     pub tenant_id: TenantId,
 }
 
+/// Immutable binding from one root to the Workbench root its Agents present
+/// it under. Canonical manifests carry paths under this root, so every Agent
+/// of the root must use the same one; provision binds it once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootPresentationBinding {
+    pub root_id: RootId,
+    pub workbench_root: nokv_types::WorkbenchRoot,
+}
+
 /// One consistent read of a tenant's principals, credentials, and roles.
 ///
 /// `revision` advances by one with every change to these records, so a

@@ -1,6 +1,6 @@
 //! Tenant identity records: tenants, their principals, the credentials that
-//! authenticate those principals, the roles they hold, and the tenant that
-//! owns each root.
+//! authenticate those principals, the roles they hold, the tenant that owns
+//! each root, and the Workbench root each root is presented under.
 //!
 //! Records are created once, and an exact replay is idempotent. Every change
 //! to a tenant's principals, credentials, or roles advances that tenant's
@@ -11,10 +11,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use nokv_types::WorkbenchRoot;
+
 use crate::{
     ControlError, CredentialBinding, CredentialFingerprint, InMemoryControlStore, PrincipalId,
-    PrincipalRecord, RoleBinding, RoleScope, RootId, RootTenantBinding, TenantId, TenantPolicy,
-    TenantRecord,
+    PrincipalRecord, RoleBinding, RoleScope, RootId, RootPresentationBinding, RootTenantBinding,
+    TenantId, TenantPolicy, TenantRecord,
 };
 
 /// Upper bounds on one tenant's records, so a policy read stays bounded.
@@ -70,6 +72,18 @@ pub trait IdentityStore: Send + Sync {
 
     fn get_root_tenant(&self, root_id: &RootId) -> Result<Option<RootTenantBinding>, ControlError>;
 
+    /// Bind a root to the Workbench root its Agents present it under. A root
+    /// is never rebound, and no tenant needs to own it yet.
+    fn bind_root_presentation(
+        &self,
+        binding: RootPresentationBinding,
+    ) -> Result<RootPresentationBinding, ControlError>;
+
+    fn get_root_presentation(
+        &self,
+        root_id: &RootId,
+    ) -> Result<Option<RootPresentationBinding>, ControlError>;
+
     /// Read a tenant's records at one revision; `None` for an absent tenant.
     fn load_tenant_policy(
         &self,
@@ -95,6 +109,7 @@ pub(crate) struct TenantState {
 pub(crate) struct IdentityState {
     pub(crate) tenants: BTreeMap<TenantId, TenantState>,
     pub(crate) root_tenants: BTreeMap<RootId, TenantId>,
+    pub(crate) root_presentations: BTreeMap<RootId, WorkbenchRoot>,
 }
 
 impl IdentityState {
@@ -239,6 +254,32 @@ impl IdentityState {
             })
     }
 
+    pub(crate) fn bind_root_presentation(
+        &mut self,
+        binding: RootPresentationBinding,
+    ) -> Result<RootPresentationBinding, ControlError> {
+        match self.root_presentations.get(&binding.root_id) {
+            Some(existing) if *existing == binding.workbench_root => Ok(binding),
+            Some(_) => Err(ControlError::RootPresentationAlreadyBound {
+                root_id: binding.root_id,
+            }),
+            None => {
+                self.root_presentations
+                    .insert(binding.root_id, binding.workbench_root.clone());
+                Ok(binding)
+            }
+        }
+    }
+
+    pub(crate) fn root_presentation(&self, root_id: &RootId) -> Option<RootPresentationBinding> {
+        self.root_presentations
+            .get(root_id)
+            .map(|workbench_root| RootPresentationBinding {
+                root_id: *root_id,
+                workbench_root: workbench_root.clone(),
+            })
+    }
+
     pub(crate) fn policy(&self, tenant_id: &TenantId) -> Option<TenantPolicy> {
         let tenant = self.tenants.get(tenant_id)?;
         Some(TenantPolicy {
@@ -372,6 +413,20 @@ impl IdentityStore for InMemoryControlStore {
 
     fn get_root_tenant(&self, root_id: &RootId) -> Result<Option<RootTenantBinding>, ControlError> {
         Ok(self.identity().root_tenant(root_id))
+    }
+
+    fn bind_root_presentation(
+        &self,
+        binding: RootPresentationBinding,
+    ) -> Result<RootPresentationBinding, ControlError> {
+        self.identity().bind_root_presentation(binding)
+    }
+
+    fn get_root_presentation(
+        &self,
+        root_id: &RootId,
+    ) -> Result<Option<RootPresentationBinding>, ControlError> {
+        Ok(self.identity().root_presentation(root_id))
     }
 
     fn load_tenant_policy(

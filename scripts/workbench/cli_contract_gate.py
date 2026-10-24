@@ -271,10 +271,8 @@ class Stack:
                 time.sleep(0.1)
         raise NotQualified(f"{what} did not listen on port {port}")
 
-    def run(self, label: str, arguments: list[str], *, client: bool = True) -> Call:
+    def run(self, label: str, arguments: list[str]) -> Call:
         prefix = [*self.route, "--agent-id", self.ids["agent"], *self.objects]
-        if client:
-            prefix += ["--workbench-root", WORKBENCH_ROOT]
         argv = [str(self.binary), *prefix, *arguments]
         with self.proxy._lock:
             connections, requests = self.proxy.connections, len(self.proxy.requests)
@@ -307,7 +305,7 @@ class Stack:
         return call
 
     def provision(self) -> None:
-        call = self.run("provision", ["provision", self.ids["shard"]], client=False)
+        call = self.run("provision", ["provision", self.ids["shard"], "--workbench-root", WORKBENCH_ROOT])
         if call.exit != 0:
             raise NotQualified(f"provision failed: {call.stderr[-600:]}")
 

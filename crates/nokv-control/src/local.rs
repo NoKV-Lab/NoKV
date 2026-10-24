@@ -38,8 +38,8 @@ use crate::{
     ControlError, ControlStore, CredentialBinding, CredentialFingerprint, IdentityLimits,
     IdentityStore, InMemoryControlStore, LogicalShardId, LogicalShardLease, LogicalShardRecord,
     NodeId, OwnerEpoch, PrincipalRecord, RecoveryPublication, RecoveryUploadIntent, RoleBinding,
-    RootAgentBinding, RootId, RootObjectNamespaceBinding, RootPlacement, RootTenantBinding,
-    TenantId, TenantPolicy, TenantRecord,
+    RootAgentBinding, RootId, RootObjectNamespaceBinding, RootPlacement, RootPresentationBinding,
+    RootTenantBinding, TenantId, TenantPolicy, TenantRecord,
 };
 
 const STATE_FILE: &str = "control-state.json";
@@ -540,6 +540,20 @@ impl IdentityStore for LocalControlStore {
 
     fn get_root_tenant(&self, root_id: &RootId) -> Result<Option<RootTenantBinding>, ControlError> {
         Ok(self.read_identity()?.1.root_tenant(root_id))
+    }
+
+    fn bind_root_presentation(
+        &self,
+        binding: RootPresentationBinding,
+    ) -> Result<RootPresentationBinding, ControlError> {
+        self.mutate_identity(|state| state.bind_root_presentation(binding))
+    }
+
+    fn get_root_presentation(
+        &self,
+        root_id: &RootId,
+    ) -> Result<Option<RootPresentationBinding>, ControlError> {
+        Ok(self.read_identity()?.1.root_presentation(root_id))
     }
 
     fn load_tenant_policy(

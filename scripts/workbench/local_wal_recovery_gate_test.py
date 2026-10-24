@@ -372,7 +372,9 @@ class LocalWalRecoveryGateContractTests(unittest.TestCase):
                 expected_agent_id,
                 *object_arguments,
                 "provision",
-                provision_command[-1],
+                provision_command[-3],
+                "--workbench-root",
+                "/agents/issue450/wb",
             ],
         )
 

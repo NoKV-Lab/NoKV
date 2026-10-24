@@ -244,7 +244,7 @@ real-service acceptance gate is still **not qualified**.
 | `nokv operation status` | Query an append, publish, commit (`--commit-identity`), or restore by its identity and report its stored receipt or next action. | Metadata only: no payload, current workspace, or object-store connection is required. |
 | `nokv operation inspect` | Inspect a bounded page of retained staged objects and save the exact operation token. | Metadata only; the cursor binds one observation and fails if state changes. |
 | `nokv operation recover` | Ask the owner to retry quarantined append cleanup. | No payload or object credentials; an explicit saved state digest replays one durable recovery request. |
-| `nokv provision` | Bind `RootId` to `AgentId`, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. Over RPC TLS, the owner checks roles instead and the binding is not consulted. |
+| `nokv provision` | Bind `RootId` to `AgentId`, the Workbench root its Agents present it under, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. Over RPC TLS, the owner checks roles instead and the binding is not consulted. |
 | `nokv serve` | Start one explicit metadata owner from create, same-namespace reopen, or recovery-log state. | Shared recovery publication is opt-in and not currently qualified. |
 | `nokv identity` | Create tenants and principals, bind certificate fingerprints to principals, grant or revoke tenant- and root-scoped roles, and bind roots to tenants. | Operator command that writes the control store directly. An owner that serves RPC TLS enforces these records within about a second. |
 | `nokv mcp` | Deprecated stdio transport retained only because qualification runners still use it. | **Unsupported for integration.** |
@@ -599,7 +599,6 @@ native-CLI real-service Gate 0 remains not qualified.
 nokv \
   --root-id "$NOKV_ROOT_ID" \
   --agent-id "$NOKV_AGENT_ID" \
-  --workbench-root /agents/research/wb \
   --etcd-endpoint "$NOKV_ETCD_ENDPOINT" \
   --object-bucket "$NOKV_BUCKET" \
   --object-endpoint "$NOKV_OBJECT_ENDPOINT" \
@@ -608,7 +607,6 @@ nokv \
 nokv \
   --root-id "$NOKV_ROOT_ID" \
   --agent-id "$NOKV_AGENT_ID" \
-  --workbench-root /agents/research/wb \
   --etcd-endpoint "$NOKV_ETCD_ENDPOINT" \
   --object-bucket "$NOKV_BUCKET" \
   --object-endpoint "$NOKV_OBJECT_ENDPOINT" \
@@ -618,7 +616,6 @@ nokv \
 nokv \
   --root-id "$NOKV_ROOT_ID" \
   --agent-id "$NOKV_AGENT_ID" \
-  --workbench-root /agents/research/wb \
   --etcd-endpoint "$NOKV_ETCD_ENDPOINT" \
   --object-bucket "$NOKV_BUCKET" \
   --object-endpoint "$NOKV_OBJECT_ENDPOINT" \

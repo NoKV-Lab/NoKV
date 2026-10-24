@@ -31,7 +31,6 @@ from cli_contract_gate import (
     Call,
     ContractFailure,
     NotQualified,
-    WORKBENCH_ROOT,
     Stack,
     new_id,
     require,
@@ -104,20 +103,21 @@ class TlsStack(Stack):
             "--rpc-tls-server-name", server_name,
         ]
 
-    def run(self, label: str, arguments: list[str], *, client: bool = True,
-            tls: str | None = "agent", server_name: str = SERVER_NAME,
-            agent_id: str | None = None) -> Call:
-        options = self.tls_options(tls, server_name) if client else []
+    def run(self, label: str, arguments: list[str], *, tls: str | None = "agent",
+            server_name: str = SERVER_NAME, agent_id: str | None = None) -> Call:
+        # provision and identity write the control store and never connect.
+        connects = arguments[0] not in ("provision", "identity")
+        options = self.tls_options(tls, server_name) if connects else []
         if agent_id is None:
-            return super().run(label, [*options, *arguments], client=client)
+            return super().run(label, [*options, *arguments])
         configured, self.ids["agent"] = self.ids["agent"], agent_id
         try:
-            return super().run(label, [*options, *arguments], client=client)
+            return super().run(label, [*options, *arguments])
         finally:
             self.ids["agent"] = configured
 
     def identity(self, label: str, *arguments: str) -> dict[str, Any]:
-        return self.success(self.run(label, ["identity", *arguments], client=False))
+        return self.success(self.run(label, ["identity", *arguments]))
 
     def register(self, client: str, principal: str = "agent") -> dict[str, Any]:
         certificate, _ = self.clients[client]
@@ -268,7 +268,7 @@ def two_principals_write_one_root(stack: TlsStack) -> dict[str, Any]:
 def revoked_role_stops_an_open_session(stack: TlsStack) -> dict[str, Any]:
     """T8: a role revoked while a session is open stops that session's next
     write within the owner's refresh interval."""
-    argv = [str(stack.binary), *stack.route, *stack.objects, "--workbench-root", WORKBENCH_ROOT,
+    argv = [str(stack.binary), *stack.route, *stack.objects,
             *stack.tls_options("session", SERVER_NAME), "workbench-session"]
     session = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
                                env=stack.env)

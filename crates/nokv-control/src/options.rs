@@ -237,6 +237,16 @@ impl EtcdControlStoreOptions {
         .into_bytes()
     }
 
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn root_presentation_key(&self, root_id: &RootId) -> Vec<u8> {
+        format!(
+            "{}/root-presentations/{}",
+            self.normalized_key_prefix(),
+            encode_fixed_id(root_id.as_bytes())
+        )
+        .into_bytes()
+    }
+
     /// Stable session key shared by every owner generation of one logical shard.
     #[cfg(any(feature = "etcd", test))]
     pub(crate) fn logical_shard_session_key(&self, logical_shard_id: &LogicalShardId) -> Vec<u8> {
@@ -368,6 +378,10 @@ mod tests {
         assert_eq!(
             key(options.root_tenant_key(&root_id(0x01))),
             "/nokv/test/root-tenants/01010101010101010101010101010101"
+        );
+        assert_eq!(
+            key(options.root_presentation_key(&root_id(0x01))),
+            "/nokv/test/root-presentations/01010101010101010101010101010101"
         );
     }
 

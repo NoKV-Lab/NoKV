@@ -786,7 +786,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         agent_common = [*common, "--agent-id", agent_id]
         objects = object_args(s3_endpoint, bucket, object_root, access_key, secret_key)
         run(
-            [*agent_common, *objects, "provision", shard_id],
+            [*agent_common, *objects, "provision", shard_id, "--workbench-root", WORKBENCH_ROOT],
             cwd=repo,
             timeout=args.timeout,
             evidence=evidence,
@@ -828,8 +828,6 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             *agent_common,
             "--max-attempts",
             "1",
-            "--workbench-root",
-            WORKBENCH_ROOT,
             *objects,
         ]
 

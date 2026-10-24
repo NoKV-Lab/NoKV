@@ -5,23 +5,26 @@
 //! its record and the advanced counter in one transaction guarded by the
 //! counter's modification revision, so concurrent changes serialize and the
 //! counts bound a policy read. A policy read fetches the whole prefix at one
-//! etcd revision. Root ownership lives under `root-tenants/{root}`.
+//! etcd revision. Root ownership lives under `root-tenants/{root}`, and the
+//! Workbench root a root is presented under lives under
+//! `root-presentations/{root}`; neither is part of a tenant's policy.
 
 use etcd_client::{Client, Compare, CompareOp, GetOptions, KeyValue, Txn, TxnOp, TxnOpResponse};
 
 use crate::codec::{
     decode_credential_binding, decode_principal_record, decode_role_binding,
-    decode_root_tenant_binding, decode_tenant_policy_counter, decode_tenant_record,
-    encode_credential_binding, encode_principal_record, encode_role_binding,
-    encode_root_tenant_binding, encode_tenant_policy_counter, encode_tenant_record,
-    TenantPolicyCounter,
+    decode_root_presentation_binding, decode_root_tenant_binding, decode_tenant_policy_counter,
+    decode_tenant_record, encode_credential_binding, encode_principal_record, encode_role_binding,
+    encode_root_presentation_binding, encode_root_tenant_binding, encode_tenant_policy_counter,
+    encode_tenant_record, TenantPolicyCounter,
 };
 use crate::etcd::etcd_backend;
 use crate::identity::{check_limit, require_root_in_tenant, validate_credential};
 use crate::{
     ControlError, CredentialBinding, CredentialFingerprint, EtcdControlStore,
     EtcdControlStoreOptions, IdentityLimits, IdentityStore, PrincipalId, PrincipalRecord,
-    RoleBinding, RoleScope, RootId, RootTenantBinding, TenantId, TenantPolicy, TenantRecord,
+    RoleBinding, RoleScope, RootId, RootPresentationBinding, RootTenantBinding, TenantId,
+    TenantPolicy, TenantRecord,
 };
 
 /// Bound on optimistic retries when other changes to the same tenant keep
@@ -266,6 +269,67 @@ impl IdentityStore for EtcdControlStore {
         let options = self.options().clone();
         let root_id = *root_id;
         self.block_on(async move { fetch_root_tenant(&mut client, &options, &root_id).await })
+    }
+
+    fn bind_root_presentation(
+        &self,
+        binding: RootPresentationBinding,
+    ) -> Result<RootPresentationBinding, ControlError> {
+        let mut client = self.client();
+        let options = self.options().clone();
+        self.block_on(async move {
+            let key = options.root_presentation_key(&binding.root_id);
+            let value = encode_root_presentation_binding(&binding)?;
+            let response = client
+                .txn(
+                    Txn::new()
+                        .when(vec![Compare::version(key.clone(), CompareOp::Equal, 0)])
+                        .and_then(vec![TxnOp::put(key.clone(), value, None)])
+                        .or_else(vec![TxnOp::get(key.clone(), None)]),
+                )
+                .await
+                .map_err(etcd_backend)?;
+            if response.succeeded() {
+                return Ok(binding);
+            }
+            let Some(TxnOpResponse::Get(existing)) = response.op_responses().into_iter().next()
+            else {
+                return Err(unexpected_response());
+            };
+            let Some(existing) = existing.kvs().first() else {
+                return Err(ControlError::Backend(
+                    "root presentation binding disappeared after a create conflict".to_owned(),
+                ));
+            };
+            let existing = validate_root_presentation_entry(&options, &binding.root_id, existing)?;
+            if existing == binding {
+                Ok(binding)
+            } else {
+                Err(ControlError::RootPresentationAlreadyBound {
+                    root_id: binding.root_id,
+                })
+            }
+        })
+    }
+
+    fn get_root_presentation(
+        &self,
+        root_id: &RootId,
+    ) -> Result<Option<RootPresentationBinding>, ControlError> {
+        let mut client = self.client();
+        let options = self.options().clone();
+        let root_id = *root_id;
+        self.block_on(async move {
+            let response = client
+                .get(options.root_presentation_key(&root_id), None)
+                .await
+                .map_err(etcd_backend)?;
+            response
+                .kvs()
+                .first()
+                .map(|entry| validate_root_presentation_entry(&options, &root_id, entry))
+                .transpose()
+        })
     }
 
     fn load_tenant_policy(
@@ -602,6 +666,20 @@ fn validate_root_tenant_entry(
     if binding.root_id != *root_id || entry.key() != options.root_tenant_key(root_id) {
         return Err(ControlError::Codec(
             "root tenant key and value identities differ".to_owned(),
+        ));
+    }
+    Ok(binding)
+}
+
+fn validate_root_presentation_entry(
+    options: &EtcdControlStoreOptions,
+    root_id: &RootId,
+    entry: &KeyValue,
+) -> Result<RootPresentationBinding, ControlError> {
+    let binding = decode_root_presentation_binding(entry.value())?;
+    if binding.root_id != *root_id || entry.key() != options.root_presentation_key(root_id) {
+        return Err(ControlError::Codec(
+            "root presentation key and value identities differ".to_owned(),
         ));
     }
     Ok(binding)

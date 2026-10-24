@@ -20,6 +20,8 @@ Before registration, obtain:
 - one 16-byte `RootId`;
 - one persisted 16-byte `AgentId` and its immutable control-plane binding to
   that RootId;
+- the absolute Workbench root every Agent presents the root under, bound once
+  by `nokv provision --workbench-root`;
 - its persisted 16-byte `LogicalShardId` affinity;
 - the current non-zero placement generation and owner epoch;
 - the reachable workspace RPC owner address;
@@ -98,9 +100,11 @@ a normal reopen alone does not cover interrupted `Recovering` retries.
 process. That sidecar is deprecated and is not a supported NoKV integration
 surface; it remains only as this harness's transport, and evidence produced
 over it qualifies neither the CLI nor the Python SDK path.
-The selected `--workbench-root` is durable presentation configuration because
-canonical v1 manifests contain its projected paths. Keep it identical across
-restart/replay; it never replaces `RootId` as the storage or routing identity.
+The Workbench root is durable presentation configuration because canonical v1
+manifests contain its projected paths. `nokv provision --workbench-root` binds
+it to the root once, and Agent-facing commands read it from the control plane,
+so every Agent of the root presents it the same way; it never replaces `RootId`
+as the storage or routing identity.
 Agent-facing commands require control routing (a local control directory or
 etcd). Without RPC TLS they also verify the immutable
 RootId-to-AgentId binding before RPC preflight, object binding, stdin reads, or

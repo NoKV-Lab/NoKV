@@ -48,6 +48,6 @@ pub use types::{
     LogicalShardState, NodeId, NodeIdError, ObjectNamespaceId, OwnerEpoch, PlacementGeneration,
     PrincipalId, PrincipalRecord, RecoveryPublication, RecoveryUploadIntent, Role, RoleBinding,
     RoleScope, RootAgentBinding, RootId, RootObjectNamespaceBinding, RootPlacement,
-    RootPlacementLifecycle, RootTenantBinding, TenantId, TenantPolicy, TenantRecord,
-    UnknownLogicalShardState,
+    RootPlacementLifecycle, RootPresentationBinding, RootTenantBinding, TenantId, TenantPolicy,
+    TenantRecord, UnknownLogicalShardState,
 };
