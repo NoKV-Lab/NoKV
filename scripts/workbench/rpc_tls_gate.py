@@ -24,6 +24,7 @@ import json
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
@@ -87,10 +88,12 @@ class TlsStack(Stack):
         self.pki = Pki(evidence / "pki")
         self.clients = {
             name: self.pki.client(name)
-            for name in ("agent", "stranger", "rotated", "reader", "peer", "session")
+            for name in ("agent", "stranger", "rotated", "reader", "peer", "session", "operator", "fourth")
         }
         self.tenant = new_id()
-        self.principals = {name: new_id() for name in ("agent", "reader", "peer", "session")}
+        self.principals = {
+            name: new_id() for name in ("agent", "reader", "peer", "session", "operator", "fourth")
+        }
         self.principal = self.principals["agent"]
 
     def tls_options(self, client: str | None, server_name: str) -> list[str]:
@@ -315,6 +318,108 @@ def revoked_role_stops_an_open_session(stack: TlsStack) -> dict[str, Any]:
     return {"before": before, "after": after}
 
 
+COMMIT_ARGUMENTS = {
+    "id": WORKBENCH,
+    "manifest": {"dataset": "tls-gate", "task": "attribution"},
+    "content_digest_uri": "sha256:" + hashlib.sha256(b"attribution").hexdigest(),
+    "replace": False,
+}
+
+
+def tool(stack: TlsStack, label: str, name: str, arguments: dict[str, Any], **client: Any) -> Call:
+    return stack.run(label, ["workbench", name, json.dumps(arguments)], **client)
+
+
+def another_principal_presenting_an_operation_id_observes_or_conflicts(stack: TlsStack) -> dict[str, Any]:
+    """T9: an operation id belongs to the principal that claimed it. Another
+    principal presenting it with the same inputs is answered from the
+    existing operation without a write, and with other inputs is refused;
+    either way the path keeps the first principal's revision and the
+    operation keeps its initiator."""
+    operation_id = new_id()
+    first = stack.success(stack.put("t9-agent", WORKBENCH, "t9.txt", operation_id, b"agent"))
+    same = stack.success(stack.run(
+        "t9-peer-same", stack.put_arguments("t9-peer-same", WORKBENCH, "t9.txt", operation_id, b"agent"),
+        tls="peer"))
+    require(same.get("commit_version") is None and same.get("artifact_revision_id") == first.get("artifact_revision_id"),
+            "t9: the same inputs are answered from the existing operation, not written again", [first, same])
+    other = stack.failure(stack.run(
+        "t9-peer-other", stack.put_arguments("t9-peer-other", WORKBENCH, "t9.txt", operation_id, b"peer"),
+        tls="peer"), "identity_conflict", "do_not_retry")
+    status = stack.success(stack.run("t9-status", ["operation", "status", operation_id], tls="peer"))
+    require(status.get("initiator") == stack.principals["agent"], "t9: the operation keeps its initiator", status)
+    oracle = stack.assert_live("t9", WORKBENCH, "t9.txt", b"agent", first)
+    return {"first": first, "same": same, "other": other, "status": status, "oracle": oracle}
+
+
+def operation_status_names_the_initiator(stack: TlsStack) -> dict[str, Any]:
+    """T10: an operation's status names the principal that began it, to any
+    reader of the root."""
+    operation_id = new_id()
+    stack.success(stack.put("t10-put", WORKBENCH, "t10.txt", operation_id, b"attributed"))
+    status = stack.success(stack.run("t10-status", ["operation", "status", operation_id], tls="reader"))
+    require(status.get("initiator") == stack.principals["agent"], "t10: the status names the initiator", status)
+    return status
+
+
+def only_the_minter_or_an_operator_renews_a_snapshot(stack: TlsStack) -> dict[str, Any]:
+    """T11: a snapshot is renewed or retired by the principal that minted it
+    or by an operator; another writer is refused and changes nothing."""
+    committed = stack.success(tool(stack, "t11-commit", "workbench_commit", COMMIT_ARGUMENTS))
+    minted = stack.success(tool(stack, "t11-mint", "workbench_snapshot",
+                                {"id": WORKBENCH, "name": "t11", "ttl_days": 1}))
+    renew = {"id": WORKBENCH, "name": "t11", "ttl_days": 2}
+    refused = stack.failure(tool(stack, "t11-peer-renew", "workbench_snapshot_renew", renew, tls="peer"),
+                            "operator_required", "operator")
+    require(refused["code"] == "PermissionDenied", "t11: the refusal is PermissionDenied", refused)
+    by_operator = stack.success(tool(stack, "t11-operator-renew", "workbench_snapshot_renew", renew,
+                                     tls="operator"))
+    by_minter = stack.success(tool(stack, "t11-agent-renew", "workbench_snapshot_renew",
+                                   {**renew, "ttl_days": 3}))
+    retire = {"id": WORKBENCH, "name": "t11"}
+    stack.failure(tool(stack, "t11-peer-retire", "workbench_snapshot_retire", retire, tls="peer"),
+                  "operator_required", "operator")
+    retired = stack.success(tool(stack, "t11-agent-retire", "workbench_snapshot_retire", retire))
+    require(retired.get("retired") is True, "t11: the minter retires its snapshot", retired)
+    return {"commit": committed, "minted": minted, "refused": refused, "operator": by_operator,
+            "minter": by_minter, "retired": retired}
+
+
+def an_identical_commit_replays_across_principals(stack: TlsStack) -> dict[str, Any]:
+    """T12: a commit's identity derives from its content, so another principal
+    committing the same content gets the first commit back as a replay, not
+    a second commit."""
+    first = stack.success(tool(stack, "t12-agent-commit", "workbench_commit", COMMIT_ARGUMENTS))
+    second = stack.success(tool(stack, "t12-peer-commit", "workbench_commit", COMMIT_ARGUMENTS, tls="peer"))
+    require(second.get("idempotent_replay") is True
+            and second.get("commit_identity") == first.get("commit_identity"),
+            "t12: the other principal's identical commit replays the first", [first, second])
+    return {"first": first, "second": second}
+
+
+def four_principals_write_one_root_concurrently(stack: TlsStack) -> dict[str, Any]:
+    """T13: four principals write the same root at once; every write lands and
+    every operation names its own principal."""
+    writers = ["agent", "peer", "fourth", "operator"]
+
+    def write(client: str) -> dict[str, Any]:
+        operation_id = new_id()
+        arguments = stack.put_arguments(f"t13-{client}", WORKBENCH, f"t13-{client}.txt", operation_id,
+                                        client.encode())
+        put = stack.success(stack.run(f"t13-{client}", arguments, tls=client))
+        status = stack.success(stack.run(f"t13-{client}-status", ["operation", "status", operation_id],
+                                         tls=client))
+        return {"put": put, "status": status, "operation_id": operation_id}
+
+    with ThreadPoolExecutor(max_workers=len(writers)) as pool:
+        results = dict(zip(writers, pool.map(write, writers)))
+    for client, result in results.items():
+        require(result["status"].get("initiator") == stack.principals[client],
+                f"t13: {client}'s operation names {client}", result["status"])
+        stack.assert_live(f"t13-{client}", WORKBENCH, f"t13-{client}.txt", client.encode(), result["put"])
+    return results
+
+
 SCENARIOS: dict[str, Callable[[TlsStack], dict]] = {
     "t1_registered_client_round_trip": registered_client_round_trip,
     "t2_unregistered_certificate_refused": unregistered_certificate_refused,
@@ -324,6 +429,12 @@ SCENARIOS: dict[str, Callable[[TlsStack], dict]] = {
     "t6_reader_cannot_write": reader_cannot_write,
     "t7_two_principals_write_one_root": two_principals_write_one_root,
     "t8_revoked_role_stops_an_open_session": revoked_role_stops_an_open_session,
+    "t9_another_principal_presenting_an_operation_id_observes_or_conflicts":
+        another_principal_presenting_an_operation_id_observes_or_conflicts,
+    "t10_operation_status_names_the_initiator": operation_status_names_the_initiator,
+    "t11_only_the_minter_or_an_operator_renews_a_snapshot": only_the_minter_or_an_operator_renews_a_snapshot,
+    "t12_an_identical_commit_replays_across_principals": an_identical_commit_replays_across_principals,
+    "t13_four_principals_write_one_root_concurrently": four_principals_write_one_root_concurrently,
 }
 
 
@@ -372,6 +483,8 @@ def main() -> int:
         stack.role("grant", "agent", "writer", ["--tenant-wide"])
         stack.role("grant", "reader", "reader", ["--tenant-wide"])
         stack.role("grant", "session", "writer", ["--tenant-wide"])
+        stack.role("grant", "operator", "operator", ["--tenant-wide"])
+        stack.role("grant", "fourth", "writer", ["--tenant-wide"])
         report["scenarios"]["t0_owner_refuses_an_unbound_root"] = run_scenario(stack, owner_refuses_an_unbound_root)
         stack.identity("root", "root", "bind", stack.ids["root"], stack.tenant)
         report["scenarios"]["t0b_plaintext_owner_refuses_a_tenant_root"] = run_scenario(

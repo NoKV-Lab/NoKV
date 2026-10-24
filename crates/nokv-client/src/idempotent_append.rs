@@ -671,6 +671,7 @@ mod tests {
         let (publication_operation_id, artifact_revision_id) =
             stable_append_attempt_identities(RootIdentity([3; 16]), options.operation_id, 4);
         OperationStatus {
+            initiator: None,
             token: OperationToken {
                 operation_id: options.operation_id,
                 state_digest: Digest([9; 32]),

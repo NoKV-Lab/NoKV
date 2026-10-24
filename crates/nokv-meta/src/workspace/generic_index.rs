@@ -44,8 +44,8 @@ use super::generic_index_records::{
 };
 use super::keyspace::MetadataFamily;
 use super::namespace::{
-    get_visible_path_at, get_visible_workspace_at, NamespaceError, RootReadContext,
-    RootWriteContext,
+    get_visible_path_at, get_visible_workspace_at, NamespaceError, NotTheInitiator,
+    RootReadContext, RootWriteContext,
 };
 use super::publication_records::{PathEntry, PublicationRecordCodecError};
 use super::query_records::QueryFieldId;
@@ -157,6 +157,9 @@ pub enum GenericIndexError {
     RegistrationRootIsArtifact,
     RegistrationRootMissing,
     OperationMissing,
+    /// Another principal began the operation; only it or an operator
+    /// continues it.
+    NotTheInitiator(NotTheInitiator),
     OperationInputMismatch,
     GenerationAlreadyExists,
     GenerationMissing,
@@ -223,6 +226,7 @@ impl fmt::Display for GenericIndexError {
                 "Generic index registration root is not a virtual or implicit directory",
             ),
             Self::OperationMissing => formatter.write_str("Generic index operation is missing"),
+            Self::NotTheInitiator(error) => error.fmt(formatter),
             Self::OperationInputMismatch => {
                 formatter.write_str("Generic index operation input does not match")
             }
@@ -1221,17 +1225,23 @@ impl GenericIndexRegistrationService<'_> {
         context: RootWriteContext,
         operation_id: OperationId,
     ) -> Result<Loaded<GenericIndexRegistrationOperationRecord>, GenericIndexError> {
-        self.read_record(
-            context,
-            MetadataFamily::Operation,
-            &operation_key(
-                context.root_id,
-                OperationKind::RegisterGenericIndex,
-                operation_id,
-            ),
-            GenericIndexRegistrationOperationRecord::decode,
-        )?
-        .ok_or(GenericIndexError::OperationMissing)
+        let loaded = self
+            .read_record(
+                context,
+                MetadataFamily::Operation,
+                &operation_key(
+                    context.root_id,
+                    OperationKind::RegisterGenericIndex,
+                    operation_id,
+                ),
+                GenericIndexRegistrationOperationRecord::decode,
+            )?
+            .ok_or(GenericIndexError::OperationMissing)?;
+        context
+            .authority
+            .continuation(loaded.record.initiator)
+            .map_err(GenericIndexError::NotTheInitiator)?;
+        Ok(loaded)
     }
 
     fn load_generation(
@@ -2208,6 +2218,55 @@ mod tests {
                 context.read_version,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn only_the_initiator_or_an_operator_continues_a_registration() {
+        use crate::workspace::namespace::WriteAuthority;
+        use nokv_types::PrincipalId;
+
+        let (store, workspace_incarnation) = ready_store(0);
+        let service = GenericIndexRegistrationService::new(&store);
+        let alice = PrincipalId::from_bytes([0xa1; 16]);
+        let bob = PrincipalId::from_bytes([0xb2; 16]);
+        let context_as = |request_fill: u8, principal: PrincipalId, operator: bool| {
+            let mut context = write_context(&store, request_fill);
+            context.authority = WriteAuthority {
+                initiator: Some(principal),
+                operator,
+            };
+            context
+        };
+        let begun = service
+            .begin(BeginGenericIndexRegistrationRequest {
+                context: context_as(20, alice, false),
+                operation_id: operation(30),
+                generation_id: generation(40),
+                workbench_id: workbench(),
+                expected_workspace_incarnation_id: workspace_incarnation,
+                index_path: None,
+                expected_current_generation: None,
+                capabilities: vec![capability()],
+                declared_row_count: 0,
+            })
+            .unwrap();
+        assert_eq!(begun.operation.initiator, Some(alice));
+        let abort = |request_fill: u8, principal: PrincipalId, operator: bool| {
+            service.abort(AbortGenericIndexRegistrationRequest {
+                context: context_as(request_fill, principal, operator),
+                operation_id: operation(30),
+                limit: MAX_GENERIC_INDEX_CLEANUP_BATCH_ROWS,
+            })
+        };
+        assert!(matches!(
+            abort(21, bob, false),
+            Err(GenericIndexError::NotTheInitiator(_))
+        ));
+        let aborted = abort(22, bob, true).unwrap();
+        assert_ne!(
+            aborted.command.operation.phase,
+            GenericIndexRegistrationPhase::Appending
+        );
     }
 
     #[test]

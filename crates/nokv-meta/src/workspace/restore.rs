@@ -61,9 +61,9 @@ use super::generic_index_records::{
     GenericIndexRecordError,
 };
 use super::keyspace::MetadataFamily;
-use super::namespace::RootWriteContext;
 #[cfg(test)]
 use super::namespace::WriteAuthority;
+use super::namespace::{NotTheInitiator, RootWriteContext};
 use super::publication_records::{
     ArtifactRevisionRecord, GcCandidateRecord, PathEntry, PublicationRecordCodecError,
     RevisionRefRecord, WorkspaceIncarnationClaimRecord, WorkspaceRecord,
@@ -217,6 +217,12 @@ pub enum RestoreError {
         workbench_id: WorkbenchId,
     },
     SourceWorkspaceMismatch,
+    /// Another principal began the operation; only it or an operator
+    /// continues it.
+    NotTheInitiator(NotTheInitiator),
+    /// Another principal's identical restore is still in flight; once it is
+    /// terminal, beginning the same restore replays it.
+    OperationHeldByAnother(NotTheInitiator),
     DestinationExists {
         workbench_id: WorkbenchId,
     },
@@ -347,6 +353,11 @@ impl fmt::Display for RestoreError {
             Self::SourceWorkspaceMismatch => {
                 formatter.write_str("restore source does not belong to the selected workspace")
             }
+            Self::NotTheInitiator(error) => error.fmt(formatter),
+            Self::OperationHeldByAnother(error) => write!(
+                formatter,
+                "an identical restore is still in flight for another principal: {error}"
+            ),
             Self::DestinationExists { workbench_id } => {
                 write!(formatter, "destination workbench {workbench_id} already exists")
             }
@@ -901,6 +912,19 @@ pub fn begin_restore(
             || !begin_provenance_matches
         {
             return Err(RestoreError::RestoreManifestBindingMismatch { operation_id });
+        }
+        // The operation id derives from the source and destination, so
+        // another principal restoring the same thing observes this
+        // operation: its terminal outcome replays, and while it is in flight
+        // the other principal waits rather than continuing it.
+        if !matches!(
+            existing.record.phase,
+            RestorePhase::Complete | RestorePhase::Cleaned | RestorePhase::Quarantined
+        ) {
+            context
+                .authority
+                .continuation(existing.record.initiator)
+                .map_err(RestoreError::OperationHeldByAnother)?;
         }
         return Ok(RestoreCommandOutcome {
             operation: existing.record,
@@ -5385,14 +5409,19 @@ fn load_operation(
     context: RootWriteContext,
     operation_id: OperationId,
 ) -> Result<Loaded<RestoreOperationRecord>, RestoreError> {
-    read_record(
+    let loaded = read_record(
         store,
         context,
         MetadataFamily::Operation,
         &operation_key(context.root_id, OperationKind::Restore, operation_id),
         RestoreOperationRecord::decode,
     )?
-    .ok_or(RestoreError::OperationMissing { operation_id })
+    .ok_or(RestoreError::OperationMissing { operation_id })?;
+    context
+        .authority
+        .continuation(loaded.record.initiator)
+        .map_err(RestoreError::NotTheInitiator)?;
+    Ok(loaded)
 }
 
 fn load_path(
@@ -8025,6 +8054,67 @@ mod tests {
                 0x6e, 0xe6,
             ])
         );
+    }
+
+    #[test]
+    fn an_identical_restore_of_another_principal_is_held_and_never_continued() {
+        use crate::workspace::namespace::WriteAuthority;
+        use nokv_types::PrincipalId;
+
+        let mut counter = 0_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = seed_source(&store, &mut counter, owner_epoch, 0);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+        let request = snapshot_restore_request(
+            &source,
+            snapshot_id,
+            "held-destination",
+            WorkspaceIncarnationId::from_bytes([0x51; 16]),
+            0,
+        );
+        let alice = PrincipalId::from_bytes([0xa1; 16]);
+        let bob = PrincipalId::from_bytes([0xb2; 16]);
+        let context_as = |counter: &mut u128, principal: PrincipalId, operator: bool| {
+            let mut context = write_context(&store, counter, owner_epoch);
+            context.authority = WriteAuthority {
+                initiator: Some(principal),
+                operator,
+            };
+            context
+        };
+
+        let begun =
+            begin_restore(&store, context_as(&mut counter, alice, false), &request).unwrap();
+        assert_eq!(begun.operation.initiator, Some(alice));
+        // The operation id derives from the source and destination, so Bob's
+        // identical restore meets Alice's: it waits while hers is in flight.
+        assert!(matches!(
+            begin_restore(&store, context_as(&mut counter, bob, false), &request),
+            Err(RestoreError::OperationHeldByAnother(mismatch))
+                if mismatch.initiator == alice && mismatch.principal == bob
+        ));
+        // Bob cannot continue it either; an operator can.
+        assert!(matches!(
+            start_restore_copy(
+                &store,
+                context_as(&mut counter, bob, false),
+                RestoreOperationRequest {
+                    operation_id: request.operation_id,
+                },
+            ),
+            Err(RestoreError::NotTheInitiator(_))
+        ));
+        let copying = start_restore_copy(
+            &store,
+            context_as(&mut counter, bob, true),
+            RestoreOperationRequest {
+                operation_id: request.operation_id,
+            },
+        )
+        .unwrap();
+        assert_eq!(copying.operation.phase, RestorePhase::Copying);
     }
 
     #[test]

@@ -44,7 +44,7 @@ model carries a class itself, and no new caller should read it.
 | 6 | `in_progress` | The identified operation is still running. |
 | 7 | `identity_conflict` | The identity was already used for other inputs; nothing was applied. |
 | 8 | `incompatible` | The client and owner do not share a protocol version or capability. |
-| 9 | `operator_required` | Durable or control state needs operator action, the owner refused the client's TLS settings or credential, or the principal lacks the role a request needs. |
+| 9 | `operator_required` | Durable or control state needs operator action, the owner refused the client's TLS settings or credential, or the principal lacks the role a request needs, or the request continues an operation another principal began. |
 <!-- exit-codes:end -->
 
 A Rust panic exits `101`, outside this table. A `nokv workbench-session`
@@ -117,7 +117,10 @@ commit by the `commit_identity` that `workbench_commit` reports. A result
 reports `state` (`running`, `succeeded`, `aborting`, `failed`, `quarantined`,
 or the append states) with its `next_action`, and a succeeded operation
 carries its stored `receipt`: the original result, not a re-evaluation of
-current state. An absent operation is `not_found` with `resubmit_same`: absence
+current state. Over RPC TLS a result also names `initiator`, the principal
+that began the operation, as 32 lowercase hex characters; it is `null` on a
+plaintext deployment. The Python SDK's `operation_status` reports the same
+fields. An absent operation is `not_found` with `resubmit_same`: absence
 is a point-in-time observation, and resubmitting the same command admits it at
 most once.
 

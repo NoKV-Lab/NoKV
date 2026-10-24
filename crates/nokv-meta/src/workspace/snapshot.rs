@@ -30,7 +30,7 @@ use super::engine::{
 };
 use super::event_projection::change_event_projection;
 use super::keyspace::MetadataFamily;
-use super::namespace::{RootReadContext, RootWriteContext};
+use super::namespace::{NotTheInitiator, RootReadContext, RootWriteContext};
 use super::publication_records::{PublicationRecordCodecError, WorkspaceRecord};
 use super::query_records::{
     ChangeEventKind, ChangeEventRecord, QueryFieldId, QueryRecordError, QueryScalar,
@@ -137,6 +137,9 @@ pub enum SnapshotError {
     SourceCommitBindingMismatch,
     SourceCommitConsumerMissing,
     SourceCommitConsumerMismatch,
+    /// Another principal minted the snapshot; only it or an operator renews
+    /// or retires it.
+    NotTheInitiator(NotTheInitiator),
     SnapshotAlreadyExists {
         snapshot_id: SnapshotId,
     },
@@ -209,6 +212,7 @@ impl fmt::Display for SnapshotError {
             Self::SourceCommitMissing => {
                 formatter.write_str("snapshot source commit is missing")
             }
+            Self::NotTheInitiator(error) => error.fmt(formatter),
             Self::SourceCommitUnavailable { state } => {
                 write!(formatter, "snapshot source commit is not sealed: {state:?}")
             }
@@ -543,6 +547,10 @@ pub fn renew_snapshot(
         &request.selector,
     )?;
     require_active(&loaded.resolved)?;
+    context
+        .authority
+        .continuation(loaded.resolved.record.initiator)
+        .map_err(SnapshotError::NotTheInitiator)?;
     if request.lease_deadline_ms <= loaded.resolved.record.lease_deadline_ms {
         return Err(SnapshotError::LeaseDeadlineNotExtended {
             current: loaded.resolved.record.lease_deadline_ms,
@@ -597,6 +605,10 @@ pub fn retire_snapshot(
         &request.selector,
     )?;
     require_active(&loaded.resolved)?;
+    context
+        .authority
+        .continuation(loaded.resolved.record.initiator)
+        .map_err(SnapshotError::NotTheInitiator)?;
     require_no_consumers(&loaded.resolved)?;
     terminalize_snapshot(
         store,
@@ -2683,6 +2695,89 @@ mod tests {
         assert_eq!(
             terminal.alias_record.unwrap().snapshot_state,
             SnapshotState::Retired
+        );
+    }
+
+    #[test]
+    fn only_the_minter_or_an_operator_renews_or_retires_a_snapshot() {
+        use crate::workspace::namespace::WriteAuthority;
+        use nokv_types::PrincipalId;
+
+        let store = ready_store();
+        let name = workbench("owned");
+        create_workspace(&store, 3, &name, 3);
+        let alice = PrincipalId::from_bytes([0xa1; FIXED_ID_BYTES]);
+        let bob = PrincipalId::from_bytes([0xb2; FIXED_ID_BYTES]);
+        let context_as = |request_fill: u8, principal: PrincipalId, operator: bool| {
+            let mut context = write_context(&store, request_fill);
+            context.authority = WriteAuthority {
+                initiator: Some(principal),
+                operator,
+            };
+            context
+        };
+        let minted = mint_snapshot(
+            &store,
+            context_as(4, alice, false),
+            &MintSnapshotRequest {
+                workbench_id: name.clone(),
+                snapshot_id: SnapshotId::new(1),
+                alias: None,
+                lease_deadline_ms: 100,
+                annotation: b"owned".to_vec(),
+            },
+        )
+        .unwrap();
+        assert_eq!(minted.snapshot.record.initiator, Some(alice));
+        let renew = |request_fill: u8, principal: PrincipalId, operator: bool, deadline: u64| {
+            renew_snapshot(
+                &store,
+                context_as(request_fill, principal, operator),
+                &RenewSnapshotRequest {
+                    workbench_id: name.clone(),
+                    selector: SnapshotSelector::Id(SnapshotId::new(1)),
+                    lease_deadline_ms: deadline,
+                },
+            )
+        };
+        assert!(matches!(
+            renew(5, bob, false, 200),
+            Err(SnapshotError::NotTheInitiator(_))
+        ));
+        assert_eq!(
+            renew(6, alice, false, 200)
+                .unwrap()
+                .snapshot
+                .record
+                .lease_deadline_ms,
+            200
+        );
+        assert_eq!(
+            renew(7, bob, true, 300)
+                .unwrap()
+                .snapshot
+                .record
+                .lease_deadline_ms,
+            300
+        );
+        let retire = |request_fill: u8, principal: PrincipalId, operator: bool| {
+            retire_snapshot(
+                &store,
+                context_as(request_fill, principal, operator),
+                &RetireSnapshotRequest {
+                    workbench_id: name.clone(),
+                    selector: SnapshotSelector::Id(SnapshotId::new(1)),
+                    retire_annotation: None,
+                },
+            )
+        };
+        assert!(matches!(
+            retire(8, bob, false),
+            Err(SnapshotError::NotTheInitiator(_))
+        ));
+        assert_ne!(
+            retire(9, alice, false).unwrap().snapshot.record.state,
+            SnapshotState::Active
         );
     }
 

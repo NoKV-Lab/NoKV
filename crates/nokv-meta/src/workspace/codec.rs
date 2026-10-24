@@ -918,7 +918,7 @@ fn push_short_len_prefixed(target: &mut Vec<u8>, bytes: &[u8]) {
     target.extend_from_slice(bytes);
 }
 
-fn lower_hex(bytes: &[u8]) -> String {
+pub(crate) fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

@@ -4434,6 +4434,7 @@ fn protocol_change_event(
         artifact_revision_id: artifact_revision_id.map(Into::into),
         commit_id: commit_id.map(Into::into),
         operation_id: operation_id.map(Into::into),
+        initiator: change.event.initiator.map(Into::into),
     })
 }
 
@@ -4871,6 +4872,7 @@ fn append_operation_status(
             state_digest: protocol::Digest(state_digest),
         },
         kind: protocol::OperationKind::ArtifactAppend,
+        initiator: parent.initiator.map(Into::into),
         publish_preparation: None,
         commit_preparation: None,
         restore_preparation: None,
@@ -4968,6 +4970,7 @@ fn publish_operation_status(
             state_digest: publish_state_digest(operation)?,
         },
         kind: protocol::OperationKind::ArtifactPublish,
+        initiator: operation.initiator.map(Into::into),
         commit_preparation: None,
         restore_preparation: None,
         state,
@@ -5044,6 +5047,7 @@ fn build_commit_operation_status(
             state_digest: build_state_digest(operation)?,
         },
         kind: protocol::OperationKind::Commit,
+        initiator: operation.initiator.map(Into::into),
         commit_preparation: Some(Box::new(protocol::CommitPreparation {
             request: Box::new(protocol::CommitRequest {
                 operation_id: operation.operation_id.into(),
@@ -5879,6 +5883,7 @@ fn restore_operation_status(
             state_digest: restore_state_digest(operation)?,
         },
         kind: protocol::OperationKind::Restore,
+        initiator: operation.initiator.map(Into::into),
         commit_preparation: None,
         restore_preparation: Some(Box::new(restore_operation_preparation(operation)?)),
         state,
@@ -5928,6 +5933,7 @@ fn generic_index_failure(error: meta::GenericIndexError) -> protocol::RpcFailure
     match error {
         meta::GenericIndexError::Meta(source) => meta_failure(source),
         meta::GenericIndexError::Namespace(source) => namespace_failure(source),
+        meta::GenericIndexError::NotTheInitiator(_) => not_the_initiator(error.to_string()),
         meta::GenericIndexError::WorkspaceMissing
         | meta::GenericIndexError::RegistrationRootMissing
         | meta::GenericIndexError::OperationMissing
@@ -6126,6 +6132,7 @@ fn rename_path_failure(error: meta::RenamePathError) -> protocol::RpcFailure {
 fn snapshot_failure(error: meta::SnapshotError) -> protocol::RpcFailure {
     match error {
         meta::SnapshotError::Meta(source) => meta_failure(source),
+        meta::SnapshotError::NotTheInitiator(_) => not_the_initiator(error.to_string()),
         meta::SnapshotError::WorkspaceMissing { .. }
         | meta::SnapshotError::SnapshotMissing { .. }
         | meta::SnapshotError::AliasMissing { .. }
@@ -6233,6 +6240,8 @@ fn restore_failure(error: meta::RestoreError) -> protocol::RpcFailure {
         meta::RestoreError::GenericIndex(meta::GenericIndexError::Meta(source)) => {
             meta_failure(source)
         }
+        meta::RestoreError::NotTheInitiator(_) => not_the_initiator(error.to_string()),
+        meta::RestoreError::OperationHeldByAnother(_) => held_by_another(error.to_string()),
         meta::RestoreError::SourceWorkspaceMissing { .. } => failure(
             protocol::ErrorCode::NotFound,
             error.to_string(),
@@ -6358,6 +6367,7 @@ fn publication_failure(error: meta::PublicationError) -> protocol::RpcFailure {
             true,
             Some(protocol::ConflictKind::OperationState),
         ),
+        meta::PublicationError::NotTheInitiator(_) => not_the_initiator(error.to_string()),
         meta::PublicationError::WorkspaceNotFound | meta::PublicationError::PathNotFound => {
             not_found(error.to_string())
         }
@@ -6461,6 +6471,8 @@ fn commit_failure(error: meta::CommitError) -> protocol::RpcFailure {
             false,
             None,
         ),
+        meta::CommitError::NotTheInitiator(_) => not_the_initiator(error.to_string()),
+        meta::CommitError::OperationHeldByAnother(_) => held_by_another(error.to_string()),
         meta::CommitError::InvalidBatchLimit { .. } => invalid_argument(error.to_string()),
         _ => failure(
             protocol::ErrorCode::PreconditionFailed,
@@ -6660,6 +6672,22 @@ fn conflict(
     let mut failure = failure(protocol::ErrorCode::Conflict, message, false, Some(kind));
     failure.current_generation = current_generation;
     failure
+}
+
+/// The request continues an operation another principal began.
+fn not_the_initiator(message: String) -> protocol::RpcFailure {
+    failure(protocol::ErrorCode::PermissionDenied, message, false, None)
+}
+
+/// An identical operation of another principal is in flight; the same
+/// request replays its outcome once it is terminal.
+fn held_by_another(message: String) -> protocol::RpcFailure {
+    failure(
+        protocol::ErrorCode::Conflict,
+        message,
+        true,
+        Some(protocol::ConflictKind::OperationState),
+    )
 }
 
 fn failure(
@@ -9318,6 +9346,7 @@ mod tests {
             principal: Some(types::PrincipalId::from_bytes(
                 [fill; types::FIXED_ID_BYTES],
             )),
+            role: Some(types::Role::Writer),
         }
     }
 
@@ -9343,8 +9372,17 @@ mod tests {
         }
     }
 
+    fn operator(fill: u8) -> RequestAuthority {
+        RequestAuthority {
+            principal: Some(types::PrincipalId::from_bytes(
+                [fill; types::FIXED_ID_BYTES],
+            )),
+            role: Some(types::Role::Operator),
+        }
+    }
+
     #[test]
-    fn a_publication_records_the_principal_that_began_it() {
+    fn a_publication_records_the_principal_that_began_it_and_shows_it_to_observers() {
         let (_store, executor, _plan, begin) = fused_publication_fixture("attributed", 0x72);
         let request =
             inline_publication(0x74, &begin, protocol::PublishCondition::CreateOnly, b"a");
@@ -9353,12 +9391,54 @@ mod tests {
             protocol::WorkspaceRequest::PublishInlineArtifact(request.clone()),
         );
         executor.execute(&rpc, principal(0xa1)).unwrap();
+        let alice = protocol::PrincipalIdentity([0xa1; types::FIXED_ID_BYTES]);
         let read_version = executor.meta.current_read_version().unwrap();
         let operation = executor
             .find_publish_operation(rpc.route, read_version, begin.operation_id)
             .unwrap()
             .unwrap();
-        assert_eq!(operation.initiator, principal(0xa1).principal);
+        assert_eq!(operation.initiator, Some(alice.into()));
+        // Any reader of the root sees who began it: in the operation status
+        // and in the change event.
+        let status = executed_operation(
+            &executor
+                .execute(
+                    &restore_rpc(
+                        0x77,
+                        protocol::WorkspaceRequest::GetOperation(protocol::GetOperationRequest {
+                            operation_id: begin.operation_id,
+                        }),
+                    ),
+                    principal(0xb2),
+                )
+                .unwrap(),
+        );
+        assert_eq!(status.initiator, Some(alice));
+        let changes = executor
+            .execute(
+                &restore_rpc(
+                    0x78,
+                    protocol::WorkspaceRequest::ReadChanges(protocol::ChangePageRequest {
+                        after_commit_version: None,
+                        workbench: None,
+                        page: protocol::PageRequest {
+                            cursor: None,
+                            limit: 16,
+                        },
+                    }),
+                ),
+                principal(0xb2),
+            )
+            .unwrap();
+        let protocol::WorkspaceResult::Changes(page) = changes.result else {
+            panic!("read changes returned the wrong result variant");
+        };
+        let published = page
+            .events
+            .iter()
+            .find(|event| event.kind == protocol::ChangeKind::ArtifactPublished)
+            .expect("the publication's change event");
+        assert_eq!(published.initiator, Some(alice));
         // The initiator is sealed into the operation's identity: another
         // principal presenting the same operation is a different intent.
         let other = restore_rpc(
@@ -9367,6 +9447,92 @@ mod tests {
         );
         let refused = executor.execute(&other, principal(0xb2)).unwrap_err();
         assert_eq!(refused.code, protocol::ErrorCode::RequestReplayMismatch);
+    }
+
+    #[test]
+    fn only_the_initiator_or_an_operator_continues_a_publication_over_rpc() {
+        let (_store, executor, _plan, begin) = fused_publication_fixture("owned", 0x90);
+        let begun = executor
+            .execute(
+                &restore_rpc(
+                    0x92,
+                    protocol::WorkspaceRequest::BeginArtifactPublish(begin),
+                ),
+                principal(0xa1),
+            )
+            .unwrap();
+        let status = executed_operation(&begun);
+        assert_eq!(
+            status.initiator,
+            Some(protocol::PrincipalIdentity([0xa1; types::FIXED_ID_BYTES]))
+        );
+        let abort = |fill: u8| {
+            restore_rpc(
+                fill,
+                protocol::WorkspaceRequest::AbortArtifactPublish(
+                    protocol::AbortArtifactPublishRequest {
+                        token: status.token,
+                        reason: "another agent cancelled it".to_owned(),
+                    },
+                ),
+            )
+        };
+        let refused = executor.execute(&abort(0x93), principal(0xb2)).unwrap_err();
+        assert_eq!(refused.code, protocol::ErrorCode::PermissionDenied);
+        assert!(!refused.retryable);
+        assert!(refused.message.contains("did not begin this operation"));
+        // The refusal changed nothing: the same token still aborts, here
+        // for an operator.
+        let aborted = executed_operation(&executor.execute(&abort(0x94), operator(0xb2)).unwrap());
+        assert_eq!(aborted.state, protocol::OperationState::Aborting);
+    }
+
+    #[test]
+    fn only_the_minter_or_an_operator_renews_a_snapshot_over_rpc() {
+        let (store, executor) = ready_executor();
+        executor
+            .execute(
+                &create_request(80, "owned-snapshot", 81, 1),
+                RequestAuthority::TRUSTED,
+            )
+            .unwrap();
+        install_snapshot_committed_head(
+            &store,
+            types::WorkspaceIncarnationId::from_bytes([81; types::FIXED_ID_BYTES]),
+            0xD1,
+        );
+        let workbench = protocol::WorkbenchName::new("owned-snapshot").unwrap();
+        let mint = protocol::WorkspaceRpcRequest {
+            route: route(1),
+            request_id: protocol::RequestIdentity([82; types::FIXED_ID_BYTES]),
+            operation: protocol::WorkspaceRequest::MintSnapshot(protocol::MintSnapshotRequest {
+                workbench: workbench.clone(),
+                workspace_incarnation_id: protocol::WorkspaceIdentity([81; types::FIXED_ID_BYTES]),
+                snapshot_id: 7,
+                lease_deadline_ms: 1_000,
+                alias: None,
+                annotation: b"owned".to_vec(),
+            }),
+        };
+        executor.execute(&mint, principal(0xa1)).unwrap();
+        let renew = |fill: u8, lease_deadline_ms: u64| protocol::WorkspaceRpcRequest {
+            route: route(1),
+            request_id: protocol::RequestIdentity([fill; types::FIXED_ID_BYTES]),
+            operation: protocol::WorkspaceRequest::RenewSnapshot(protocol::RenewSnapshotRequest {
+                workbench: workbench.clone(),
+                selector: protocol::SnapshotSelector::Id(7),
+                lease_deadline_ms,
+            }),
+        };
+        let refused = executor
+            .execute(&renew(83, 2_000), principal(0xb2))
+            .unwrap_err();
+        assert_eq!(refused.code, protocol::ErrorCode::PermissionDenied);
+        assert!(!refused.retryable);
+        executor
+            .execute(&renew(84, 2_000), principal(0xa1))
+            .unwrap();
+        executor.execute(&renew(85, 3_000), operator(0xb2)).unwrap();
     }
 
     #[test]

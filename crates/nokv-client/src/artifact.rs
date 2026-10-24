@@ -3746,6 +3746,7 @@ mod tests {
                 + self.uploaded_objects
                 + self.manifest_rows.len()) as u64;
             OperationStatus {
+                initiator: None,
                 token: self.next_token(operation_id),
                 kind: OperationKind::ArtifactPublish,
                 append_preparation: None,
@@ -3868,6 +3869,7 @@ mod tests {
                         .expect("stage follows begin")
                         .manifest_row_count;
                     let status = OperationStatus {
+                        initiator: None,
                         token: state.next_token(stage.token.operation_id),
                         kind: OperationKind::ArtifactPublish,
                         append_preparation: None,
@@ -4180,6 +4182,7 @@ mod tests {
                     body_digest: complete.artifact.body_digest.clone(),
                 };
                 let status = OperationStatus {
+                    initiator: None,
                     token: state.next_token(begin.operation_id),
                     kind: OperationKind::ArtifactPublish,
                     append_preparation: None,
@@ -4249,6 +4252,7 @@ mod tests {
                 require_token(state, abort.token)?;
                 state.abort_applies = state.abort_applies.saturating_add(1);
                 let status = OperationStatus {
+                    initiator: None,
                     token: state.next_token(abort.token.operation_id),
                     kind: OperationKind::ArtifactPublish,
                     append_preparation: None,
@@ -5889,6 +5893,7 @@ mod tests {
     fn begin_progress_recovers_each_ordered_publication_cursor() {
         let operation_id = OperationIdentity([0x44; 16]);
         let status = OperationStatus {
+            initiator: None,
             token: OperationToken {
                 operation_id,
                 state_digest: Digest([0x55; 32]),

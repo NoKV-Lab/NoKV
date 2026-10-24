@@ -14,8 +14,8 @@ use crate::types::{
     validate_capability_set, validate_field_id, validate_optional_text, ArtifactDescriptor,
     ArtifactManifestRow, ArtifactRevisionIdentity, ByteRange, CommitIdentity, ContentType, Digest,
     DigestUri, FieldValue, GenericIndexGenerationIdentity, OperationIdentity, OperationKind,
-    OperationToken, PathMetadata, RequestIdentity, RootRoute, ScalarValue, SnapshotAlias,
-    WorkbenchName, WorkspaceCapability, WorkspaceIdentity, WorkspacePath,
+    OperationToken, PathMetadata, PrincipalIdentity, RequestIdentity, RootRoute, ScalarValue,
+    SnapshotAlias, WorkbenchName, WorkspaceCapability, WorkspaceIdentity, WorkspacePath,
 };
 use crate::{WORKSPACE_CAPABILITY_SCHEMA, WORKSPACE_PREFLIGHT_SCHEMA, WORKSPACE_PROTOCOL_SCHEMA};
 
@@ -1573,6 +1573,9 @@ pub struct OperationStatus {
     pub append_preparation: Option<Box<crate::AppendPreparation>>,
     pub token: OperationToken,
     pub kind: OperationKind,
+    /// The principal that began the operation: none on a plaintext
+    /// deployment and for the owner's own work.
+    pub initiator: Option<PrincipalIdentity>,
     /// Present exactly for artifact-publication operations, including terminal ones.
     pub publish_preparation: Option<Box<PublishPreparation>>,
     /// Present exactly for commit operations, including terminal ones.
@@ -2290,6 +2293,9 @@ pub struct ChangeEvent {
     pub artifact_revision_id: Option<ArtifactRevisionIdentity>,
     pub commit_id: Option<CommitIdentity>,
     pub operation_id: Option<OperationIdentity>,
+    /// The principal whose request produced the event: none on a plaintext
+    /// deployment and for the owner's own work.
+    pub initiator: Option<PrincipalIdentity>,
 }
 
 impl ChangeEvent {
@@ -2409,6 +2415,7 @@ mod tests {
 
     fn running_status(kind: OperationKind) -> OperationStatus {
         OperationStatus {
+            initiator: None,
             append_preparation: None,
             publish_preparation: (kind == OperationKind::ArtifactPublish).then(|| {
                 Box::new(PublishPreparation {

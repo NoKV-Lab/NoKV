@@ -1910,6 +1910,10 @@ fn append_status_to_py<'py>(
     dict.set_item("status", "success")?;
     dict.set_item("operation", "append")?;
     dict.set_item("operation_id", hex(&status.token.operation_id.0))?;
+    dict.set_item(
+        "initiator",
+        status.initiator.map(|initiator| hex(&initiator.0)),
+    )?;
     dict.set_item("state", recovery.state.as_str())?;
     dict.set_item("next_action", recovery.next_action.as_str())?;
     dict.set_item("observed_state", format!("{:?}", status.state))?;
@@ -1983,6 +1987,10 @@ fn operation_status_to_py<'py>(
         },
     )?;
     dict.set_item("operation_id", hex(&status.token.operation_id.0))?;
+    dict.set_item(
+        "initiator",
+        status.initiator.map(|initiator| hex(&initiator.0)),
+    )?;
     dict.set_item("state", observation.state.as_str())?;
     dict.set_item("next_action", observation.next_action.as_str())?;
     dict.set_item("observed_state", format!("{:?}", status.state))?;
@@ -2190,6 +2198,7 @@ mod tests {
         result: Option<OperationResult>,
     ) -> nokv_protocol::OperationStatus {
         nokv_protocol::OperationStatus {
+            initiator: None,
             append_preparation: None,
             token: nokv_protocol::OperationToken {
                 operation_id: OperationIdentity([1; 16]),

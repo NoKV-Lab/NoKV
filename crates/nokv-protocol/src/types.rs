@@ -7,9 +7,9 @@ use std::fmt;
 
 use nokv_types::{
     ArtifactRevisionId, CommitId, GenericIndexGenerationId, LogicalShardId, NormalizedRelativePath,
-    ObjectNamespaceId, OperationId, OwnerEpoch, PlacementGeneration, RequestId, RootId,
-    SnapshotAliasName, SnapshotId, TagName, WorkbenchId, WorkspaceIncarnationId, FIXED_ID_BYTES,
-    SHA256_BYTES,
+    ObjectNamespaceId, OperationId, OwnerEpoch, PlacementGeneration, PrincipalId, RequestId,
+    RootId, SnapshotAliasName, SnapshotId, TagName, WorkbenchId, WorkspaceIncarnationId,
+    FIXED_ID_BYTES, SHA256_BYTES,
 };
 use serde::{de, Deserialize, Deserializer, Serialize};
 
@@ -101,6 +101,12 @@ identity!(
     CommitIdentity,
     CommitId,
     SHA256_BYTES
+);
+identity!(
+    /// The authenticated principal that began an operation.
+    PrincipalIdentity,
+    PrincipalId,
+    FIXED_ID_BYTES
 );
 
 /// SHA-256 digest used for opaque state tokens and canonical row seals.

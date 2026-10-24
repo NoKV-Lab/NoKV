@@ -432,8 +432,9 @@ authorizes every request by role instead; see [SECURITY.md](SECURITY.md).
   shard-local. NoKV does not provide cross-shard transactions.
 - Workbench jailing and `RootId` to `AgentId` binding are safety boundaries,
   not tenant authentication, authorization, or RBAC. Over RPC TLS, the owner
-  authenticates each client and authorizes each request by role, and many
-  agents can share a root.
+  authenticates each client and authorizes each request by role, many
+  agents can share a root, and every durable operation records which
+  principal began it, so only that principal or an operator continues it.
 
 ## Why Holt Fits the Current Local Profile
 
