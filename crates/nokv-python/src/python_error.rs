@@ -665,6 +665,31 @@ pub(crate) mod tests {
                     ("RuntimeError", "operator_required", "operator"),
                 ),
                 (
+                    client_failure(
+                        py,
+                        rpc(ErrorCode::Unauthenticated, false),
+                        IdempotencyScope::Unidentified,
+                    ),
+                    ("RuntimeError", "unauthenticated", "operator"),
+                ),
+                // The owner could not refresh its policy copy: retry.
+                (
+                    client_failure(
+                        py,
+                        rpc(ErrorCode::Unauthenticated, true),
+                        IdempotencyScope::Unidentified,
+                    ),
+                    ("RuntimeError", "transient", "resubmit_same"),
+                ),
+                (
+                    client_failure(
+                        py,
+                        rpc(ErrorCode::PermissionDenied, false),
+                        IdempotencyScope::Unidentified,
+                    ),
+                    ("RuntimeError", "permission_denied", "operator"),
+                ),
+                (
                     internal("bug"),
                     ("RuntimeError", "internal", "do_not_retry"),
                 ),

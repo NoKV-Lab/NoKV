@@ -211,7 +211,7 @@ def test_cleanup_error_preserves_one_recovery_request_and_optional_receipt():
 
 def test_failure_attributes_use_the_published_contract_names():
     classes, actions = _contract_names("exit-codes"), _contract_names("next-actions")
-    assert len(classes) == 10 and len(actions) == 10
+    assert len(classes) == 12 and len(actions) == 10
     invalid = nokv.AppendError(
         "append delta is too large", "a" * 32, None, "InvalidArgument", None,
         error_class="invalid_input", next_action="fix_input",
