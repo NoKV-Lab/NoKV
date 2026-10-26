@@ -27,15 +27,17 @@ flowchart LR
     Meta --> Store["TxnStore<br/>ordered reads + checked writes"]
     Store --> Holt["HoltStore<br/>serving local adapter"]
 
-    SDK --> Data["Direct immutable-object data path"]
+    SDK --> Data["Read-only immutable-object data path"]
     Data --> Cache["Local NVMe soft cache"]
     Data --> Object["S3-compatible durable objects"]
-    Owner --> Object
+    Owner -- "every object write" --> Object
 ```
 
 The metadata and object paths are separate. Small control and namespace records
-go through the shard owner. Clients stream immutable blocks directly through
-the object boundary after receiving a revision/upload plan.
+go through the shard owner. Clients read immutable blocks directly through the
+object boundary with prefix-scoped read-only credentials. Every object write is
+the owner's: a client carries each planned block to the owner in one request,
+and the owner writes it with the only credentials that can.
 
 FUSE, POSIX, CSI, and fsspec are not architecture layers.
 
@@ -273,9 +275,12 @@ sequenceDiagram
 
     C->>M: prepare: begin + staged object plan + request id
     M-->>C: durable operation token
-    C->>O: stream immutable blocks
-    C->>M: finish: upload proofs + manifest + complete
-    M->>O: verify completion evidence
+    loop one request per planned block
+        C->>M: upload: token + block bytes
+        M->>O: verify against the staged record, write immutable block
+        M-->>C: durable operation token
+    end
+    C->>M: finish: manifest + complete
     M->>S: one fenced MetadataCommand transaction
     S-->>M: deterministic commit result
     M-->>C: generation + revision + digest
@@ -294,11 +299,16 @@ mutation. It atomically publishes:
 - the deterministic replay result.
 
 A plan whose staged objects and manifest rows each fit one batch publishes with
-two metadata requests, each one write session and one durable acknowledgement:
-Prepare before the first provider write and Finish after the last. Each request
-runs the stepwise Begin, StageObjects, MarkUploaded, StageManifest, and Complete
-steps under request identities derived from its own, so replay and token rules
-are unchanged; a larger plan, or a resumed one, uses the stepwise requests.
+two metadata requests around its uploads, each one write session and one
+durable acknowledgement: Prepare before the first block and Finish after the
+last. Each request runs the stepwise Begin, StageObjects, StageManifest, and
+Complete steps under request identities derived from its own, so replay and
+token rules are unchanged; a larger plan, or a resumed one, uses the stepwise
+requests. Every block travels in its own UploadArtifactObject request of at
+most one block size: the owner checks its length and digest against the staged
+record, writes it, and records the upload in the same durable step, so a
+retried upload replays and a resumed publication continues from the owner's
+upload cursor without sending a recorded block again.
 
 Failed uploads never become visible. Response loss after commit returns the
 same result on retry. Generic random writes are absent; append is immutable

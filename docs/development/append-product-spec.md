@@ -266,9 +266,9 @@ round after the underlying problem is corrected.
 | --- | --- | --- |
 | Worker dies before admission. | No parent. | Replacement submits the same ID; attempt zero is admitted once. |
 | Prepare (admission and object staging) succeeds but its response is lost; worker or owner dies. | Parent and child already exist. | Wait for fenced cleanup, then submit the same ID to create the next child atomically. |
-| An object PUT succeeds but the client loses its response. | The child may be pending; publication is not inferred. | Query and wait for a safe child outcome. Unknown upload results never authorize an unfenced successor. |
+| The owner writes an uploaded block but the client loses its response. | The child records the upload; publication is not inferred. | The same request replays, and a resumed child continues from the owner's upload cursor. Unknown upload results never authorize an unfenced successor. |
 | A different action wins a generation CAS. | Losing child is safely aborted and cleaned. | The same logical append replans against the new head and completes once. |
-| Finish (upload proofs, manifest, and completion) commits but its response is lost. | Parent contains the committed receipt. | Replacement returns that receipt; it uploads and appends nothing. |
+| Finish (manifest and completion) commits but its response is lost. | Parent contains the committed receipt. | Replacement returns that receipt; it uploads and appends nothing. |
 | File is later appended, removed, or replaced. | Parent retains its original success. | Status and replay still return the historical result without changing the new live head. |
 | Workspace name is deleted and recreated. | Parent retains the original incarnation. | Old success remains queryable; an unfinished old intent cannot write into the new instance. |
 
