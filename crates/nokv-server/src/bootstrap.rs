@@ -672,8 +672,7 @@ pub fn bootstrap_shard(
     }
 
     let metadata_executor: Arc<dyn WorkspaceRequestExecutor> = Arc::new(
-        MetadataWorkspaceRequestExecutor::new(Arc::clone(&meta))
-            .with_object_store(Arc::clone(&recovery_objects))
+        MetadataWorkspaceRequestExecutor::new(Arc::clone(&meta), Arc::clone(&recovery_objects))
             .with_append_activity_lease_ms(boot.append_activity_lease_ms)?,
     );
     let executor: Arc<dyn WorkspaceRequestExecutor> = Arc::new(RecoveryPublishingExecutor::new(

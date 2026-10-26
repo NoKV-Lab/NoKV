@@ -164,9 +164,9 @@ impl RestorePreparationCoordinator {
 #[derive(Clone)]
 pub struct MetadataWorkspaceRequestExecutor {
     meta: Arc<meta::MetaShard>,
-    /// Where the owner writes uploaded artifact objects; without it the
-    /// executor refuses `UploadArtifactObject`.
-    objects: Option<Arc<dyn ArtifactObjectStore>>,
+    /// Where the owner writes uploaded artifact objects with its own
+    /// credentials; clients never write objects themselves.
+    objects: Arc<dyn ArtifactObjectStore>,
     append_activity_lease_ms: u64,
     restore_preparations: Arc<RestorePreparationCoordinator>,
     #[cfg(feature = "restore-crash-test-support")]
@@ -176,10 +176,10 @@ pub struct MetadataWorkspaceRequestExecutor {
 }
 
 impl MetadataWorkspaceRequestExecutor {
-    pub fn new(meta: Arc<meta::MetaShard>) -> Self {
+    pub fn new(meta: Arc<meta::MetaShard>, objects: Arc<dyn ArtifactObjectStore>) -> Self {
         Self {
             meta,
-            objects: None,
+            objects,
             append_activity_lease_ms: PUBLISH_ACTIVITY_LEASE_MS,
             restore_preparations: Arc::new(RestorePreparationCoordinator::default()),
             #[cfg(feature = "restore-crash-test-support")]
@@ -187,13 +187,6 @@ impl MetadataWorkspaceRequestExecutor {
             #[cfg(feature = "restore-crash-test-support")]
             restore_finalize_load_observer: None,
         }
-    }
-
-    /// The object store this owner writes uploaded artifact objects to, with
-    /// its own credentials; clients never write objects themselves.
-    pub fn with_object_store(mut self, objects: Arc<dyn ArtifactObjectStore>) -> Self {
-        self.objects = Some(objects);
-        self
     }
 
     pub fn with_append_activity_lease_ms(
@@ -2374,9 +2367,7 @@ impl MetadataWorkspaceRequestExecutor {
         if let Some(outcome) = self.replayed_publish(rpc.route, step_id)? {
             return publish_operation_response(outcome);
         }
-        let Some(objects) = &self.objects else {
-            return Err(internal("this owner has no object store to upload through"));
-        };
+        let objects = &self.objects;
         let operation = self.heartbeat_publish_operation(
             rpc,
             request.token,
@@ -6858,6 +6849,12 @@ mod tests {
     }
 
     fn ready_executor() -> (Arc<meta::MetaShard>, MetadataWorkspaceRequestExecutor) {
+        ready_executor_with(Arc::new(nokv_object::MemoryArtifactStore::new()))
+    }
+
+    fn ready_executor_with(
+        objects: Arc<dyn ArtifactObjectStore>,
+    ) -> (Arc<meta::MetaShard>, MetadataWorkspaceRequestExecutor) {
         let store = crate::test_support::meta_shard(shard());
         store.advance_owner_epoch(None, owner(1)).unwrap();
         store
@@ -6879,8 +6876,7 @@ mod tests {
                 owner(1),
             ))
             .unwrap();
-        let executor = MetadataWorkspaceRequestExecutor::new(Arc::clone(&store))
-            .with_object_store(Arc::new(nokv_object::MemoryArtifactStore::new()));
+        let executor = MetadataWorkspaceRequestExecutor::new(Arc::clone(&store), objects);
         (store, executor)
     }
 
@@ -6987,8 +6983,10 @@ mod tests {
     fn preflight_uses_no_workspace_state_and_reports_the_exact_route() {
         let store = crate::test_support::meta_shard(shard());
         let version_before = store.current_read_version().unwrap();
-        let executor = MetadataWorkspaceRequestExecutor::new(Arc::clone(&store))
-            .with_object_store(Arc::new(nokv_object::MemoryArtifactStore::new()));
+        let executor = MetadataWorkspaceRequestExecutor::new(
+            Arc::clone(&store),
+            Arc::new(nokv_object::MemoryArtifactStore::new()),
+        );
         let request = protocol::WorkspaceRpcRequest {
             route: route(41),
             request_id: protocol::RequestIdentity([91; types::FIXED_ID_BYTES]),
@@ -9212,7 +9210,25 @@ mod tests {
         OneBytePlan,
         protocol::BeginArtifactPublishRequest,
     ) {
-        let (store, executor) = ready_executor();
+        fused_publication_fixture_with(
+            name,
+            fill,
+            Arc::new(nokv_object::MemoryArtifactStore::new()),
+        )
+    }
+
+    /// The fused fixture over the object store the owner writes through.
+    fn fused_publication_fixture_with(
+        name: &str,
+        fill: u8,
+        objects: Arc<dyn ArtifactObjectStore>,
+    ) -> (
+        Arc<meta::MetaShard>,
+        MetadataWorkspaceRequestExecutor,
+        OneBytePlan,
+        protocol::BeginArtifactPublishRequest,
+    ) {
+        let (store, executor) = ready_executor_with(objects);
         let workbench = protocol::WorkbenchName::new(name).unwrap();
         executor
             .execute(
@@ -9338,15 +9354,16 @@ mod tests {
 
     #[test]
     fn an_ambiguous_owner_write_is_retryable_and_the_same_bytes_replay() {
-        let (_store, executor, plan, begin) =
-            fused_publication_fixture("owner-upload-ambiguous", 0xa0);
-        let operation_id = begin.operation_id;
         let objects = Arc::new(AmbiguousOnceStore {
             inner: nokv_object::MemoryArtifactStore::new(),
             creates: std::sync::atomic::AtomicUsize::new(0),
         });
-        let executor =
-            executor.with_object_store(Arc::clone(&objects) as Arc<dyn ArtifactObjectStore>);
+        let (_store, executor, plan, begin) = fused_publication_fixture_with(
+            "owner-upload-ambiguous",
+            0xa0,
+            Arc::clone(&objects) as Arc<dyn ArtifactObjectStore>,
+        );
+        let operation_id = begin.operation_id;
         let prepared = executor
             .execute(
                 &restore_rpc(
@@ -9402,10 +9419,12 @@ mod tests {
 
     #[test]
     fn the_owner_writes_an_uploaded_object_and_records_it() {
-        let (_store, executor, plan, begin) = fused_publication_fixture("owner-upload", 0x30);
         let objects = Arc::new(nokv_object::MemoryArtifactStore::new());
-        let executor =
-            executor.with_object_store(Arc::clone(&objects) as Arc<dyn ArtifactObjectStore>);
+        let (_store, executor, plan, begin) = fused_publication_fixture_with(
+            "owner-upload",
+            0x30,
+            Arc::clone(&objects) as Arc<dyn ArtifactObjectStore>,
+        );
         let prepared = executor
             .execute(
                 &restore_rpc(
