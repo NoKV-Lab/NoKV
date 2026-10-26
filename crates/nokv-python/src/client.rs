@@ -541,7 +541,6 @@ impl PythonWorkspaceClient {
                 operation_id,
                 None,
                 "InvalidArgument",
-                None,
                 ErrorClass::InvalidInput,
             )
         };
@@ -597,7 +596,7 @@ impl PythonWorkspaceClient {
         let call = match recovered {
             Some(call) => call,
             None => {
-                // Binding and admission run before any append request.
+                // Binding runs before any append request.
                 let objects = self.bind_objects(py).map_err(|failure| {
                     append_local_failure(
                         py,
@@ -605,22 +604,9 @@ impl PythonWorkspaceClient {
                         operation_id,
                         Some(incarnation),
                         "AppendFailed",
-                        None,
                         failure.class(),
                     )
                 })?;
-                py.detach(|| objects.inner().validate_append_capabilities())
-                    .map_err(|error| {
-                        append_local_failure(
-                            py,
-                            error.to_string(),
-                            operation_id,
-                            Some(incarnation),
-                            "AppendFailed",
-                            Some(error.code()),
-                            error.class(),
-                        )
-                    })?;
                 py.detach(move || {
                     client.append_artifact_idempotent(objects.as_ref(), options, &data)
                 })
@@ -715,7 +701,6 @@ impl PythonWorkspaceClient {
                 operation_id,
                 None,
                 "InvalidArgument",
-                None,
                 ErrorClass::InvalidInput,
             ));
         }
@@ -796,7 +781,6 @@ impl PythonWorkspaceClient {
                     operation_id,
                     None,
                     "InvalidArgument",
-                    None,
                     ErrorClass::InvalidInput,
                 )
             })?;

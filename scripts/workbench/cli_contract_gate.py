@@ -271,8 +271,12 @@ class Stack:
                 time.sleep(0.1)
         raise NotQualified(f"{what} did not listen on port {port}")
 
+    def object_options(self, command: str) -> list[str]:
+        """The object-store options an invocation of `command` runs with."""
+        return self.objects
+
     def run(self, label: str, arguments: list[str]) -> Call:
-        prefix = [*self.route, "--agent-id", self.ids["agent"], *self.objects]
+        prefix = [*self.route, "--agent-id", self.ids["agent"], *self.object_options(arguments[0])]
         argv = [str(self.binary), *prefix, *arguments]
         with self.proxy._lock:
             connections, requests = self.proxy.connections, len(self.proxy.requests)

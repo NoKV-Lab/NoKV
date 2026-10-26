@@ -69,7 +69,7 @@ NoKV closes that window as one artifact lifecycle:
 produce bytes
     |
     v
-upload immutable blocks + verify provider admission
+hand each immutable block to the shard owner, which verifies and writes it
     |
     v
 one final bounded metadata command makes the revision visible
@@ -635,8 +635,10 @@ clients whose certificate is a current credential of the tenant bound to its
 roots (`nokv identity`). Every request then needs a role on its root:
 reader, writer, or operator. Over TLS the CLI needs no `--agent-id`, so many
 agents can share a root, and once a root is bound to a tenant only a TLS owner
-serves it. The control plane and object store still need a trusted network.
-The Python SDK cannot yet connect to an owner that requires TLS.
+serves it. Agents never write objects: each block goes to the owner, which
+writes it, so an agent's object credentials can be read-only under the root's
+prefix. The control plane still needs a trusted network. The Python SDK cannot
+yet connect to an owner that requires TLS.
 
 ## Architecture and Ownership
 

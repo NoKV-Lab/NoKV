@@ -2858,16 +2858,6 @@ fn map_client_error_shape(error: ClientError) -> agent::BackendError {
         }
         return mapped;
     }
-    if let Some(cause) = provider_admission_cause(&error) {
-        // Admission failed before the first object write; the command
-        // reports it as an admission at its start would have.
-        return agent::BackendError::new(
-            agent::BackendErrorKind::Other("ProviderAdmissionFailed".to_owned()),
-            cause.to_string(),
-            false,
-            json!({"code": cause.code()}),
-        );
-    }
     let is_object_failure = object_failure(&error);
     let is_artifact_integrity_failure = artifact_integrity_failure(&error);
     let kind = if is_object_failure {
@@ -2882,7 +2872,7 @@ fn map_client_error_shape(error: ClientError) -> agent::BackendError {
             | ClientError::ArtifactIntegrity(_)
             | ClientError::ArtifactReadFenceChanged => agent::BackendErrorKind::InvalidState,
             ClientError::Transport(_) => agent::BackendErrorKind::Other("Transport".to_owned()),
-            ClientError::Object(_) | ClientError::ArtifactUpload(_) => unreachable!(),
+            ClientError::Object(_) => unreachable!(),
             ClientError::InvalidOptions(_) | ClientError::InvalidRoute(_) => {
                 agent::BackendErrorKind::InvalidState
             }
@@ -2916,20 +2906,9 @@ fn map_client_error_shape(error: ClientError) -> agent::BackendError {
     mapped
 }
 
-fn provider_admission_cause(error: &ClientError) -> Option<nokv_object::ProviderAdmissionError> {
-    match error {
-        ClientError::Object(nokv_object::ObjectError::ProviderAdmissionFailed(cause)) => {
-            Some(*cause)
-        }
-        ClientError::ArtifactPublishFailed { source, .. } => provider_admission_cause(source),
-        ClientError::RetryExhausted { last_error, .. } => provider_admission_cause(last_error),
-        _ => None,
-    }
-}
-
 fn object_failure(error: &ClientError) -> bool {
     match error {
-        ClientError::Object(_) | ClientError::ArtifactUpload(_) => true,
+        ClientError::Object(_) => true,
         ClientError::ArtifactPublishFailed { source, .. } => object_failure(source),
         ClientError::RetryExhausted { last_error, .. } => object_failure(last_error),
         _ => false,
@@ -3134,8 +3113,8 @@ mod tests {
         WorkspaceClient,
     };
     use nokv_object::{
-        ensure_object_namespace, plan_artifact_upload, upload_artifact_from_plan,
-        ArtifactUploadOptions, BoundArtifactStore, MemoryArtifactStore,
+        ensure_object_namespace, plan_artifact_upload, ArtifactUploadOptions, BoundArtifactStore,
+        MemoryArtifactStore,
     };
     use nokv_types::{ArtifactRevisionId, LogicalShardId, ObjectNamespaceId};
 
@@ -3437,7 +3416,13 @@ mod tests {
             bytes,
         )
         .unwrap();
-        upload_artifact_from_plan(&raw_store, &upload_plan, bytes).unwrap();
+        for block in &upload_plan.manifest.blocks {
+            let start = usize::try_from(block.logical_offset).unwrap();
+            let end = start + usize::try_from(block.len).unwrap();
+            raw_store
+                .create_immutable(&block.key, &bytes[start..end])
+                .unwrap();
+        }
         let rows = upload_plan
             .manifest
             .blocks
@@ -6327,25 +6312,6 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 3);
     }
 
-    /// A provider that refuses connections fails its deferred admission as a
-    /// transient admission failure, with the code an eager admission reports.
-    fn assert_refused_provider_admission(error: &agent::BackendError) {
-        assert_eq!(
-            error.kind,
-            agent::BackendErrorKind::Other("ProviderAdmissionFailed".to_owned())
-        );
-        assert!(!error.retryable);
-        assert_eq!(error.class, Some(ErrorClass::Transient));
-        let cause = error.details["code"].as_str().unwrap();
-        assert!(
-            matches!(
-                cause,
-                "ProviderAdmissionUnavailable" | "ProviderAdmissionInconclusive"
-            ),
-            "{cause}"
-        );
-    }
-
     #[test]
     fn an_inline_publish_never_probes_the_object_provider() {
         let route = test_route();
@@ -6584,12 +6550,29 @@ mod tests {
         assert_eq!(failure["next_action"], "resubmit_same");
     }
 
+    /// The scripted owner refuses the request that reaches it here, so the
+    /// test observes which request a command sends first.
+    fn scripted_refusal() -> wire::WorkspaceRpcOutcome {
+        wire::WorkspaceRpcOutcome::Failure(wire::RpcFailure {
+            code: wire::ErrorCode::Internal,
+            message: "scripted refusal".to_owned(),
+            retryable: false,
+            conflict: None,
+            current_generation: None,
+            route_hint: None,
+        })
+    }
+
     #[test]
-    fn publish_implicitly_admits_a_missing_workbench_before_provider_use() {
-        // A body above the inline bound is the one that needs the provider.
+    fn publish_admits_a_missing_workbench_before_its_first_publication_request() {
+        // A body above the inline bound is the one that uploads objects. The
+        // provider refuses connections: the Agent never contacts it.
         let body = vec![b' '; nokv_protocol::MAX_INLINE_ARTIFACT_BODY_BYTES + 1];
-        let objects: Arc<dyn ArtifactObjectStore> =
-            Arc::new(CliObjectStore::build(&refused_provider_config()).unwrap());
+        let objects: Arc<dyn ArtifactObjectStore> = Arc::new(
+            CliObjectStore::build(&refused_provider_config())
+                .unwrap()
+                .assume_namespace(test_route().object_namespace_id.into()),
+        );
         let (backend, requests, server) = scripted_backend_with_objects(
             vec![
                 not_found_failure(),
@@ -6598,6 +6581,7 @@ mod tests {
                     "implicit-publish",
                     [5; 16],
                 ))),
+                scripted_refusal(),
             ],
             objects,
             body.len(),
@@ -6608,11 +6592,11 @@ mod tests {
         let error = agent::WorkbenchBackend::publish(&backend, request).unwrap_err();
         server.join().unwrap();
 
-        // The first object write admits the provider; its refusal stops the
-        // publication before any publication request.
-        assert_refused_provider_admission(&error);
+        // The workbench exists before the publication's first request, which
+        // carries the sealed plan the owner uploads against.
+        assert!(!error.retryable);
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         assert!(matches!(
             requests[0].operation,
             wire::WorkspaceRequest::GetWorkspace(_)
@@ -6624,28 +6608,42 @@ mod tests {
         assert!(matches!(
             requests[2].operation,
             wire::WorkspaceRequest::GetWorkspace(_)
+        ));
+        assert!(matches!(
+            requests[3].operation,
+            wire::WorkspaceRequest::PrepareArtifactPublish(_)
         ));
     }
 
     #[test]
-    fn append_implicitly_admits_a_missing_workbench_before_provider_use() {
-        let (backend, requests, server) = scripted_backend(vec![
-            not_found_failure(),
-            already_exists_failure(),
-            success(wire::WorkspaceResult::Workspace(workspace_summary(
-                "implicit-append",
-                [6; 16],
-            ))),
-        ]);
+    fn append_admits_a_missing_workbench_before_its_first_append_request() {
+        // The provider refuses connections: the Agent never contacts it.
+        let objects: Arc<dyn ArtifactObjectStore> = Arc::new(
+            CliObjectStore::build(&refused_provider_config())
+                .unwrap()
+                .assume_namespace(test_route().object_namespace_id.into()),
+        );
+        let (backend, requests, server) = scripted_backend_with_objects(
+            vec![
+                not_found_failure(),
+                already_exists_failure(),
+                success(wire::WorkspaceResult::Workspace(workspace_summary(
+                    "implicit-append",
+                    [6; 16],
+                ))),
+                scripted_refusal(),
+            ],
+            objects,
+            1024,
+        );
 
         let error = agent::WorkbenchBackend::append(&backend, append_request()).unwrap_err();
         server.join().unwrap();
 
-        // An append asks for admission before it knows whether its result
-        // is inline.
-        assert_refused_provider_admission(&error);
+        // The workbench exists before the append reads the path it extends.
+        assert!(!error.retryable);
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         assert!(matches!(
             requests[0].operation,
             wire::WorkspaceRequest::GetWorkspace(_)
@@ -6657,6 +6655,10 @@ mod tests {
         assert!(matches!(
             requests[2].operation,
             wire::WorkspaceRequest::GetWorkspace(_)
+        ));
+        assert!(matches!(
+            requests[3].operation,
+            wire::WorkspaceRequest::GetPath(_)
         ));
     }
 

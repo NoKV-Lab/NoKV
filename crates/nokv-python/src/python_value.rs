@@ -564,8 +564,6 @@ pub(crate) fn publish_outcome_to_py<'py>(
     let upload = PyDict::new(py);
     upload.set_item("blocks", outcome.upload_stats.blocks)?;
     upload.set_item("bytes", outcome.upload_stats.bytes)?;
-    upload.set_item("created", outcome.upload_stats.created)?;
-    upload.set_item("replayed", outcome.upload_stats.replayed)?;
     dict.set_item("upload", upload)?;
     Ok(dict)
 }

@@ -1,5 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use nokv_types::{ArtifactRevisionId, LogicalShardId, RootId};
 
 use super::*;
@@ -21,13 +19,22 @@ fn options(revision_byte: u8) -> ArtifactUploadOptions {
         .with_block_size(4)
 }
 
+/// Write a body the way the owner does: one immutable object per planned
+/// block, from the plan computed before any write.
 fn execute_upload(
     store: &dyn ArtifactObjectStore,
     upload_options: ArtifactUploadOptions,
     bytes: &[u8],
-) -> ArtifactUpload {
+) -> ArtifactManifest {
     let plan = plan_artifact_upload(upload_options, bytes).unwrap();
-    upload_artifact_from_plan(store, &plan, bytes).unwrap()
+    for block in &plan.manifest.blocks {
+        let start = usize::try_from(block.logical_offset).unwrap();
+        let end = start + usize::try_from(block.len).unwrap();
+        store
+            .create_immutable(&block.key, &bytes[start..end])
+            .unwrap();
+    }
+    plan.manifest
 }
 
 #[test]
@@ -224,21 +231,19 @@ fn an_evictable_local_cache_cannot_certify_permanent_sealing() {
 fn upload_range_read_and_exact_replay_share_one_manifest() {
     let store = MemoryArtifactStore::new();
     let uploaded = execute_upload(&store, options(3), b"abcdefghij");
-    assert_eq!(uploaded.manifest.blocks.len(), 3);
-    assert_eq!(uploaded.stats.created, 3);
-    assert_eq!(uploaded.staged.len(), 3);
+    assert_eq!(uploaded.blocks.len(), 3);
+    assert_eq!(store.stats().unwrap().resident_objects, 3);
 
     let replay = execute_upload(&store, options(3), b"abcdefghij");
-    assert_eq!(replay.manifest, uploaded.manifest);
-    assert_eq!(replay.stats.replayed, 3);
+    assert_eq!(replay, uploaded);
+    assert_eq!(store.stats().unwrap().resident_objects, 3);
 
-    let range =
-        read_artifact_range(&store, None, &uploaded.manifest, 2, 7).expect("valid strict range");
+    let range = read_artifact_range(&store, None, &uploaded, 2, 7).expect("valid strict range");
     assert_eq!(range.bytes, b"cdefghi");
     assert_eq!(range.stats.planned_blocks, 3);
     assert_eq!(range.stats.verified_blocks, 3);
 
-    let whole = read_artifact(&store, None, &uploaded.manifest).unwrap();
+    let whole = read_artifact(&store, None, &uploaded).unwrap();
     assert_eq!(whole.bytes, b"abcdefghij");
 }
 
@@ -251,66 +256,9 @@ fn upload_plan_is_pure_deterministic_and_precedes_object_writes() {
     assert_eq!(first.manifest.blocks.len(), 2);
     assert_eq!(store.stats().unwrap().resident_objects, 0);
 
-    let uploaded = upload_artifact_from_plan(&store, &first, b"abcdefgh").unwrap();
-    assert_eq!(uploaded.manifest, first.manifest);
+    let uploaded = execute_upload(&store, options(9), b"abcdefgh");
+    assert_eq!(uploaded, first.manifest);
     assert_eq!(store.stats().unwrap().resident_objects, 2);
-}
-
-#[test]
-fn upload_from_plan_rejects_payload_mismatch_before_first_write() {
-    let store = MemoryArtifactStore::new();
-    let plan = plan_artifact_upload(options(10), b"abcdefgh").unwrap();
-    let failure = upload_artifact_from_plan(&store, &plan, b"abcdefgx").unwrap_err();
-    assert!(matches!(
-        *failure.source,
-        ObjectError::DigestMismatch { .. }
-    ));
-    assert!(failure.staged.is_empty());
-    assert_eq!(failure.stats, ArtifactUploadStats::default());
-    assert_eq!(store.stats().unwrap().resident_objects, 0);
-}
-
-#[test]
-fn upload_failure_returns_revision_owned_cleanup_set() {
-    let store = MemoryArtifactStore::new();
-    let keyspace = ArtifactKeyspace {
-        logical_shard_id: logical_shard(1),
-        root_id: root(2),
-        artifact_revision_id: revision(4),
-    };
-    let conflicting = keyspace.permanent_block_key(1);
-    store.create_immutable(&conflicting, b"xxxx").unwrap();
-
-    let plan = plan_artifact_upload(options(4), b"abcdefgh").unwrap();
-    let failure = upload_artifact_from_plan(&store, &plan, b"abcdefgh").unwrap_err();
-    assert!(matches!(
-        *failure.source,
-        ObjectError::ImmutableCollision { .. }
-    ));
-    assert_eq!(failure.staged.len(), 1);
-    assert_eq!(failure.stats.created, 1);
-
-    let cleanup = cleanup_staged_artifact(&store, &failure.staged).unwrap();
-    assert_eq!(cleanup.deleted, 1);
-    assert_eq!(store.read(&conflicting, None).unwrap(), b"xxxx");
-}
-
-#[test]
-fn staged_cleanup_state_rejects_cross_revision_keys() {
-    let keyspace = ArtifactKeyspace {
-        logical_shard_id: logical_shard(1),
-        root_id: root(2),
-        artifact_revision_id: revision(4),
-    };
-    let wrong_key = ArtifactKeyspace {
-        artifact_revision_id: revision(9),
-        ..keyspace
-    }
-    .permanent_block_key(0);
-    assert!(matches!(
-        StagedArtifactObjects::from_keys(logical_shard(1), root(2), revision(4), vec![wrong_key]),
-        Err(ObjectError::InvalidManifest(_))
-    ));
 }
 
 #[test]
@@ -318,22 +266,22 @@ fn strict_ranges_and_block_digests_are_verified() {
     let store = MemoryArtifactStore::new();
     let uploaded = execute_upload(&store, options(5), b"abcdefgh");
     assert!(matches!(
-        plan_artifact_read(&uploaded.manifest, 7, 2),
+        plan_artifact_read(&uploaded, 7, 2),
         Err(ObjectError::InvalidRange { .. })
     ));
     assert!(matches!(
-        plan_artifact_read(&uploaded.manifest, 0, 0),
+        plan_artifact_read(&uploaded, 0, 0),
         Err(ObjectError::InvalidRange { .. })
     ));
 
-    let mut corrupt_manifest = uploaded.manifest.clone();
+    let mut corrupt_manifest = uploaded.clone();
     corrupt_manifest.blocks[0].sha256 = [0xff; 32];
     assert!(matches!(
         read_artifact(&store, None, &corrupt_manifest),
         Err(ObjectError::DigestMismatch { .. })
     ));
 
-    let mut corrupt_artifact_digest = uploaded.manifest.clone();
+    let mut corrupt_artifact_digest = uploaded.clone();
     corrupt_artifact_digest.sha256 = [0xee; 32];
     assert!(matches!(
         read_artifact(&store, None, &corrupt_artifact_digest),
@@ -346,21 +294,18 @@ fn bounded_read_windows_reject_gaps_and_overlaps_without_synthesizing_bytes() {
     let store = MemoryArtifactStore::new();
     let uploaded = execute_upload(&store, options(11), b"abcdefghijkl");
     let mut window = ArtifactReadWindow {
-        logical_shard_id: uploaded.manifest.logical_shard_id,
-        root_id: uploaded.manifest.root_id,
-        artifact_revision_id: uploaded.manifest.artifact_revision_id,
-        artifact_logical_len: uploaded.manifest.logical_len,
-        blocks: vec![
-            uploaded.manifest.blocks[0].clone(),
-            uploaded.manifest.blocks[2].clone(),
-        ],
+        logical_shard_id: uploaded.logical_shard_id,
+        root_id: uploaded.root_id,
+        artifact_revision_id: uploaded.artifact_revision_id,
+        artifact_logical_len: uploaded.logical_len,
+        blocks: vec![uploaded.blocks[0].clone(), uploaded.blocks[2].clone()],
     };
     assert!(matches!(
         read_artifact_window(&store, None, &window, 0, 12),
         Err(ObjectError::InvalidManifest(_))
     ));
 
-    window.blocks[1] = uploaded.manifest.blocks[1].clone();
+    window.blocks[1] = uploaded.blocks[1].clone();
     window.blocks[1].logical_offset = 3;
     assert!(matches!(
         read_artifact_window(&store, None, &window, 0, 8),
@@ -372,12 +317,9 @@ fn bounded_read_windows_reject_gaps_and_overlaps_without_synthesizing_bytes() {
 fn empty_artifact_has_a_canonical_manifest() {
     let store = MemoryArtifactStore::new();
     let uploaded = execute_upload(&store, options(6), b"");
-    assert!(uploaded.manifest.blocks.is_empty());
-    assert!(uploaded.staged.is_empty());
+    assert!(uploaded.blocks.is_empty());
     assert_eq!(
-        read_artifact(&store, None, &uploaded.manifest)
-            .unwrap()
-            .bytes,
+        read_artifact(&store, None, &uploaded).unwrap().bytes,
         Vec::<u8>::new()
     );
 }
@@ -391,15 +333,15 @@ fn memory_cache_evicts_and_recovers_from_corruption() {
         max_entries: 1,
     });
 
-    let first = read_artifact_range(&store, Some(&cache), &uploaded.manifest, 0, 4).unwrap();
+    let first = read_artifact_range(&store, Some(&cache), &uploaded, 0, 4).unwrap();
     assert_eq!(first.stats.store_reads, 1);
-    let second = read_artifact_range(&store, Some(&cache), &uploaded.manifest, 0, 4).unwrap();
+    let second = read_artifact_range(&store, Some(&cache), &uploaded, 0, 4).unwrap();
     assert_eq!(second.stats.cache_hits, 1);
     assert_eq!(second.stats.store_reads, 0);
 
-    let key = uploaded.manifest.blocks[0].key.clone();
+    let key = uploaded.blocks[0].key.clone();
     cache.insert(key, b"zzzz".to_vec()).unwrap();
-    let recovered = read_artifact_range(&store, Some(&cache), &uploaded.manifest, 0, 4).unwrap();
+    let recovered = read_artifact_range(&store, Some(&cache), &uploaded, 0, 4).unwrap();
     assert_eq!(recovered.bytes, b"abcd");
     assert_eq!(recovered.stats.cache_misses, 1);
     assert_eq!(recovered.stats.store_reads, 1);
@@ -455,68 +397,6 @@ fn tiered_store_reads_durable_then_uses_hot_tier() {
     assert_eq!(stats.hot_hits, 1);
     assert_eq!(stats.durable_reads, 1);
     assert_eq!(stats.hot_populates, 1);
-}
-
-#[derive(Debug)]
-struct AmbiguousDeleteStore {
-    inner: MemoryArtifactStore,
-    fail_next_delete: AtomicBool,
-}
-
-impl AmbiguousDeleteStore {
-    fn new() -> Self {
-        Self {
-            inner: MemoryArtifactStore::new(),
-            fail_next_delete: AtomicBool::new(false),
-        }
-    }
-}
-
-impl ArtifactObjectStore for AmbiguousDeleteStore {
-    fn capabilities(&self) -> ArtifactStoreCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn create_immutable(
-        &self,
-        key: &ObjectKey,
-        bytes: &[u8],
-    ) -> Result<ImmutableCreateOutcome, ObjectError> {
-        self.inner.create_immutable(key, bytes)
-    }
-
-    fn read(&self, key: &ObjectKey, range: Option<ObjectRange>) -> Result<Vec<u8>, ObjectError> {
-        self.inner.read(key, range)
-    }
-
-    fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
-        self.inner.head(key)
-    }
-
-    fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
-        if self.fail_next_delete.swap(false, Ordering::SeqCst) {
-            return Err(ObjectError::DeleteAmbiguous {
-                key: key.clone(),
-                detail: "injected response loss".to_owned(),
-            });
-        }
-        self.inner.delete(key)
-    }
-}
-
-#[test]
-fn cleanup_surfaces_ambiguous_delete_with_progress() {
-    let store = AmbiguousDeleteStore::new();
-    let uploaded = execute_upload(&store, options(8), b"abcdefgh");
-    store.fail_next_delete.store(true, Ordering::SeqCst);
-    let failure = cleanup_staged_artifact(&store, &uploaded.staged).unwrap_err();
-    assert_eq!(failure.outcome.attempted, 1);
-    assert_eq!(failure.outcome.deleted, 0);
-    assert!(matches!(
-        *failure.source,
-        ObjectError::DeleteAmbiguous { .. }
-    ));
-    assert_eq!(store.inner.stats().unwrap().resident_objects, 2);
 }
 
 #[test]

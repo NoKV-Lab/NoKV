@@ -14,14 +14,14 @@ use nokv_protocol::{
     CreateWorkspaceRequest, ErrorCode, FinalizeRestoreRequest, FindWorkspacesRequest,
     FindWorkspacesResult, GetOperationRequest, GetPathRequest, GetSnapshotRequest,
     GetWorkspaceRequest, ListPathsRequest, ListSnapshotsRequest, LogicalShardIdentity,
-    MarkArtifactObjectsUploadedRequest, MintSnapshotRequest, OperationStatus, PathPage,
-    PathReadResult, PrepareRestoreRequest, PublishResult, ReadRestoreSourceRunManifestRequest,
-    RemovePathRequest, RemovePathResult, RenamePathRequest, RenamePathResult, RenewSnapshotRequest,
-    RequestIdentity, RestorePreparation, RestoreResult, RetireSnapshotRequest, RootIdentity,
-    RootRoute, SearchRequest, SearchResult, SnapshotPage, SnapshotResult,
-    StageArtifactManifestRequest, StageArtifactObjectsRequest, WorkspaceCapability,
-    WorkspacePreflightRequest, WorkspacePreflightResult, WorkspaceRequest, WorkspaceResult,
-    WorkspaceRpcOutcome, WorkspaceRpcRequest, WorkspaceSummary,
+    MintSnapshotRequest, OperationStatus, PathPage, PathReadResult, PrepareRestoreRequest,
+    PublishResult, ReadRestoreSourceRunManifestRequest, RemovePathRequest, RemovePathResult,
+    RenamePathRequest, RenamePathResult, RenewSnapshotRequest, RequestIdentity, RestorePreparation,
+    RestoreResult, RetireSnapshotRequest, RootIdentity, RootRoute, SearchRequest, SearchResult,
+    SnapshotPage, SnapshotResult, StageArtifactManifestRequest, StageArtifactObjectsRequest,
+    UploadArtifactObjectRequest, WorkspaceCapability, WorkspacePreflightRequest,
+    WorkspacePreflightResult, WorkspaceRequest, WorkspaceResult, WorkspaceRpcOutcome,
+    WorkspaceRpcRequest, WorkspaceSummary,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -418,16 +418,13 @@ where
             .map(expect_operation)
     }
 
-    pub fn mark_artifact_objects_uploaded(
+    pub fn upload_artifact_object(
         &self,
         request_id: RequestIdentity,
-        request: MarkArtifactObjectsUploadedRequest,
+        request: UploadArtifactObjectRequest,
     ) -> Result<ClientCall<OperationStatus>, ClientError> {
-        self.execute(
-            request_id,
-            WorkspaceRequest::MarkArtifactObjectsUploaded(request),
-        )?
-        .map(expect_operation)
+        self.execute(request_id, WorkspaceRequest::UploadArtifactObject(request))?
+            .map(expect_operation)
     }
 
     pub fn stage_artifact_manifest(

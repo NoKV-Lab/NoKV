@@ -13,6 +13,9 @@ use crate::{
 pub const MAX_ARTIFACT_PUBLISH_BATCH_ROWS: usize = 192;
 /// Durable count bound for staged objects and manifest rows.
 pub const MAX_ARTIFACT_PUBLISH_OBJECTS: usize = 1_048_576;
+/// The most bytes one `UploadArtifactObject` carries: one artifact block, well
+/// inside the wire frame bound.
+pub const MAX_ARTIFACT_UPLOAD_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum provider-neutral manifest rows returned by one range-plan page.
 pub const MAX_ARTIFACT_READ_PLAN_ROWS: usize = 512;
 
