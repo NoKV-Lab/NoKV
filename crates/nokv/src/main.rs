@@ -2495,7 +2495,6 @@ mod tests {
                         expected_digest: nokv_protocol::sha256_digest_uri(nokv_protocol::Digest(
                             [0x44; 32],
                         )),
-                        multipart_token: None,
                     }],
                     next_after: Some(1),
                 },

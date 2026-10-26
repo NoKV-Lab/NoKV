@@ -135,8 +135,8 @@ not for installing the SDK.
   same status plus logical `operation_token`, child `publication_token`, object
   namespace, `registered_count`, `cleanup_cursor`, `remaining_count`, and a page
   of retained staged `entries`. Each entry has `sequence`, `object_identity`,
-  `expected_length`, `expected_digest`, and optional `multipart_token`. Retired
-  keys are not a historical inventory. The limit is 1 to 192; `next_cursor` is
+  `expected_length`, and `expected_digest`. Retired keys are not a historical
+  inventory. The limit is 1 to 192; `next_cursor` is
   opaque `bytes` or `None`. Continue with the unchanged cursor. A changed state
   returns `Conflict`; restart inspection rather than combining different pages.
 - `Client.operation_recover(operation_id, expected_state_digest=None)` asks the

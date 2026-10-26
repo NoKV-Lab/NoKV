@@ -41,13 +41,11 @@ pub enum LifecycleCleanupPurpose {
 }
 
 /// Provider-neutral cleanup request. Failed append keys must be permanently
-/// sealed; ordinary publication and revision GC require absence. Multipart
-/// cleanup must also fence the named upload before returning success.
+/// sealed; ordinary publication and revision GC require absence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LifecycleCleanupRequest {
     pub purpose: LifecycleCleanupPurpose,
     pub object_key: String,
-    pub multipart_upload_id: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +73,7 @@ impl LifecycleCleanupProof {
     /// Build stable provider evidence for one authoritative cleanup request.
     /// The caller must pass the canonical object key received from the
     /// lifecycle worker; the digest binds the metadata schema, proof domain,
-    /// cleanup purpose, exact key, optional multipart id, and disposition.
+    /// cleanup purpose, exact key, and disposition.
     pub fn from_cleanup_request(
         request: &LifecycleCleanupRequest,
         disposition: LifecycleCleanupDisposition,
@@ -89,13 +87,6 @@ impl LifecycleCleanupProof {
             LifecycleCleanupPurpose::AbortedAppend => 3,
         }]);
         hash_part(&mut hasher, request.object_key.as_bytes());
-        match request.multipart_upload_id.as_deref() {
-            None => hasher.update([0]),
-            Some(multipart_upload_id) => {
-                hasher.update([1]);
-                hash_part(&mut hasher, multipart_upload_id);
-            }
-        }
         hasher.update([match disposition {
             LifecycleCleanupDisposition::Deleted => 1,
             LifecycleCleanupDisposition::AlreadyAbsent => 2,
@@ -144,9 +135,8 @@ impl LifecycleDurabilityBarrier for RecoveryPublisher {
 /// ordinary publication and revision GC retain physical deletion semantics.
 ///
 /// The object boundary cannot prove that a failed destructive call was not
-/// dispatched, and it currently exposes no multipart-abort operation. Both
-/// cases therefore fail closed as ambiguous so the metadata operation is
-/// quarantined instead of retrying an uncertain deletion.
+/// dispatched, so that case fails closed as ambiguous and the metadata
+/// operation is quarantined instead of retrying an uncertain deletion.
 #[derive(Clone)]
 pub struct ArtifactLifecycleCleaner<Store: ?Sized> {
     store: Arc<Store>,
@@ -166,11 +156,6 @@ where
         &self,
         request: &LifecycleCleanupRequest,
     ) -> Result<LifecycleCleanupProof, LifecycleCleanupError> {
-        if request.multipart_upload_id.is_some() {
-            return Err(LifecycleCleanupError::Ambiguous {
-                evidence: b"configured object provider has no multipart-abort boundary".to_vec(),
-            });
-        }
         let key = ObjectKey::new(request.object_key.clone()).map_err(|error| {
             LifecycleCleanupError::Ambiguous {
                 evidence: format!("authoritative lifecycle object key is invalid: {error}")
@@ -794,7 +779,6 @@ impl LifecycleRunner {
                             LifecycleCleanupPurpose::AbortedPublication
                         },
                         object_key: expected.object_key.clone(),
-                        multipart_upload_id: expected.multipart_upload_id.clone(),
                     };
                     match self.objects.cleanup(&request) {
                         Ok(proof) if proof.matches_request(&request) => {
@@ -1511,7 +1495,6 @@ impl LifecycleRunner {
                 let request = LifecycleCleanupRequest {
                     purpose: LifecycleCleanupPurpose::RevisionGarbageCollection,
                     object_key: entry.row.object_key.clone(),
-                    multipart_upload_id: None,
                 };
                 match self.objects.cleanup(&request) {
                     Ok(proof) if proof.matches_request(&request) => {
@@ -2011,7 +1994,6 @@ mod tests {
         LifecycleCleanupRequest {
             purpose: LifecycleCleanupPurpose::RevisionGarbageCollection,
             object_key: "nokv/artifacts/object".to_owned(),
-            multipart_upload_id: None,
         }
     }
 
@@ -2027,7 +2009,6 @@ mod tests {
             let request = LifecycleCleanupRequest {
                 purpose: LifecycleCleanupPurpose::AbortedAppend,
                 object_key: key.as_str().to_owned(),
-                multipart_upload_id: None,
             };
             for _ in 0..2 {
                 let proof = cleaner.cleanup(&request).unwrap();
@@ -2093,22 +2074,6 @@ mod tests {
             LifecycleCleanupDisposition::AlreadyAbsent
         );
         assert_eq!(store.delete_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn artifact_lifecycle_deleter_quarantines_multipart_before_dispatch() {
-        let store = Arc::new(FakeArtifactStore {
-            delete_result: Ok(ObjectDeleteOutcome::Deleted),
-            delete_calls: AtomicUsize::new(0),
-        });
-        let deleter = ArtifactLifecycleCleaner::new(Arc::clone(&store));
-        let mut request = lifecycle_delete_request();
-        request.multipart_upload_id = Some(b"upload-id".to_vec());
-
-        let error = deleter.cleanup(&request).unwrap_err();
-
-        assert!(matches!(error, LifecycleCleanupError::Ambiguous { .. }));
-        assert_eq!(store.delete_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -2539,7 +2504,6 @@ mod tests {
         let request = LifecycleCleanupRequest {
             purpose: LifecycleCleanupPurpose::AbortedPublication,
             object_key: "nokv/artifacts/01010101010101010101010101010101/02020202020202020202020202020202/03030303030303030303030303030303/blocks/0000000000000007".to_owned(),
-            multipart_upload_id: Some(b"multipart-7".to_vec()),
         };
         let proof = LifecycleCleanupProof::from_cleanup_request(
             &request,
@@ -2548,9 +2512,9 @@ mod tests {
         assert_eq!(
             proof.digest,
             [
-                0xdd, 0xcf, 0x71, 0xa4, 0x41, 0x4e, 0x6c, 0x96, 0xc9, 0x0a, 0x30, 0xf1, 0xc2, 0x28,
-                0x78, 0x54, 0x50, 0x2e, 0x2c, 0x3f, 0x15, 0x56, 0x2c, 0xf8, 0xbd, 0xed, 0xd2, 0x69,
-                0xd0, 0x33, 0x7c, 0xe1
+                0xb3, 0x1c, 0x58, 0xdf, 0x86, 0x18, 0x29, 0x4f, 0xec, 0xae, 0x2d, 0xa7, 0x5f, 0x06,
+                0x68, 0x23, 0x20, 0x23, 0xd3, 0x8b, 0x78, 0x84, 0xe9, 0x35, 0x36, 0x1f, 0x34, 0xab,
+                0x8c, 0xb7, 0xdf, 0x80
             ]
         );
         assert_eq!(
@@ -2566,16 +2530,6 @@ mod tests {
 
         let mut changed = request.clone();
         changed.purpose = LifecycleCleanupPurpose::RevisionGarbageCollection;
-        assert_ne!(
-            proof.digest,
-            LifecycleCleanupProof::from_cleanup_request(
-                &changed,
-                LifecycleCleanupDisposition::Deleted,
-            )
-            .digest
-        );
-        changed = request.clone();
-        changed.multipart_upload_id = None;
         assert_ne!(
             proof.digest,
             LifecycleCleanupProof::from_cleanup_request(
@@ -3110,7 +3064,6 @@ mod tests {
             artifact_revision_id: revision,
             object_sequence: 0,
             object_key: meta::object_block_key(shard(), root(), revision, 0),
-            multipart_upload_id: None,
             expected_length: 8,
             expected_digest_uri: sha256_uri([0x73; SHA256_BYTES]),
             provider_state: StagedProviderState::Planned,
@@ -3705,7 +3658,6 @@ mod tests {
             artifact_revision_id: shared_revision,
             object_sequence: 0,
             object_key: shared_object_key.clone(),
-            multipart_upload_id: None,
             expected_length: block_bytes.len() as u64,
             expected_digest_uri: sha256_uri([0x61; SHA256_BYTES]),
             provider_state: StagedProviderState::Planned,
@@ -4008,7 +3960,6 @@ mod tests {
             artifact_revision_id: shared_revision,
             object_sequence: 0,
             object_key: shared_object_key.clone(),
-            multipart_upload_id: None,
             expected_length: block_bytes.len() as u64,
             expected_digest_uri: sha256_uri([0x61; SHA256_BYTES]),
             provider_state: StagedProviderState::Planned,

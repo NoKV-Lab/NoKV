@@ -3181,7 +3181,6 @@ fn publication_rows(
             object_identity: object_identity.clone(),
             expected_length: block.len,
             expected_digest: digest.clone(),
-            multipart_token: None,
         });
         manifest_rows.push(ArtifactManifestRow {
             object_index: block.object_index,

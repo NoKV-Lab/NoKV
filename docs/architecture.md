@@ -486,7 +486,7 @@ is therefore an opt-in, not the resting state.
 
 Durable ledgers, not object listing, recover:
 
-- staged/multipart uploads;
+- staged uploads;
 - commit construction;
 - restore staging and cleanup;
 - GC claims and ambiguous deletes.

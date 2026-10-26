@@ -385,7 +385,6 @@ mod tests {
                         object_identity: object(),
                         expected_length: 1,
                         expected_digest: digest.clone(),
-                        multipart_token: None,
                     }],
                 },
             ),
@@ -445,8 +444,8 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(golden.finalize()),
             [
-                95, 157, 43, 219, 156, 245, 126, 182, 88, 13, 148, 128, 96, 253, 190, 238, 237,
-                127, 173, 41, 108, 173, 150, 72, 236, 15, 70, 203, 2, 183, 100, 149,
+                108, 207, 191, 121, 68, 172, 63, 22, 194, 9, 128, 128, 137, 110, 101, 239, 11, 98,
+                201, 199, 14, 192, 40, 140, 37, 233, 60, 50, 125, 247, 177, 184,
             ],
             "update only for an intentional fused publication v15 wire change"
         );

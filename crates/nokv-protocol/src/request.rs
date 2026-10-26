@@ -2373,7 +2373,6 @@ mod tests {
             object_identity: crate::ObjectIdentity::new(format!("objects/{sequence}")).unwrap(),
             expected_length: 1,
             expected_digest: crate::sha256_digest_uri(Digest([5; 32])),
-            multipart_token: None,
         }
     }
 
