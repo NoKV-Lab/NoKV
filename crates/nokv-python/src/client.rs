@@ -4,7 +4,6 @@
  */
 
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,7 +34,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::local_adapter::{
     collect_local_files, create_materialized_file, join_remote_path, materialized_relative_path,
-    prepare_materialize_root,
+    prepare_materialize_root, read_regular_file,
 };
 use crate::object_store::{ConfiguredObjectStore, PythonObjectStoreConfig};
 use crate::python_error::{
@@ -1633,24 +1632,6 @@ fn set_call_metadata(
     Ok(())
 }
 
-fn read_regular_file(path: &Path) -> Result<Vec<u8>, String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect local file {}: {error}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "local publish file {} is a symlink; symlinks are not followed",
-            path.display()
-        ));
-    }
-    if !metadata.is_file() {
-        return Err(format!(
-            "local publish path {} is not a regular file",
-            path.display()
-        ));
-    }
-    fs::read(path).map_err(|error| format!("cannot read local file {}: {error}", path.display()))
-}
-
 fn list_all_paths(
     client: &RustWorkspaceClient,
     workbench: WorkbenchName,
@@ -1769,8 +1750,9 @@ fn materialize_workspace(
                     expected.path.path.as_str()
                 )));
             }
-            let local_path = create_materialized_file(&root, &relative, &read.bytes)?;
-            created.push(local_path.clone());
+            let created_file = create_materialized_file(&root, &relative, &read.bytes)?;
+            let local_path = created_file.path.clone();
+            created.push(created_file);
             materialized.push(MaterializedFile {
                 remote_path: expected.path.path.as_str().to_owned(),
                 local_path,
@@ -1781,8 +1763,8 @@ fn materialize_workspace(
         Ok(materialized)
     })();
     if result.is_err() {
-        for path in created.into_iter().rev() {
-            let _ = fs::remove_file(path);
+        for file in created.into_iter().rev() {
+            let _ = file.remove();
         }
     }
     result
@@ -1799,11 +1781,11 @@ fn collect_workspace(
     producer: Option<String>,
     block_size: usize,
 ) -> Result<Vec<CollectedFile>, String> {
-    let files = collect_local_files(local_directory)?;
-    let mut collected = Vec::with_capacity(files.len());
-    for file in files {
+    let source = collect_local_files(local_directory)?;
+    let mut collected = Vec::with_capacity(source.files.len());
+    for file in &source.files {
         let remote_path = join_remote_path(prefix.as_ref(), &file.relative_path)?;
-        let bytes = read_regular_file(&file.absolute_path)?;
+        let bytes = source.read_file(file)?;
         let mut options = ArtifactPublishOptions::new(
             OperationIdentity(client.new_request_id().0),
             ArtifactRevisionIdentity(client.new_request_id().0),
@@ -1822,7 +1804,7 @@ fn collect_workspace(
             .publish_artifact(objects, options, &bytes)
             .map_err(|error| error.to_string())?;
         collected.push(CollectedFile {
-            local_path: file.absolute_path,
+            local_path: file.absolute_path.clone(),
             outcome,
         });
     }
@@ -2058,6 +2040,8 @@ enum PublishFileError {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    #[cfg(unix)]
+    use std::fs;
 
     use super::*;
 
@@ -2080,23 +2064,21 @@ mod tests {
         assert!(parse_workspace_path("run-42", "outputs\\secret").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn publish_file_rejects_symlinks_and_directories() {
         let root = tempfile::tempdir().unwrap();
-        assert!(read_regular_file(root.path())
+        let base = root.path().canonicalize().unwrap();
+        assert!(read_regular_file(&base)
             .unwrap_err()
             .contains("regular file"));
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-
-            let source = root.path().join("source.bin");
-            fs::write(&source, b"bytes").unwrap();
-            let link = root.path().join("link.bin");
-            symlink(&source, &link).unwrap();
-            assert!(read_regular_file(&link).unwrap_err().contains("symlink"));
-        }
+        use std::os::unix::fs::symlink;
+        let source = base.join("source.bin");
+        fs::write(&source, b"bytes").unwrap();
+        let link = base.join("link.bin");
+        symlink(&source, &link).unwrap();
+        assert!(read_regular_file(&link).unwrap_err().contains("symlink"));
     }
 
     #[test]
