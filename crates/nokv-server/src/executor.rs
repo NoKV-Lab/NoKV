@@ -2332,7 +2332,6 @@ impl MetadataWorkspaceRequestExecutor {
                 artifact_revision_id: operation.artifact_revision_id,
                 object_sequence: object.sequence,
                 object_key: object.object_identity.as_str().to_owned(),
-                multipart_upload_id: object.multipart_token.clone(),
                 expected_length: object.expected_length,
                 expected_digest_uri: object.expected_digest.as_str().to_owned(),
                 provider_state: types::StagedProviderState::Planned,
@@ -3176,7 +3175,6 @@ impl MetadataWorkspaceRequestExecutor {
                 expected_length: row.expected_length,
                 expected_digest: protocol::DigestUri::new(row.expected_digest_uri)
                     .map_err(|e| internal(e.to_string()))?,
-                multipart_token: row.multipart_upload_id,
             });
         }
         Ok(ExecutedRequest {
@@ -9127,7 +9125,6 @@ mod tests {
                 object_identity: protocol::ObjectIdentity::new(object_key.clone()).unwrap(),
                 expected_length: length,
                 expected_digest: body_digest.clone(),
-                multipart_token: None,
             }];
             let manifest_rows = vec![protocol::ArtifactManifestRow {
                 object_index: 0,
@@ -12598,7 +12595,6 @@ mod tests {
             object_identity: protocol::ObjectIdentity::new(object_key.clone()).unwrap(),
             expected_length: 1,
             expected_digest: body_digest.clone(),
-            multipart_token: None,
         }];
         let manifest_rows = vec![protocol::ArtifactManifestRow {
             object_index: 0,
@@ -12857,7 +12853,6 @@ mod tests {
                 expected_digest: protocol::sha256_digest_uri(protocol::Digest(
                     [sequence as u8; 32],
                 )),
-                multipart_token: None,
             })
             .collect();
         let seals =
@@ -13756,7 +13751,6 @@ mod tests {
             object_identity: protocol::ObjectIdentity::new(object_key.clone()).unwrap(),
             expected_length: 1,
             expected_digest: body_digest.clone(),
-            multipart_token: None,
         }];
         let manifest_rows = vec![protocol::ArtifactManifestRow {
             object_index: 0,

@@ -313,7 +313,6 @@ mod tests {
             object_identity: ObjectIdentity::new(key).unwrap(),
             expected_length: 4,
             expected_digest: digest("sha256:abcd"),
-            multipart_token: None,
         }
     }
 

@@ -739,7 +739,6 @@ impl PythonWorkspaceClient {
             row.set_item("object_identity", entry.object_identity.as_str())?;
             row.set_item("expected_length", entry.expected_length)?;
             row.set_item("expected_digest", entry.expected_digest.as_str())?;
-            row.set_item("multipart_token", entry.multipart_token.clone())?;
             entries.append(row)?;
         }
         dict.set_item("entries", entries)?;
