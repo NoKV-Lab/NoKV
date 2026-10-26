@@ -31,7 +31,7 @@ pub use append::{
 pub use artifact_publish::{
     inline_artifact_body_digest, parse_sha256_digest_uri, seal_artifact_publish_plan,
     sha256_digest_uri, ArtifactPublishPlanSeal, MAX_ARTIFACT_PUBLISH_BATCH_ROWS,
-    MAX_ARTIFACT_PUBLISH_OBJECTS, MAX_ARTIFACT_READ_PLAN_ROWS,
+    MAX_ARTIFACT_PUBLISH_OBJECTS, MAX_ARTIFACT_READ_PLAN_ROWS, MAX_ARTIFACT_UPLOAD_BODY_BYTES,
 };
 pub use codec::{
     decode_request, decode_response, encode_request, encode_response, MAX_FRAME_BYTES,
@@ -54,15 +54,14 @@ pub use request::{
     FindWorkspacesRequest, FinishArtifactPublishRequest, GenericIndexFieldCapability,
     GenericIndexFieldValues, GenericIndexRow, GetGenericIndexRegistrationRequest,
     GetOperationRequest, GetPathRequest, GetSnapshotRequest, GetWorkspaceRequest, ListPathsRequest,
-    ListSnapshotsRequest, MarkArtifactObjectsUploadedRequest, MintSnapshotRequest,
-    ObjectUploadProof, PrepareArtifactPublishRequest, PrepareRestoreRequest,
-    PublishInlineArtifactRequest, QuarantineResolution, QueryOperand, QueryOperator,
-    QueryPredicate, QueryProfile, QueryScope, ReadRestoreSourceRunManifestRequest,
+    ListSnapshotsRequest, MintSnapshotRequest, PrepareArtifactPublishRequest,
+    PrepareRestoreRequest, PublishInlineArtifactRequest, QuarantineResolution, QueryOperand,
+    QueryOperator, QueryPredicate, QueryProfile, QueryScope, ReadRestoreSourceRunManifestRequest,
     ReconcileQuarantinedArtifactPublishRequest, RemovePathRequest, RenamePathRequest,
     RenewSnapshotRequest, RestoreManifestDescriptor, RestoreManifestIdentity, RestoreSource,
     RetireSnapshotRequest, SearchRequest, SortDirection, SortField, StageArtifactManifestRequest,
-    StageArtifactObjectsRequest, WorkspaceContinuationFence, WorkspacePreflightRequest,
-    WorkspaceRequest, WorkspaceRpcRequest, MAX_GENERIC_INDEX_ABORT_ROWS,
+    StageArtifactObjectsRequest, UploadArtifactObjectRequest, WorkspaceContinuationFence,
+    WorkspacePreflightRequest, WorkspaceRequest, WorkspaceRpcRequest, MAX_GENERIC_INDEX_ABORT_ROWS,
     MAX_GENERIC_INDEX_APPEND_ROWS, MAX_GENERIC_INDEX_FIELDS, MAX_GENERIC_INDEX_ROW_BYTES,
     MAX_GENERIC_INDEX_ROW_FIELDS, MAX_GENERIC_INDEX_VALUES_PER_FIELD, MAX_QUERY_PAGE_LIMIT,
 };

@@ -107,10 +107,6 @@ pub enum ObjectError {
     AtomicCreateUnsupported,
     ImmutableSealingUnsupported,
     ProviderAdmissionRequired,
-    ProviderAdmissionBlockSizeExceeded {
-        requested: usize,
-        admitted: usize,
-    },
     ProviderAdmissionFailed(ProviderAdmissionError),
     CreateAmbiguous {
         key: ObjectKey,
@@ -851,8 +847,7 @@ impl ObjectError {
             | Self::CurrentDirectory
             | Self::BackslashInKey
             | Self::ContainsNul
-            | Self::InvalidRange { .. }
-            | Self::ProviderAdmissionBlockSizeExceeded { .. } => ErrorClass::InvalidInput,
+            | Self::InvalidRange { .. } => ErrorClass::InvalidInput,
             Self::ObjectNotFound { .. } => ErrorClass::NotFound,
             Self::ProviderAdmissionFailed(cause) => cause.class(),
             Self::CreateAmbiguous { .. }
@@ -940,13 +935,6 @@ impl fmt::Display for ObjectError {
                 .write_str("artifact object provider does not support permanent immutable sealing"),
             Self::ProviderAdmissionRequired => formatter
                 .write_str("artifact object provider has no valid write-conformance admission"),
-            Self::ProviderAdmissionBlockSizeExceeded {
-                requested,
-                admitted,
-            } => write!(
-                formatter,
-                "artifact block size {requested} exceeds admitted provider limit {admitted}"
-            ),
             Self::ProviderAdmissionFailed(cause) => write!(formatter, "{cause}"),
             Self::CreateAmbiguous { .. } => {
                 formatter.write_str("immutable create outcome is ambiguous")

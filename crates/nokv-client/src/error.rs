@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use nokv_object::{ArtifactUploadFailure, ObjectError};
+use nokv_object::ObjectError;
 use nokv_protocol::{
     AppendCleanupRetryResult, ConflictKind, ErrorCode, OperationIdentity, OperationState,
     OperationToken, ProtocolError, RpcFailure, WorkspaceCapability,
@@ -96,11 +96,11 @@ pub enum ArtifactPublishStage {
     StageObjects,
     /// `Begin` and staging of a whole one-batch object plan in one request.
     Prepare,
+    /// One object block carried to the owner, which writes and records it.
     UploadObjects,
-    MarkObjectsUploaded,
     StageManifest,
     Complete,
-    /// Marking uploads, staging the manifest, and `Complete` in one request.
+    /// Staging the manifest and `Complete` in one request.
     Finish,
     /// `Begin` and `Complete` of a body stored inline, in one request.
     PublishInline,
@@ -118,7 +118,6 @@ pub enum ClientError {
     ArtifactIntegrity(String),
     ArtifactReadFenceChanged,
     Object(ObjectError),
-    ArtifactUpload(Box<ArtifactUploadFailure>),
     ArtifactPublishFailed {
         stage: ArtifactPublishStage,
         source: Box<ClientError>,
@@ -151,7 +150,6 @@ impl ClientError {
             Self::Transport(error) => error.retryable(),
             Self::Rpc(error) => error.retryable,
             Self::Object(error) => error.retryable(),
-            Self::ArtifactUpload(error) => error.retryable(),
             Self::ArtifactPublishFailed {
                 source,
                 abort_failure,
@@ -205,13 +203,6 @@ impl ClientError {
             Self::ArtifactIntegrity(_) => ErrorClass::OperatorRequired,
             Self::ArtifactReadFenceChanged => ErrorClass::Transient,
             Self::Object(error) => error.class(),
-            Self::ArtifactUpload(error) => {
-                if error.retryable() {
-                    ErrorClass::Transient
-                } else {
-                    ErrorClass::OutcomeUnknown
-                }
-            }
             Self::ArtifactPublishFailed {
                 source,
                 abort_failure,
@@ -327,7 +318,6 @@ impl fmt::Display for ClientError {
                 formatter.write_str("artifact metadata changed during a paged read")
             }
             Self::Object(error) => write!(formatter, "artifact object operation failed: {error}"),
-            Self::ArtifactUpload(error) => write!(formatter, "{error}"),
             Self::ArtifactPublishFailed {
                 stage,
                 source,
@@ -381,7 +371,6 @@ impl fmt::Display for ArtifactPublishStage {
             Self::StageObjects => "stage objects",
             Self::Prepare => "prepare",
             Self::UploadObjects => "upload objects",
-            Self::MarkObjectsUploaded => "mark objects uploaded",
             Self::StageManifest => "stage manifest",
             Self::Complete => "complete",
             Self::Finish => "finish",
@@ -396,7 +385,6 @@ impl std::error::Error for ClientError {
             Self::Transport(error) => Some(error),
             Self::Protocol(error) => Some(error),
             Self::Object(error) => Some(error),
-            Self::ArtifactUpload(error) => Some(error.as_ref()),
             Self::ArtifactPublishFailed { source, .. } => Some(source.as_ref()),
             Self::AppendUnresolved { source, .. } => Some(source.as_ref()),
             Self::AppendCleanupUnresolved { source, .. } => Some(source.as_ref()),

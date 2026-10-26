@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::artifact_publish::MAX_ARTIFACT_UPLOAD_BODY_BYTES;
 use crate::error::ProtocolError;
 use crate::types::{
     validate_capability_set, validate_field_id, validate_optional_text, ArtifactDescriptor,
@@ -81,7 +82,7 @@ pub enum WorkspaceRequest {
     RemovePath(RemovePathRequest),
     BeginArtifactPublish(BeginArtifactPublishRequest),
     StageArtifactObjects(StageArtifactObjectsRequest),
-    MarkArtifactObjectsUploaded(MarkArtifactObjectsUploadedRequest),
+    UploadArtifactObject(UploadArtifactObjectRequest),
     StageArtifactManifest(StageArtifactManifestRequest),
     CompleteArtifactPublish(CompleteArtifactPublishRequest),
     PrepareArtifactPublish(PrepareArtifactPublishRequest),
@@ -129,7 +130,7 @@ impl WorkspaceRequest {
                 request.validate()
             }
             Self::StageArtifactObjects(request) => request.validate(),
-            Self::MarkArtifactObjectsUploaded(request) => request.validate(),
+            Self::UploadArtifactObject(request) => request.validate(),
             Self::StageArtifactManifest(request) => request.validate(),
             Self::CompleteArtifactPublish(request) => request.validate(),
             Self::PrepareArtifactPublish(request) => request.validate(),
@@ -605,36 +606,38 @@ impl StageArtifactObjectsRequest {
     }
 }
 
+/// One staged object's bytes, written to the object store by the owner.
+///
+/// The owner checks the body against the staged object's sealed length and
+/// digest, creates the immutable object with its own credentials, and records
+/// the upload; a client never writes an object itself. The sequence must be
+/// the next one the publication has not recorded. An exact retry of a block
+/// the owner already wrote replays, because the store accepts the same bytes
+/// at the same key.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ObjectUploadProof {
+pub struct UploadArtifactObjectRequest {
+    pub token: OperationToken,
     pub sequence: u32,
-    pub observed_length: u64,
-    pub observed_digest: DigestUri,
+    #[serde(with = "crate::artifact_publish::wire_bytes")]
+    pub body: Vec<u8>,
 }
 
-impl ObjectUploadProof {
+impl UploadArtifactObjectRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        if self.observed_length == 0 {
+        if self.body.is_empty() {
             return Err(ProtocolError::invalid(
-                "object_upload_proof.observed_length",
-                "must be greater than zero",
+                "upload_artifact_object.body",
+                "must not be empty",
+            ));
+        }
+        if self.body.len() > MAX_ARTIFACT_UPLOAD_BODY_BYTES {
+            return Err(ProtocolError::invalid(
+                "upload_artifact_object.body",
+                format!("exceeds {MAX_ARTIFACT_UPLOAD_BODY_BYTES} bytes"),
             ));
         }
         Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct MarkArtifactObjectsUploadedRequest {
-    pub token: OperationToken,
-    pub objects: Vec<ObjectUploadProof>,
-}
-
-impl MarkArtifactObjectsUploadedRequest {
-    fn validate(&self) -> Result<(), ProtocolError> {
-        validate_upload_proofs("mark_artifact_objects_uploaded.objects", &self.objects)
     }
 }
 
@@ -699,15 +702,14 @@ impl PrepareArtifactPublishRequest {
     }
 }
 
-/// Recording the remaining uploaded objects, staging the remaining manifest
-/// rows, and completing the publication in one write session, with one
-/// acknowledgement after the provider writes. Each step keeps the replay,
-/// heartbeat, and token rules of its stepwise request.
+/// Staging the remaining manifest rows and completing the publication in one
+/// write session, with one acknowledgement after the owner wrote every staged
+/// object. Each step keeps the replay, heartbeat, and token rules of its
+/// stepwise request.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FinishArtifactPublishRequest {
     pub token: OperationToken,
-    pub uploaded_objects: Vec<ObjectUploadProof>,
     pub manifest_rows: Vec<ArtifactManifestRow>,
     pub dependency_owner_revision_ids: Vec<ArtifactRevisionIdentity>,
     pub artifact: ArtifactDescriptor,
@@ -715,12 +717,6 @@ pub struct FinishArtifactPublishRequest {
 
 impl FinishArtifactPublishRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        if !self.uploaded_objects.is_empty() {
-            validate_upload_proofs(
-                "finish_artifact_publish.uploaded_objects",
-                &self.uploaded_objects,
-            )?;
-        }
         if !self.manifest_rows.is_empty() {
             validate_manifest_rows("finish_artifact_publish.manifest_rows", &self.manifest_rows)?;
         }
@@ -1891,17 +1887,6 @@ fn validate_staged_objects(
     )
 }
 
-fn validate_upload_proofs(
-    field: &'static str,
-    proofs: &[ObjectUploadProof],
-) -> Result<(), ProtocolError> {
-    validate_artifact_batch(field, proofs)?;
-    for proof in proofs {
-        proof.validate()?;
-    }
-    require_strict_sequences(field, proofs.iter().map(|proof| u64::from(proof.sequence)))
-}
-
 fn validate_manifest_rows(
     field: &'static str,
     rows: &[ArtifactManifestRow],
@@ -2392,21 +2377,12 @@ mod tests {
         }
     }
 
-    fn upload_proof(sequence: u32) -> ObjectUploadProof {
-        ObjectUploadProof {
-            sequence,
-            observed_length: 1,
-            observed_digest: crate::sha256_digest_uri(Digest([5; 32])),
-        }
-    }
-
     fn finish_request() -> FinishArtifactPublishRequest {
         FinishArtifactPublishRequest {
             token: OperationToken {
                 operation_id: OperationIdentity([1; 16]),
                 state_digest: Digest([6; 32]),
             },
-            uploaded_objects: vec![upload_proof(0)],
             manifest_rows: vec![ArtifactManifestRow {
                 object_index: 0,
                 physical_object_index: 0,
@@ -2485,22 +2461,36 @@ mod tests {
     }
 
     #[test]
+    fn an_upload_carries_one_bounded_nonempty_block() {
+        let upload = |body: Vec<u8>| UploadArtifactObjectRequest {
+            token: OperationToken {
+                operation_id: OperationIdentity([1; 16]),
+                state_digest: Digest([6; 32]),
+            },
+            sequence: 0,
+            body,
+        };
+        upload(vec![7]).validate().unwrap();
+        upload(vec![7; MAX_ARTIFACT_UPLOAD_BODY_BYTES])
+            .validate()
+            .unwrap();
+        for body in [Vec::new(), vec![7; MAX_ARTIFACT_UPLOAD_BODY_BYTES + 1]] {
+            assert!(matches!(
+                upload(body).validate(),
+                Err(ProtocolError::InvalidField {
+                    field: "upload_artifact_object.body",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
     fn finish_validates_each_step_it_carries() {
         finish_request().validate().unwrap();
         let mut complete_only = finish_request();
-        complete_only.uploaded_objects.clear();
         complete_only.manifest_rows.clear();
         complete_only.validate().unwrap();
-
-        let mut unordered = finish_request();
-        unordered.uploaded_objects = vec![upload_proof(1), upload_proof(0)];
-        assert!(matches!(
-            unordered.validate(),
-            Err(ProtocolError::InvalidField {
-                field: "finish_artifact_publish.uploaded_objects",
-                ..
-            })
-        ));
         let mut repeated_row = finish_request();
         repeated_row
             .manifest_rows

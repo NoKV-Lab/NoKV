@@ -1,13 +1,8 @@
-use std::fmt;
-
 use nokv_types::{ArtifactRevisionId, LogicalShardId, RootId};
 
 use crate::cache::ArtifactBlockCache;
 use crate::digest::{hex, sha256};
-use crate::store::{
-    ArtifactObjectStore, ImmutableCreateOutcome, ObjectDeleteOutcome, ObjectError, ObjectKey,
-    ObjectRange,
-};
+use crate::store::{ArtifactObjectStore, ObjectError, ObjectKey, ObjectRange};
 
 pub const DEFAULT_ARTIFACT_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 
@@ -63,42 +58,6 @@ pub struct ArtifactUploadPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StagedArtifactObjects {
-    logical_shard_id: LogicalShardId,
-    root_id: RootId,
-    artifact_revision_id: ArtifactRevisionId,
-    keys: Vec<ObjectKey>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ArtifactUploadStats {
-    pub blocks: u64,
-    pub bytes: u64,
-    pub created: u64,
-    pub replayed: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ArtifactUpload {
-    pub manifest: ArtifactManifest,
-    pub staged: StagedArtifactObjects,
-    pub stats: ArtifactUploadStats,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct ArtifactUploadFailure {
-    pub source: Box<ObjectError>,
-    pub staged: StagedArtifactObjects,
-    pub stats: ArtifactUploadStats,
-}
-
-impl ArtifactUploadFailure {
-    pub fn retryable(&self) -> bool {
-        self.source.retryable()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactBlockRead {
     pub key: ObjectKey,
     pub expected_len: usize,
@@ -129,20 +88,6 @@ pub struct ArtifactReadStats {
 pub struct ArtifactReadOutcome {
     pub bytes: Vec<u8>,
     pub stats: ArtifactReadStats,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ArtifactCleanupOutcome {
-    pub attempted: u64,
-    pub deleted: u64,
-    pub absent: u64,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct ArtifactCleanupFailure {
-    pub outcome: ArtifactCleanupOutcome,
-    pub failed_key: ObjectKey,
-    pub source: Box<ObjectError>,
 }
 
 impl ArtifactKeyspace {
@@ -409,120 +354,6 @@ impl ArtifactUploadPlan {
         }
         Ok(())
     }
-
-    fn validate_payload(&self, bytes: &[u8]) -> Result<(), ObjectError> {
-        self.validate()?;
-        if bytes.len() as u64 != self.manifest.logical_len {
-            return Err(ObjectError::InvalidManifest(format!(
-                "artifact upload payload has {} bytes, plan declares {}",
-                bytes.len(),
-                self.manifest.logical_len
-            )));
-        }
-        let actual_artifact_digest = sha256(bytes);
-        if actual_artifact_digest != self.manifest.sha256 {
-            return Err(ObjectError::DigestMismatch {
-                key: artifact_identity_key(&self.manifest),
-                expected_sha256: hex(&self.manifest.sha256),
-                actual_sha256: hex(&actual_artifact_digest),
-            });
-        }
-        for block in &self.manifest.blocks {
-            let start = usize::try_from(block.logical_offset).map_err(|_| {
-                ObjectError::InvalidManifest("artifact upload offset is not addressable".to_owned())
-            })?;
-            let block_len = usize::try_from(block.len).map_err(|_| {
-                ObjectError::InvalidManifest("artifact upload block is not addressable".to_owned())
-            })?;
-            let end = start.checked_add(block_len).ok_or_else(|| {
-                ObjectError::InvalidManifest("artifact upload range overflows".to_owned())
-            })?;
-            let actual_block_digest = sha256(&bytes[start..end]);
-            if actual_block_digest != block.sha256 {
-                return Err(ObjectError::DigestMismatch {
-                    key: block.key.clone(),
-                    expected_sha256: hex(&block.sha256),
-                    actual_sha256: hex(&actual_block_digest),
-                });
-            }
-        }
-        Ok(())
-    }
-}
-
-impl StagedArtifactObjects {
-    fn empty_manifest(manifest: &ArtifactManifest) -> Self {
-        Self {
-            logical_shard_id: manifest.logical_shard_id,
-            root_id: manifest.root_id,
-            artifact_revision_id: manifest.artifact_revision_id,
-            keys: Vec::new(),
-        }
-    }
-
-    /// Rebuild a cleanup set from durable upload-operation state.
-    pub fn from_keys(
-        logical_shard_id: LogicalShardId,
-        root_id: RootId,
-        artifact_revision_id: ArtifactRevisionId,
-        keys: Vec<ObjectKey>,
-    ) -> Result<Self, ObjectError> {
-        let staged = Self {
-            logical_shard_id,
-            root_id,
-            artifact_revision_id,
-            keys,
-        };
-        staged.validate()?;
-        Ok(staged)
-    }
-
-    pub fn logical_shard_id(&self) -> LogicalShardId {
-        self.logical_shard_id
-    }
-
-    pub fn root_id(&self) -> RootId {
-        self.root_id
-    }
-
-    pub fn artifact_revision_id(&self) -> ArtifactRevisionId {
-        self.artifact_revision_id
-    }
-
-    pub fn keys(&self) -> &[ObjectKey] {
-        &self.keys
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.keys.len()
-    }
-
-    fn push(&mut self, key: ObjectKey) {
-        self.keys.push(key);
-    }
-
-    fn validate(&self) -> Result<(), ObjectError> {
-        let keyspace = ArtifactKeyspace {
-            logical_shard_id: self.logical_shard_id,
-            root_id: self.root_id,
-            artifact_revision_id: self.artifact_revision_id,
-        };
-        let prefix = keyspace.revision_prefix();
-        if self
-            .keys
-            .iter()
-            .any(|key| !key.as_str().starts_with(&prefix))
-        {
-            return Err(ObjectError::InvalidManifest(
-                "staged artifact contains an object outside its revision prefix".to_owned(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// Compute the complete immutable object layout without performing object I/O.
@@ -563,64 +394,6 @@ pub fn plan_artifact_upload(
     };
     plan.validate()?;
     Ok(plan)
-}
-
-/// Execute a previously computed upload plan.
-///
-/// The entire plan and payload are verified before the first object create, so
-/// caller ordering can be `metadata begin -> stage planned rows -> object
-/// upload -> mark uploaded -> stage manifest -> metadata complete` without a
-/// hidden pre-begin write.
-pub fn upload_artifact_from_plan(
-    store: &dyn ArtifactObjectStore,
-    plan: &ArtifactUploadPlan,
-    bytes: &[u8],
-) -> Result<ArtifactUpload, ArtifactUploadFailure> {
-    if let Err(source) = plan.validate_payload(bytes) {
-        return Err(ArtifactUploadFailure {
-            source: Box::new(source),
-            staged: StagedArtifactObjects::empty_manifest(&plan.manifest),
-            stats: ArtifactUploadStats::default(),
-        });
-    }
-
-    let mut staged = StagedArtifactObjects::empty_manifest(&plan.manifest);
-    let mut stats = ArtifactUploadStats {
-        blocks: plan.manifest.blocks.len() as u64,
-        bytes: bytes.len() as u64,
-        ..ArtifactUploadStats::default()
-    };
-    for block in &plan.manifest.blocks {
-        let start = usize::try_from(block.logical_offset)
-            .expect("validated artifact upload offset is addressable");
-        let block_len =
-            usize::try_from(block.len).expect("validated artifact upload block is addressable");
-        let end = start
-            .checked_add(block_len)
-            .expect("validated artifact upload range does not overflow");
-        match store.create_immutable(&block.key, &bytes[start..end]) {
-            Ok(ImmutableCreateOutcome::Created) => {
-                stats.created = stats.created.saturating_add(1);
-            }
-            Ok(ImmutableCreateOutcome::Replayed) => {
-                stats.replayed = stats.replayed.saturating_add(1);
-            }
-            Err(source) => {
-                return Err(ArtifactUploadFailure {
-                    source: Box::new(source),
-                    staged,
-                    stats,
-                });
-            }
-        }
-        staged.push(block.key.clone());
-    }
-
-    Ok(ArtifactUpload {
-        manifest: plan.manifest.clone(),
-        staged,
-        stats,
-    })
 }
 
 pub fn plan_artifact_read(
@@ -844,100 +617,4 @@ fn read_verified_block(
         cache.insert(block.key.clone(), bytes.clone())?;
     }
     Ok(bytes)
-}
-
-pub fn cleanup_staged_artifact(
-    store: &dyn ArtifactObjectStore,
-    staged: &StagedArtifactObjects,
-) -> Result<ArtifactCleanupOutcome, ArtifactCleanupFailure> {
-    if let Err(source) = staged.validate() {
-        let failed_key = staged.keys.first().cloned().unwrap_or_else(|| {
-            ArtifactKeyspace {
-                logical_shard_id: staged.logical_shard_id,
-                root_id: staged.root_id,
-                artifact_revision_id: staged.artifact_revision_id,
-            }
-            .permanent_block_key(0)
-        });
-        return Err(ArtifactCleanupFailure {
-            outcome: ArtifactCleanupOutcome::default(),
-            failed_key,
-            source: Box::new(source),
-        });
-    }
-
-    let mut outcome = ArtifactCleanupOutcome::default();
-    for key in &staged.keys {
-        outcome.attempted = outcome.attempted.saturating_add(1);
-        match store.delete(key) {
-            Ok(ObjectDeleteOutcome::Deleted) => {
-                outcome.deleted = outcome.deleted.saturating_add(1);
-            }
-            Ok(ObjectDeleteOutcome::Absent) => {
-                outcome.absent = outcome.absent.saturating_add(1);
-            }
-            Err(source) => {
-                return Err(ArtifactCleanupFailure {
-                    outcome,
-                    failed_key: key.clone(),
-                    source: Box::new(source),
-                });
-            }
-        }
-    }
-    Ok(outcome)
-}
-
-impl fmt::Display for ArtifactUploadFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "artifact upload failed after {} staged objects: {}",
-            self.staged.len(),
-            self.source
-        )
-    }
-}
-
-impl fmt::Debug for ArtifactUploadFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ArtifactUploadFailure")
-            .field("staged_objects", &self.staged.len())
-            .field("stats", &self.stats)
-            .field("source", &self.source)
-            .finish()
-    }
-}
-
-impl std::error::Error for ArtifactUploadFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.source.as_ref())
-    }
-}
-
-impl fmt::Display for ArtifactCleanupFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "artifact cleanup stopped after {} attempts: {}",
-            self.outcome.attempted, self.source
-        )
-    }
-}
-
-impl fmt::Debug for ArtifactCleanupFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ArtifactCleanupFailure")
-            .field("outcome", &self.outcome)
-            .field("source", &self.source)
-            .finish()
-    }
-}
-
-impl std::error::Error for ArtifactCleanupFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.source.as_ref())
-    }
 }
