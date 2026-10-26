@@ -627,6 +627,9 @@ nokv \
 Credentials use the provider's normal chain or
 `--object-access-key-id`, `--object-secret-access-key`, and optional
 `--object-session-token`; never embed them in Workbench content or manifests.
+Agents need only read access under the root's prefix; see
+[Object Store Credentials](docs/object-credentials.md) for the keys each role
+touches and example policies.
 
 To carry workspace RPC over TLS 1.3, start the owner with `--rpc-tls-cert` and
 `--rpc-tls-key`, and give each client `--rpc-tls-ca`, `--rpc-tls-cert`,
