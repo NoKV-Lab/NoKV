@@ -238,8 +238,11 @@ same Holt authority; the production CLI contains no fault-only admission path.
 The independent object-provider runner is
 [`scripts/workbench/object_namespace_recovery_gate.py`](../../scripts/workbench/object_namespace_recovery_gate.py).
 It owns real etcd and digest-pinned RustFS instances and retains its raw process
-and transport evidence separately from the epoch-boundary runner. It also drives
-the product through the deprecated `nokv mcp` child process.
+and CLI transcript evidence separately from the epoch-boundary runner. It
+drives the product through the native `nokv workbench <tool>` CLI only, and
+grades the provider-outage read against the failure contract in
+[`docs/cli-contract.md`](../cli-contract.md): exit code, `class`, `next_action`,
+and one stderr JSON line.
 
 Required evidence:
 
@@ -276,8 +279,10 @@ Required evidence:
   process exits, and terminal metadata probe.
 - the object-provider record proves healthy wrong-prefix rejection occurs
   before workspace metadata, owner-control, or payload mutation, a `SIGKILL`
-  restart preserves exact payloads, temporary outage is reported as redacted
-  and retryable, and the same logical request succeeds after provider recovery;
+  restart preserves exact payloads, temporary outage fails the CLI read closed
+  at its object-namespace fence as redacted `ObjectProviderFailed` of class
+  `transient` with `next_action: resubmit_same` and the exit code of that
+  class, and the same logical request succeeds after provider recovery;
 - the simulated PhyMat gate retains exact structure, ML-potential screening,
   DFT relaxation, thermodynamic fields, and their provenance digest across
   owner and provider restarts.
