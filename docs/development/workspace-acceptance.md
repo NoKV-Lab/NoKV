@@ -12,10 +12,10 @@ native full CLI, the secondary direct Python SDK, metadata semantics, object
 publication, root routing, recovery, and garbage collection must run against
 the same workspace format.
 
-The `nokv mcp` sidecar is a deprecated transport, not a qualified surface. It
-is named in this document only because the restore-composition runner still
-drives the product through it. Evidence produced over that transport qualifies
-neither the CLI nor the Python SDK path.
+The `nokv mcp` sidecar is a deprecated transport, not a qualified surface. No
+runner in this document drives the product through it; every live runner runs
+its Workbench tool calls as `nokv workbench <tool>` processes. Evidence
+produced over the sidecar qualifies neither the CLI nor the Python SDK path.
 Passing a codec or Holt microbenchmark alone does not qualify the product.
 
 Every applicable gate reports exactly one status:
@@ -286,9 +286,10 @@ Required evidence:
   DFT relaxation, thermodynamic fields, and their provenance digest across
   owner and provider restarts.
 - restore crash qualification records exact socket readiness, lease-session
-  loss, bounded MCP `ClientFailure`, controlled exit, both binary digests, and
-  the two authoritative publication reads; its access-key identifier and
-  secret value are both redacted;
+  loss, the bounded CLI `ClientFailure` of class `outcome_unknown` with
+  `next_action: resubmit_same` and the exit code of that class, controlled
+  exit, both binary digests, and the two authoritative publication reads; its
+  access-key identifier and secret value are both redacted;
 - within this workspace, `restore-crash-test-support` is enabled only by the
   Cargo-publish-disabled bench package. The feature exists on `nokv-server` so
   the bench can install its exact-operation barrier, while default server and

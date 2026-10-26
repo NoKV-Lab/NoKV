@@ -23,7 +23,6 @@ from restore_composition_gate import (
     Config,
     WorkflowFailure,
     build_timeout,
-    matching_mcp_structured_content,
     mutation_request_id,
     mutation_command,
     oracle_plan,
@@ -231,15 +230,18 @@ def valid_evidence() -> dict[str, object]:
             "replay_label": "restore-b",
             "fault_owner_socket_ready": True,
             "successor_owner_socket_ready": True,
-            "mcp_survived_fault_owner_exit": True,
+            "client_exit_code": 6,
             "pre_replay_object_inventory_sha256": "de" * 32,
             "post_replay_object_inventory_sha256": "de" * 32,
             "object_inventory_stable_across_replay": True,
             "client_failure": {
                 "status": "error",
                 "code": "ClientFailure",
+                "message": "workspace request exhausted 3 attempts: transport failure",
                 "retryable": True,
                 "details": {"source": "nokv-client", "attempts": 3},
+                "class": "outcome_unknown",
+                "next_action": "resubmit_same",
             },
             "idempotent_replay": True,
         },
@@ -657,40 +659,26 @@ class RestoreCompositionGateTest(unittest.TestCase):
             validate_fault_barrier_evidence(drifted, arm)
 
     def test_only_bounded_client_failure_qualifies_owner_loss(self) -> None:
-        error = {
-            "status": "error",
-            "code": "ClientFailure",
-            "retryable": True,
-            "details": {"source": "nokv-client", "attempts": 3},
-        }
+        error = valid_evidence()["fault_injection"]["client_failure"]
         validate_owner_loss_error(error, "restore-b")
         for field, value in (
             ("code", "Transport"),
-            ("retryable", False),
             ("details", {"source": "nokv-client", "attempts": 2}),
+            ("class", "transient"),
+            ("next_action", "query_same"),
         ):
             invalid = copy.deepcopy(error)
             invalid[field] = value
             with self.assertRaisesRegex(WorkflowFailure, "bounded client failure"):
                 validate_owner_loss_error(invalid, "restore-b")
 
-    def test_owner_loss_requires_matching_text_and_structured_content(self) -> None:
-        error = {
-            "status": "error",
-            "code": "ClientFailure",
-            "retryable": True,
-            "details": {"source": "nokv-client", "attempts": 3},
-        }
-        result = {
-            "isError": True,
-            "content": [{"type": "text", "text": json.dumps(error)}],
-            "structuredContent": error,
-        }
-        self.assertEqual(matching_mcp_structured_content(result, "restore-b"), error)
-        drifted = copy.deepcopy(result)
-        drifted["structuredContent"]["retryable"] = False
-        with self.assertRaisesRegex(WorkflowFailure, "text and structured"):
-            matching_mcp_structured_content(drifted, "restore-b")
+    def test_oracle_tool_steps_run_on_the_workbench_cli_verb(self) -> None:
+        surfaces = {step.surface for step in oracle_plan(config(Path("/tmp/restore-gate-test")))}
+        self.assertEqual(surfaces, {"workbench", "workspace-path"})
+        source = (REPO / "scripts/workbench/restore_composition_gate.py").read_text()
+        for sidecar in ('"mcp"', "nokv mcp", "jsonrpc", "tools/call"):
+            with self.subTest(sidecar=sidecar):
+                self.assertNotIn(sidecar, source)
 
     def test_build_timeout_is_independent_from_the_fault_deadline(self) -> None:
         self.assertEqual(build_timeout(60.0), BUILD_TIMEOUT_SECONDS)
@@ -701,12 +689,15 @@ class RestoreCompositionGateTest(unittest.TestCase):
         for field in (
             "fault_owner_socket_ready",
             "successor_owner_socket_ready",
-            "mcp_survived_fault_owner_exit",
         ):
             missing = valid_evidence()
             missing["fault_injection"][field] = False
             with self.assertRaisesRegex(WorkflowFailure, "successor/replay boundary"):
                 validate_composition_evidence(missing)
+        succeeded = valid_evidence()
+        succeeded["fault_injection"]["client_exit_code"] = 0
+        with self.assertRaisesRegex(WorkflowFailure, "failure code"):
+            validate_composition_evidence(succeeded)
 
         unbound = valid_evidence()
         unbound["fault_injection"]["interrupted_oracle_label"] = "restore-c"

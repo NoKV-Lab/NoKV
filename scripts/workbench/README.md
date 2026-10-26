@@ -9,15 +9,11 @@ These assets validate the same 18-tool Workbench semantics exported by
 `crates/nokv-agent`. The native full CLI is the primary integration surface,
 and the direct Python SDK is second for embedded callers.
 
-The live Workbench and object-namespace runners drive the 18 tools through
-`nokv workbench <tool>` processes graded against `docs/cli-contract.md`. The
-restore-composition runner still reaches them through a `nokv mcp` child
-process. That sidecar is deprecated and is not a supported NoKV integration
-surface: it survives only as that runner's transport, evidence produced over
-it qualifies that transport alone, and nothing here makes MCP a deployment
+Every live runner here drives the 18 tools through `nokv workbench <tool>`
+processes graded against `docs/cli-contract.md`. The deprecated `nokv mcp`
+sidecar has no caller in this directory; nothing here makes MCP a deployment
 component or defines a runtime-specific metadata layout, capability alias,
-migration helper, or filesystem frontend. Re-pointing that runner at
-`nokv workbench <tool>` is tracked work, not a documentation change.
+migration helper, or filesystem frontend.
 
 The checked-in integration assets are deliberately small:
 
@@ -84,8 +80,9 @@ The checked-in integration assets are deliberately small:
 
 The source-bound qualification manifest covers every producer declared by the
 pre-#423 ledger. Live producers bind the exact product binary, pinned dependency
-identities, and their required `qualification` and MCP-transcript evidence
-roles. Missing LingTai and installed-Python live runners emit typed `NQ`
+identities, and their required `qualification` and transcript evidence roles
+(`cli-transcript` for the native runners, `mcp-transcript` for the historical
+LingTai gap). Missing LingTai and installed-Python live runners emit typed `NQ`
 receipts with a concrete gap reason. The native Workbench and object-namespace
 entrypoints also refuse to claim scenarios their bounded harnesses do not run.
 Snapshot lifecycle scenarios execute exact `nokv-meta`, `nokv-server`, and
@@ -283,8 +280,9 @@ uploads its complete evidence directory even on failure.
 
 ## Restore-composition evidence
 
-The composition gate uses a real flat `nokv mcp` sidecar for the stable 18-tool
-Workbench surface. Atomic path mutations use the separate,
+The composition gate drives the stable 18-tool Workbench surface through
+`nokv workbench <tool>`, one process per call graded against
+`docs/cli-contract.md`. Atomic path mutations use the separate,
 Workbench-scoped custom CLI and never absolute paths:
 
 ```text
@@ -297,7 +295,7 @@ nokv [root, Agent, route, and object options] workspace-path remove \
 ```
 
 The gate derives stable, non-secret request ids from its seed and normalized
-mutation fields. It does not add rename or removal to the 18 MCP tools and
+mutation fields. It does not add rename or removal to the 18 Workbench tools and
 does not recreate FUSE, POSIX, Yanex, inode, dentry, or physical-layout
 behavior.
 
@@ -343,7 +341,10 @@ payload copy. A clean A-to-B restore keeps the source content digest while
 changing destination commit identity. The dirty B-to-C restore must change
 both the effective content digest and destination commit identity.
 
-`mcp-transcript.jsonl` retains exact requests and responses;
+`cli-transcript.jsonl` retains every tool call with its arguments, exit code,
+stdout, and stderr; the owner-loss restore must fail as one stderr line of
+`ClientFailure`, class `outcome_unknown`, `next_action: resubmit_same`, with
+the exit code of that class, before its exact replay converges.
 `processes.jsonl` retains redacted commands, socket-readiness observations,
 the controlled fault-owner exit, and stable mutation request ids. Access-key
 identifiers and secret values are both redacted. `environment.json` binds both
@@ -374,9 +375,9 @@ composition chain. They are classified explicitly rather than rediscovered
 one failure at a time:
 
 - `put-artifact` and `cat` outcomes map to current `collect`, `materialize`, and
-  MCP byte reads; the old command spellings are not required.
-- the old profiled MCP launch maps to the current flat `nokv mcp` command; the
-  exact 18-tool schema remains authoritative.
+  `workbench_read` byte reads; the old command spellings are not required.
+- the old profiled MCP launch maps to per-call `nokv workbench <tool>`
+  processes; the exact 18-tool schema remains authoritative.
 - old one-manifest restore accounting is superseded by two destination-owned
   manifests: `run_manifest.json` and `restore_manifest.json`.
 - numeric mounts, projected source/destination roots, inode/dentry identities,
@@ -391,9 +392,9 @@ one failure at a time:
   replacement. The bench-only exact barrier qualifies restore restart without
   exposing a production hook; provider recovery and GC drain remain separate
   gates.
-- an optional second Agent-runtime entry must consume the same flat MCP sidecar
-  launch and produce the same transcript contract; it cannot weaken or
-  substitute for the native sidecar gate.
+- an optional second Agent-runtime entry must drive the same
+  `nokv workbench <tool>` commands and produce the same transcript contract; it
+  cannot weaken or substitute for the native CLI gate.
 
 ## Path-native fork-to-restore recovery evidence
 
