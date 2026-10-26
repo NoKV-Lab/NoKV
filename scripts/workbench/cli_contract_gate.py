@@ -20,7 +20,6 @@ reproduces the contract gaps on a binary that predates them.
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import hashlib
 import json
 import os
@@ -35,6 +34,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from append_identity_recovery_gate import unpack
+from cli_contract import (
+    Call,
+    ContractFailure,
+    NotQualified,
+    contract_failure,
+    contract_success,
+    contract_tables,
+    require,
+)
 from fork_restore_recovery_gate import (
     ResponseDropProxy,
     _recv_exact,
@@ -60,43 +68,6 @@ NOT_QUALIFIED_SCENARIOS = {
 }
 
 
-class ContractFailure(Exception):
-    """The binary under test broke the published contract."""
-
-
-class NotQualified(Exception):
-    """The gate could not establish a scenario's precondition."""
-
-
-def require(condition: bool, claim: str, observed: Any = None) -> None:
-    if not condition:
-        detail = json.dumps(observed, sort_keys=True, default=str)[:900]
-        raise ContractFailure(f"{claim}: {detail}")
-
-
-def contract_tables(document: str) -> tuple[dict[str, int], set[str]]:
-    """The class-to-exit-code map and the next actions the contract publishes."""
-
-    def rows(name: str) -> list[list[str]]:
-        begin, end = f"<!-- {name}:begin -->", f"<!-- {name}:end -->"
-        start = document.index(begin) + len(begin)
-        table = document[start : document.index(end, start)]
-        cells = [
-            [cell.strip() for cell in line.strip().strip("|").split("|")]
-            for line in table.splitlines()
-            if line.startswith("| ") and not line.startswith("| ---")
-        ]
-        return cells[1:]
-
-    exits = {
-        row[1].strip("`"): int(row[0]) for row in rows("exit-codes") if row[1]
-    }
-    actions = {row[0].strip("`") for row in rows("next-actions")}
-    if not exits or not actions:
-        raise NotQualified("docs/cli-contract.md publishes no contract tables")
-    return exits, actions
-
-
 def free_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -110,16 +81,6 @@ def new_id() -> str:
 def hex_of(value: Any) -> str:
     """A decoded wire id: a MessagePack array of bytes or a binary value."""
     return value["binary_hex"] if isinstance(value, dict) else bytes(value).hex()
-
-
-@dataclasses.dataclass
-class Call:
-    label: str
-    exit: int
-    stdout: str
-    stderr: str
-    connections: int
-    requests: list[str]
 
 
 class TracingProxy(ResponseDropProxy):
@@ -358,45 +319,11 @@ class Stack:
     # Grading.
 
     def success(self, call: Call) -> dict[str, Any]:
-        require(call.exit == 0, f"{call.label} succeeds", [call.exit, call.stderr[-600:]])
-        try:
-            result = json.loads(call.stdout)
-        except json.JSONDecodeError:
-            raise ContractFailure(f"{call.label} prints one JSON result: {call.stdout[:300]}")
-        require(result.get("status") == "success", f"{call.label} reports success", result)
-        return result
+        return contract_success(call)
 
     def failure(self, call: Call, klass: str, next_action: str) -> dict[str, Any]:
         """The call failed with exactly the contract envelope of `klass`."""
-        observed = [call.exit, call.stdout[:200], call.stderr[-600:]]
-        require(call.exit != 0, f"{call.label} fails", observed)
-        require(call.stdout == "", f"{call.label} writes nothing to stdout", observed)
-        lines = call.stderr.splitlines()
-        require(len(lines) == 1, f"{call.label} writes exactly one stderr line", observed)
-        try:
-            envelope = json.loads(lines[0])
-        except json.JSONDecodeError:
-            raise ContractFailure(f"{call.label} writes a JSON failure line: {lines[0][:300]}")
-        require(
-            isinstance(envelope, dict)
-            and envelope.get("status") == "error"
-            and {"code", "message", "retryable", "details"} <= envelope.keys(),
-            f"{call.label} keeps the Agent error envelope",
-            envelope,
-        )
-        require(envelope.get("class") in self.exits, f"{call.label} names a published class", envelope)
-        require(envelope.get("next_action") in self.actions, f"{call.label} names a published next action", envelope)
-        require(
-            [envelope["class"], envelope["next_action"]] == [klass, next_action],
-            f"{call.label} is {klass} with {next_action}",
-            envelope,
-        )
-        require(
-            call.exit == self.exits[klass],
-            f"{call.label} exits with the code of {klass}",
-            [call.exit, self.exits[klass]],
-        )
-        return envelope
+        return contract_failure(call, self.exits, self.actions, klass, next_action)
 
     def faulted(self, label: str, arguments: list[str], operation: str) -> Call:
         """Run a command whose successful `operation` response is dropped and
