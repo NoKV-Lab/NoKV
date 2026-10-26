@@ -14,7 +14,7 @@ use nokv_types::{ErrorClass, IdempotencyScope, NextAction};
 use serde_json::{json, Value};
 
 /// Version of the CLI's observable contract, reported by `nokv version --json`.
-pub(crate) const CLI_CONTRACT: &str = "nokv.cli.contract.v1";
+pub(crate) const CLI_CONTRACT: &str = "nokv.cli.contract.v2";
 
 /// The exit code of a failure class. Success is `0` and a Rust panic `101`;
 /// both stay outside this table.
@@ -29,6 +29,8 @@ pub(crate) const fn exit_code(class: ErrorClass) -> u8 {
         ErrorClass::IdentityConflict => 7,
         ErrorClass::Incompatible => 8,
         ErrorClass::OperatorRequired => 9,
+        ErrorClass::Unauthenticated => 10,
+        ErrorClass::PermissionDenied => 11,
     }
 }
 
@@ -179,6 +181,21 @@ mod tests {
             exit_code(ErrorClass::InProgress),
             exit_code(ErrorClass::OutcomeUnknown)
         );
+    }
+
+    #[test]
+    fn a_refused_identity_or_role_exits_with_its_own_code_and_hands_to_an_operator() {
+        for (class, code) in [
+            (ErrorClass::Unauthenticated, 10),
+            (ErrorClass::PermissionDenied, 11),
+        ] {
+            assert_eq!(exit_code(class), code);
+            assert_eq!(
+                class.next_action(IdempotencyScope::CallerOperation),
+                NextAction::Operator
+            );
+            assert_eq!(class.for_read(), class);
+        }
     }
 
     #[test]

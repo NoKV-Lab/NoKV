@@ -31,14 +31,23 @@ pub enum ErrorClass {
     IdentityConflict,
     /// The client and owner do not share a protocol version or capability.
     Incompatible,
-    /// Durable or control state needs operator action.
+    /// Durable or control state needs operator action, or the client's TLS
+    /// settings do not fit the owner.
     OperatorRequired,
+    /// The owner does not accept this client's identity: the connection has
+    /// no TLS where the owner requires it, or its certificate is not a
+    /// current credential of the owner's tenant. Nothing was applied.
+    Unauthenticated,
+    /// The authenticated principal holds no role that allows the request, or
+    /// it tried to continue an operation another principal began. Nothing
+    /// was applied.
+    PermissionDenied,
     /// An unexpected failure.
     Internal,
 }
 
 impl ErrorClass {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::InvalidInput,
         Self::NotFound,
         Self::PreconditionFailed,
@@ -48,6 +57,8 @@ impl ErrorClass {
         Self::IdentityConflict,
         Self::Incompatible,
         Self::OperatorRequired,
+        Self::Unauthenticated,
+        Self::PermissionDenied,
         Self::Internal,
     ];
 
@@ -62,6 +73,8 @@ impl ErrorClass {
             Self::IdentityConflict => "identity_conflict",
             Self::Incompatible => "incompatible",
             Self::OperatorRequired => "operator_required",
+            Self::Unauthenticated => "unauthenticated",
+            Self::PermissionDenied => "permission_denied",
             Self::Internal => "internal",
         }
     }
@@ -96,7 +109,10 @@ impl ErrorClass {
             },
             Self::InProgress => NextAction::Poll,
             Self::IdentityConflict | Self::Incompatible | Self::Internal => NextAction::DoNotRetry,
-            Self::OperatorRequired => NextAction::Operator,
+            // A credential or a role is granted by an operator.
+            Self::OperatorRequired | Self::Unauthenticated | Self::PermissionDenied => {
+                NextAction::Operator
+            }
         }
     }
 }

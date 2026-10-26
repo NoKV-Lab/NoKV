@@ -39,15 +39,27 @@ impl TransportError {
         }
     }
 
-    /// Transport security failed before any request was sent: the two sides
-    /// disagree on TLS, a certificate was rejected, or the owner did not
-    /// accept the client's credential. Repeating it cannot succeed until an
-    /// operator fixes the credential or the settings.
+    /// Transport security failed before any request was sent: the client's
+    /// TLS settings do not fit the owner, or a certificate was rejected at
+    /// the TLS layer. Repeating it cannot succeed until an operator fixes
+    /// the settings.
     pub fn security(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             retryable: false,
             refusal: Some(ErrorClass::OperatorRequired),
+        }
+    }
+
+    /// The owner refused this client's identity in the handshake: it
+    /// requires TLS the client did not offer, or the certificate is not a
+    /// current credential of its tenant. No request was sent; an operator
+    /// must register or renew the credential.
+    pub fn unauthenticated(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+            refusal: Some(ErrorClass::Unauthenticated),
         }
     }
 
@@ -254,11 +266,17 @@ pub fn rpc_failure_class(failure: &RpcFailure) -> ErrorClass {
         ErrorCode::NotOwner | ErrorCode::ObjectUnavailable => ErrorClass::OutcomeUnknown,
         ErrorCode::SnapshotExpired | ErrorCode::SnapshotReaped => ErrorClass::NotFound,
         ErrorCode::CommitRetiring | ErrorCode::OperationFailed => ErrorClass::PreconditionFailed,
-        // An operator must renew the credential or grant the role.
-        ErrorCode::Quarantined
-        | ErrorCode::ResourceExhausted
-        | ErrorCode::Unauthenticated
-        | ErrorCode::PermissionDenied => ErrorClass::OperatorRequired,
+        ErrorCode::Quarantined | ErrorCode::ResourceExhausted => ErrorClass::OperatorRequired,
+        // The owner that cannot refresh its policy copy asks for a retry;
+        // otherwise the credential is no longer accepted.
+        ErrorCode::Unauthenticated => {
+            if failure.retryable {
+                ErrorClass::Transient
+            } else {
+                ErrorClass::Unauthenticated
+            }
+        }
+        ErrorCode::PermissionDenied => ErrorClass::PermissionDenied,
         ErrorCode::Internal => {
             if failure.retryable {
                 ErrorClass::OutcomeUnknown
@@ -391,5 +409,50 @@ impl std::error::Error for ClientError {
             | Self::ArtifactIntegrity(_)
             | Self::ArtifactReadFenceChanged => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refusal(code: ErrorCode, retryable: bool) -> RpcFailure {
+        RpcFailure {
+            code,
+            message: String::new(),
+            retryable,
+            conflict: None,
+            current_generation: None,
+            route_hint: None,
+        }
+    }
+
+    #[test]
+    fn a_refused_credential_or_role_has_its_own_class() {
+        assert_eq!(
+            rpc_failure_class(&refusal(ErrorCode::Unauthenticated, false)),
+            ErrorClass::Unauthenticated
+        );
+        // The owner that cannot refresh its policy copy asks for a retry.
+        assert_eq!(
+            rpc_failure_class(&refusal(ErrorCode::Unauthenticated, true)),
+            ErrorClass::Transient
+        );
+        assert_eq!(
+            rpc_failure_class(&refusal(ErrorCode::PermissionDenied, false)),
+            ErrorClass::PermissionDenied
+        );
+        assert_eq!(
+            rpc_failure_class(&refusal(ErrorCode::Quarantined, false)),
+            ErrorClass::OperatorRequired
+        );
+        assert_eq!(
+            TransportError::unauthenticated("no credential").refusal_class(),
+            Some(ErrorClass::Unauthenticated)
+        );
+        assert_eq!(
+            TransportError::security("bad settings").refusal_class(),
+            Some(ErrorClass::OperatorRequired)
+        );
     }
 }

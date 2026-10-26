@@ -173,10 +173,10 @@ class TlsStack(Stack):
         for key in self.pki.directory.glob("*.key"):
             key.unlink()
 
-    def refused(self, label: str, path: str, **client: Any) -> dict[str, Any]:
-        """A write by this client fails before any request and changes nothing."""
+    def refused(self, label: str, path: str, klass: str = "unauthenticated", **client: Any) -> dict[str, Any]:
+        """A write by this client fails as `klass` and changes nothing."""
         arguments = self.put_arguments(label, WORKBENCH, path, new_id(), label.encode())
-        envelope = self.failure(self.run(label, arguments, **client), "operator_required", "operator")
+        envelope = self.failure(self.run(label, arguments, **client), klass, "operator")
         oracle = self.stat(f"{label}-oracle", WORKBENCH, path)
         require(oracle.get("exists") is False, f"{label}: the refused write left nothing", oracle)
         return envelope
@@ -238,7 +238,7 @@ def plaintext_client_refused(stack: TlsStack) -> dict[str, Any]:
 
 def mismatched_owner_name_refused(stack: TlsStack) -> dict[str, Any]:
     """T4: a client that expects another owner name rejects the certificate."""
-    envelope = stack.refused("t4-other-name", "other-name.txt", server_name="other.test")
+    envelope = stack.refused("t4-other-name", "other-name.txt", klass="operator_required", server_name="other.test")
     require("RPC TLS failed" in envelope["message"], "t4: the refusal names TLS", envelope)
     return envelope
 
@@ -266,7 +266,7 @@ def reader_cannot_write(stack: TlsStack) -> dict[str, Any]:
     """T6: a reader reads, and its write is refused without effect."""
     stack.success(stack.run("t6-read", ["workspace-path", "stat", WORKBENCH, "outputs", "registered.txt"],
                             tls="reader"))
-    envelope = stack.refused("t6-write", "reader.txt", tls="reader")
+    envelope = stack.refused("t6-write", "reader.txt", klass="permission_denied", tls="reader")
     require(envelope["code"] == "PermissionDenied", "t6: the refusal is PermissionDenied", envelope)
     return envelope
 
@@ -311,8 +311,8 @@ def revoked_role_stops_an_open_session(stack: TlsStack) -> dict[str, Any]:
     finally:
         session.stdin.close()
         session.wait(timeout=stack.timeout)
-    require(after.get("class") == "operator_required" and after.get("error", {}).get("code") == "PermissionDenied",
-            "t8: the open session's next write is PermissionDenied", after)
+    require(after.get("class") == "permission_denied" and after.get("error", {}).get("code") == "PermissionDenied",
+            "t8: the open session's next write is permission_denied", after)
     oracle = stack.stat("t8-oracle", WORKBENCH, "session-2.txt")
     require(oracle.get("exists") is False, "t8: the refused write left nothing", oracle)
     return {"before": before, "after": after}
@@ -370,7 +370,7 @@ def only_the_minter_or_an_operator_renews_a_snapshot(stack: TlsStack) -> dict[st
                                 {"id": WORKBENCH, "name": "t11", "ttl_days": 1}))
     renew = {"id": WORKBENCH, "name": "t11", "ttl_days": 2}
     refused = stack.failure(tool(stack, "t11-peer-renew", "workbench_snapshot_renew", renew, tls="peer"),
-                            "operator_required", "operator")
+                            "permission_denied", "operator")
     require(refused["code"] == "PermissionDenied", "t11: the refusal is PermissionDenied", refused)
     by_operator = stack.success(tool(stack, "t11-operator-renew", "workbench_snapshot_renew", renew,
                                      tls="operator"))
@@ -378,7 +378,7 @@ def only_the_minter_or_an_operator_renews_a_snapshot(stack: TlsStack) -> dict[st
                                    {**renew, "ttl_days": 3}))
     retire = {"id": WORKBENCH, "name": "t11"}
     stack.failure(tool(stack, "t11-peer-retire", "workbench_snapshot_retire", retire, tls="peer"),
-                  "operator_required", "operator")
+                  "permission_denied", "operator")
     retired = stack.success(tool(stack, "t11-agent-retire", "workbench_snapshot_retire", retire))
     require(retired.get("retired") is True, "t11: the minter retires its snapshot", retired)
     return {"commit": committed, "minted": minted, "refused": refused, "operator": by_operator,

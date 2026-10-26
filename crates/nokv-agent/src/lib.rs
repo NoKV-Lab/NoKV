@@ -235,6 +235,8 @@ fn agent_error_code_class(code: &str, retryable: bool) -> ErrorClass {
         | "WorkbenchCommitProtocolMismatch"
         | "RestoreProtocolMismatch" => ErrorClass::Incompatible,
         "ResourceExhausted" | "Quarantined" => ErrorClass::OperatorRequired,
+        "Unauthenticated" => ErrorClass::Unauthenticated,
+        "PermissionDenied" => ErrorClass::PermissionDenied,
         "ObjectUnavailable" | "AppendUnresolved" | "AppendCleanupUnresolved" | "Transport" => {
             ErrorClass::OutcomeUnknown
         }
@@ -624,6 +626,22 @@ fn schema_array<'a>(value: &'a Value, path: &str, keyword: &str) -> Result<&'a [
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn refused_credentials_and_roles_keep_their_classes_through_the_adapter() {
+        assert_eq!(
+            agent_error_code_class("Unauthenticated", false),
+            ErrorClass::Unauthenticated
+        );
+        assert_eq!(
+            agent_error_code_class("PermissionDenied", false),
+            ErrorClass::PermissionDenied
+        );
+        assert_eq!(
+            agent_error_code_class("Quarantined", false),
+            ErrorClass::OperatorRequired
+        );
+    }
+
     #[test]
     fn every_workbench_tool_has_a_declared_idempotency_scope() {
         let tools = tool_definitions();

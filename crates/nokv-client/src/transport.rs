@@ -544,10 +544,10 @@ fn perform_handshake(stream: &mut RpcStream) -> Result<(), TransportError> {
             "workspace RPC handshake accepted a different operation schema: {}",
             response.operation_schema()
         ))),
-        HandshakeKind::TlsRequired => Err(TransportError::security(
+        HandshakeKind::TlsRequired => Err(TransportError::unauthenticated(
             "the owner requires TLS; configure RPC TLS for this client",
         )),
-        HandshakeKind::Unauthenticated => Err(TransportError::security(
+        HandshakeKind::Unauthenticated => Err(TransportError::unauthenticated(
             "the owner did not accept this client's certificate: it is not a current \
              credential of the owner's tenant",
         )),
@@ -844,7 +844,7 @@ mod tests {
 
         let error = transport().round_trip(endpoint, b"plain").unwrap_err();
         assert!(!error.retryable());
-        assert_eq!(error.refusal_class(), Some(ErrorClass::OperatorRequired));
+        assert_eq!(error.refusal_class(), Some(ErrorClass::Unauthenticated));
         assert!(error.message().contains("requires TLS"));
         server.join().unwrap();
     }
@@ -1049,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unauthenticated_answer_is_a_security_refusal() {
+    fn an_unauthenticated_answer_is_an_unauthenticated_refusal() {
         let pki = Pki::new();
         let config = pki.server_config();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1064,7 +1064,7 @@ mod tests {
             .round_trip(endpoint, b"never")
             .unwrap_err();
         assert!(!error.retryable());
-        assert_eq!(error.refusal_class(), Some(ErrorClass::OperatorRequired));
+        assert_eq!(error.refusal_class(), Some(ErrorClass::Unauthenticated));
         assert!(
             error.message().contains("not a current credential"),
             "{error}"

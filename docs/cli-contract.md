@@ -5,8 +5,12 @@ SPDX-License-Identifier: Apache-2.0
 
 # Native CLI Contract
 
-Contract `nokv.cli.contract.v1`, reported by `nokv version --json` as
-`cli_contract` beside the wire `rpc_schema`.
+Contract `nokv.cli.contract.v2`, reported by `nokv version --json` as
+`cli_contract` beside the wire `rpc_schema`. Version 2 adds the
+`unauthenticated` and `permission_denied` classes for an owner that
+authenticates its clients over RPC TLS, narrows `operator_required` to what
+only an operator can change, and replaces the one-Agent-per-root scope with
+the authenticated principal.
 
 This is the contract an Agent harness or script relies on when it drives the
 native `nokv` CLI: how a command names its effect so a retry is safe, how it
@@ -44,7 +48,9 @@ model carries a class itself, and no new caller should read it.
 | 6 | `in_progress` | The identified operation is still running. |
 | 7 | `identity_conflict` | The identity was already used for other inputs; nothing was applied. |
 | 8 | `incompatible` | The client and owner do not share a protocol version or capability. |
-| 9 | `operator_required` | Durable or control state needs operator action, the owner refused the client's TLS settings or credential, or the principal lacks the role a request needs, or the request continues an operation another principal began. |
+| 9 | `operator_required` | Durable or control state needs operator action, or the client's TLS settings do not fit the owner. |
+| 10 | `unauthenticated` | The owner does not accept this client's identity: the connection has no TLS where the owner requires it, or its certificate is not a current credential of the owner's tenant. Nothing was applied. |
+| 11 | `permission_denied` | The authenticated principal holds no role that allows the request, or it tried to continue an operation another principal began. Nothing was applied. |
 <!-- exit-codes:end -->
 
 A Rust panic exits `101`, outside this table. A `nokv workbench-session`
@@ -136,6 +142,13 @@ append made through one surface replays through the other. See
 
 ## Scope
 
-The principal that owns an identity is reserved in the owner's request
-fingerprint but is not yet authenticated: one root is bound to one Agent, and
-any client of that root shares its identity namespace.
+Over RPC TLS the owner authenticates each client as a principal of the
+root's tenant and authorizes each request by the principal's role, so many
+Agents share one root. A request id and an operation id belong to the
+principal that claimed them: another principal presenting the same id with
+other inputs is `identity_conflict`, and one presenting a durable
+operation it did not begin is `permission_denied`, except that an operator
+continues any operation. The owner that cannot refresh its tenant policy
+answers `transient` with `resubmit_same`. Without RPC TLS the owner
+authenticates nobody: every client of a root shares its identity namespace,
+and the `unauthenticated` and `permission_denied` classes do not occur.
