@@ -75,7 +75,7 @@ jobs:
           venv="$RUNNER_TEMP/nokv-sdk-venv"
           python3 -m venv "$venv"
           "$venv/bin/python" -m pip install --quiet --upgrade pip
-          "$venv/bin/python" -m pip install --quiet pytest fsspec
+          "$venv/bin/python" -m pip install --quiet pytest fsspec 'msgpack>=1.1,<2'
           "$venv/bin/python" -m pip install --quiet --no-index --find-links dist "nokv==$version"
           python3 scripts/release/python_sdk_release.py verify-install \
             --python "$venv/bin/python" --version "$version"
