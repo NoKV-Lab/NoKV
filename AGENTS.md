@@ -58,18 +58,18 @@ examples, release guidance, or reviews. Do not accept new work that extends it,
 and do not restore MCP to any surface ordering: the order is CLI first, Python
 SDK second, Rust SDK third.
 
-The sidecar's code still ships because part of the live qualification harness
-drives the product through it. `scripts/workbench/live_workbench.py` and
-`scripts/workbench/restore_composition_gate.py` launch `nokv mcp` as a child
-process and retain `mcp-transcript.jsonl` as evidence;
-`scripts/workbench/lingtai_mcp_qualification.py` is a source-bound gap
-declaration that emits a synthetic transcript stub rather than running
-anything. `scripts/workbench/object_namespace_recovery_gate.py` already drives
-the product through `nokv workbench <tool>` only and grades its provider
-outage against `docs/cli-contract.md`. Treat the remaining references as
-harness plumbing, not as a product claim, and do not delete them while they
-are the only executed live path. The stable 18-tool Workbench contract itself
-is independent of MCP and remains authoritative.
+The sidecar's code still ships because one live qualification gate drives
+the product through it. `scripts/workbench/restore_composition_gate.py`
+launches `nokv mcp` as a child process and retains `mcp-transcript.jsonl` as
+evidence; `scripts/workbench/lingtai_mcp_qualification.py` is a source-bound
+gap declaration that emits a synthetic transcript stub rather than running
+anything. `scripts/workbench/object_namespace_recovery_gate.py` and
+`scripts/workbench/live_workbench.py` already drive the product through
+`nokv workbench <tool>` only, grade failures against `docs/cli-contract.md`,
+and retain `cli-transcript.jsonl`. Treat the remaining references as harness
+plumbing, not as a product claim, and do not delete them while they are the
+only executed live path. The stable 18-tool Workbench contract itself is
+independent of MCP and remains authoritative.
 
 ## Tenant Identity And Access Direction
 
