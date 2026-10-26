@@ -13,7 +13,12 @@ import struct
 import sys
 from collections import OrderedDict
 
-import msgpack
+try:
+    import msgpack
+except ImportError as exc:  # pragma: no cover - msgpack ships with the torch extra.
+    raise ImportError(
+        "nokv.torch requires msgpack; install the nokv[torch] extra"
+    ) from exc
 import torch
 
 
@@ -22,22 +27,33 @@ _SCHEMA = "nokv.torch.dcp.payload.v1"
 _MAX_HEADER_BYTES = 64 * 1024 * 1024
 _MAX_DEPTH = 64
 _MAX_DIMENSION = (1 << 63) - 1
+_DTYPE_NAMES = (
+    "bool",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "float8_e4m3fn",
+    "float8_e4m3fnuz",
+    "float8_e5m2",
+    "float8_e5m2fnuz",
+    "float16",
+    "bfloat16",
+    "float32",
+    "float64",
+    "complex64",
+    "complex128",
+)
+# uint16/uint32/uint64 and the float8 dtypes are missing from older PyTorch
+# releases; such a build still imports and rejects payloads that name them.
 _DTYPES = {
     name: getattr(torch, name)
-    for name in (
-        "bool",
-        "uint8",
-        "int8",
-        "int16",
-        "int32",
-        "int64",
-        "float16",
-        "bfloat16",
-        "float32",
-        "float64",
-        "complex64",
-        "complex128",
-    )
+    for name in _DTYPE_NAMES
+    if getattr(torch, name, None) is not None
 }
 SUPPORTED_DTYPE_NAMES = frozenset(_DTYPES)
 

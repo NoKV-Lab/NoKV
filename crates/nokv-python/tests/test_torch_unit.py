@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import io
 import json
@@ -94,6 +95,7 @@ def _load_torch_module():
         },
     )
     sys.modules["torch.distributed.checkpoint"] = dcp
+    torch.distributed.checkpoint = dcp
 
     metadata_module = types.ModuleType("torch.distributed.checkpoint.metadata")
 
@@ -434,8 +436,109 @@ def test_duplicate_json_keys_are_rejected():
 
 def test_old_pytorch_release_fails_closed(monkeypatch):
     monkeypatch.setattr(torch, "__version__", "2.1.9")
-    with pytest.raises(ImportError, match="PyTorch release >=2.2.0"):
+    with pytest.raises(ImportError, match="requires PyTorch >=2.2.0"):
         nokv_torch.WorkbenchStorageReader(_RoundTripClient(), "wb", "run", 1)
+
+
+def test_unparseable_pytorch_version_fails_closed(monkeypatch):
+    monkeypatch.setattr(torch, "__version__", "main")
+    with pytest.raises(ImportError, match="cannot parse PyTorch version 'main'"):
+        nokv_torch.WorkbenchStorageReader(_RoundTripClient(), "wb", "run", 1)
+
+
+@pytest.mark.parametrize(
+    ("version", "entry_point"),
+    [
+        ("2.2.2", "load_state_dict"),
+        ("2.3.0", "load_state_dict"),
+        ("2.3.1+cu121", "load_state_dict"),
+        ("2.4.0", "load"),
+        ("2.9.0", "load"),
+        ("2.10.0rc1", "load"),
+        ("2.10.0+cpu", "load"),
+        ("2.11.0.dev20261001", "load"),
+    ],
+)
+def test_load_checkpoint_uses_dcp_load_from_pytorch_2_4(
+    monkeypatch, version, entry_point
+):
+    dcp = sys.modules["torch.distributed.checkpoint"]
+    calls = []
+    for name in ("load", "load_state_dict"):
+        monkeypatch.setattr(
+            dcp,
+            name,
+            lambda state, name=name, **kwargs: calls.append((name, kwargs)),
+            raising=False,
+        )
+    monkeypatch.setattr(torch, "__version__", version)
+    nokv_torch.load_checkpoint({}, _RoundTripClient(), "wb", "run", 1, no_dist=True)
+    assert [name for name, _ in calls] == [entry_point]
+    kwargs = calls[0][1]
+    assert kwargs["no_dist"] is True
+    assert type(kwargs["storage_reader"]) is nokv_torch.WorkbenchStorageReader
+
+
+class _Shaped:
+    def __init__(self, shape):
+        self.shape = shape
+        self.copied_from = None
+
+    def detach(self):
+        return self
+
+    def copy_(self, other):
+        self.copied_from = other
+
+
+def test_tensor_payload_shape_must_equal_the_read_plan_shape(monkeypatch):
+    payloads = iter((_Shaped((1, 3)), _Shaped((2, 3))))
+    monkeypatch.setattr(nokv_torch, "decode_payload", lambda blob, kind: next(payloads))
+    index = dcp_metadata.MetadataIndex("weight")
+    item = types.SimpleNamespace(type="TENSOR", storage_index=index, dest_index=index)
+    plan = types.SimpleNamespace(items=[item])
+    reader = nokv_torch.WorkbenchStorageReader(_Client(), "wb", "run", 1)
+    reader.storage_data = {index: _Info("shard_0.dcp", 0, 5)}
+    target = _Shaped((2, 3))
+    committed = []
+    planner = types.SimpleNamespace(
+        resolve_tensor=lambda read_item: target,
+        commit_tensor=lambda read_item, tensor: committed.append(tensor),
+    )
+    # (1, 3) would broadcast into (2, 3) through copy_(); it must fail instead.
+    with pytest.raises(
+        RuntimeError,
+        match=r"'weight' payload shape \(1, 3\) differs from its read plan shape \(2, 3\)",
+    ):
+        reader.read_data(plan, planner)
+    assert target.copied_from is None and committed == []
+    reader.read_data(plan, planner)
+    assert target.copied_from.shape == (2, 3) and committed == [target]
+
+
+def test_missing_msgpack_names_the_torch_extra(monkeypatch):
+    monkeypatch.setitem(sys.modules, "msgpack", None)
+    monkeypatch.delitem(sys.modules, "nokv.dcp_payload")
+    with pytest.raises(
+        ImportError, match=r"requires msgpack; install the nokv\[torch\] extra"
+    ):
+        importlib.import_module("nokv.dcp_payload")
+
+
+def test_dtypes_absent_from_the_installed_torch_are_rejected():
+    supported = sys.modules["nokv.dcp_payload"].SUPPORTED_DTYPE_NAMES
+    # The stub torch predates uint16 and float8, like PyTorch releases before 2.3.
+    assert {"uint16", "uint64", "float8_e4m3fn", "float8_e5m2"}.isdisjoint(supported)
+    assert {"bool", "uint8", "bfloat16", "complex128"} <= supported
+    document = {
+        "schema": "nokv.torch.dcp.payload.v1",
+        "kind": "tensor",
+        "dtype": "float8_e4m3fn",
+        "shape": [1],
+        "byteorder": sys.byteorder,
+    }
+    with pytest.raises(ValueError, match="tensor dtype is unsupported"):
+        nokv_torch.decode_payload(_payload_document(document, trailing=b"\x00"), "tensor")
 
 
 def _payload_document(document, *, trailing=b""):

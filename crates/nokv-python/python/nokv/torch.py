@@ -40,20 +40,35 @@ if _HAS_DCP:
     from .dcp_payload import decode_payload, encode_payload
 
 
+def _torch_version() -> tuple[int, int, int]:
+    """Numeric major.minor.patch prefix of ``torch.__version__``.
+
+    Nightly, release-candidate, and local-build suffixes such as
+    ``2.11.0.dev20261001``, ``2.10.0rc1``, and ``2.10.0+cpu`` are ignored.
+    """
+    version = re.match(r"(\d+)\.(\d+)\.(\d+)", str(torch.__version__))
+    if version is None:
+        raise ImportError(
+            f"nokv.torch cannot parse PyTorch version {torch.__version__!r}"
+        )
+    return tuple(int(part) for part in version.groups())
+
+
 def _require_dcp() -> None:
     if not _HAS_DCP:
         raise ImportError("torch.distributed.checkpoint is unavailable")
-    version = re.fullmatch(
-        r"(\d+)\.(\d+)\.(\d+)(?:\+[A-Za-z0-9_.-]+)?", str(torch.__version__)
-    )
-    if version is None or tuple(map(int, version.group(1, 2, 3))) < (2, 2, 0):
-        raise ImportError("nokv.torch requires a stable PyTorch release >=2.2.0")
+    if _torch_version() < (2, 2, 0):
+        raise ImportError("nokv.torch requires PyTorch >=2.2.0")
+
 
 def _legacy_dcp_load() -> bool:
-    version = re.fullmatch(
-        r"(\d+)\.(\d+)\.(\d+)(?:\+[A-Za-z0-9_.-]+)?", str(torch.__version__)
-    )
-    return version is not None and tuple(map(int, version.group(1, 2, 3))) < (2, 10, 0)
+    # PyTorch 2.2 load() gathers state_dict keys across ranks before it honours
+    # no_dist, and PyTorch 2.3 load() discards nested non-tensor values after
+    # the read (fixed in 2.4 by state_dict_loader assigning the loaded copy).
+    # Both must load through the deprecated load_state_dict entry point.
+    # From 2.4 on, load() is correct and is the only entry point that drives
+    # Stateful values, so every later release uses it.
+    return _torch_version() < (2, 4, 0)
 
 
 def _resolve(name: str, modules):
@@ -398,6 +413,14 @@ class WorkbenchStorageReader(_StorageReader):  # type: ignore[misc,valid-type]
                     tensor = decode_payload(bytes(blob), "tensor")
                     tensor = _narrow_to_read_item(tensor, read_item)
                     target = planner.resolve_tensor(read_item).detach()
+                    # copy_() broadcasts, so a shard whose tensor disagrees with
+                    # the read plan must fail here instead of filling the target.
+                    if tuple(tensor.shape) != tuple(target.shape):
+                        raise RuntimeError(
+                            f"DCP tensor {read_item.dest_index.fqn!r} payload shape "
+                            f"{tuple(tensor.shape)} differs from its read plan shape "
+                            f"{tuple(target.shape)}"
+                        )
                     target.copy_(tensor)
                     planner.commit_tensor(read_item, target)
 
