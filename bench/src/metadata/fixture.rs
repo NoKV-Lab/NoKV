@@ -14,6 +14,7 @@ use nokv_meta::workspace::{
 };
 use nokv_meta_holt::{HoltOptions, HoltStore, TreeBinding};
 use nokv_meta_store::TxnStore;
+use nokv_object::MemoryArtifactStore;
 use nokv_protocol::{LogicalShardIdentity, RootIdentity, RootRoute, WorkbenchName};
 use nokv_server::MetadataWorkspaceRequestExecutor;
 use nokv_types::{
@@ -129,7 +130,10 @@ impl Harness {
             owner_epoch: identity.owner.get(),
         };
         Ok(Self {
-            executor: MetadataWorkspaceRequestExecutor::new(Arc::clone(&meta)),
+            executor: MetadataWorkspaceRequestExecutor::new(
+                Arc::clone(&meta),
+                Arc::new(MemoryArtifactStore::new()),
+            ),
             meta,
             holt,
             route,

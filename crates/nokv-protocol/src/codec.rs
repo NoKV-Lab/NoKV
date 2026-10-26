@@ -385,7 +385,6 @@ mod tests {
                         object_identity: object(),
                         expected_length: 1,
                         expected_digest: digest.clone(),
-                        multipart_token: None,
                     }],
                 },
             ),
@@ -399,11 +398,6 @@ mod tests {
                         operation_id: OperationIdentity([1; 16]),
                         state_digest: Digest([6; 32]),
                     },
-                    uploaded_objects: vec![crate::ObjectUploadProof {
-                        sequence: 0,
-                        observed_length: 1,
-                        observed_digest: digest.clone(),
-                    }],
                     manifest_rows: vec![crate::ArtifactManifestRow {
                         object_index: 0,
                         physical_object_index: 0,
@@ -428,8 +422,20 @@ mod tests {
                 },
             ),
         };
+        let upload = WorkspaceRpcRequest {
+            route: route(),
+            request_id: RequestIdentity([0x53; 16]),
+            operation: WorkspaceRequest::UploadArtifactObject(crate::UploadArtifactObjectRequest {
+                token: crate::OperationToken {
+                    operation_id: OperationIdentity([1; 16]),
+                    state_digest: Digest([6; 32]),
+                },
+                sequence: 0,
+                body: vec![0x61],
+            }),
+        };
         let mut golden = Sha256::new();
-        for request in [&prepare, &finish] {
+        for request in [&prepare, &upload, &finish] {
             let encoded = encode_request(request).unwrap();
             assert_eq!(&decode_request(&encoded).unwrap(), request);
             golden.update((encoded.len() as u64).to_be_bytes());
@@ -438,8 +444,8 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(golden.finalize()),
             [
-                219, 231, 28, 40, 247, 96, 212, 4, 86, 247, 174, 146, 201, 59, 208, 121, 13, 119,
-                207, 205, 16, 51, 34, 70, 208, 135, 232, 70, 40, 74, 230, 205,
+                108, 207, 191, 121, 68, 172, 63, 22, 194, 9, 128, 128, 137, 110, 101, 239, 11, 98,
+                201, 199, 14, 192, 40, 140, 37, 233, 60, 50, 125, 247, 177, 184,
             ],
             "update only for an intentional fused publication v15 wire change"
         );

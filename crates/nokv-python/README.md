@@ -135,8 +135,8 @@ not for installing the SDK.
   same status plus logical `operation_token`, child `publication_token`, object
   namespace, `registered_count`, `cleanup_cursor`, `remaining_count`, and a page
   of retained staged `entries`. Each entry has `sequence`, `object_identity`,
-  `expected_length`, `expected_digest`, and optional `multipart_token`. Retired
-  keys are not a historical inventory. The limit is 1 to 192; `next_cursor` is
+  `expected_length`, and `expected_digest`. Retired keys are not a historical
+  inventory. The limit is 1 to 192; `next_cursor` is
   opaque `bytes` or `None`. Continue with the unchanged cursor. A changed state
   returns `Conflict`; restart inspection rather than combining different pages.
 - `Client.operation_recover(operation_id, expected_state_digest=None)` asks the
@@ -171,6 +171,12 @@ not for installing the SDK.
   generation. `collect` publishes its files one by one under fresh
   identities, so a failure can leave some of them published and reports
   `outcome_unknown` with `reread_then_retry`.
+- Local file operations open each directory component and file without
+  following symlinks. `materialize` stages and atomically publishes each new
+  regular file; it never overwrites an existing name. `collect` checks that
+  enumerated files still name the opened file before reading it. On macOS,
+  the root-owned `/var`, `/tmp`, and `/etc` aliases are resolved to `/private`.
+  Use a physical path for any other symlinked parent.
 - Append and operation failures raise `AppendError` for every operation kind,
   carrying `operation_id`, observed `state`, `code`, expected incarnation in
   `expected`, and `cause_code`: an invalid argument is `invalid_input` with
@@ -196,7 +202,25 @@ not for installing the SDK.
   The manifest is the checkpoint commit point, so incomplete shard sets are not
   discoverable as committed checkpoints.
 - `nokv.torch` is an optional `torch.distributed.checkpoint` adapter. Import it
-  explicitly after installing the `torch` extra.
+  explicitly after installing the `torch` extra. New DCP metadata and shard
+  payloads use versioned, non-executable formats. Legacy pickle checkpoints
+  are rejected on load; re-save them from a trusted original state to migrate.
+  The formats have declared limits. The metadata document is at most 64 MiB.
+  Tensor leaves are stored as raw bytes with no adapter-imposed size limit and
+  support dense strided tensors of every `bool`, integer (including `uint16`,
+  `uint32`, and `uint64`), `float8`, `float16`, `bfloat16`, `float32`,
+  `float64`, and complex dtype that the installed PyTorch defines. A non-tensor
+  leaf that MessagePack carries directly (`None`, booleans, 64-bit integers,
+  floats, strings, bytes, lists, and string-keyed dictionaries) has no
+  adapter-imposed size limit; any other supported Python value (tuples,
+  bytearrays, complex numbers, non-string dictionary keys, or tensors nested in
+  a Python value) is JSON-encoded and limited to 64 MiB. Other dtypes, sparse
+  layouts, and Python object types fail closed at save time. PyTorch 2.2 and
+  2.3 load through the deprecated `load_state_dict` entry point because their
+  `load()` cannot run without a process group (2.2) or discards nested
+  non-tensor values (2.3); `Stateful` values therefore need PyTorch 2.4 or
+  later, and loading on 2.2 or 2.3 without a process group needs
+  `no_dist=True`.
 
 The fsspec adapter supports byte modes `r`, `rb`, `w`, `wb`, `x`, and `xb`.
 Append, update, text, permissions, inode/dentry identity, mounts, recursive

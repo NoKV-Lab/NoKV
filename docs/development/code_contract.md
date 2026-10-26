@@ -178,7 +178,9 @@ these rules:
   metadata format version.
 - **Object and control planes.** Both are part of the boundary. An agent never
   holds object-store or control-plane credentials that bypass metadata
-  authorization.
+  authorization. Only the shard owner writes objects: a client hands each
+  block to the owner, and an agent's object credentials are read-only under
+  its root's prefix.
 - **Credentials and disclosure.** Credentials never appear in argv, logs,
   errors, or evidence. An authorization failure does not reveal another
   tenant's roots, paths, or versions.

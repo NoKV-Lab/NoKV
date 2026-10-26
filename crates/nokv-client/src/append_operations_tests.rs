@@ -170,7 +170,6 @@ fn inspection(observation: OperationStatus, start: u32, end: u32) -> AppendClean
                 object_identity: ObjectIdentity::new(format!("object-{sequence}")).unwrap(),
                 expected_length: 4,
                 expected_digest: sha256_digest_uri(Digest([7; 32])),
-                multipart_token: None,
             })
             .collect(),
         next_after: (end < 5).then(|| end - 1),

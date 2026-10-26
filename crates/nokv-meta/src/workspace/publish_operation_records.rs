@@ -18,8 +18,14 @@ use nokv_types::{
     WorkspaceRevision, FIXED_ID_BYTES, SHA256_BYTES,
 };
 
-/// Durable value format for publication-owned payloads.
+/// Durable value format for publication-owned payloads. Clients seal manifest
+/// rows against this encoding, so it moves only with the manifest row.
 pub const PUBLISH_VALUE_FORMAT_VERSION: u8 = 7;
+/// Durable value format for the staged-object record. Version 8 dropped the
+/// multipart upload id that no provider path ever set; a version 7 record is
+/// refused rather than read with the field's bytes shifted into its
+/// neighbours.
+pub const STAGED_OBJECT_VALUE_FORMAT_VERSION: u8 = 8;
 /// Durable value format for the publish operation record. Version 9 records
 /// the initiating principal; version 8 added the sealed digest of a body
 /// published inline.
@@ -36,7 +42,6 @@ pub const MAX_DEPENDENCY_DEPTH: u8 = 8;
 /// Maximum append-segment sequence admitted by the durable publication codec.
 pub const MAX_APPEND_SEGMENTS: u32 = 1_048_576;
 
-pub const MAX_MULTIPART_ID_BYTES: usize = 1_024;
 pub const MAX_DIGEST_URI_BYTES: usize = 256;
 pub const MAX_TERMINAL_ERROR_BYTES: usize = 4_096;
 
@@ -351,7 +356,6 @@ pub struct StagedObjectRecord {
     pub artifact_revision_id: ArtifactRevisionId,
     pub object_sequence: u32,
     pub object_key: String,
-    pub multipart_upload_id: Option<Vec<u8>>,
     pub expected_length: u64,
     pub expected_digest_uri: String,
     pub provider_state: StagedProviderState,
@@ -1300,9 +1304,6 @@ impl StagedObjectRecord {
             });
         }
         validate_object_key(&self.object_key, self.artifact_revision_id)?;
-        if let Some(upload_id) = &self.multipart_upload_id {
-            validate_opaque_bytes("multipart_upload_id", upload_id, MAX_MULTIPART_ID_BYTES)?;
-        }
         if self.expected_length == 0 {
             return Err(PublishRecordError::ZeroScalar {
                 field: "expected_length",
@@ -1315,15 +1316,10 @@ impl StagedObjectRecord {
     pub fn encode(&self) -> Result<Vec<u8>, PublishRecordError> {
         self.validate()?;
         let mut encoded = Vec::with_capacity(256);
-        encoded.push(PUBLISH_VALUE_FORMAT_VERSION);
+        encoded.push(STAGED_OBJECT_VALUE_FORMAT_VERSION);
         encoded.extend_from_slice(self.artifact_revision_id.as_bytes());
         encoded.extend_from_slice(&self.object_sequence.to_be_bytes());
         push_string(&mut encoded, "object_key", &self.object_key)?;
-        push_optional_bytes(
-            &mut encoded,
-            "multipart_upload_id",
-            self.multipart_upload_id.as_deref(),
-        )?;
         encoded.extend_from_slice(&self.expected_length.to_be_bytes());
         push_string(
             &mut encoded,
@@ -1347,13 +1343,11 @@ impl StagedObjectRecord {
             MAX_STAGED_OBJECT_RECORD_BYTES,
         )?;
         let mut decoder = Decoder::new(encoded);
-        decoder.require_value_version()?;
+        decoder.require_version(STAGED_OBJECT_VALUE_FORMAT_VERSION)?;
         let artifact_revision_id =
             ArtifactRevisionId::from_bytes(decoder.fixed("artifact_revision_id")?);
         let object_sequence = decoder.u32("object_sequence")?;
         let object_key = decoder.string("object_key", OBJECT_KEY_BYTES)?;
-        let multipart_upload_id =
-            decoder.optional_bytes("multipart_upload_id", MAX_MULTIPART_ID_BYTES)?;
         let expected_length = decoder.u64("expected_length")?;
         let expected_digest_uri = decoder.string("expected_digest_uri", MAX_DIGEST_URI_BYTES)?;
         let provider_state = decode_provider_state(decoder.u8("provider_state")?)?;
@@ -1363,7 +1357,6 @@ impl StagedObjectRecord {
             artifact_revision_id,
             object_sequence,
             object_key,
-            multipart_upload_id,
             expected_length,
             expected_digest_uri,
             provider_state,
@@ -1576,13 +1569,10 @@ fn validate_staged_state_pair(
     let valid = matches!(
         (provider, cleanup),
         (
-            StagedProviderState::Planned
-                | StagedProviderState::Uploading
-                | StagedProviderState::Uploaded,
+            StagedProviderState::Planned | StagedProviderState::Uploaded,
             StagedCleanupState::Owned
         ) | (
             StagedProviderState::Planned
-                | StagedProviderState::Uploading
                 | StagedProviderState::Uploaded
                 | StagedProviderState::AbortPending,
             StagedCleanupState::DeletePending
@@ -1688,24 +1678,6 @@ fn validate_text(field: &'static str, value: &str, max: usize) -> Result<(), Pub
     }
     if value.contains('\0') {
         return Err(PublishRecordError::InvalidAsciiField { field });
-    }
-    Ok(())
-}
-
-fn validate_opaque_bytes(
-    field: &'static str,
-    value: &[u8],
-    max: usize,
-) -> Result<(), PublishRecordError> {
-    if value.is_empty() {
-        return Err(PublishRecordError::EmptyField { field });
-    }
-    if value.len() > max {
-        return Err(PublishRecordError::FieldTooLong {
-            field,
-            length: value.len(),
-            max,
-        });
     }
     Ok(())
 }
@@ -1880,21 +1852,6 @@ fn push_bytes(
     Ok(())
 }
 
-fn push_optional_bytes(
-    target: &mut Vec<u8>,
-    field: &'static str,
-    value: Option<&[u8]>,
-) -> Result<(), PublishRecordError> {
-    match value {
-        None => target.push(0),
-        Some(value) => {
-            target.push(1);
-            push_bytes(target, field, value)?;
-        }
-    }
-    Ok(())
-}
-
 fn push_optional_fixed<const N: usize>(target: &mut Vec<u8>, value: &Option<[u8; N]>) {
     match value {
         None => target.push(0),
@@ -1964,18 +1921,6 @@ impl<'a> Decoder<'a> {
     fn string(&mut self, field: &'static str, max: usize) -> Result<String, PublishRecordError> {
         String::from_utf8(self.bytes(field, max)?)
             .map_err(|_| PublishRecordError::InvalidUtf8 { field })
-    }
-
-    fn optional_bytes(
-        &mut self,
-        field: &'static str,
-        max: usize,
-    ) -> Result<Option<Vec<u8>>, PublishRecordError> {
-        match self.u8(field)? {
-            0 => Ok(None),
-            1 => self.bytes(field, max).map(Some),
-            value => Err(PublishRecordError::InvalidOptionalTag { field, value }),
-        }
     }
 
     fn optional_fixed<const N: usize>(
@@ -2288,7 +2233,6 @@ mod tests {
             artifact_revision_id: revision(0x22),
             object_sequence: 7,
             object_key: object_key(0x22),
-            multipart_upload_id: Some(b"upload-1".to_vec()),
             expected_length: 4_096,
             expected_digest_uri: "sha256:block".to_owned(),
             provider_state: StagedProviderState::Uploaded,
@@ -2296,14 +2240,11 @@ mod tests {
         };
         let key = object_key(0x22);
         let expected = [
-            &[PUBLISH_VALUE_FORMAT_VERSION][..],
+            &[STAGED_OBJECT_VALUE_FORMAT_VERSION][..],
             &[0x22; 16],
             &7_u32.to_be_bytes(),
             &(key.len() as u32).to_be_bytes(),
             key.as_bytes(),
-            &[1],
-            &8_u32.to_be_bytes(),
-            b"upload-1",
             &4_096_u64.to_be_bytes(),
             &12_u32.to_be_bytes(),
             b"sha256:block",
@@ -2649,7 +2590,6 @@ mod tests {
             artifact_revision_id: revision(0x22),
             object_sequence: 0,
             object_key: object_key(0x22),
-            multipart_upload_id: None,
             expected_length: 1,
             expected_digest_uri: "sha256:a".to_owned(),
             provider_state: StagedProviderState::Uploaded,
@@ -2760,7 +2700,6 @@ mod tests {
             artifact_revision_id: revision(0x22),
             object_sequence: 0,
             object_key: object_key(0x22),
-            multipart_upload_id: None,
             expected_length: 1,
             expected_digest_uri: "sha256:a".to_owned(),
             provider_state: StagedProviderState::Uploaded,
@@ -2857,24 +2796,6 @@ mod tests {
 
     #[test]
     fn oversized_fields_and_records_fail_before_allocation_or_acceptance() {
-        let staged = StagedObjectRecord {
-            artifact_revision_id: revision(0x22),
-            object_sequence: 0,
-            object_key: object_key(0x22),
-            multipart_upload_id: Some(vec![0; MAX_MULTIPART_ID_BYTES + 1]),
-            expected_length: 1,
-            expected_digest_uri: "sha256:a".to_owned(),
-            provider_state: StagedProviderState::Uploading,
-            cleanup_state: StagedCleanupState::Owned,
-        };
-        assert!(matches!(
-            staged.encode(),
-            Err(PublishRecordError::FieldTooLong {
-                field: "multipart_upload_id",
-                ..
-            })
-        ));
-
         let oversized = vec![0; MAX_PUBLISH_OPERATION_RECORD_BYTES + 1];
         assert_eq!(
             PublishOperationRecord::decode(&oversized).unwrap_err(),

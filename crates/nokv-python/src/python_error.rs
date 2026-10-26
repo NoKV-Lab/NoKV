@@ -24,7 +24,6 @@ use nokv_types::{ErrorClass, IdempotencyScope, NextAction};
 use pyo3::exceptions::{PyFileExistsError, PyFileNotFoundError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::object_store::ConfiguredObjectStoreBuildError;
 use crate::python_value::{cleanup_retry_receipt_to_py, hex};
 
 /// Attach the class and next action of a failure that ended a call of
@@ -299,14 +298,13 @@ pub(crate) fn append_failure(
 }
 
 /// An append-family failure the SDK detects before any request, such as an
-/// invalid argument or an object provider that failed its admission.
+/// invalid argument or an object store that could not be bound.
 pub(crate) fn append_local_failure(
     py: Python<'_>,
     message: String,
     operation_id: OperationIdentity,
     expected: Option<WorkspaceIdentity>,
     code: &str,
-    cause_code: Option<&str>,
     class: ErrorClass,
 ) -> PyErr {
     let exception = new_append_error(
@@ -316,7 +314,7 @@ pub(crate) fn append_local_failure(
         None,
         code,
         expected.map(|value| hex(&value.0)),
-        cause_code.map(str::to_owned),
+        None,
     );
     classified(py, exception, class, IdempotencyScope::CallerOperation)
 }
@@ -352,8 +350,8 @@ fn new_append_error(
 pub(crate) enum ObjectBindFailure {
     /// The client was constructed without an `object_store`.
     Unconfigured,
-    /// The configured store could not be built or admitted.
-    Build(ConfiguredObjectStoreBuildError),
+    /// The configured store could not be built.
+    Build(ObjectError),
     /// The preflight that names the root's object namespace failed.
     Preflight(ClientError),
     /// The object namespace could not be opened or verified.
@@ -365,8 +363,9 @@ pub(crate) enum ObjectBindFailure {
 impl ObjectBindFailure {
     pub(crate) fn class(&self) -> ErrorClass {
         match self {
-            Self::Unconfigured => ErrorClass::InvalidInput,
-            Self::Build(error) => error.class(),
+            // A store that cannot be constructed is a configuration the
+            // caller must change, as the native CLI reports it.
+            Self::Unconfigured | Self::Build(_) => ErrorClass::InvalidInput,
             Self::Preflight(error) => error.class(),
             Self::Namespace(error) => error.class(),
             Self::Poisoned => ErrorClass::Internal,
@@ -507,7 +506,6 @@ pub(crate) mod tests {
     use std::sync::Once;
 
     use nokv_client::TransportError;
-    use nokv_object::ProviderAdmissionError;
     use nokv_protocol::{Digest, OperationState, OperationToken, RpcFailure};
     use pyo3::types::PyAnyMethods;
 
@@ -748,7 +746,6 @@ pub(crate) mod tests {
                 OPERATION,
                 Some(WorkspaceIdentity([0xbb; 16])),
                 "InvalidArgument",
-                None,
                 ErrorClass::InvalidInput,
             );
             assert_eq!(
@@ -774,18 +771,6 @@ pub(crate) mod tests {
                 "bb".repeat(16)
             );
             assert!(!field("retryable").extract::<bool>().unwrap());
-            // An unavailable provider admitted nothing: resubmit the same append.
-            let admission = append_local_failure(
-                py,
-                "provider unavailable".to_owned(),
-                OPERATION,
-                None,
-                "AppendFailed",
-                Some(ProviderAdmissionError::Unavailable.code()),
-                ProviderAdmissionError::Unavailable.class(),
-            );
-            assert_eq!(contract_of(py, &admission).1, "transient");
-            assert_eq!(contract_of(py, &admission).2, "resubmit_same");
         });
     }
 
@@ -935,17 +920,7 @@ pub(crate) mod tests {
                     ("ValueError", "invalid_input", "fix_input"),
                 ),
                 (
-                    ObjectBindFailure::Build(ConfiguredObjectStoreBuildError::Admission(
-                        ProviderAdmissionError::Unavailable,
-                    ))
-                    .into_py_err(py),
-                    ("ValueError", "transient", "resubmit_same"),
-                ),
-                (
-                    ObjectBindFailure::Build(ConfiguredObjectStoreBuildError::Object(
-                        ObjectError::MissingBucket,
-                    ))
-                    .into_py_err(py),
+                    ObjectBindFailure::Build(ObjectError::MissingBucket).into_py_err(py),
                     ("ValueError", "invalid_input", "fix_input"),
                 ),
                 // Binding applies nothing, so a lost preflight reply is transient.

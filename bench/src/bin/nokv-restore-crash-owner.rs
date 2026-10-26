@@ -800,7 +800,7 @@ fn run_server(config: ServeConfig) -> Result<(), String> {
     let owner = bootstrap_shard(
         Arc::clone(&control),
         Arc::clone(&registry),
-        recovery_objects,
+        Arc::clone(&recovery_objects),
         ShardBoot {
             append_activity_lease_ms: 1_800_000,
             shard_id: placement.logical_shard_id,
@@ -843,7 +843,7 @@ fn run_server(config: ServeConfig) -> Result<(), String> {
     let barrier: Arc<dyn RestoreInitializationBarrier> =
         Arc::new(CrashBarrier::new(arm.clone(), config.evidence_file));
     let executor: Arc<dyn WorkspaceRequestExecutor> = Arc::new(
-        MetadataWorkspaceRequestExecutor::new(Arc::clone(owner.meta()))
+        MetadataWorkspaceRequestExecutor::new(Arc::clone(owner.meta()), recovery_objects)
             .with_restore_initialization_barrier(arm.operation_id, barrier),
     );
     registry

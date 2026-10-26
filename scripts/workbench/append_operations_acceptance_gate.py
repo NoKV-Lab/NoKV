@@ -418,8 +418,7 @@ def inspect_all(
         require(
             row["expected_length"] == len(block)
             and row["expected_digest"] == "sha256:" + hashlib.sha256(block).hexdigest()
-            and row["object_identity"].endswith(f"/blocks/{row['sequence']:016x}")
-            and row["multipart_token"] is None,
+            and row["object_identity"].endswith(f"/blocks/{row['sequence']:016x}"),
             "public ledger preserves exact expected object identity, bytes, and digest",
             row,
         )
