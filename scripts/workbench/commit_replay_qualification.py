@@ -58,14 +58,14 @@ META_REPLACED_HEAD_REPLAY = _test(
 IMPLICIT_PUT = _test(
     "cli-backend-implicit-put",
     "nokv",
-    "backend::tests::publish_implicitly_admits_a_missing_workbench_before_provider_use",
+    "backend::tests::publish_admits_a_missing_workbench_before_its_first_publication_request",
     "--bin",
     "nokv",
 )
 IMPLICIT_APPEND = _test(
     "cli-backend-implicit-append",
     "nokv",
-    "backend::tests::append_implicitly_admits_a_missing_workbench_before_provider_use",
+    "backend::tests::append_admits_a_missing_workbench_before_its_first_append_request",
     "--bin",
     "nokv",
 )
