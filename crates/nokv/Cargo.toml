@@ -16,6 +16,7 @@ etcd = ["control", "nokv-client/etcd", "nokv-control/etcd", "nokv-server/etcd"]
 
 [dependencies]
 base64.workspace = true
+getrandom.workspace = true
 nokv-client.workspace = true
 nokv-control.workspace = true
 nokv-object.workspace = true
@@ -24,6 +25,7 @@ nokv-server.workspace = true
 nokv-agent.workspace = true
 nokv-workbench-projection.workspace = true
 nokv-types.workspace = true
+rustix.workspace = true
 rustls.workspace = true
 sha2.workspace = true
 signal-hook = { workspace = true, optional = true }

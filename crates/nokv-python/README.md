@@ -171,6 +171,12 @@ not for installing the SDK.
   generation. `collect` publishes its files one by one under fresh
   identities, so a failure can leave some of them published and reports
   `outcome_unknown` with `reread_then_retry`.
+- Local file operations open each directory component and file without
+  following symlinks. `materialize` stages and atomically publishes each new
+  regular file; it never overwrites an existing name. `collect` checks that
+  enumerated files still name the opened file before reading it. On macOS,
+  the root-owned `/var`, `/tmp`, and `/etc` aliases are resolved to `/private`.
+  Use a physical path for any other symlinked parent.
 - Append and operation failures raise `AppendError` for every operation kind,
   carrying `operation_id`, observed `state`, `code`, expected incarnation in
   `expected`, and `cause_code`: an invalid argument is `invalid_input` with
