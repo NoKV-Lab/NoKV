@@ -13,6 +13,8 @@ use std::fs::File;
 #[cfg(unix)]
 use std::io::{Read, Write};
 #[cfg(unix)]
+use std::os::fd::AsFd;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -21,10 +23,38 @@ use std::path::Component;
 
 #[cfg(unix)]
 use rustix::fs::{
-    mkdirat, openat, renameat_with, unlinkat, AtFlags, Dir, Mode, OFlags, RenameFlags,
+    linkat, mkdirat, openat, renameat_with, unlinkat, AtFlags, Dir, Mode, OFlags, RenameFlags,
 };
 #[cfg(unix)]
 use rustix::io::Errno;
+
+/// Directory components are pinned with search-only descriptors: walking a
+/// path needs execute permission on each directory, not read permission, and
+/// every `*at` call below accepts such a descriptor.
+#[cfg(target_os = "linux")]
+const DIRECTORY_FLAGS: OFlags = OFlags::PATH
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+/// macOS `O_SEARCH` is `O_EXEC | O_DIRECTORY`; rustix has no name for it.
+#[cfg(target_os = "macos")]
+const DIRECTORY_FLAGS: OFlags = OFlags::from_bits_retain(0x4000_0000)
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
+/// A directory opened for listing; only the directories collect enumerates
+/// need read permission.
+#[cfg(unix)]
+const LISTING_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
 
 use nokv_protocol::RelativePath;
 
@@ -134,12 +164,14 @@ fn collect_local_files_with_hook(
         .map_err(|error| format!("cannot open local collect path anchor: {error}"))?;
     let components = normal_components(&root)?;
     let directory = walk_directories(&anchor, &components, false)?;
+    let listing = openat(&directory, ".", LISTING_FLAGS, Mode::empty())
+        .map_err(|error| format!("cannot list local collect root {}: {error}", root.display()))?;
     before_entry_open(&root);
 
     let mut files = Vec::new();
     visit_directory(
         &root,
-        &directory,
+        &File::from(listing),
         Path::new(""),
         &mut files,
         &mut before_entry_open,
@@ -405,11 +437,15 @@ pub(crate) struct MaterializeRoot {
     path: PathBuf,
 }
 
+/// One file a materialization created. It holds no descriptor, so a
+/// materialization of any size keeps only the root's handles open; rollback
+/// walks from that pinned root again and removes only the file whose
+/// identity it recorded.
 #[derive(Debug)]
 pub(crate) struct CreatedMaterializedFile {
     pub(crate) path: PathBuf,
     #[cfg(unix)]
-    parent: File,
+    directories: Vec<OsString>,
     #[cfg(unix)]
     file_name: OsString,
     #[cfg(unix)]
@@ -417,11 +453,13 @@ pub(crate) struct CreatedMaterializedFile {
 }
 
 impl CreatedMaterializedFile {
-    pub(crate) fn remove(self) -> io::Result<()> {
+    pub(crate) fn remove(self, root: &MaterializeRoot) -> io::Result<()> {
         #[cfg(unix)]
         {
+            let parent = walk_directories(&root.directory, &self.directories, false)
+                .map_err(io::Error::other)?;
             let descriptor = match openat(
-                &self.parent,
+                &parent,
                 &self.file_name,
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::empty(),
@@ -436,10 +474,11 @@ impl CreatedMaterializedFile {
                     "materialized target changed before rollback",
                 ));
             }
-            unlinkat(&self.parent, &self.file_name, AtFlags::empty()).map_err(io::Error::from)
+            unlinkat(&parent, &self.file_name, AtFlags::empty()).map_err(io::Error::from)
         }
         #[cfg(not(unix))]
         {
+            let _ = root;
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "local materialization requires Unix directory descriptors",
@@ -448,32 +487,139 @@ impl CreatedMaterializedFile {
     }
 }
 
+/// How a staged file reaches its final name without overwriting anything.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Publication {
+    /// `renameat2(RENAME_NOREPLACE)`: atomic and create-only where the file
+    /// system supports the flag.
+    RenameNoReplace,
+    /// Link the staged file under its final name, which fails with `EEXIST`
+    /// when the name exists, then drop the staging name.
+    Link,
+    /// Create the final name with `O_CREAT | O_EXCL` under the pinned
+    /// directory and write the bytes again; create-only without staging.
+    CreateExclusive,
+}
+
+#[cfg(unix)]
+impl Publication {
+    /// The next strategy to try when a file system refuses this one, such as
+    /// the Linux NFS client's `EINVAL` for every rename flag or a provider
+    /// without hard links.
+    fn fallback(self, error: &io::Error) -> Option<Self> {
+        let code = error.raw_os_error();
+        let refused = |candidates: &[Errno]| {
+            candidates
+                .iter()
+                .any(|candidate| code == Some(candidate.raw_os_error()))
+        };
+        match self {
+            Self::RenameNoReplace
+                if refused(&[Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP]) =>
+            {
+                Some(Self::Link)
+            }
+            Self::Link
+                if refused(&[
+                    Errno::INVAL,
+                    Errno::NOSYS,
+                    Errno::NOTSUP,
+                    Errno::OPNOTSUPP,
+                    Errno::PERM,
+                    Errno::XDEV,
+                    Errno::MLINK,
+                ]) =>
+            {
+                Some(Self::CreateExclusive)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Publish the staged file `staging` under `name` in the pinned `directory`,
+/// never replacing an existing name; `bytes` are the staged contents, needed
+/// only by the last fallback. Returns the strategy that succeeded.
+#[cfg(unix)]
+fn publish_staged(
+    directory: &File,
+    staging: &str,
+    name: &OsStr,
+    bytes: &[u8],
+    first: Publication,
+) -> io::Result<Publication> {
+    let mut strategy = first;
+    loop {
+        let attempt = match strategy {
+            Publication::RenameNoReplace => renameat_with(
+                directory.as_fd(),
+                staging,
+                directory.as_fd(),
+                name,
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(io::Error::from),
+            Publication::Link => linkat(
+                directory.as_fd(),
+                staging,
+                directory.as_fd(),
+                name,
+                AtFlags::empty(),
+            )
+            .map_err(io::Error::from)
+            .map(|()| {
+                let _ = unlinkat(directory, staging, AtFlags::empty());
+            }),
+            Publication::CreateExclusive => create_exclusive(directory, name, bytes).map(|()| {
+                let _ = unlinkat(directory, staging, AtFlags::empty());
+            }),
+        };
+        match attempt {
+            Ok(()) => return Ok(strategy),
+            Err(error) => match strategy.fallback(&error) {
+                Some(next) => strategy = next,
+                None => return Err(error),
+            },
+        }
+    }
+}
+
+#[cfg(unix)]
+fn create_exclusive(directory: &File, name: &OsStr, bytes: &[u8]) -> io::Result<()> {
+    let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let descriptor = openat(directory, name, flags, Mode::from_bits_retain(0o666))?;
+    let mut file = File::from(descriptor);
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = unlinkat(directory, name, AtFlags::empty());
+        return Err(error);
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn open_directory(parent: &File, name: &OsStr, create: bool) -> Result<File, String> {
-    let flags = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let opened = openat(parent, name, flags, Mode::empty());
+    let opened = openat(parent, name, DIRECTORY_FLAGS, Mode::empty());
     let descriptor = match opened {
         Ok(descriptor) => descriptor,
         Err(Errno::NOENT) if create => {
-            match mkdirat(parent, name, Mode::from_bits_retain(0o700)) {
+            // The process umask applies, as `create_dir_all` would.
+            match mkdirat(parent, name, Mode::from_bits_retain(0o777)) {
                 Ok(()) | Err(Errno::EXIST) => {}
                 Err(error) => {
-                    return Err(format!(
-                        "cannot create materialize directory {:?}: {error}",
-                        name
-                    ));
+                    return Err(format!("cannot create local directory {:?}: {error}", name));
                 }
             }
-            openat(parent, name, flags, Mode::empty()).map_err(|error| {
+            openat(parent, name, DIRECTORY_FLAGS, Mode::empty()).map_err(|error| {
                 format!(
-                    "cannot open materialize directory {:?} without following symlinks: {error}",
+                    "cannot open local directory {:?} without following symlinks: {error}",
                     name
                 )
             })?
         }
         Err(error) => {
             return Err(format!(
-                "cannot open materialize directory {:?} without following symlinks: {error}",
+                "cannot open local directory {:?} without following symlinks: {error}",
                 name
             ));
         }
@@ -610,11 +756,12 @@ fn create_materialized_file_with_hook(
         .map_err(|error| format!("cannot name materialize staging file: {error}"))?;
     let staging_name = format!(".nokv-materialize-{:032x}.tmp", u128::from_le_bytes(nonce));
     let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    // The process umask applies, as `File::create` would.
     let descriptor = openat(
         &parent,
         staging_name.as_str(),
         flags,
-        Mode::from_bits_retain(0o600),
+        Mode::from_bits_retain(0o666),
     )
     .map_err(|error| {
         format!(
@@ -642,27 +789,48 @@ fn create_materialized_file_with_hook(
             return Err(format!("cannot inspect staged materialized file: {error}"));
         }
     };
-    if let Err(error) = renameat_with(
+    let published = publish_staged(
         &parent,
         staging_name.as_str(),
-        &parent,
-        *file_name,
-        RenameFlags::NOREPLACE,
-    ) {
+        OsStr::new(*file_name),
+        bytes,
+        Publication::RenameNoReplace,
+    );
+    if let Err(error) = published {
         let _ = unlinkat(&parent, staging_name.as_str(), AtFlags::empty());
         return Err(format!(
             "cannot publish materialized file {} without overwriting: {error}",
             target.display()
         ));
     }
+    let identity = match published {
+        // The exclusive create wrote a new inode under the final name.
+        Ok(Publication::CreateExclusive) => {
+            let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+            match openat(&parent, *file_name, flags, Mode::empty())
+                .map_err(io::Error::from)
+                .and_then(|descriptor| File::from(descriptor).metadata())
+            {
+                Ok(metadata) => (metadata.dev(), metadata.ino()),
+                Err(error) => {
+                    let _ = unlinkat(&parent, *file_name, AtFlags::empty());
+                    return Err(format!(
+                        "cannot inspect published materialized file {}: {error}",
+                        target.display()
+                    ));
+                }
+            }
+        }
+        _ => (metadata.dev(), metadata.ino()),
+    };
     let created = CreatedMaterializedFile {
         path: target,
-        parent,
+        directories: directories.iter().map(OsString::from).collect(),
         file_name: OsString::from(*file_name),
-        identity: (metadata.dev(), metadata.ino()),
+        identity,
     };
-    if let Err(error) = root.verify_directory(directories, &created.parent) {
-        let _ = created.remove();
+    if let Err(error) = root.verify_directory(directories, &parent) {
+        let _ = created.remove(root);
         return Err(error);
     }
     // These files are disposable scratch. Keep the file sync and atomic
@@ -828,9 +996,150 @@ mod tests {
         let created = create_materialized_file(&root, &relative, b"payload").unwrap();
         fs::rename(&root_path, &held).unwrap();
         symlink(&outside, &root_path).unwrap();
-        created.remove().unwrap();
+        created.remove(&root).unwrap();
         assert!(!held.join("output.bin").exists());
         assert_eq!(fs::read(outside.join("output.bin")).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    fn open_descriptors() -> usize {
+        fs::read_dir("/dev/fd").unwrap().count()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_holds_no_descriptor_per_created_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = prepare_materialize_root(&directory.path().canonicalize().unwrap()).unwrap();
+        let before = open_descriptors();
+        let created = (0..300)
+            .map(|index| {
+                let relative =
+                    RelativePath::new(format!("deep/{}/file-{index}.bin", index % 7)).unwrap();
+                create_materialized_file(&root, &relative, b"payload").unwrap()
+            })
+            .collect::<Vec<_>>();
+        // Other tests in this process open descriptors concurrently; the bug
+        // this guards against would add one per file, three hundred here.
+        let after = open_descriptors();
+        assert!(
+            after.saturating_sub(before) < 100,
+            "created files must not keep directory descriptors open: {before} before, {after} after"
+        );
+        for file in created.into_iter().rev() {
+            file.remove(&root).unwrap();
+        }
+        assert!(!root.path.join("deep/0/file-0.bin").exists());
+        assert!(!root.path.join("deep/6/file-299.bin").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_fallbacks_stay_create_only() {
+        for strategy in [Publication::Link, Publication::CreateExclusive] {
+            let directory = tempfile::tempdir().unwrap();
+            let base = directory.path().canonicalize().unwrap();
+            let handle = File::open(&base).unwrap();
+            fs::write(base.join(".staging"), b"first").unwrap();
+            let used = publish_staged(
+                &handle,
+                ".staging",
+                OsStr::new("out.bin"),
+                b"first",
+                strategy,
+            )
+            .unwrap();
+            assert_eq!(used, strategy);
+            assert_eq!(fs::read(base.join("out.bin")).unwrap(), b"first");
+            assert!(
+                !base.join(".staging").exists(),
+                "{strategy:?} must drop the staging name"
+            );
+
+            fs::write(base.join(".staging"), b"second").unwrap();
+            let error = publish_staged(
+                &handle,
+                ".staging",
+                OsStr::new("out.bin"),
+                b"second",
+                strategy,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists,
+                "{strategy:?}: {error}"
+            );
+            assert_eq!(fs::read(base.join("out.bin")).unwrap(), b"first");
+        }
+        let refused = io::Error::from_raw_os_error(Errno::INVAL.raw_os_error());
+        assert_eq!(
+            Publication::RenameNoReplace.fallback(&refused),
+            Some(Publication::Link)
+        );
+        assert_eq!(
+            Publication::Link.fallback(&refused),
+            Some(Publication::CreateExclusive)
+        );
+        assert_eq!(Publication::CreateExclusive.fallback(&refused), None);
+        let exists = io::Error::from_raw_os_error(Errno::EXIST.raw_os_error());
+        assert_eq!(Publication::RenameNoReplace.fallback(&exists), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialized_files_and_directories_follow_the_process_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        fs::write(base.join("control.bin"), b"control").unwrap();
+        fs::create_dir(base.join("control-dir")).unwrap();
+        let root = prepare_materialize_root(&base.join("out")).unwrap();
+        let relative = RelativePath::new("nested/output.bin").unwrap();
+        create_materialized_file(&root, &relative, b"payload").unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&base.join("out/nested/output.bin")),
+            mode(&base.join("control.bin"))
+        );
+        assert_eq!(
+            mode(&base.join("out/nested")),
+            mode(&base.join("control-dir"))
+        );
+        assert_eq!(mode(&base.join("out")), mode(&base.join("control-dir")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_only_ancestors_are_enough_to_collect_and_materialize() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        let ancestor = base.join("ancestor");
+        fs::create_dir_all(ancestor.join("source")).unwrap();
+        fs::write(ancestor.join("source/file.bin"), b"bytes").unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o311)).unwrap();
+        if fs::read_dir(&ancestor).is_ok() {
+            // Running with privileges that ignore the mode: nothing to prove.
+            fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let collected = collect_local_files(&ancestor.join("source")).unwrap();
+        assert_eq!(collected.read_file(&collected.files[0]).unwrap(), b"bytes");
+        assert_eq!(
+            read_regular_file(&ancestor.join("source/file.bin")).unwrap(),
+            b"bytes"
+        );
+        let root = prepare_materialize_root(&ancestor.join("out")).unwrap();
+        let relative = RelativePath::new("target.bin").unwrap();
+        create_materialized_file(&root, &relative, b"complete").unwrap();
+        assert_eq!(
+            fs::read(ancestor.join("out/target.bin")).unwrap(),
+            b"complete"
+        );
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[cfg(unix)]

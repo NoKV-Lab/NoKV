@@ -1764,7 +1764,7 @@ fn materialize_workspace(
     })();
     if result.is_err() {
         for file in created.into_iter().rev() {
-            let _ = file.remove();
+            let _ = file.remove(&root);
         }
     }
     result

@@ -21,14 +21,139 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Component;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use rustix::fs::{openat, renameat_with, unlinkat, AtFlags, Mode, OFlags, RenameFlags, CWD};
+use std::os::fd::AsFd;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
+use rustix::fs::{
+    linkat, openat, renameat_with, unlinkat, AtFlags, Mode, OFlags, RenameFlags, CWD,
+};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use rustix::io::Errno;
+
+/// Path components are pinned with search-only descriptors: walking a path
+/// needs execute permission on each directory, not read permission, and every
+/// `*at` call below accepts such a descriptor.
+#[cfg(target_os = "linux")]
+const DIRECTORY_FLAGS: OFlags = OFlags::PATH
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
-    .union(OFlags::NONBLOCK)
     .union(OFlags::CLOEXEC);
+/// macOS `O_SEARCH` is `O_EXEC | O_DIRECTORY`; rustix has no name for it.
+#[cfg(target_os = "macos")]
+const DIRECTORY_FLAGS: OFlags = OFlags::from_bits_retain(0x4000_0000)
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
+/// How a staged file reaches its final name without overwriting anything.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Publication {
+    /// `renameat2(RENAME_NOREPLACE)`: atomic and create-only where the file
+    /// system supports the flag.
+    RenameNoReplace,
+    /// Link the staged file under its final name, which fails with `EEXIST`
+    /// when the name exists, then drop the staging name.
+    Link,
+    /// Create the final name with `O_CREAT | O_EXCL` under the pinned
+    /// directory and write the bytes again; create-only without staging.
+    CreateExclusive,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Publication {
+    /// The next strategy to try when a file system refuses this one, such as
+    /// the Linux NFS client's `EINVAL` for every rename flag or a provider
+    /// without hard links.
+    fn fallback(self, error: &io::Error) -> Option<Self> {
+        let code = error.raw_os_error();
+        let refused = |candidates: &[Errno]| {
+            candidates
+                .iter()
+                .any(|candidate| code == Some(candidate.raw_os_error()))
+        };
+        match self {
+            Self::RenameNoReplace
+                if refused(&[Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP]) =>
+            {
+                Some(Self::Link)
+            }
+            Self::Link
+                if refused(&[
+                    Errno::INVAL,
+                    Errno::NOSYS,
+                    Errno::NOTSUP,
+                    Errno::OPNOTSUPP,
+                    Errno::PERM,
+                    Errno::XDEV,
+                    Errno::MLINK,
+                ]) =>
+            {
+                Some(Self::CreateExclusive)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Publish the staged file `staging` under `name` in the pinned `directory`,
+/// never replacing an existing name; `bytes` are the staged contents, needed
+/// only by the last fallback. Returns the strategy that succeeded.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_staged(
+    directory: &File,
+    staging: &str,
+    name: &OsStr,
+    bytes: &[u8],
+    first: Publication,
+) -> io::Result<Publication> {
+    let mut strategy = first;
+    loop {
+        let attempt = match strategy {
+            Publication::RenameNoReplace => renameat_with(
+                directory.as_fd(),
+                staging,
+                directory.as_fd(),
+                name,
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(io::Error::from),
+            Publication::Link => linkat(
+                directory.as_fd(),
+                staging,
+                directory.as_fd(),
+                name,
+                AtFlags::empty(),
+            )
+            .map_err(io::Error::from)
+            .map(|()| {
+                let _ = unlinkat(directory, staging, AtFlags::empty());
+            }),
+            Publication::CreateExclusive => create_exclusive(directory, name, bytes).map(|()| {
+                let _ = unlinkat(directory, staging, AtFlags::empty());
+            }),
+        };
+        match attempt {
+            Ok(()) => return Ok(strategy),
+            Err(error) => match strategy.fallback(&error) {
+                Some(next) => strategy = next,
+                None => return Err(error),
+            },
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn create_exclusive(directory: &File, name: &OsStr, bytes: &[u8]) -> io::Result<()> {
+    let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let descriptor = openat(directory, name, flags, Mode::from_raw_mode(0o666))?;
+    let mut file = File::from(descriptor);
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = unlinkat(directory, name, AtFlags::empty());
+        return Err(error);
+    }
+    Ok(())
+}
 
 #[cfg(target_os = "macos")]
 fn physical_system_alias(path: &Path) -> PathBuf {
@@ -217,11 +342,12 @@ fn write_materialized_file_with_hook(
     getrandom::fill(&mut nonce)
         .map_err(|error| format!("cannot name a materialize staging file: {error}"))?;
     let staging_name = format!(".nokv-materialize-{:032x}.tmp", u128::from_le_bytes(nonce));
+    // The process umask applies, as `File::create` would.
     let descriptor = openat(
         &directory,
         staging_name.as_str(),
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o600),
+        Mode::from_raw_mode(0o666),
     )
     .map_err(|error| {
         format!(
@@ -238,12 +364,13 @@ fn write_materialized_file_with_hook(
             destination.display()
         ));
     }
-    if let Err(error) = renameat_with(
+    let directory = File::from(directory);
+    if let Err(error) = publish_staged(
         &directory,
         staging_name.as_str(),
-        &directory,
         name,
-        RenameFlags::NOREPLACE,
+        bytes,
+        Publication::RenameNoReplace,
     ) {
         let _ = unlinkat(&directory, staging_name.as_str(), AtFlags::empty());
         return Err(format!(
@@ -251,7 +378,6 @@ fn write_materialized_file_with_hook(
             destination.display()
         ));
     }
-    let directory = File::from(directory);
     let still_named = open_parent_directory(destination)
         .and_then(|(observed, _)| {
             let expected = directory.metadata()?;
@@ -464,6 +590,100 @@ mod tests {
         assert!(error.contains("parent changed"));
         assert!(!moved.join("artifact.bin").exists());
         assert!(!other.join("artifact.bin").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn publication_fallbacks_stay_create_only() {
+        for strategy in [Publication::Link, Publication::CreateExclusive] {
+            let (_temporary, root) = physical_tempdir();
+            let handle = File::open(&root).unwrap();
+            fs::write(root.join(".staging"), b"first").unwrap();
+            let used = publish_staged(
+                &handle,
+                ".staging",
+                OsStr::new("out.bin"),
+                b"first",
+                strategy,
+            )
+            .unwrap();
+            assert_eq!(used, strategy);
+            assert_eq!(fs::read(root.join("out.bin")).unwrap(), b"first");
+            assert!(
+                !root.join(".staging").exists(),
+                "{strategy:?} must drop the staging name"
+            );
+
+            fs::write(root.join(".staging"), b"second").unwrap();
+            let error = publish_staged(
+                &handle,
+                ".staging",
+                OsStr::new("out.bin"),
+                b"second",
+                strategy,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists,
+                "{strategy:?}: {error}"
+            );
+            assert_eq!(fs::read(root.join("out.bin")).unwrap(), b"first");
+        }
+        let refused = io::Error::from_raw_os_error(Errno::INVAL.raw_os_error());
+        assert_eq!(
+            Publication::RenameNoReplace.fallback(&refused),
+            Some(Publication::Link)
+        );
+        assert_eq!(
+            Publication::Link.fallback(&refused),
+            Some(Publication::CreateExclusive)
+        );
+        assert_eq!(Publication::CreateExclusive.fallback(&refused), None);
+        let exists = io::Error::from_raw_os_error(Errno::EXIST.raw_os_error());
+        assert_eq!(Publication::RenameNoReplace.fallback(&exists), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn materialized_files_follow_the_process_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temporary, root) = physical_tempdir();
+        fs::write(root.join("control.bin"), b"control").unwrap();
+        write_materialized_file(&root.join("output.bin"), b"payload").unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&root.join("output.bin")),
+            mode(&root.join("control.bin"))
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn search_only_ancestors_are_enough_to_collect_and_materialize() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temporary, root) = physical_tempdir();
+        let ancestor = root.join("ancestor");
+        fs::create_dir_all(ancestor.join("leaf")).unwrap();
+        fs::write(ancestor.join("leaf/source.bin"), b"source").unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o311)).unwrap();
+        if fs::read_dir(&ancestor).is_ok() {
+            // Running with privileges that ignore the mode: nothing to prove.
+            fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        assert_eq!(
+            read_collect_source(&ancestor.join("leaf/source.bin"), 1024).unwrap(),
+            b"source"
+        );
+        write_materialized_file(&ancestor.join("leaf/output.bin"), b"output").unwrap();
+        assert_eq!(
+            fs::read(ancestor.join("leaf/output.bin")).unwrap(),
+            b"output"
+        );
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
