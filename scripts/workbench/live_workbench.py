@@ -28,11 +28,13 @@ from typing import Any, Iterable
 
 from cli_contract import (
     Call,
+    Contract,
     ContractFailure,
     NotQualified as ContractTablesMissing,
     contract_failure,
     contract_success,
-    contract_tables,
+    owner_serves,
+    published_contract,
 )
 from source_bound_producer import ProducerError, ScenarioContract
 from typed_live_qualification import (
@@ -212,10 +214,6 @@ class ToolStep:
     error_code: str | None = None
     error_class: str | None = None
     error_next_action: str | None = None
-
-
-# The published exit codes by class and the published next actions.
-Contract = tuple[dict[str, int], set[str]]
 
 
 def canonical_json(value: Any) -> str:
@@ -870,7 +868,7 @@ def completed_process(
 
 def load_contract(config: Config) -> Contract:
     try:
-        return contract_tables((config.repo / "docs" / "cli-contract.md").read_text())
+        return published_contract(config.repo)
     except (OSError, ContractTablesMissing) as error:
         raise NotQualified(f"CLI contract tables are unavailable: {error}") from error
 
@@ -1412,12 +1410,7 @@ def wait_owner_ready(
             config,
         )
         call = Call("owner-ready", probe.returncode, probe.stdout, probe.stderr)
-        try:
-            envelope = contract_failure(call, exits, actions, "not_found", "resubmit_same")
-        except ContractFailure:
-            time.sleep(0.25)
-            continue
-        if envelope.get("code") == "NotFound":
+        if owner_serves(call, exits, actions):
             return
         time.sleep(0.25)
     raise WorkflowFailure("serve did not become ready for metadata reads")

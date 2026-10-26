@@ -14,7 +14,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from pathlib import Path
 from typing import Any
+
+# The published exit codes by class and the published next actions.
+Contract = tuple[dict[str, int], set[str]]
 
 
 class ContractFailure(Exception):
@@ -52,6 +56,11 @@ def contract_tables(document: str) -> tuple[dict[str, int], set[str]]:
     if not exits or not actions:
         raise NotQualified("docs/cli-contract.md publishes no contract tables")
     return exits, actions
+
+
+def published_contract(repository: Path) -> Contract:
+    """The contract tables of the repository's docs/cli-contract.md."""
+    return contract_tables((repository / "docs" / "cli-contract.md").read_text())
 
 
 @dataclasses.dataclass
@@ -111,3 +120,13 @@ def contract_failure(call: Call, exits: dict[str, int], actions: set[str], klass
         [call.exit, exits[klass]],
     )
     return envelope
+
+
+def owner_serves(call: Call, exits: dict[str, int], actions: set[str]) -> bool:
+    """An `operation status` probe of an unknown id shows that the owner serves
+    metadata reads once it answers not_found rather than a transport failure."""
+    try:
+        envelope = contract_failure(call, exits, actions, "not_found", "resubmit_same")
+    except ContractFailure:
+        return False
+    return envelope.get("code") == "NotFound"
