@@ -43,9 +43,10 @@ The checked-in integration assets are deliberately small:
 - `object_namespace_recovery_gate.py` owns an isolated real etcd member and a
   digest-pinned RustFS container. It records deterministic PhyMat evidence,
   kills and reopens the owner, rejects a healthy wrong prefix, and proves the
-  retryable outage/recovery contract over one long-lived MCP process. The
-  outage read targets a body above the 16 KiB inline bound, because an inline
-  body is served from shard metadata without the object store.
+  retryable outage/recovery contract through `nokv workbench <tool>` calls
+  graded against `docs/cli-contract.md`. The outage read targets a body above
+  the 16 KiB inline bound, because an inline body is served from shard
+  metadata without the object store.
 - `object_namespace_recovery_gate_test.py` freezes those terminal assertions
   and the independent GitHub Actions evidence-upload contract.
 - `restore_composition_gate.py` carries the exact externally observable
@@ -264,10 +265,13 @@ of the fixture values. The gate requires all of the following:
 2. structure and relaxation bytes remain exact after the restart;
 3. a second healthy RustFS prefix has its own marker and is rejected before
    changing workspace metadata, the first root's control record, or payloads;
-4. a live MCP read during a RustFS outage exhausts the configured attempts as
-   redacted `ObjectUnavailable` with `retryable: true`;
+4. a native CLI read during a RustFS outage fails closed at the command's
+   object-namespace fence as redacted `ObjectProviderFailed`, written as one
+   stderr JSON line of class `transient` with `next_action: resubmit_same`
+   and the exit code of that class;
 5. the same logical read succeeds with exact PhyMat evidence after RustFS is
-   restarted.
+   restarted. `cli-transcript.jsonl` retains every Workbench tool call with
+   its transport-independent request digest.
 
 GitHub Actions runs this as the separate `object-namespace-recovery` job and
 uploads its complete evidence directory even on failure.

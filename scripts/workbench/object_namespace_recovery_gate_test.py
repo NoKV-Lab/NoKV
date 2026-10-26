@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+from cli_contract import contract_failure, contract_tables
 from object_namespace_recovery_gate import (
     INLINE_ARTIFACT_BODY_MAX_BYTES,
     PINNED_RUSTFS_IMAGE,
@@ -22,9 +24,12 @@ from object_namespace_recovery_gate import (
     control_args,
     execute,
     fixed_id,
+    graded,
+    logical_request_digest,
     parse_args,
     phymat_documents,
     run,
+    run_workbench_tool,
     rustfs_container_command,
     server_command,
     validate_gate_evidence,
@@ -62,11 +67,14 @@ def valid_evidence() -> dict[str, object]:
         "outage": {
             "error": {
                 "status": "error",
-                "code": "ObjectUnavailable",
-                "retryable": True,
-                "details": {"attempts": 3, "source": "nokv-client"},
-                "message": "workspace request exhausted 3 attempts: artifact object backend is unavailable",
+                "code": "ObjectProviderFailed",
+                "retryable": False,
+                "details": {},
+                "message": "artifact object backend is unavailable",
+                "class": "transient",
+                "next_action": "resubmit_same",
             },
+            "exit_code": 5,
             "failed_request_digest": "22" * 32,
             "recovered_request_digest": "22" * 32,
             "recovered": relaxation,
@@ -287,11 +295,76 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
     def test_valid_evidence_covers_namespace_restart_outage_and_phymat(self) -> None:
         validate_gate_evidence(valid_evidence())
 
-    def test_retryable_false_is_a_release_failure(self) -> None:
+    def test_outage_read_must_fail_under_the_cli_contract(self) -> None:
+        for field, value, claim in (
+            ("code", "ObjectUnavailable", "ObjectProviderFailed"),
+            ("class", "outcome_unknown", "transient"),
+            ("next_action", "query_same", "resubmit_same"),
+        ):
+            evidence = valid_evidence()
+            evidence["outage"]["error"][field] = value  # type: ignore[index]
+            with self.subTest(field=field), self.assertRaisesRegex(
+                WorkflowFailure, claim
+            ):
+                validate_gate_evidence(evidence)
         evidence = valid_evidence()
-        evidence["outage"]["error"]["retryable"] = False  # type: ignore[index]
-        with self.assertRaisesRegex(WorkflowFailure, "retryable"):
+        evidence["outage"]["exit_code"] = 0  # type: ignore[index]
+        with self.assertRaisesRegex(WorkflowFailure, "failure code"):
             validate_gate_evidence(evidence)
+
+    def test_outage_read_is_graded_from_the_cli_failure_line(self) -> None:
+        exits, actions = contract_tables((REPO / "docs" / "cli-contract.md").read_text())
+        envelope = valid_evidence()["outage"]["error"]  # type: ignore[index]
+        arguments = {"id": "phymat-campaign", "section": "outputs", "path": "r.json"}
+
+        def completed(returncode: int) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(
+                ["nokv"], returncode, "", json.dumps(envelope) + "\n"
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = Evidence(Path(temporary) / "evidence")
+            evidence.prepare()
+            with mock.patch(
+                "object_namespace_recovery_gate.run",
+                side_effect=[completed(exits["transient"]), completed(1)],
+            ):
+                call = run_workbench_tool(
+                    ["nokv"], "workbench_read", arguments, REPO, 5, evidence, "outage"
+                )
+                graded_envelope = graded(
+                    contract_failure, call, exits, actions, "transient", "resubmit_same"
+                )
+                wrong_exit = run_workbench_tool(
+                    ["nokv"], "workbench_read", arguments, REPO, 5, evidence, "outage"
+                )
+                with self.assertRaisesRegex(WorkflowFailure, "exits with the code"):
+                    graded(
+                        contract_failure,
+                        wrong_exit,
+                        exits,
+                        actions,
+                        "transient",
+                        "resubmit_same",
+                    )
+            transcript = [
+                json.loads(line)
+                for line in (evidence.root / "cli-transcript.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+        self.assertEqual(graded_envelope, envelope)
+        self.assertEqual([entry["exit"] for entry in transcript], [exits["transient"], 1])
+        self.assertEqual(
+            {entry["request_digest"] for entry in transcript},
+            {logical_request_digest("workbench_read", arguments)},
+        )
+
+    def test_gate_drives_the_product_through_the_native_cli_only(self) -> None:
+        source = (REPO / "scripts/workbench/object_namespace_recovery_gate.py").read_text()
+        for sidecar in ('"mcp"', "nokv mcp", "jsonrpc", "tools/call"):
+            with self.subTest(sidecar=sidecar):
+                self.assertNotIn(sidecar, source)
 
     def test_provider_identity_must_not_leak_in_public_error(self) -> None:
         evidence = valid_evidence()

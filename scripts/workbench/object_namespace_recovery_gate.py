@@ -4,8 +4,11 @@
 The gate owns an isolated etcd member and a digest-pinned RustFS container. It
 records a small PhyMat campaign, kills the metadata owner, reopens the same Holt
 directory, rejects a healthy but different object prefix before metadata or
-control mutation, and proves that an in-flight RustFS outage is reported as a
-redacted retryable error before the same logical read succeeds after recovery.
+control mutation, and proves that a RustFS outage fails the same logical read
+closed as a redacted transient failure before that read succeeds after
+recovery. Every Workbench request goes through the native `nokv workbench
+<tool>` CLI, and the outage read is graded against the CLI contract in
+docs/cli-contract.md.
 """
 
 from __future__ import annotations
@@ -16,7 +19,6 @@ import hashlib
 import json
 import os
 import platform
-import selectors
 import shutil
 import signal
 import socket
@@ -24,8 +26,15 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Sequence, TextIO
+from typing import Any, Callable, Sequence, TextIO
 
+from cli_contract import (
+    Call,
+    ContractFailure,
+    contract_failure,
+    contract_success,
+    contract_tables,
+)
 from source_bound_producer import ProducerError, ScenarioContract
 from typed_live_qualification import (
     gap_record,
@@ -34,7 +43,6 @@ from typed_live_qualification import (
 )
 
 SCHEMA = "nokv.object_namespace_recovery_gate.v1"
-PROTOCOL_VERSION = "2025-11-25"
 PINNED_RUSTFS_IMAGE = (
     "rustfs/rustfs@sha256:"
     "e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
@@ -230,11 +238,20 @@ def validate_gate_evidence(evidence: dict[str, object]) -> None:
 
     outage = _mapping(evidence, "outage")
     error = _mapping(outage, "error")
-    if error.get("code") != "ObjectUnavailable" or error.get("retryable") is not True:
-        raise WorkflowFailure("RustFS outage must be ObjectUnavailable and retryable")
-    details = _mapping(error, "details")
-    if not isinstance(details.get("attempts"), int) or details.get("attempts", 0) < 1:
-        raise WorkflowFailure("retryable outage lacks a positive attempt count")
+    # Every CLI command fences the configured object namespace against the
+    # durable marker before its first request, so a provider outage fails the
+    # command at that fence. docs/cli-contract.md classes the failure as
+    # transient (a read never reports an unknown outcome) and the caller
+    # resubmits the same command once the provider is back.
+    if error.get("code") != "ObjectProviderFailed":
+        raise WorkflowFailure("RustFS outage must fail the read as ObjectProviderFailed")
+    if error.get("class") != "transient" or error.get("next_action") != "resubmit_same":
+        raise WorkflowFailure(
+            "RustFS outage read must fail as transient with resubmit_same"
+        )
+    exit_code = outage.get("exit_code")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool) or exit_code <= 0:
+        raise WorkflowFailure("RustFS outage read must exit with a failure code")
     rendered_error = canonical_json(error).lower()
     if any(token in rendered_error for token in PHYSICAL_ERROR_TOKENS):
         raise WorkflowFailure("public error leaked physical object identity")
@@ -660,6 +677,57 @@ def server_command(
     ]
 
 
+def logical_request_digest(tool: str, arguments: dict[str, Any]) -> str:
+    """The identity of one Workbench request independent of its transport:
+    the tool and its canonical arguments."""
+    return digest(canonical_json({"name": tool, "arguments": arguments}).encode())
+
+
+def run_workbench_tool(
+    client: list[str],
+    tool: str,
+    arguments: dict[str, Any],
+    repo: Path,
+    timeout: float,
+    evidence: Evidence,
+    label: str,
+) -> Call:
+    """Run one Workbench tool through `nokv workbench` and record the call in
+    the CLI transcript, whatever its exit code."""
+    result = run(
+        [*client, "workbench", tool, canonical_json(arguments)],
+        cwd=repo,
+        timeout=timeout,
+        check=False,
+        evidence=evidence,
+        label=label,
+    )
+    evidence.line(
+        "cli-transcript.jsonl",
+        {
+            "schema": SCHEMA,
+            "label": label,
+            "tool": tool,
+            "arguments": arguments,
+            "request_digest": logical_request_digest(tool, arguments),
+            "exit": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "recorded_at": now(),
+        },
+    )
+    return Call(label, result.returncode, result.stdout, result.stderr)
+
+
+def graded(grade: Callable[..., dict[str, Any]], *arguments: Any) -> dict[str, Any]:
+    """Grade a CLI call against the published contract; a violation fails the
+    gate."""
+    try:
+        return grade(*arguments)
+    except ContractFailure as error:
+        raise WorkflowFailure(str(error)) from None
+
+
 def workbench_call(
     client: list[str],
     tool: str,
@@ -669,20 +737,9 @@ def workbench_call(
     evidence: Evidence,
     label: str,
 ) -> dict[str, Any]:
-    result = run(
-        [*client, "workbench", tool, canonical_json(arguments)],
-        cwd=repo,
-        timeout=timeout,
-        evidence=evidence,
-        label=label,
-    )
-    try:
-        decoded = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
-        raise WorkflowFailure(f"{label} returned invalid JSON") from error
-    if not isinstance(decoded, dict) or decoded.get("status") != "success":
-        raise WorkflowFailure(f"{label} did not succeed: {decoded!r}")
-    return decoded
+    """A Workbench tool call that must print one success result."""
+    call = run_workbench_tool(client, tool, arguments, repo, timeout, evidence, label)
+    return graded(contract_success, call)
 
 
 def read_document(result: dict[str, Any], label: str) -> dict[str, Any]:
@@ -696,106 +753,6 @@ def read_document(result: dict[str, Any], label: str) -> dict[str, Any]:
     ):
         raise WorkflowFailure(f"{label} did not return one structured document")
     return items[0]["value"]
-
-
-class McpClient:
-    def __init__(
-        self,
-        process: subprocess.Popen[str],
-        evidence: Evidence,
-        timeout: float,
-    ) -> None:
-        self.process = process
-        self.evidence = evidence
-        self.timeout = timeout
-        self.next_id = 1
-        self.last_call_digest: str | None = None
-
-    def request(
-        self, method: str, params: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        request_id = self.next_id
-        self.next_id += 1
-        request: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
-        if params is not None:
-            request["params"] = params
-        encoded = canonical_json(request)
-        if self.process.stdin is None or self.process.stdout is None:
-            raise WorkflowFailure("MCP pipes are unavailable")
-        self.process.stdin.write(encoded + "\n")
-        self.process.stdin.flush()
-        selector = selectors.DefaultSelector()
-        selector.register(self.process.stdout, selectors.EVENT_READ)
-        try:
-            if not selector.select(self.timeout):
-                raise WorkflowFailure("MCP response timed out")
-            received = self.process.stdout.readline().rstrip("\n")
-        finally:
-            selector.close()
-        if not received:
-            raise WorkflowFailure(
-                f"MCP exited before responding ({self.process.poll()})"
-            )
-        try:
-            response = json.loads(received)
-        except json.JSONDecodeError as error:
-            raise WorkflowFailure(f"MCP returned invalid JSON: {received!r}") from error
-        self.evidence.line(
-            "mcp-transcript.jsonl",
-            {
-                "schema": SCHEMA,
-                "request": request,
-                "response": response,
-                "recorded_at": now(),
-            },
-        )
-        if response.get("jsonrpc") != "2.0" or response.get("id") != request_id:
-            raise WorkflowFailure("MCP response envelope mismatch")
-        return response
-
-    def notify(self, method: str) -> None:
-        if self.process.stdin is None:
-            raise WorkflowFailure("MCP stdin is unavailable")
-        self.process.stdin.write(
-            canonical_json({"jsonrpc": "2.0", "method": method}) + "\n"
-        )
-        self.process.stdin.flush()
-
-    def initialize(self) -> None:
-        response = self.request(
-            "initialize",
-            {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "object-namespace-gate", "version": "1"},
-            },
-        )
-        result = response.get("result")
-        if (
-            not isinstance(result, dict)
-            or result.get("serverInfo", {}).get("name") != "nokv-mcp"
-        ):
-            raise WorkflowFailure("unexpected MCP initialize result")
-        self.notify("notifications/initialized")
-
-    def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        params = {"name": name, "arguments": arguments}
-        self.last_call_digest = digest(canonical_json(params).encode())
-        response = self.request("tools/call", params)
-        result = response.get("result")
-        structured = (
-            result.get("structuredContent") if isinstance(result, dict) else None
-        )
-        if not isinstance(structured, dict):
-            raise WorkflowFailure(f"{name} lacks structuredContent")
-        content = result.get("content")
-        try:
-            text_value = json.loads(content[0]["text"])
-        except (IndexError, KeyError, TypeError, json.JSONDecodeError) as error:
-            raise WorkflowFailure(f"{name} lacks matching JSON text content") from error
-        if text_value != structured:
-            raise WorkflowFailure(f"{name} text and structured results differ")
-        return structured
 
 
 def parse_control_record(raw: str, label: str) -> dict[str, Any]:
@@ -861,6 +818,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         binary = build_binary(repo, target, max(args.timeout, 900.0))
     if not binary.is_file():
         raise NotQualified("built nokv binary is required")
+    exits, actions = contract_tables((repo / "docs" / "cli-contract.md").read_text())
 
     root_id = fixed_id(args.seed, "root")
     agent_id = fixed_id(args.seed, "agent")
@@ -886,11 +844,9 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
     etcd_log = (evidence.root / "etcd.log").open("w", encoding="utf-8")
     owner_log = (evidence.root / "owner-e1.log").open("w", encoding="utf-8")
     retry_log = (evidence.root / "owner-e2.log").open("w", encoding="utf-8")
-    mcp_log = (evidence.root / "mcp.stderr.log").open("w", encoding="utf-8")
     etcd: subprocess.Popen[str] | None = None
     owner: subprocess.Popen[str] | None = None
     retry_owner: subprocess.Popen[str] | None = None
-    mcp_process: subprocess.Popen[str] | None = None
     container_created = False
     volume_created = False
     started_at = now()
@@ -1259,21 +1215,15 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         )
         marker_id = decode_marker(marker_path)
 
-        mcp_process = subprocess.Popen(
-            [*client, "mcp"],
-            cwd=repo,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=mcp_log,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
+        workbench_call(
+            client,
+            "workbench_read",
+            read_arguments,
+            repo,
+            args.timeout,
+            evidence,
+            "outage-baseline-read",
         )
-        mcp = McpClient(mcp_process, evidence, max(args.timeout, 45.0))
-        mcp.initialize()
-        baseline = mcp.call("workbench_read", read_arguments)
-        if baseline.get("status") != "success":
-            raise WorkflowFailure("MCP baseline object read did not succeed")
 
         run(
             [args.docker_bin, "stop", "--timeout", "1", container],
@@ -1282,9 +1232,24 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             evidence=evidence,
             label="stop-rustfs",
         )
-        # The relaxation body is above the inline bound, so this read needs RustFS.
-        outage_error = mcp.call("workbench_read", read_arguments)
-        failed_request_digest = mcp.last_call_digest
+        # The relaxation body is above the inline bound, so this read needs
+        # RustFS. The command fences the object namespace before its first
+        # request and fails there; a read never reports an unknown outcome, so
+        # the failure is transient and the same command is resubmitted once
+        # the provider is back.
+        outage_call = run_workbench_tool(
+            client,
+            "workbench_read",
+            read_arguments,
+            repo,
+            max(args.timeout, 45.0),
+            evidence,
+            "outage-read",
+        )
+        outage_error = graded(
+            contract_failure, outage_call, exits, actions, "transient", "resubmit_same"
+        )
+        failed_request_digest = logical_request_digest("workbench_read", read_arguments)
         run(
             [args.docker_bin, "start", container],
             cwd=repo,
@@ -1301,13 +1266,21 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             docker=Path(args.docker_bin),
             container=container,
         )
-        recovered_result = mcp.call("workbench_read", read_arguments)
-        recovered_request_digest = mcp.last_call_digest
-        if recovered_result.get("status") != "success":
-            raise WorkflowFailure(
-                "same logical read did not recover after RustFS restart"
-            )
-        recovered = read_document(recovered_result, "outage recovery read")
+        recovered = read_document(
+            workbench_call(
+                client,
+                "workbench_read",
+                read_arguments,
+                repo,
+                args.timeout,
+                evidence,
+                "outage-recovered-read",
+            ),
+            "outage recovery read",
+        )
+        recovered_request_digest = logical_request_digest(
+            "workbench_read", read_arguments
+        )
 
         binding_raw = etcd_value(
             Path(args.etcdctl_bin),
@@ -1360,6 +1333,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             },
             "outage": {
                 "error": outage_error,
+                "exit_code": outage_call.exit,
                 "failed_request_digest": failed_request_digest,
                 "recovered_request_digest": recovered_request_digest,
                 "recovered": recovered,
@@ -1374,11 +1348,10 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         validate_gate_evidence(result)
         return result
     finally:
-        stop_process(mcp_process)
         stop_process(retry_owner)
         stop_process(owner)
         stop_process(etcd)
-        for log in (mcp_log, retry_log, owner_log, etcd_log):
+        for log in (retry_log, owner_log, etcd_log):
             log.close()
         if container_created:
             capture_rustfs_log(

@@ -63,6 +63,7 @@ jobs:
             scripts/workbench/object_namespace_recovery_gate.py \
             scripts/workbench/restore_composition_gate.py \
             scripts/workbench/fork_restore_recovery_gate.py \
+            scripts/workbench/cli_contract.py \
             scripts/workbench/cli_contract_gate.py \
             scripts/workbench/rpc_tls_gate.py \
             scripts/workbench/owner_upload_interference_probe.py \
