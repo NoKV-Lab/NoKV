@@ -665,12 +665,8 @@ fn create_materialized_file_with_hook(
         let _ = created.remove();
         return Err(error);
     }
-    created.parent.sync_all().map_err(|error| {
-        format!(
-            "materialized file {} was published but its directory sync failed: {error}",
-            created.path.display()
-        )
-    })?;
+    // These files are disposable scratch. Keep the file sync and atomic
+    // publication without adding a directory durability guarantee.
     Ok(created)
 }
 

@@ -266,12 +266,8 @@ fn write_materialized_file_with_hook(
             destination.display()
         ));
     }
-    directory.sync_all().map_err(|error| {
-        format!(
-            "materialize destination {} was published but its directory sync failed: {error}",
-            destination.display()
-        )
-    })?;
+    // Materialized paths are disposable scratch. The staged file is synced,
+    // while atomic publication does not promise directory durability.
     Ok(reported)
 }
 
