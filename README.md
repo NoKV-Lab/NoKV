@@ -235,8 +235,8 @@ real-service acceptance gate is still **not qualified**.
 | --- | --- | --- |
 | `nokv version --json` | Report the exact NoKV revision, lockfile identity, Holt source/version/checksum, schema, and tool count. | Identity/readback only. |
 | `nokv schema` | Emit the exact 18 normalized Workbench input schemas. | Contract inventory, not a live health check. |
-| `nokv materialize` | Copy a verified workspace artifact to a new local path. | The destination is disposable scratch, not a namespace or mount. |
-| `nokv collect` | Publish one bounded regular local file, create-only or generation-fenced replace. | Symlinks and unbounded/non-regular inputs fail closed. With `--operation-id` it publishes like `workspace-path put`. |
+| `nokv materialize` | Copy a verified workspace artifact to a new local path. | The destination is disposable scratch, not a namespace or mount. Parents are opened without following symlinks; publication is create-only and atomic. |
+| `nokv collect` | Publish one bounded regular local file, create-only or generation-fenced replace. | Symlinks in the file or its parents and unbounded/non-regular inputs fail closed. With `--operation-id` it publishes like `workspace-path put`. |
 | `nokv workspace-path put` | Publish one whole body, create-only or pinned to `--expected-generation`, under a caller `--operation-id`. | A retry with the same id and inputs from any process returns the original receipt; other inputs are an `identity_conflict`. |
 | `nokv workspace-path stat` | Read a path's incarnation, workspace revision, generation, and artifact revision in one metadata read. | Read-only; no object-store connection. |
 | `nokv workspace-path rename` / `nokv workspace-path remove` | Apply an explicit generation- and request-id-fenced path mutation. | Custom CLI surface; not one of the 18 Workbench tools. |
