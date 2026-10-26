@@ -306,9 +306,11 @@ Complete steps under request identities derived from its own, so replay and
 token rules are unchanged; a larger plan, or a resumed one, uses the stepwise
 requests. Every block travels in its own UploadArtifactObject request of at
 most one block size: the owner checks its length and digest against the staged
-record, writes it, and records the upload in the same durable step, so a
-retried upload replays and a resumed publication continues from the owner's
-upload cursor without sending a recorded block again.
+record in one short write session, writes it to the provider with no metadata
+lock held, and records the upload in a second session, so other requests of
+the shard never wait for a provider round trip, a retried upload replays, and
+a resumed publication continues from the owner's upload cursor without sending
+a recorded block again.
 
 Failed uploads never become visible. Response loss after commit returns the
 same result on retry. Generic random writes are absent; append is immutable
