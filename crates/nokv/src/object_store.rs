@@ -32,7 +32,7 @@ enum CliObjectStoreInner {
 pub struct CliObjectStore {
     inner: CliObjectStoreInner,
     namespace_id: Option<ObjectNamespaceId>,
-    admission: Arc<OnceLock<ProviderAdmissionReceipt>>,
+    /// The owner's write admission; an Agent process never records one.
     append_admission: Arc<OnceLock<ProviderAdmissionReceipt>>,
     admission_probe: Arc<Mutex<()>>,
 }
@@ -84,7 +84,6 @@ impl CliObjectStore {
             return Ok(Self {
                 inner: CliObjectStoreInner::S3(durable),
                 namespace_id: None,
-                admission: Arc::new(OnceLock::new()),
                 append_admission: Arc::new(OnceLock::new()),
                 admission_probe: Arc::new(Mutex::new(())),
             });
@@ -98,22 +97,13 @@ impl CliObjectStore {
                 TieredArtifactStoreOptions::default(),
             )),
             namespace_id: None,
-            admission: Arc::new(OnceLock::new()),
             append_admission: Arc::new(OnceLock::new()),
             admission_probe: Arc::new(Mutex::new(())),
         })
     }
 
-    /// Verify the immutable single-put semantics every Agent object write
-    /// requires.
-    pub fn validate_agent_capabilities(&self) -> Result<(), ProviderAdmissionError> {
-        self.cache_admission(&self.admission, |store| {
-            let profile = ProviderAdmissionProfile::single_put(DEFAULT_ARTIFACT_BLOCK_SIZE)?;
-            admit_artifact_provider(store, profile)
-        })
-    }
-
-    /// Prove monotonic sealing before admitting stable append uploads.
+    /// Prove the single-put and monotonic-sealing semantics the owner's
+    /// object writes need: the one admission `serve` and `provision` run.
     pub fn validate_append_capabilities(&self) -> Result<(), ProviderAdmissionError> {
         self.cache_admission(&self.append_admission, |store| {
             let profile = ProviderAdmissionProfile::single_put(DEFAULT_ARTIFACT_BLOCK_SIZE)?
@@ -192,18 +182,7 @@ impl ArtifactObjectStore for CliObjectStore {
     }
 
     fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
-        self.append_admission.get().or_else(|| self.admission.get())
-    }
-
-    /// Admit the provider once, before the first object write of this process
-    /// or session; a command that writes no objects never probes it.
-    fn admit_object_writes(&self) -> Result<&ProviderAdmissionReceipt, ObjectError> {
-        if self.provider_admission_receipt().is_none() {
-            self.validate_agent_capabilities()
-                .map_err(ObjectError::ProviderAdmissionFailed)?;
-        }
-        self.provider_admission_receipt()
-            .ok_or(ObjectError::ProviderAdmissionRequired)
+        self.append_admission.get()
     }
 
     fn create_immutable(
@@ -318,7 +297,7 @@ mod tests {
 
         for _ in 0..2 {
             let error = store
-                .cache_admission(&store.admission, |_| {
+                .cache_admission(&store.append_admission, |_| {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Err(ProviderAdmissionError::Inconclusive)
                 })
@@ -330,13 +309,10 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_deferred_admission_is_typed_and_keeps_no_receipt() {
+    fn a_refusing_provider_fails_the_owner_admission_typed_and_keeps_no_receipt() {
         let store = CliObjectStore::build(&refused_provider_config()).unwrap();
         for _ in 0..2 {
-            let Err(ObjectError::ProviderAdmissionFailed(cause)) = store.admit_object_writes()
-            else {
-                panic!("an unreachable provider admitted object writes");
-            };
+            let cause = store.validate_append_capabilities().unwrap_err();
             assert_eq!(cause.class(), ErrorClass::Transient);
             assert!(store.provider_admission_receipt().is_none());
         }

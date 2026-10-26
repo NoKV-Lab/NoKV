@@ -6,10 +6,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use nokv_object::{
-    plan_artifact_upload, read_artifact_window, upload_artifact_from_plan, verify_artifact_bytes,
-    ArtifactBlock, ArtifactBlockCache, ArtifactKeyspace, ArtifactManifest, ArtifactObjectStore,
-    ArtifactReadStats, ArtifactReadWindow, ArtifactUploadOptions, ArtifactUploadPlan,
-    ArtifactUploadStats, ObjectError, ObjectKey, DEFAULT_ARTIFACT_BLOCK_SIZE,
+    plan_artifact_upload, read_artifact_window, verify_artifact_bytes, ArtifactBlock,
+    ArtifactBlockCache, ArtifactKeyspace, ArtifactManifest, ArtifactObjectStore, ArtifactReadStats,
+    ArtifactReadWindow, ArtifactUploadOptions, ArtifactUploadPlan, ObjectError, ObjectKey,
+    DEFAULT_ARTIFACT_BLOCK_SIZE,
 };
 use nokv_protocol::{
     inline_artifact_body_digest, parse_sha256_digest_uri, seal_artifact_publish_plan,
@@ -17,15 +17,15 @@ use nokv_protocol::{
     ArtifactDescriptor, ArtifactManifestRow, ArtifactRevisionIdentity, BeginArtifactPublishRequest,
     ByteRange, CompleteArtifactPublishRequest, ContentType, Digest, ErrorCode, FieldValue,
     FinishArtifactPublishRequest, GetOperationRequest, GetPathRequest, LogicalShardIdentity,
-    MarkArtifactObjectsUploadedRequest, ObjectIdentity, ObjectUploadProof, OperationIdentity,
-    OperationKind, OperationResult, OperationState, OperationStatus, OperationToken, PageRequest,
-    PathMetadata, PathReadResult, PrepareArtifactPublishRequest, PublicationAuthority,
-    PublishCondition, PublishInlineArtifactRequest, PublishResult,
-    ReadRestoreSourceRunManifestRequest, RootRoute, StageArtifactManifestRequest,
-    StageArtifactObjectsRequest, StagedObject, WorkspaceIdentity, WorkspacePath, WorkspaceReadView,
+    ObjectIdentity, OperationIdentity, OperationKind, OperationResult, OperationState,
+    OperationStatus, OperationToken, PageRequest, PathMetadata, PathReadResult,
+    PrepareArtifactPublishRequest, PublicationAuthority, PublishCondition,
+    PublishInlineArtifactRequest, PublishResult, ReadRestoreSourceRunManifestRequest, RootRoute,
+    StageArtifactManifestRequest, StageArtifactObjectsRequest, StagedObject,
+    UploadArtifactObjectRequest, WorkspaceIdentity, WorkspacePath, WorkspaceReadView,
     WorkspaceRequest, WorkspaceResult, MAX_ARTIFACT_DEPENDENCY_DEPTH,
     MAX_ARTIFACT_DEPENDENCY_OWNERS, MAX_ARTIFACT_PUBLISH_BATCH_ROWS, MAX_ARTIFACT_READ_PLAN_ROWS,
-    MAX_INLINE_ARTIFACT_BODY_BYTES,
+    MAX_ARTIFACT_UPLOAD_BODY_BYTES, MAX_INLINE_ARTIFACT_BODY_BYTES,
 };
 use nokv_types::{ArtifactRevisionId, LogicalShardId, RootId};
 use sha2::{Digest as _, Sha256};
@@ -127,6 +127,14 @@ impl ArtifactPublishOptions {
 pub struct ArtifactPublishOutcome {
     pub publication: ClientCall<PublishResult>,
     pub upload_stats: ArtifactUploadStats,
+}
+
+/// Object blocks this client sent to the owner for one publication, counting
+/// every block sent whether or not its acknowledgement arrived.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ArtifactUploadStats {
+    pub blocks: u64,
+    pub bytes: u64,
 }
 
 /// Caller-owned identity seed and policy for one logical append.
@@ -315,7 +323,6 @@ where
                 bytes,
             );
         }
-        require_provider_admission(store, options.block_size)?;
 
         let route = self.resolve_artifact_route()?;
         require_object_namespace(store, route)?;
@@ -347,7 +354,6 @@ where
             index_fields: options.index_fields.clone(),
         };
         self.publish_artifact_plan(
-            store,
             logical_shard,
             options.operation_id,
             options.artifact_revision_id,
@@ -544,7 +550,6 @@ where
     #[allow(clippy::too_many_arguments)]
     fn publish_artifact_plan(
         &self,
-        store: &dyn ArtifactObjectStore,
         logical_shard: LogicalShardIdentity,
         operation_id: OperationIdentity,
         artifact_revision_id: ArtifactRevisionIdentity,
@@ -561,11 +566,10 @@ where
         descriptor: ArtifactDescriptor,
         bytes: &[u8],
     ) -> Result<ArtifactPublishOutcome, ClientError> {
-        require_provider_admission(store, object_plan.block_size)?;
+        require_uploadable_block_size(object_plan.block_size)?;
         let mut upload_stats = ArtifactUploadStats::default();
         for attempt in 1..=self.max_attempts() {
             match self.publish_artifact_plan_once(
-                store,
                 logical_shard,
                 operation_id,
                 artifact_revision_id,
@@ -604,7 +608,6 @@ where
     #[allow(clippy::too_many_arguments)]
     fn publish_artifact_plan_once(
         &self,
-        store: &dyn ArtifactObjectStore,
         logical_shard: LogicalShardIdentity,
         operation_id: OperationIdentity,
         artifact_revision_id: ArtifactRevisionIdentity,
@@ -799,32 +802,59 @@ where
             }
         }
 
-        if resume.uploaded_object_cursor == 0 {
-            let upload = match upload_artifact_from_plan(store, object_plan, bytes) {
-                Ok(upload) => upload,
+        // Every object the owner has not recorded yet travels in one request
+        // of its own: the owner verifies it against the staged record, writes
+        // it to the object store, and records the upload under one durable
+        // acknowledgement. The client never holds object write credentials.
+        for block in object_plan
+            .manifest
+            .blocks
+            .iter()
+            .skip(resume.uploaded_object_cursor)
+        {
+            let request = match planned_block_upload(token, block, bytes) {
+                Ok(request) => request,
+                Err(source) => {
+                    return Err(fail(
+                        Some(token),
+                        ArtifactPublishStage::UploadObjects,
+                        source,
+                    ));
+                }
+            };
+            upload_stats.blocks = upload_stats.blocks.saturating_add(1);
+            upload_stats.bytes = upload_stats.bytes.saturating_add(block.len);
+            match self.publish_status_on_shard(
+                logical_shard,
+                WorkspaceRequest::UploadArtifactObject(request),
+            ) {
+                Ok(status) => match running_publish_token(status.value, operation_id) {
+                    Ok(next_token) => token = next_token,
+                    Err(source) => {
+                        return Err(fail(
+                            Some(token),
+                            ArtifactPublishStage::UploadObjects,
+                            source,
+                        ));
+                    }
+                },
                 Err(source) => {
                     return Err(fail_or_resume(
                         token,
                         ArtifactPublishStage::UploadObjects,
-                        ClientError::ArtifactUpload(Box::new(source)),
-                    ));
+                        source,
+                    ))
                 }
-            };
-            accumulate_upload_stats(upload_stats, upload.stats);
+            }
         }
 
-        let upload_proofs = upload_proofs(staged_objects);
-        let remaining_proofs = &upload_proofs[resume.uploaded_object_cursor..];
         let remaining_rows = &manifest_rows[resume.manifest_cursor..];
-        let (final_stage, final_result) = if remaining_proofs.len()
-            <= MAX_ARTIFACT_PUBLISH_BATCH_ROWS
-            && remaining_rows.len() <= MAX_ARTIFACT_PUBLISH_BATCH_ROWS
+        let (final_stage, final_result) = if remaining_rows.len() <= MAX_ARTIFACT_PUBLISH_BATCH_ROWS
         {
-            // The remaining upload proofs, the manifest, and the completion
-            // share one durable acknowledgement.
+            // The manifest and the completion share one durable
+            // acknowledgement.
             let finish = FinishArtifactPublishRequest {
                 token,
-                uploaded_objects: remaining_proofs.to_vec(),
                 manifest_rows: remaining_rows.to_vec(),
                 dependency_owner_revision_ids: dependencies.to_vec(),
                 artifact: descriptor.clone(),
@@ -838,35 +868,6 @@ where
                 ),
             )
         } else {
-            for batch in remaining_proofs.chunks(MAX_ARTIFACT_PUBLISH_BATCH_ROWS) {
-                let request = MarkArtifactObjectsUploadedRequest {
-                    token,
-                    objects: batch.to_vec(),
-                };
-                match self.publish_status_on_shard(
-                    logical_shard,
-                    WorkspaceRequest::MarkArtifactObjectsUploaded(request),
-                ) {
-                    Ok(status) => match running_publish_token(status.value, operation_id) {
-                        Ok(next_token) => token = next_token,
-                        Err(source) => {
-                            return Err(fail(
-                                Some(token),
-                                ArtifactPublishStage::MarkObjectsUploaded,
-                                source,
-                            ));
-                        }
-                    },
-                    Err(source) => {
-                        return Err(fail_or_resume(
-                            token,
-                            ArtifactPublishStage::MarkObjectsUploaded,
-                            source,
-                        ))
-                    }
-                }
-            }
-
             for batch in remaining_rows.chunks(MAX_ARTIFACT_PUBLISH_BATCH_ROWS) {
                 let request = StageArtifactManifestRequest {
                     token,
@@ -947,7 +948,6 @@ where
         options: ArtifactAppendOptions,
         delta: &[u8],
     ) -> Result<ArtifactAppendOutcome, ClientError> {
-        require_provider_admission(store, options.block_size)?;
         for attempt in 0..self.max_attempts() {
             let (operation_id, artifact_revision_id) = append_attempt_identities(
                 options.operation_id,
@@ -993,14 +993,6 @@ where
         append_intent_digest: Option<Digest>,
         append_attempt: Option<AppendAttemptBinding>,
     ) -> Result<ArtifactAppendOutcome, ClientError> {
-        require_provider_admission(store, options.block_size)?;
-        if append_attempt.is_some()
-            && !store
-                .provider_admission_receipt()
-                .is_some_and(|receipt| receipt.admits_append_store(store, options.block_size))
-        {
-            return Err(ObjectError::ProviderAdmissionRequired.into());
-        }
         let route = self.resolve_artifact_route()?;
         require_object_namespace(store, route)?;
         let logical_shard = route.logical_shard_id;
@@ -1133,7 +1125,6 @@ where
                     )?;
                     if let Some(base) = loaded.inline_body {
                         return self.append_to_inline_base(
-                            store,
                             options,
                             logical_shard,
                             operation_id,
@@ -1257,7 +1248,6 @@ where
         let upload_bytes = owned_body.as_deref().unwrap_or(delta);
         let published_rows = manifest_rows.clone();
         let outcome = self.publish_artifact_plan(
-            store,
             logical_shard,
             operation_id,
             artifact_revision_id,
@@ -1291,7 +1281,6 @@ where
     #[allow(clippy::too_many_arguments)]
     fn append_to_inline_base(
         &self,
-        store: &dyn ArtifactObjectStore,
         options: &ArtifactAppendOptions,
         logical_shard: LogicalShardIdentity,
         operation_id: OperationIdentity,
@@ -1367,7 +1356,6 @@ where
         body_digest.update(&body);
         let published_rows = manifest_rows.clone();
         let outcome = self.publish_artifact_plan(
-            store,
             logical_shard,
             operation_id,
             artifact_revision_id,
@@ -2843,30 +2831,43 @@ fn require_object_namespace(
     }
 }
 
-fn require_provider_admission(
-    store: &dyn ArtifactObjectStore,
-    block_size: usize,
-) -> Result<(), ClientError> {
-    // Keep zero-size validation owned by the upload planner. Every positive
-    // block must fit the endpoint payload actually exercised by admission.
-    if block_size == 0 {
-        return Ok(());
-    }
-    let receipt = store.admit_object_writes()?;
-    if !receipt.is_bound_to_store(store) {
-        return Err(ObjectError::ProviderAdmissionRequired.into());
-    }
-    if block_size > receipt.max_verified_object_bytes() {
-        return Err(ObjectError::ProviderAdmissionBlockSizeExceeded {
-            requested: block_size,
-            admitted: receipt.max_verified_object_bytes(),
-        }
-        .into());
-    }
-    if !receipt.admits_store(store, block_size) {
-        return Err(ObjectError::ProviderAdmissionRequired.into());
+/// Every object of a plan travels to the owner in one request, so a block
+/// must fit the body one upload carries. Zero-size validation stays with the
+/// upload planner.
+fn require_uploadable_block_size(block_size: usize) -> Result<(), ClientError> {
+    if block_size > MAX_ARTIFACT_UPLOAD_BODY_BYTES {
+        return Err(ClientError::InvalidOptions(format!(
+            "artifact block size {block_size} exceeds the {MAX_ARTIFACT_UPLOAD_BODY_BYTES} bytes \
+             one owner upload carries"
+        )));
     }
     Ok(())
+}
+
+/// The upload request for one planned block, carrying the bytes the plan was
+/// sealed over at that block's logical range.
+fn planned_block_upload(
+    token: OperationToken,
+    block: &ArtifactBlock,
+    bytes: &[u8],
+) -> Result<UploadArtifactObjectRequest, ClientError> {
+    let sequence = u32::try_from(block.object_index)
+        .map_err(|_| ClientError::InvalidOptions("artifact object count exceeds u32".to_owned()))?;
+    let body = usize::try_from(block.logical_offset)
+        .ok()
+        .zip(usize::try_from(block.len).ok())
+        .and_then(|(start, len)| start.checked_add(len).map(|end| start..end))
+        .and_then(|range| bytes.get(range))
+        .ok_or_else(|| {
+            ClientError::ArtifactIntegrity(
+                "the upload plan addresses bytes outside the body it was sealed over".to_owned(),
+            )
+        })?;
+    Ok(UploadArtifactObjectRequest {
+        token,
+        sequence,
+        body: body.to_vec(),
+    })
 }
 
 fn next_append_segment_sequence(rows: &[ArtifactManifestRow]) -> Result<u32, ClientError> {
@@ -3158,7 +3159,6 @@ fn is_append_retry_error(error: &ClientError) -> bool {
         | ClientError::MissingCapabilities(_)
         | ClientError::ArtifactIntegrity(_)
         | ClientError::Object(_)
-        | ClientError::ArtifactUpload(_)
         | ClientError::AppendUnresolved { .. }
         | ClientError::AppendCleanupUnresolved { .. } => false,
     }
@@ -3196,17 +3196,6 @@ fn publication_rows(
         });
     }
     Ok((staged_objects, manifest_rows))
-}
-
-fn upload_proofs(staged_objects: &[StagedObject]) -> Vec<ObjectUploadProof> {
-    staged_objects
-        .iter()
-        .map(|object| ObjectUploadProof {
-            sequence: object.sequence,
-            observed_length: object.expected_length,
-            observed_digest: object.expected_digest.clone(),
-        })
-        .collect()
 }
 
 fn manifest_from_rows(
@@ -3303,13 +3292,6 @@ fn publication_failure_without_abort(
         source: Box::new(source),
         abort_failure: None,
     }
-}
-
-fn accumulate_upload_stats(total: &mut ArtifactUploadStats, next: ArtifactUploadStats) {
-    total.blocks = total.blocks.saturating_add(next.blocks);
-    total.bytes = total.bytes.saturating_add(next.bytes);
-    total.created = total.created.saturating_add(next.created);
-    total.replayed = total.replayed.saturating_add(next.replayed);
 }
 
 fn running_publish_resume(
@@ -3508,9 +3490,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use nokv_object::{
-        admit_artifact_provider, ArtifactStoreCapabilities, ImmutableCreateOutcome,
-        MemoryArtifactStore, ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectRange,
-        ProviderAdmissionError, ProviderAdmissionProfile, ProviderAdmissionReceipt,
+        ArtifactStoreCapabilities, ImmutableCreateOutcome, MemoryArtifactStore,
+        ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectRange,
     };
     use nokv_protocol::{
         decode_request, encode_response, ConflictKind, OperationProgress, PathReadResult,
@@ -3534,6 +3515,9 @@ mod tests {
         begin: Option<BeginArtifactPublishRequest>,
         staged_objects: Vec<StagedObject>,
         uploaded_objects: usize,
+        /// The object store only the owner writes; readers share its bytes.
+        objects: MemoryArtifactStore,
+        upload_applies: usize,
         manifest_rows: Vec<ArtifactManifestRow>,
         manifest_dependency_batches: Vec<Vec<ArtifactRevisionIdentity>>,
         operation: Option<OperationStatus>,
@@ -3544,6 +3528,12 @@ mod tests {
         commit_version: u64,
         lose_stage_response_once: bool,
         stage_response_lost: bool,
+        lose_upload_response_once: bool,
+        upload_response_lost: bool,
+        advance_upload_before_response_once: bool,
+        /// The owner's object store refuses every write, as a provider outage
+        /// the owner cannot retry would.
+        refuse_uploads: bool,
         lose_complete_responses: bool,
         stage_applies: usize,
         abort_applies: usize,
@@ -3570,6 +3560,8 @@ mod tests {
                     begin: None,
                     staged_objects: Vec::new(),
                     uploaded_objects: 0,
+                    objects: MemoryArtifactStore::new(),
+                    upload_applies: 0,
                     manifest_rows: Vec::new(),
                     manifest_dependency_batches: Vec::new(),
                     operation: None,
@@ -3579,6 +3571,10 @@ mod tests {
                     commit_version: 0,
                     lose_stage_response_once,
                     stage_response_lost: false,
+                    lose_upload_response_once: false,
+                    upload_response_lost: false,
+                    advance_upload_before_response_once: false,
+                    refuse_uploads: false,
                     lose_complete_responses: false,
                     stage_applies: 0,
                     abort_applies: 0,
@@ -3615,6 +3611,26 @@ mod tests {
 
         fn lose_complete_responses(&self) {
             self.state.lock().unwrap().lose_complete_responses = true;
+        }
+
+        fn lose_upload_response_once(&self) {
+            self.state.lock().unwrap().lose_upload_response_once = true;
+        }
+
+        fn refuse_uploads(&self) {
+            self.state.lock().unwrap().refuse_uploads = true;
+        }
+
+        fn advance_upload_before_response_once(&self) {
+            self.state
+                .lock()
+                .unwrap()
+                .advance_upload_before_response_once = true;
+        }
+
+        /// A handle on the bytes the owner wrote, for a read-only Agent store.
+        fn objects(&self) -> MemoryArtifactStore {
+            self.state.lock().unwrap().objects.clone()
         }
 
         fn lose_inline_responses(&self) {
@@ -3712,6 +3728,59 @@ mod tests {
 
         /// The durable operation row the engine would replay for `operation_id`
         /// when it has already reached a terminal state.
+        /// How the owner refuses an upload before writing anything: an
+        /// injected provider failure, a block the cursor already passed, one
+        /// ahead of it, or bytes that miss their staged record.
+        fn upload_failure(&self, upload: &UploadArtifactObjectRequest) -> Option<RpcFailure> {
+            let failure = |code, message: &str, conflict| RpcFailure {
+                code,
+                message: message.to_owned(),
+                retryable: false,
+                conflict,
+                current_generation: None,
+                route_hint: None,
+            };
+            if self.refuse_uploads {
+                return Some(failure(
+                    ErrorCode::ObjectUnavailable,
+                    "injected owner object write failure",
+                    None,
+                ));
+            }
+            let Some(staged) = self.staged_objects.get(self.uploaded_objects) else {
+                return Some(failure(
+                    ErrorCode::Conflict,
+                    "every staged object is already uploaded",
+                    Some(ConflictKind::OperationState),
+                ));
+            };
+            if u64::from(upload.sequence) < self.uploaded_objects as u64 {
+                return Some(failure(
+                    ErrorCode::Conflict,
+                    "object already uploaded",
+                    Some(ConflictKind::OperationState),
+                ));
+            }
+            if upload.sequence != staged.sequence {
+                return Some(failure(
+                    ErrorCode::InvalidArgument,
+                    "upload does not continue the owner's cursor",
+                    None,
+                ));
+            }
+            let digest = sha256_digest_uri(Digest(Sha256::digest(&upload.body).into()));
+            if upload.body.len() as u64 != staged.expected_length
+                || digest != staged.expected_digest
+            {
+                return Some(failure(
+                    ErrorCode::InvalidArgument,
+                    "uploaded body does not match its staged record",
+                    None,
+                ));
+            }
+            None
+        }
+
         fn replayable_terminal_status(
             &self,
             operation_id: OperationIdentity,
@@ -3878,7 +3947,7 @@ mod tests {
                         restore_preparation: None,
                         state: OperationState::Running,
                         progress: OperationProgress {
-                            completed_rows: u64::from(staged_object_count),
+                            completed_rows: state.staged_objects.len() as u64,
                             total_rows: Some(
                                 u64::from(staged_object_count)
                                     .saturating_mul(2)
@@ -3911,13 +3980,42 @@ mod tests {
                 }
             }
 
+            if let WorkspaceRequest::UploadArtifactObject(upload) = &request.operation {
+                let mut failure = state.upload_failure(upload);
+                if failure.is_none() && state.advance_upload_before_response_once {
+                    state.advance_upload_before_response_once = false;
+                    // The block is durably written and recorded, but under a
+                    // token this caller no longer holds.
+                    apply_request(&mut state, &request)?;
+                    failure = Some(RpcFailure {
+                        code: ErrorCode::Conflict,
+                        message: "operation token state digest is stale".to_owned(),
+                        retryable: false,
+                        conflict: Some(ConflictKind::OperationState),
+                        current_generation: None,
+                        route_hint: None,
+                    });
+                }
+                if let Some(failure) = failure {
+                    let response = WorkspaceRpcResponse {
+                        route: request.route,
+                        request_id: request.request_id,
+                        commit_version: None,
+                        replayed: false,
+                        outcome: WorkspaceRpcOutcome::Failure(failure),
+                    };
+                    state.replay.insert(request.request_id, response.clone());
+                    return encode_response(&response)
+                        .map_err(|error| TransportError::new(error.to_string(), false));
+                }
+            }
+
             if let WorkspaceRequest::FinishArtifactPublish(finish) = &request.operation {
                 state.finish_requests.push(finish.clone());
                 if state.advance_finish_before_response_once {
                     state.advance_finish_before_response_once = false;
-                    // The winner's uploads and manifest are durable; this
-                    // caller's token no longer names the current state.
-                    state.uploaded_objects += finish.uploaded_objects.len();
+                    // The winner's manifest is durable; this caller's token no
+                    // longer names the current state.
                     state.manifest_rows.extend(finish.manifest_rows.clone());
                     let status = state.running_status(finish.token.operation_id);
                     state.operation = Some(status);
@@ -3944,6 +4042,7 @@ mod tests {
             self.events.lock().unwrap().push(label);
             state.commit_version = state.commit_version.saturating_add(1);
             let stage_applies = state.stage_applies;
+            let upload_applies = state.upload_applies;
             let result = apply_request(&mut state, &request)?;
             let response = WorkspaceRpcResponse {
                 route: request.route,
@@ -3960,6 +4059,16 @@ mod tests {
                 state.stage_response_lost = true;
                 return Err(TransportError::new(
                     "injected response loss after durable stage",
+                    true,
+                ));
+            }
+            if state.upload_applies > upload_applies
+                && state.lose_upload_response_once
+                && !state.upload_response_lost
+            {
+                state.upload_response_lost = true;
+                return Err(TransportError::new(
+                    "injected response loss after a durable upload",
                     true,
                 ));
             }
@@ -4025,10 +4134,23 @@ mod tests {
                 state.operation = Some(status.clone());
                 Ok(WorkspaceResult::Operation(status))
             }
-            WorkspaceRequest::MarkArtifactObjectsUploaded(mark) => {
-                require_token(state, mark.token)?;
-                state.uploaded_objects += mark.objects.len();
-                let status = state.running_status(mark.token.operation_id);
+            WorkspaceRequest::UploadArtifactObject(upload) => {
+                require_token(state, upload.token)?;
+                // Refusals were answered before this apply: what is left is
+                // the owner's write of a verified block at its cursor.
+                let staged = state
+                    .staged_objects
+                    .get(state.uploaded_objects)
+                    .ok_or_else(|| TransportError::new("upload beyond the staged plan", false))?;
+                let key = ObjectKey::new(staged.object_identity.as_str())
+                    .map_err(|error| TransportError::new(error.to_string(), false))?;
+                state
+                    .objects
+                    .create_immutable(&key, &upload.body)
+                    .map_err(|error| TransportError::new(error.to_string(), false))?;
+                state.uploaded_objects += 1;
+                state.upload_applies = state.upload_applies.saturating_add(1);
+                let status = state.running_status(upload.token.operation_id);
                 state.operation = Some(status.clone());
                 Ok(WorkspaceResult::Operation(status))
             }
@@ -4072,20 +4194,6 @@ mod tests {
             }
             WorkspaceRequest::FinishArtifactPublish(finish) => {
                 let mut token = finish.token;
-                if !finish.uploaded_objects.is_empty() {
-                    token = running_token(apply_request(
-                        state,
-                        &publication_step(
-                            request,
-                            WorkspaceRequest::MarkArtifactObjectsUploaded(
-                                MarkArtifactObjectsUploadedRequest {
-                                    token,
-                                    objects: finish.uploaded_objects.clone(),
-                                },
-                            ),
-                        ),
-                    )?)?;
-                }
                 if !finish.manifest_rows.is_empty() {
                     token = running_token(apply_request(
                         state,
@@ -4432,7 +4540,7 @@ mod tests {
         match operation {
             WorkspaceRequest::BeginArtifactPublish(_) => "begin",
             WorkspaceRequest::StageArtifactObjects(_) => "stage_objects",
-            WorkspaceRequest::MarkArtifactObjectsUploaded(_) => "mark_uploaded",
+            WorkspaceRequest::UploadArtifactObject(_) => "upload_object",
             WorkspaceRequest::StageArtifactManifest(_) => "stage_manifest",
             WorkspaceRequest::CompleteArtifactPublish(_) => "complete",
             WorkspaceRequest::PrepareArtifactPublish(_) => "prepare",
@@ -4445,31 +4553,35 @@ mod tests {
         }
     }
 
+    /// The Agent's view of the object store: prefix-scoped read-only
+    /// credentials over the bytes the owner wrote. Every write is refused, so
+    /// a client that still wrote objects itself would fail these tests.
     struct RecordingStore {
         inner: MemoryArtifactStore,
         events: Arc<Mutex<Vec<&'static str>>>,
-        creates: AtomicUsize,
-        deletes: AtomicUsize,
         reads: AtomicUsize,
         temporary_read_failures: AtomicUsize,
-        fail_create_at: Option<usize>,
         corrupt_reads: AtomicBool,
         short_reads: AtomicBool,
     }
 
     impl RecordingStore {
-        fn new(events: Arc<Mutex<Vec<&'static str>>>, fail_create_at: Option<usize>) -> Self {
+        fn new(events: Arc<Mutex<Vec<&'static str>>>, objects: MemoryArtifactStore) -> Self {
             Self {
-                inner: MemoryArtifactStore::new(),
+                inner: objects,
                 events,
-                creates: AtomicUsize::new(0),
-                deletes: AtomicUsize::new(0),
                 reads: AtomicUsize::new(0),
                 temporary_read_failures: AtomicUsize::new(0),
-                fail_create_at,
                 corrupt_reads: AtomicBool::new(false),
                 short_reads: AtomicBool::new(false),
             }
+        }
+
+        fn refused_write<T>() -> Result<T, ObjectError> {
+            Err(ObjectError::backend_failure(
+                "read-only Agent credentials refuse object writes",
+                false,
+            ))
         }
 
         fn fail_next_reads(&self, count: usize) {
@@ -4490,24 +4602,13 @@ mod tests {
             self.inner.provider_handle_identity()
         }
 
-        fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
-            self.inner.provider_admission_receipt()
-        }
-
         fn create_immutable(
             &self,
-            key: &ObjectKey,
-            bytes: &[u8],
+            _key: &ObjectKey,
+            _bytes: &[u8],
         ) -> Result<ImmutableCreateOutcome, ObjectError> {
             self.events.lock().unwrap().push("object_create");
-            let attempt = self.creates.fetch_add(1, Ordering::SeqCst);
-            if self.fail_create_at == Some(attempt) {
-                return Err(ObjectError::backend_failure(
-                    "injected upload failure",
-                    false,
-                ));
-            }
-            self.inner.create_immutable(key, bytes)
+            Self::refused_write()
         }
 
         fn read(
@@ -4542,178 +4643,9 @@ mod tests {
             self.inner.head(key)
         }
 
-        fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
-            self.deletes.fetch_add(1, Ordering::SeqCst);
-            self.inner.delete(key)
-        }
-    }
-
-    struct AdmissionOverrideStore {
-        inner: RecordingStore,
-        receipt: Option<ProviderAdmissionReceipt>,
-    }
-
-    impl AdmissionOverrideStore {
-        fn unadmitted(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
-            Self {
-                inner: RecordingStore::new(events, None),
-                receipt: None,
-            }
-        }
-
-        fn admitted_for(
-            events: Arc<Mutex<Vec<&'static str>>>,
-            max_verified_object_bytes: usize,
-        ) -> Self {
-            let inner = RecordingStore::new(events, None);
-            let receipt = admit_artifact_provider(
-                &inner,
-                ProviderAdmissionProfile::single_put(max_verified_object_bytes).unwrap(),
-            )
-            .unwrap();
-            inner.events.lock().unwrap().clear();
-            inner.creates.store(0, Ordering::SeqCst);
-            inner.deletes.store(0, Ordering::SeqCst);
-            inner.reads.store(0, Ordering::SeqCst);
-            Self {
-                inner,
-                receipt: Some(receipt),
-            }
-        }
-    }
-
-    impl ArtifactObjectStore for AdmissionOverrideStore {
-        fn object_namespace(&self) -> Option<nokv_types::ObjectNamespaceId> {
-            self.inner.object_namespace()
-        }
-
-        fn capabilities(&self) -> ArtifactStoreCapabilities {
-            self.inner.capabilities()
-        }
-
-        fn provider_handle_identity(&self) -> nokv_object::ProviderHandleIdentity {
-            self.inner.provider_handle_identity()
-        }
-
-        fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
-            self.receipt.as_ref()
-        }
-
-        fn create_immutable(
-            &self,
-            key: &ObjectKey,
-            bytes: &[u8],
-        ) -> Result<ImmutableCreateOutcome, ObjectError> {
-            self.inner.create_immutable(key, bytes)
-        }
-
-        fn read(
-            &self,
-            key: &ObjectKey,
-            range: Option<ObjectRange>,
-        ) -> Result<Vec<u8>, ObjectError> {
-            self.inner.read(key, range)
-        }
-
-        fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
-            self.inner.head(key)
-        }
-
-        fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
-            self.inner.delete(key)
-        }
-    }
-
-    /// Proves the provider at its first object write and keeps only success,
-    /// as the native CLI composes its store.
-    struct DeferredAdmissionStore {
-        inner: RecordingStore,
-        proof: Result<ProviderAdmissionReceipt, ProviderAdmissionError>,
-        admitted: AtomicBool,
-        probes: AtomicUsize,
-    }
-
-    impl DeferredAdmissionStore {
-        fn proving(
-            events: Arc<Mutex<Vec<&'static str>>>,
-            max_verified_object_bytes: usize,
-        ) -> Self {
-            let AdmissionOverrideStore { inner, receipt } =
-                AdmissionOverrideStore::admitted_for(events, max_verified_object_bytes);
-            Self {
-                inner,
-                proof: Ok(receipt.unwrap()),
-                admitted: AtomicBool::new(false),
-                probes: AtomicUsize::new(0),
-            }
-        }
-
-        fn refusing(events: Arc<Mutex<Vec<&'static str>>>, cause: ProviderAdmissionError) -> Self {
-            Self {
-                inner: RecordingStore::new(events, None),
-                proof: Err(cause),
-                admitted: AtomicBool::new(false),
-                probes: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    impl ArtifactObjectStore for DeferredAdmissionStore {
-        fn object_namespace(&self) -> Option<nokv_types::ObjectNamespaceId> {
-            self.inner.object_namespace()
-        }
-
-        fn capabilities(&self) -> ArtifactStoreCapabilities {
-            self.inner.capabilities()
-        }
-
-        fn provider_handle_identity(&self) -> nokv_object::ProviderHandleIdentity {
-            self.inner.provider_handle_identity()
-        }
-
-        fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
-            self.admitted
-                .load(Ordering::SeqCst)
-                .then(|| self.proof.as_ref().ok())
-                .flatten()
-        }
-
-        fn admit_object_writes(&self) -> Result<&ProviderAdmissionReceipt, ObjectError> {
-            if let Some(receipt) = self.provider_admission_receipt() {
-                return Ok(receipt);
-            }
-            self.probes.fetch_add(1, Ordering::SeqCst);
-            self.inner.events.lock().unwrap().push("provider_admission");
-            let receipt = self
-                .proof
-                .as_ref()
-                .map_err(|cause| ObjectError::ProviderAdmissionFailed(*cause))?;
-            self.admitted.store(true, Ordering::SeqCst);
-            Ok(receipt)
-        }
-
-        fn create_immutable(
-            &self,
-            key: &ObjectKey,
-            bytes: &[u8],
-        ) -> Result<ImmutableCreateOutcome, ObjectError> {
-            self.inner.create_immutable(key, bytes)
-        }
-
-        fn read(
-            &self,
-            key: &ObjectKey,
-            range: Option<ObjectRange>,
-        ) -> Result<Vec<u8>, ObjectError> {
-            self.inner.read(key, range)
-        }
-
-        fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
-            self.inner.head(key)
-        }
-
-        fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
-            self.inner.delete(key)
+        fn delete(&self, _key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
+            self.events.lock().unwrap().push("object_delete");
+            Self::refused_write()
         }
     }
 
@@ -4768,126 +4700,25 @@ mod tests {
     }
 
     #[test]
-    fn provider_admission_is_required_before_begin_publish_rpc() {
+    fn a_block_above_one_owner_upload_is_rejected_before_begin_publish_rpc() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
         let client = client(transport);
-        let store = AdmissionOverrideStore::unadmitted(Arc::clone(&events));
-
-        assert!(matches!(
-            client
-                .publish_artifact(&store, publish_options(4), b"abcdefgh")
-                .unwrap_err(),
-            ClientError::Object(ObjectError::ProviderAdmissionRequired)
-        ));
-        assert!(events.lock().unwrap().is_empty());
-        assert_eq!(store.inner.creates.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn block_size_above_admission_is_rejected_before_begin_publish_rpc() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
-        let client = client(transport);
-        let store = AdmissionOverrideStore::admitted_for(Arc::clone(&events), 4);
-
-        assert!(matches!(
-            client
-                .publish_artifact(&store, publish_options(5), b"abcdefgh")
-                .unwrap_err(),
-            ClientError::Object(ObjectError::ProviderAdmissionBlockSizeExceeded {
-                requested: 5,
-                admitted: 4,
-            })
-        ));
-        assert!(events.lock().unwrap().is_empty());
-        assert_eq!(store.inner.creates.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn a_receipt_from_provider_a_cannot_admit_provider_b() {
-        let source_events = Arc::new(Mutex::new(Vec::new()));
-        let source = RecordingStore::new(source_events, None);
-        let foreign_receipt =
-            admit_artifact_provider(&source, ProviderAdmissionProfile::single_put(4).unwrap())
-                .unwrap();
-
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
-        let client = client(transport);
-        let store = AdmissionOverrideStore {
-            inner: RecordingStore::new(Arc::clone(&events), None),
-            receipt: Some(foreign_receipt),
-        };
-
-        assert!(matches!(
-            client
-                .publish_artifact(&store, publish_options(4), b"abcdefgh")
-                .unwrap_err(),
-            ClientError::Object(ObjectError::ProviderAdmissionRequired)
-        ));
-        assert!(events.lock().unwrap().is_empty());
-        assert_eq!(store.inner.creates.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn deferred_admission_runs_once_before_the_first_object_write() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
-        let client = client(transport);
-        let store = DeferredAdmissionStore::proving(Arc::clone(&events), 4);
-
-        client
-            .publish_artifact(&store, publish_options(4), b"abcdefgh")
-            .unwrap();
-        // Admission precedes the publication's first request and its first
-        // object write, and the publication asks for it only once.
-        let events = events.lock().unwrap();
-        assert_eq!(events[0], "provider_admission");
-        assert!(!events[1..].contains(&"provider_admission"));
-        assert!(events.contains(&"object_create"));
-        assert_eq!(store.probes.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn an_inline_publication_never_asks_for_provider_admission() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
-        let client = client(transport);
-        let store = DeferredAdmissionStore::refusing(
-            Arc::clone(&events),
-            ProviderAdmissionError::Unavailable,
-        );
-
-        client
-            .publish_artifact(&store, publish_options(DEFAULT_ARTIFACT_BLOCK_SIZE), b"ok")
-            .unwrap();
-        assert_eq!(events.lock().unwrap().as_slice(), ["publish_inline"]);
-        assert_eq!(store.probes.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn a_failed_deferred_admission_stops_before_begin_and_any_object_write() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
-        let client = client(transport);
-        let store = DeferredAdmissionStore::refusing(
-            Arc::clone(&events),
-            ProviderAdmissionError::Unavailable,
-        );
+        let store = RecordingStore::new(events, inspector.objects());
+        let body = vec![0x5a; MAX_INLINE_ARTIFACT_BODY_BYTES + 1];
 
         let error = client
-            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .publish_artifact(
+                &store,
+                publish_options(MAX_ARTIFACT_UPLOAD_BODY_BYTES + 1),
+                &body,
+            )
             .unwrap_err();
-        assert!(matches!(
-            error,
-            ClientError::Object(ObjectError::ProviderAdmissionFailed(
-                ProviderAdmissionError::Unavailable
-            ))
-        ));
-        assert_eq!(error.class(), nokv_types::ErrorClass::Transient);
-        assert_eq!(events.lock().unwrap().as_slice(), ["provider_admission"]);
-        assert_eq!(store.inner.creates.load(Ordering::SeqCst), 0);
+        assert!(matches!(error, ClientError::InvalidOptions(ref reason)
+            if reason.contains("one owner upload carries")));
+        assert_eq!(error.class(), nokv_types::ErrorClass::InvalidInput);
+        assert!(inspector.state().attempts.is_empty());
     }
 
     #[test]
@@ -4896,7 +4727,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
 
         let outcome = client
             .append_artifact(
@@ -4909,10 +4740,10 @@ mod tests {
         assert_eq!(outcome.publication.value.generation, 1);
         assert_eq!(outcome.publication.value.logical_size, 5);
         assert_eq!(outcome.descriptor.content_type.as_str(), "text/plain");
-        assert_eq!(outcome.upload_stats.created, 3);
-        assert_eq!(store.creates.load(Ordering::SeqCst), 3);
+        assert_eq!(outcome.upload_stats.blocks, 3);
         let state = inspector.state();
         assert_eq!(state.staged_objects.len(), 3);
+        assert_eq!(state.upload_applies, 3);
         assert!(state
             .begin
             .as_ref()
@@ -4930,14 +4761,14 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         let base = b"abcdefgh";
         let delta = b"XYZ";
 
         client
             .publish_artifact(&store, publish_options(4), base)
             .unwrap();
-        let creates_before_append = store.creates.load(Ordering::SeqCst);
+        let uploads_before_append = inspector.state().upload_applies;
         inspector.conflict_append_begins(1);
         let outcome = client
             .append_artifact(&store, append_options(2).with_max_logical_size(64), delta)
@@ -4956,9 +4787,9 @@ mod tests {
             "an append without an override must inherit the base content type"
         );
         assert_eq!(outcome.base_read_stats.store_read_bytes, 8);
-        assert_eq!(outcome.upload_stats.created, 2);
+        assert_eq!(outcome.upload_stats.blocks, 2);
         assert_eq!(
-            store.creates.load(Ordering::SeqCst) - creates_before_append,
+            inspector.state().upload_applies - uploads_before_append,
             2,
             "only the two delta blocks may be uploaded after a head conflict"
         );
@@ -5031,7 +4862,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         let mut expected_body = vec![b'a'];
         client
             .publish_artifact(&store, publish_options(1), &expected_body)
@@ -5066,7 +4897,7 @@ mod tests {
                 // the whole body uploads it once.
                 inspector.conflict_append_begins(1);
             }
-            let creates_before = store.creates.load(Ordering::SeqCst);
+            let uploads_before = inspector.state().upload_applies;
             let outcome = client
                 .append_artifact(
                     &store,
@@ -5081,7 +4912,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(
-                store.creates.load(Ordering::SeqCst) - creates_before,
+                inspector.state().upload_applies - uploads_before,
                 uploaded,
                 "append {index}"
             );
@@ -5113,8 +4944,12 @@ mod tests {
                 && row.object_index == row.physical_object_index
         }));
         drop(state);
+        let owner_objects = inspector.objects();
         for key in ancestor_keys {
-            assert_eq!(store.delete(&key).unwrap(), ObjectDeleteOutcome::Deleted);
+            assert_eq!(
+                owner_objects.delete(&key).unwrap(),
+                ObjectDeleteOutcome::Deleted
+            );
         }
         let read = client
             .read_artifact(&store, None, target(), WorkspaceReadView::Live)
@@ -5192,27 +5027,27 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         client
             .publish_artifact(&store, publish_options(4), b"abcdefgh")
             .unwrap();
-        let creates = store.creates.load(Ordering::SeqCst);
+        let uploads = inspector.state().upload_applies;
         let begins = admissions(&inspector.state());
 
         let error = client
             .append_artifact(&store, append_options(2).with_max_logical_size(8), b"!")
             .unwrap_err();
         assert!(matches!(error, ClientError::InvalidOptions(_)));
-        assert_eq!(store.creates.load(Ordering::SeqCst), creates);
+        assert_eq!(inspector.state().upload_applies, uploads);
         assert_eq!(admissions(&inspector.state()), begins);
     }
 
     #[test]
-    fn every_planned_row_is_durable_before_the_first_object_write() {
+    fn every_planned_row_is_durable_before_the_first_object_upload() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let store = RecordingStore::new(Arc::clone(&events), transport.objects());
         let client = client(transport);
-        let store = RecordingStore::new(Arc::clone(&events), None);
         let bytes = vec![0x5a; MAX_ARTIFACT_PUBLISH_BATCH_ROWS + 1];
 
         let outcome = client
@@ -5224,9 +5059,9 @@ mod tests {
         );
 
         let events = events.lock().unwrap();
-        let first_create = events
+        let first_upload = events
             .iter()
-            .position(|event| *event == "object_create")
+            .position(|event| *event == "upload_object")
             .unwrap();
         let stage_positions = events
             .iter()
@@ -5236,7 +5071,7 @@ mod tests {
         assert_eq!(stage_positions.len(), 2);
         assert!(stage_positions
             .into_iter()
-            .all(|index| index < first_create));
+            .all(|index| index < first_upload));
         assert_eq!(events[0], "begin");
     }
 
@@ -5254,9 +5089,8 @@ mod tests {
     fn a_one_block_body_publishes_inline_in_one_request_without_provider_writes() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let store = RecordingStore::new(Arc::clone(&events), transport.objects());
         let client = client(transport);
-        // Nothing reaches the provider, so its admission is not required.
-        let store = AdmissionOverrideStore::unadmitted(Arc::clone(&events));
         let body = br#"{"turn":3,"role":"tool","text":"ok"}"#;
 
         let outcome = client
@@ -5300,8 +5134,8 @@ mod tests {
             batch.items[0].ranges,
             vec![body[0..1].to_vec(), body[3..7].to_vec()]
         );
-        assert!(!events.lock().unwrap().contains(&"object_create"));
-        assert_eq!(store.inner.reads.load(Ordering::SeqCst), 0);
+        assert!(!events.lock().unwrap().contains(&"upload_object"));
+        assert_eq!(store.reads.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -5310,7 +5144,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         client
             .publish_artifact(
                 &store,
@@ -5351,7 +5185,7 @@ mod tests {
             let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
             let inspector = transport.clone();
             let client = client(transport);
-            let store = RecordingStore::new(events, None);
+            let store = RecordingStore::new(events, inspector.objects());
             client
                 .publish_artifact(
                     &store,
@@ -5383,7 +5217,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         client
             .publish_artifact(
                 &store,
@@ -5421,7 +5255,7 @@ mod tests {
         let inspector = transport.clone();
         inspector.lose_inline_responses();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
 
         let outcome = client
             .publish_artifact(
@@ -5454,7 +5288,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         let first = client
             .publish_artifact(
                 &store,
@@ -5485,7 +5319,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         client
             .publish_artifact(
                 &store,
@@ -5522,7 +5356,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         let options = caller_identified(0x41);
         // Before any attempt, a metadata-only replay finds nothing to return.
         assert_eq!(
@@ -5588,7 +5422,7 @@ mod tests {
         let inspector = transport.clone();
         inspector.lose_inline_responses();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         let options = caller_identified(0x42);
 
         let receipt = client
@@ -5607,7 +5441,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         client
             .publish_idempotent(&store, &caller_identified(0x43), b"first")
             .unwrap();
@@ -5627,7 +5461,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         client
             .publish_artifact(
                 &store,
@@ -5645,7 +5479,7 @@ mod tests {
             .unwrap();
         assert_eq!(appended.upload_stats, ArtifactUploadStats::default());
         assert_eq!(appended.descriptor.logical_size, 10);
-        assert_eq!(store.creates.load(Ordering::SeqCst), 0);
+        assert_eq!(inspector.state().upload_applies, 0);
         assert_eq!(
             inspector
                 .state()
@@ -5665,8 +5499,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(appended.upload_stats.blocks, 1);
-        assert_eq!(store.creates.load(Ordering::SeqCst), 1);
         let state = inspector.state();
+        assert_eq!(state.upload_applies, 1);
         assert!(state
             .begin
             .as_ref()
@@ -5688,8 +5522,8 @@ mod tests {
     fn one_batch_plan_publishes_with_one_request_before_and_one_after_upload() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let store = RecordingStore::new(Arc::clone(&events), transport.objects());
         let client = client(transport);
-        let store = RecordingStore::new(Arc::clone(&events), None);
 
         client
             .publish_artifact(&store, publish_options(4), b"abcdefghijkl")
@@ -5700,12 +5534,12 @@ mod tests {
             events.as_slice(),
             [
                 "prepare",
-                "object_create",
-                "object_create",
-                "object_create",
+                "upload_object",
+                "upload_object",
+                "upload_object",
                 "finish"
             ],
-            "the plan is durable before the first provider write and complete after the last"
+            "the plan is durable before the first upload and complete after the last"
         );
     }
 
@@ -5716,27 +5550,24 @@ mod tests {
         let inspector = transport.clone();
         inspector.advance_finish_before_response_once();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
 
         let outcome = client
             .publish_artifact(&store, publish_options(4), b"abcdefgh")
             .unwrap();
 
         assert_eq!(outcome.publication.value.logical_size, 8);
-        assert_eq!(store.creates.load(Ordering::SeqCst), 2);
         let state = inspector.state();
+        assert_eq!(state.upload_applies, 2);
         assert_eq!(state.abort_applies, 0, "a stale token proves progress");
         assert_eq!(admissions(&state), 2);
         assert_eq!(state.stage_applies, 1);
         let [first, resumed] = state.finish_requests.as_slice() else {
             panic!("expected two finish requests: {:?}", state.finish_requests);
         };
-        assert_eq!(
-            (first.uploaded_objects.len(), first.manifest_rows.len()),
-            (2, 2)
-        );
+        assert_eq!(first.manifest_rows.len(), 2);
         assert!(
-            resumed.uploaded_objects.is_empty() && resumed.manifest_rows.is_empty(),
+            resumed.manifest_rows.is_empty(),
             "the resumed finish carries only the completion"
         );
         assert_eq!(
@@ -5752,7 +5583,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(Arc::clone(&events), None);
+        let store = RecordingStore::new(Arc::clone(&events), inspector.objects());
         let options = publish_options(4).with_index_fields(vec![
             FieldValue {
                 field_id: "z".to_owned(),
@@ -5774,9 +5605,9 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(store.creates.load(Ordering::SeqCst), 0);
         assert!(events.lock().unwrap().is_empty());
         let state = inspector.state();
+        assert_eq!(state.upload_applies, 0);
         assert!(state.begin.is_none());
         assert!(state.attempts.is_empty());
     }
@@ -5787,7 +5618,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         let index_fields = vec![
             FieldValue {
                 field_id: "agent.owner".to_owned(),
@@ -5834,7 +5665,7 @@ mod tests {
             let transport = ScriptedArtifactTransport::new(Arc::clone(&events), true);
             let inspector = transport.clone();
             let client = client(transport);
-            let store = RecordingStore::new(events, None);
+            let store = RecordingStore::new(events, inspector.objects());
 
             client
                 .publish_artifact(&store, publish_options(block_size), &bytes)
@@ -5860,7 +5691,7 @@ mod tests {
         let inspector = transport.clone();
         inspector.advance_stage_before_response_once();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
 
         // Only a multi-batch plan stages outside Prepare's single session.
         let bytes = vec![0x5a; MAX_ARTIFACT_PUBLISH_BATCH_ROWS + 1];
@@ -5880,8 +5711,8 @@ mod tests {
             "the losing caller must reload the exact durable operation"
         );
         assert_eq!(
-            state.stage_applies, 1,
-            "the durable cursor must skip the stage completed by the winner"
+            state.stage_applies, 2,
+            "the durable cursor skips the batch the winner completed and stages only the rest"
         );
         assert_eq!(
             state.abort_applies, 0,
@@ -5933,7 +5764,7 @@ mod tests {
         let inspector = transport.clone();
         inspector.lose_complete_responses();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
 
         let outcome = client
             .publish_artifact(&store, publish_options(4), b"abcdefgh")
@@ -5966,7 +5797,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
 
         let first = client
             .publish_artifact(&store, publish_options(4), b"abcdefgh")
@@ -6008,7 +5839,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
 
         client
             .publish_artifact(&store, publish_options(4), b"abcdefgh")
@@ -6048,12 +5879,13 @@ mod tests {
     }
 
     #[test]
-    fn upload_failure_durably_aborts_without_direct_object_delete() {
+    fn an_owner_object_write_failure_durably_aborts_the_publication() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
+        inspector.refuse_uploads();
         let client = client(transport);
-        let store = RecordingStore::new(events, Some(1));
+        let store = RecordingStore::new(Arc::clone(&events), inspector.objects());
 
         let error = client
             .publish_artifact(&store, publish_options(4), b"abcdefghijkl")
@@ -6066,13 +5898,102 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(store.deletes.load(Ordering::SeqCst), 0);
         let state = inspector.state();
+        assert_eq!(state.upload_applies, 0);
+        assert_eq!(state.objects.stats().unwrap().resident_objects, 0);
         assert_eq!(state.abort_applies, 1);
         assert_eq!(
             state.operation.as_ref().unwrap().state,
             OperationState::Aborting
         );
+        // The Agent's own credentials never touched the object store.
+        assert!(!events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("object_")));
+    }
+
+    #[test]
+    fn an_upload_recorded_under_a_stale_token_is_not_sent_again() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        inspector.advance_upload_before_response_once();
+        let client = client(transport);
+        let store = RecordingStore::new(events, inspector.objects());
+
+        let outcome = client
+            .publish_artifact(&store, publish_options(4), b"abcdefghijkl")
+            .unwrap();
+
+        assert_eq!(outcome.publication.value.logical_size, 12);
+        assert_eq!(outcome.upload_stats.blocks, 3);
+        let state = inspector.state();
+        assert_eq!(
+            admissions(&state),
+            2,
+            "a stale token makes the caller reload the durable cursor"
+        );
+        assert_eq!(
+            state.upload_applies, 3,
+            "the block recorded under the stale token is not written twice"
+        );
+        assert_eq!(
+            state
+                .attempts
+                .iter()
+                .filter(|(label, _)| *label == "upload_object")
+                .count(),
+            3,
+            "the resumed attempt sends only the blocks past the owner's cursor"
+        );
+        assert_eq!(state.abort_applies, 0);
+        drop(state);
+        let read = client
+            .read_artifact(&store, None, target(), WorkspaceReadView::Live)
+            .unwrap();
+        assert_eq!(read.bytes, b"abcdefghijkl");
+    }
+
+    #[test]
+    fn a_lost_upload_acknowledgement_resumes_past_the_recorded_block() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        inspector.lose_upload_response_once();
+        let client = client(transport);
+        let store = RecordingStore::new(events, inspector.objects());
+
+        let outcome = client
+            .publish_artifact(&store, publish_options(4), b"abcdefghijkl")
+            .unwrap();
+
+        assert_eq!(outcome.publication.value.logical_size, 12);
+        assert_eq!(outcome.upload_stats.blocks, 3);
+        let state = inspector.state();
+        assert_eq!(
+            state.upload_applies, 3,
+            "the block whose acknowledgement was lost is written once"
+        );
+        assert_eq!(state.abort_applies, 0);
+        assert_eq!(admissions(&state), 1, "the retry stays inside the request");
+        let uploads = state
+            .attempts
+            .iter()
+            .filter(|(label, _)| *label == "upload_object")
+            .map(|(_, request_id)| *request_id)
+            .collect::<Vec<_>>();
+        assert_eq!(uploads.len(), 4);
+        assert_eq!(
+            uploads[0], uploads[1],
+            "the retry reuses the request identity the owner recorded"
+        );
+        drop(state);
+        let read = client
+            .read_artifact(&store, None, target(), WorkspaceReadView::Live)
+            .unwrap();
+        assert_eq!(read.bytes, b"abcdefghijkl");
     }
 
     #[test]
@@ -6097,8 +6018,8 @@ mod tests {
     fn temporary_object_read_is_retried_and_recovers() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let store = RecordingStore::new(events, transport.objects());
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
         client
             .publish_artifact(&store, publish_options(4), b"abcdefgh")
             .unwrap();
@@ -6117,8 +6038,8 @@ mod tests {
     fn exhausted_object_read_preserves_retryability_without_provider_details() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let store = RecordingStore::new(events, transport.objects());
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
         client
             .publish_artifact(&store, publish_options(4), b"abcdefgh")
             .unwrap();
@@ -6144,8 +6065,8 @@ mod tests {
     fn range_reads_rebuild_and_verify_the_complete_provider_neutral_manifest() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let store = RecordingStore::new(events, transport.objects());
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
         let bytes = b"abcdefghijkl";
         client
             .publish_artifact(&store, publish_options(4), bytes)
@@ -6170,7 +6091,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         client
             .publish_artifact(&store, publish_options(4), &[])
             .unwrap();
@@ -6197,7 +6118,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         client
             .publish_artifact(&store, publish_options(4), b"abcdefgh")
             .unwrap();
@@ -6216,7 +6137,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         let bytes = vec![0x5a; MAX_ARTIFACT_READ_PLAN_ROWS + 1];
         client
             .publish_artifact(&store, publish_options(1), &bytes)
@@ -6245,7 +6166,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         let bytes = vec![0x6b; MAX_ARTIFACT_READ_PLAN_ROWS + 1];
         client
             .publish_artifact(&store, publish_options(1), &bytes)
@@ -6291,7 +6212,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         client
             .publish_artifact(&store, publish_options(4), b"same bytes")
             .unwrap();
@@ -6334,8 +6255,8 @@ mod tests {
     fn range_batch_preserves_request_range_order_duplicates_and_overlaps() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let store = RecordingStore::new(events, transport.objects());
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
         client
             .publish_artifact(&store, publish_options(4), b"abcdefghijkl")
             .unwrap();
@@ -6387,8 +6308,8 @@ mod tests {
     fn range_batch_rejects_empty_zero_overflow_and_out_of_bounds_inputs() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let store = RecordingStore::new(events, transport.objects());
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
         client
             .publish_artifact(&store, publish_options(4), b"abcdefgh")
             .unwrap();
@@ -6433,7 +6354,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         client
             .publish_artifact(&store, publish_options(4), b"abcdefghijkl")
             .unwrap();
@@ -6465,8 +6386,8 @@ mod tests {
     fn range_batch_short_provider_read_fails_instead_of_truncating_output() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let store = RecordingStore::new(events, transport.objects());
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
         client
             .publish_artifact(&store, publish_options(4), b"abcdefgh")
             .unwrap();
@@ -6493,8 +6414,8 @@ mod tests {
     fn range_batch_retries_the_whole_bounded_attempt_and_exhausts_cleanly() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let store = RecordingStore::new(events, transport.objects());
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
         client
             .publish_artifact(&store, publish_options(4), b"abcdefgh")
             .unwrap();
@@ -6528,7 +6449,7 @@ mod tests {
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
         let inspector = transport.clone();
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
+        let store = RecordingStore::new(events, inspector.objects());
         client
             .publish_artifact(&store, publish_options(4), b"abcdefghijkl")
             .unwrap();
@@ -6588,8 +6509,8 @@ mod tests {
     fn duplicate_target_checks_every_expected_generation_before_object_reads() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let store = RecordingStore::new(events, transport.objects());
         let client = client(transport);
-        let store = RecordingStore::new(events, None);
         client
             .publish_artifact(&store, publish_options(4), b"abcdefgh")
             .unwrap();

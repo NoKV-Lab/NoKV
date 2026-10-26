@@ -268,9 +268,7 @@ pub(crate) fn classify(operation: &WorkspaceRequest) -> OperationClass {
         WorkspaceRequest::RemovePath(_) => ("RemovePath", Role::Writer),
         WorkspaceRequest::BeginArtifactPublish(_) => ("BeginArtifactPublish", Role::Writer),
         WorkspaceRequest::StageArtifactObjects(_) => ("StageArtifactObjects", Role::Writer),
-        WorkspaceRequest::MarkArtifactObjectsUploaded(_) => {
-            ("MarkArtifactObjectsUploaded", Role::Writer)
-        }
+        WorkspaceRequest::UploadArtifactObject(_) => ("UploadArtifactObject", Role::Writer),
         WorkspaceRequest::StageArtifactManifest(_) => ("StageArtifactManifest", Role::Writer),
         WorkspaceRequest::CompleteArtifactPublish(_) => ("CompleteArtifactPublish", Role::Writer),
         WorkspaceRequest::PrepareArtifactPublish(_) => ("PrepareArtifactPublish", Role::Writer),

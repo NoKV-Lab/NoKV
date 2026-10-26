@@ -36,12 +36,10 @@ pub use admission::{
     ProviderHandleIdentity, MAX_SINGLE_PUT_ADMISSION_BYTES, PROVIDER_ADMISSION_CONTRACT_VERSION,
 };
 pub use artifact::{
-    cleanup_staged_artifact, plan_artifact_read, plan_artifact_upload, read_artifact,
-    read_artifact_range, read_artifact_window, upload_artifact_from_plan, verify_artifact_bytes,
-    ArtifactBlock, ArtifactBlockRead, ArtifactCleanupFailure, ArtifactCleanupOutcome,
+    plan_artifact_read, plan_artifact_upload, read_artifact, read_artifact_range,
+    read_artifact_window, verify_artifact_bytes, ArtifactBlock, ArtifactBlockRead,
     ArtifactKeyspace, ArtifactManifest, ArtifactReadOutcome, ArtifactReadPlan, ArtifactReadStats,
-    ArtifactReadWindow, ArtifactUpload, ArtifactUploadFailure, ArtifactUploadOptions,
-    ArtifactUploadPlan, ArtifactUploadStats, StagedArtifactObjects, DEFAULT_ARTIFACT_BLOCK_SIZE,
+    ArtifactReadWindow, ArtifactUploadOptions, ArtifactUploadPlan, DEFAULT_ARTIFACT_BLOCK_SIZE,
 };
 pub use cache::{
     ArtifactBlockCache, ArtifactCacheStats, MemoryArtifactCache, MemoryArtifactCacheOptions,
