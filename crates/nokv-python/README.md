@@ -202,7 +202,25 @@ not for installing the SDK.
   The manifest is the checkpoint commit point, so incomplete shard sets are not
   discoverable as committed checkpoints.
 - `nokv.torch` is an optional `torch.distributed.checkpoint` adapter. Import it
-  explicitly after installing the `torch` extra.
+  explicitly after installing the `torch` extra. New DCP metadata and shard
+  payloads use versioned, non-executable formats. Legacy pickle checkpoints
+  are rejected on load; re-save them from a trusted original state to migrate.
+  The formats have declared limits. The metadata document is at most 64 MiB.
+  Tensor leaves are stored as raw bytes with no adapter-imposed size limit and
+  support dense strided tensors of every `bool`, integer (including `uint16`,
+  `uint32`, and `uint64`), `float8`, `float16`, `bfloat16`, `float32`,
+  `float64`, and complex dtype that the installed PyTorch defines. A non-tensor
+  leaf that MessagePack carries directly (`None`, booleans, 64-bit integers,
+  floats, strings, bytes, lists, and string-keyed dictionaries) has no
+  adapter-imposed size limit; any other supported Python value (tuples,
+  bytearrays, complex numbers, non-string dictionary keys, or tensors nested in
+  a Python value) is JSON-encoded and limited to 64 MiB. Other dtypes, sparse
+  layouts, and Python object types fail closed at save time. PyTorch 2.2 and
+  2.3 load through the deprecated `load_state_dict` entry point because their
+  `load()` cannot run without a process group (2.2) or discards nested
+  non-tensor values (2.3); `Stateful` values therefore need PyTorch 2.4 or
+  later, and loading on 2.2 or 2.3 without a process group needs
+  `no_dist=True`.
 
 The fsspec adapter supports byte modes `r`, `rb`, `w`, `wb`, `x`, and `xb`.
 Append, update, text, permissions, inode/dentry identity, mounts, recursive

@@ -20,7 +20,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-torch = ["torch>=2.2"]
+torch = ["torch>=2.2.0", "msgpack>=1.1,<2"]
 
 [tool.maturin]
 module-name = "nokv._native"

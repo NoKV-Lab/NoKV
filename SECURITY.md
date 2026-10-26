@@ -33,8 +33,10 @@ Every object write is the owner's: a client never holds object write
 credentials, and sends each block to the owner, which verifies it against the
 staged plan before writing it. Give Agent processes prefix-scoped read-only
 object credentials (GET and HEAD under the root's prefix); the owner's
-credentials write. The object store itself still authenticates only what the
-deployment's IAM gives each credential.
+credentials write ([object store credentials](docs/object-credentials.md)
+lists the keys each role touches and example policies). The object store
+itself still authenticates only what the deployment's IAM gives each
+credential.
 
 - Workbench-root jailing only contains paths.
 - Without TLS, the native CLI's `RootId`-to-`AgentId` check only catches
