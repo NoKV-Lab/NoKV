@@ -399,11 +399,6 @@ mod tests {
                         operation_id: OperationIdentity([1; 16]),
                         state_digest: Digest([6; 32]),
                     },
-                    uploaded_objects: vec![crate::ObjectUploadProof {
-                        sequence: 0,
-                        observed_length: 1,
-                        observed_digest: digest.clone(),
-                    }],
                     manifest_rows: vec![crate::ArtifactManifestRow {
                         object_index: 0,
                         physical_object_index: 0,
@@ -428,8 +423,20 @@ mod tests {
                 },
             ),
         };
+        let upload = WorkspaceRpcRequest {
+            route: route(),
+            request_id: RequestIdentity([0x53; 16]),
+            operation: WorkspaceRequest::UploadArtifactObject(crate::UploadArtifactObjectRequest {
+                token: crate::OperationToken {
+                    operation_id: OperationIdentity([1; 16]),
+                    state_digest: Digest([6; 32]),
+                },
+                sequence: 0,
+                body: vec![0x61],
+            }),
+        };
         let mut golden = Sha256::new();
-        for request in [&prepare, &finish] {
+        for request in [&prepare, &upload, &finish] {
             let encoded = encode_request(request).unwrap();
             assert_eq!(&decode_request(&encoded).unwrap(), request);
             golden.update((encoded.len() as u64).to_be_bytes());
@@ -438,8 +445,8 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(golden.finalize()),
             [
-                219, 231, 28, 40, 247, 96, 212, 4, 86, 247, 174, 146, 201, 59, 208, 121, 13, 119,
-                207, 205, 16, 51, 34, 70, 208, 135, 232, 70, 40, 74, 230, 205,
+                95, 157, 43, 219, 156, 245, 126, 182, 88, 13, 148, 128, 96, 253, 190, 238, 237,
+                127, 173, 41, 108, 173, 150, 72, 236, 15, 70, 203, 2, 183, 100, 149,
             ],
             "update only for an intentional fused publication v15 wire change"
         );

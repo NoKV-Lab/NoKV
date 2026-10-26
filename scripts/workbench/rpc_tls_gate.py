@@ -14,16 +14,27 @@ the root is bound to its tenant, an owner without TLS must refuse to serve it. E
 refusal must be exactly one `operator_required` failure line, and a read-back
 by a writer must show that the refused write changed nothing. Certificates come
 from the `openssl` command.
+
+Every Agent process reaches the object store through an endpoint that forwards
+only GET and HEAD, as prefix-scoped read-only credentials would; the owner
+keeps the provider's full coordinates. A publication whose body spans two
+object blocks must therefore complete through the owner, and the Agent must
+read it back without one refused request.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import http.client
+import http.server
 import json
 import subprocess
 import sys
+import threading
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
@@ -34,6 +45,7 @@ from cli_contract_gate import (
     ContractFailure,
     NotQualified,
     Stack,
+    free_port,
     new_id,
     require,
     verdict,
@@ -42,6 +54,109 @@ from cli_contract_gate import (
 SCHEMA = "nokv.rpc_tls_gate.v1"
 SERVER_NAME = "owner.test"
 WORKBENCH = "tls"
+# Two object blocks at the default block size, so the body cannot publish
+# inline and the owner must write more than one object.
+MULTI_BLOCK_BODY_BYTES = 4 * 1024 * 1024 + 17
+
+
+class ReadOnlyObjectProxy:
+    """The object endpoint an Agent process is given. It forwards GET and
+    HEAD to the provider unchanged and answers every other method with 403
+    before contacting the provider, as prefix-scoped read-only credentials
+    would; it records every request it saw."""
+
+    def __init__(self, port: int, upstream: str, timeout: float) -> None:
+        self.port, self.timeout = port, timeout
+        self.upstream = urllib.parse.urlsplit(upstream)
+        self.lock = threading.Lock()
+        self.requests: list[dict[str, Any]] = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_arguments: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                outer.forward(self)
+
+            def do_HEAD(self) -> None:
+                outer.forward(self)
+
+            def do_PUT(self) -> None:
+                outer.refuse(self)
+
+            def do_POST(self) -> None:
+                outer.refuse(self)
+
+            def do_DELETE(self) -> None:
+                outer.refuse(self)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def record(self, handler: http.server.BaseHTTPRequestHandler, forwarded: bool, status: int) -> None:
+        with self.lock:
+            self.requests.append(
+                {"method": handler.command, "path": handler.path, "forwarded": forwarded, "status": status}
+            )
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        with self.lock:
+            return list(self.requests)
+
+    def forward(self, handler: http.server.BaseHTTPRequestHandler) -> None:
+        length = int(handler.headers.get("Content-Length", "0"))
+        payload = handler.rfile.read(length) if length else b""
+        with contextlib.closing(
+            http.client.HTTPConnection(self.upstream.hostname, self.upstream.port, timeout=self.timeout)
+        ) as upstream:
+            upstream.putrequest(handler.command, handler.path, skip_host=True, skip_accept_encoding=True)
+            for key, value in handler.headers.items():
+                if key.lower() != "connection":
+                    upstream.putheader(key, value)
+            upstream.putheader("Connection", "close")
+            upstream.endheaders(payload)
+            response = upstream.getresponse()
+            body = response.read()
+        handler.send_response(response.status)
+        for key, value in response.getheaders():
+            if key.lower() in ("connection", "transfer-encoding"):
+                continue
+            if key.lower() == "content-length" and handler.command != "HEAD":
+                continue
+            handler.send_header(key, value)
+        if handler.command != "HEAD":
+            handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        if handler.command != "HEAD":
+            handler.wfile.write(body)
+        handler.close_connection = True
+        self.record(handler, True, response.status)
+
+    def refuse(self, handler: http.server.BaseHTTPRequestHandler) -> None:
+        body = b"<Error><Code>AccessDenied</Code><Message>read-only Agent credentials</Message></Error>"
+        handler.send_response(403)
+        handler.send_header("Content-Type", "application/xml")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.wfile.write(body)
+        handler.close_connection = True
+        self.record(handler, False, 403)
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def with_object_endpoint(options: list[str], endpoint: str) -> list[str]:
+    """The same object-store options, reaching the provider at `endpoint`."""
+    index = options.index("--object-endpoint") + 1
+    return [*options[:index], endpoint, *options[index + 1:]]
 
 
 def openssl(directory: Path, *arguments: str) -> None:
@@ -85,6 +200,12 @@ class TlsStack(Stack):
 
     def __init__(self, args: argparse.Namespace, evidence: Path) -> None:
         super().__init__(args, evidence)
+        # The owner and the operator's provision keep the provider's full
+        # coordinates; every Agent process reads through the proxy.
+        self.owner_objects = list(self.objects)
+        self.object_proxy = ReadOnlyObjectProxy(free_port(), self.objects[self.objects.index("--object-endpoint") + 1],
+                                                self.timeout)
+        self.agent_objects = with_object_endpoint(self.objects, f"http://127.0.0.1:{self.object_proxy.port}")
         self.pki = Pki(evidence / "pki")
         self.clients = {
             name: self.pki.client(name)
@@ -95,6 +216,9 @@ class TlsStack(Stack):
             name: new_id() for name in ("agent", "reader", "peer", "session", "operator", "fourth")
         }
         self.principal = self.principals["agent"]
+
+    def object_options(self, command: str) -> list[str]:
+        return self.owner_objects if command == "provision" else self.agent_objects
 
     def tls_options(self, client: str | None, server_name: str) -> list[str]:
         if client is None:
@@ -142,7 +266,7 @@ class TlsStack(Stack):
             "--rpc-tls-key", str(self.pki.directory / "owner.key"),
         ] if tls else []
         argv = [
-            str(self.binary), *self.route, *self.objects, *tls_options,
+            str(self.binary), *self.route, *self.owner_objects, *tls_options,
             "--bind", f"127.0.0.1:{self.owner_port}",
             "--advertise-endpoint", f"127.0.0.1:{self.owner_port}",
             "--node-id", "rpc-tls-owner",
@@ -169,6 +293,7 @@ class TlsStack(Stack):
 
     def close(self) -> None:
         super().close()
+        self.object_proxy.close()
         # Evidence keeps the certificates, never the private keys.
         for key in self.pki.directory.glob("*.key"):
             key.unlink()
@@ -420,6 +545,38 @@ def four_principals_write_one_root_concurrently(stack: TlsStack) -> dict[str, An
     return results
 
 
+def multi_block_publish_through_the_owner_with_read_only_agent_credentials(stack: TlsStack) -> dict[str, Any]:
+    """T14: an Agent whose object credentials can only read publishes a body of
+    two blocks. The owner writes every block with its own credentials; the
+    Agent reads the body back through its read-only endpoint, and no Agent
+    process attempts an object write."""
+    pattern = hashlib.sha256(b"t14").digest()
+    body = (pattern * (MULTI_BLOCK_BODY_BYTES // len(pattern) + 1))[:MULTI_BLOCK_BODY_BYTES]
+    operation_id = new_id()
+    seen = len(stack.object_proxy.snapshot())
+    arguments = stack.put_arguments("t14", WORKBENCH, "t14.bin", operation_id, body)
+    put = stack.success(stack.run("t14-put", arguments))
+    require(put.get("logical_size") == len(body), "t14: the receipt names the whole body", put)
+    stack.assert_live("t14", WORKBENCH, "t14.bin", body, put)
+    requests = stack.object_proxy.snapshot()[seen:]
+    methods: dict[str, int] = {}
+    for request in requests:
+        methods[request["method"]] = methods.get(request["method"], 0) + 1
+    require(set(methods) and set(methods) <= {"GET", "HEAD"},
+            "t14: Agent processes only read the object store", requests[:8])
+    require(all(request["forwarded"] for request in requests),
+            "t14: no Agent object request was refused", [r for r in requests if not r["forwarded"]][:8])
+    status = stack.success(stack.run("t14-status", ["operation", "status", operation_id]))
+    require(status.get("initiator") == stack.principal, "t14: the publication names its initiator", status)
+    return {
+        "body_bytes": len(body),
+        "body_sha256": hashlib.sha256(body).hexdigest(),
+        "receipt": put,
+        "agent_object_methods": methods,
+        "status": status,
+    }
+
+
 SCENARIOS: dict[str, Callable[[TlsStack], dict]] = {
     "t1_registered_client_round_trip": registered_client_round_trip,
     "t2_unregistered_certificate_refused": unregistered_certificate_refused,
@@ -435,6 +592,8 @@ SCENARIOS: dict[str, Callable[[TlsStack], dict]] = {
     "t11_only_the_minter_or_an_operator_renews_a_snapshot": only_the_minter_or_an_operator_renews_a_snapshot,
     "t12_an_identical_commit_replays_across_principals": an_identical_commit_replays_across_principals,
     "t13_four_principals_write_one_root_concurrently": four_principals_write_one_root_concurrently,
+    "t14_multi_block_publish_through_the_owner_with_read_only_agent_credentials":
+        multi_block_publish_through_the_owner_with_read_only_agent_credentials,
 }
 
 

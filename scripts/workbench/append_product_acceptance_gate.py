@@ -237,7 +237,7 @@ class ObjectProxy:
                         with outer.lock:
                             outer.rejected_requests.append(event)
                         outer.stack.record("object-http-transcript.jsonl", event)
-                        body = b"<Error><Code>ServiceUnavailable</Code><Message>Injected temporary admission outage</Message></Error>"
+                        body = b"<Error><Code>ServiceUnavailable</Code><Message>Injected temporary provider outage</Message></Error>"
                         self.send_response(503)
                         self.send_header("Content-Type", "application/xml")
                         self.send_header("Content-Length", str(len(body)))
@@ -2171,7 +2171,7 @@ except Exception as error:
     print(json.dumps({"status":"error", "type":type(error).__name__, "message":str(error), **{field:getattr(error, field, None) for field in ("operation_id", "code", "cause_code", "error_class", "next_action", "publication_operation_id", "state", "retryable")}}))
 """
 
-PYTHON_ADMISSION_RECOVERY_PROGRAM = r"""
+PYTHON_UPLOAD_OUTAGE_RECOVERY_PROGRAM = r"""
 import json, os, sys, time
 from pathlib import Path
 import nokv
@@ -2193,12 +2193,12 @@ def wait(name):
 
 def append_once():
     try:
-        return {"status":"success", "result":client.append_bytes(config["workbench"], "logs/effects.log", b"admission-recovered\n", config["operation_id"], content_type="text/plain", max_logical_size=1048576)}
+        return {"status":"success", "result":client.append_bytes(config["workbench"], "logs/effects.log", bytes.fromhex(config["delta_hex"]), config["operation_id"], content_type="text/plain", max_logical_size=1048576)}
     except Exception as error:
         return {"status":"error", "type":type(error).__name__, "message":str(error), **{field:getattr(error,field,None) for field in ("operation_id","code","cause_code","error_class","next_action","state")}}
 
 # Generic publication binds and caches this exact Client's object handle before
-# the append-specific admission fault is armed by the parent coordinator.
+# the owner-side upload fault is armed by the parent coordinator.
 seed = client.publish_bytes(config["workbench"], "logs/effects.log", b"python-bound-seed\n", content_type="text/plain")
 ready = emit("ready", {"status":"success", "seed":seed})
 wait("first-go")
@@ -2219,11 +2219,25 @@ def wait_json_file(path, timeout):
     raise TimeoutError(f"Python coordinator did not receive {path}")
 
 
-def python_same_client_admission_recovery(stack):
-    workbench, operation_id = "product-python-admission-recovery", "eb" * 16
+def python_same_client_upload_outage_recovery(stack):
+    """The owner writes every object block. While the provider refuses the
+    owner's block writes, the same live Python Client's append leaves its
+    child publication pending and reports that, typed, with its logical
+    identity; once the provider recovers and the stalled child is fenced at
+    the end of its activity lease, the same Client completes that append
+    exactly once."""
+    workbench, operation_id = "product-python-upload-outage-recovery", "eb" * 16
+    lease_ms = stack.publication_lease_ms
+    if lease_ms is None or lease_ms > stack.timeout * 1000:
+        raise base.infra.NotQualified(
+            "the owner-side upload outage case needs --append-activity-lease-ms at most the "
+            "timeout, so the stalled child publication is fenced within the run"
+        )
     stack.cli("workbench_create", {"id": workbench})
     control = stack.evidence_dir / "python-same-client-control"
     control.mkdir()
+    # Above the inline bound, so the append uploads an object block.
+    delta = above_inline_bound("upload-recovered\n").encode()
     config = {
         "root_id": stack.root_id,
         "etcd_endpoint": stack.etcd_endpoint,
@@ -2236,13 +2250,14 @@ def python_same_client_admission_recovery(stack):
         "secret_key": stack.secret_key,
         "workbench": workbench,
         "operation_id": operation_id,
+        "delta_hex": delta.hex(),
         "control_directory": str(control),
     }
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(
             stack.run,
-            [stack.python_executable, "-c", PYTHON_ADMISSION_RECOVERY_PROGRAM],
-            label="python-one-client-admission-recovery",
+            [stack.python_executable, "-c", PYTHON_UPLOAD_OUTAGE_RECOVERY_PROGRAM],
+            label="python-one-client-upload-outage-recovery",
             input_text=json.dumps(config),
             timeout=2 * stack.timeout,
         )
@@ -2252,54 +2267,80 @@ def python_same_client_admission_recovery(stack):
                 stack,
                 workbench,
                 b"python-bound-seed\n",
-                "python-admission-seed-before-fault",
+                "python-upload-outage-seed-before-fault",
             )
             with stack.object_proxy.lock:
                 prior_faults = len(stack.object_proxy.rejected_requests)
                 stack.object_proxy.reject_matching = {
                     "method": "PUT",
-                    "path_contains": "/seal-",
+                    "path_contains": "/blocks/",
                 }
             (control / "first-go").touch()
             first = wait_json_file(control / "first.json", stack.timeout)
             faults = stack.object_proxy.rejected_requests[prior_faults:]
             if not faults:
                 raise base.infra.NotQualified(
-                    "Append-specific seal admission was not reached by this installed Python Client; no outage was injected."
+                    "No owner block write was attempted during the armed outage; nothing was injected."
                 )
             require(
-                first.get("status") == "error"
-                and first.get("operation_id") == operation_id
-                and first.get("code") == "AppendFailed"
-                and first.get("cause_code") == "ProviderAdmissionInconclusive"
-                # Admission runs before any append request, as on the CLI.
-                and first.get("error_class") == "transient"
-                and first.get("next_action") == "resubmit_same"
-                and first.get("state") is None,
-                "temporary seal admission failure is typed and keeps logical identity",
-                first,
+                all(
+                    fault["method"] == "PUT" and "/blocks/" in fault["path"]
+                    for fault in faults
+                ),
+                "every injected fault hit an owner block write",
+                faults,
             )
-            absent = operation_status(
-                stack, operation_id, "python-admission-failure-unadmitted"
-            )
+            # The owner's block write failed, so the child publication stays
+            # pending: the same identity reports it and must be retained.
             require(
-                absent.get("code") == "NotFound",
-                "provider admission failure creates no logical operation",
-                absent,
+                first.get("status") == "error"
+                and first.get("type") == "AppendError"
+                and first.get("operation_id") == operation_id
+                and first.get("code") == "AppendUnresolved"
+                and first.get("cause_code") == "Conflict"
+                and first.get("error_class") == "in_progress"
+                and first.get("next_action") == "poll"
+                and first.get("state") == "Running",
+                "an owner-side upload outage leaves the append pending, typed in_progress/poll with its identity",
+                first,
             )
             exact_body(
                 stack,
                 workbench,
                 b"python-bound-seed\n",
-                "python-admission-failure-no-effect",
+                "python-upload-outage-no-effect",
             )
             with stack.object_proxy.lock:
                 stack.object_proxy.reject_matching = None
+            # The stalled child is fenced once its activity lease expires; the
+            # same logical identity is then ready to retry.
+            fence_deadline = time.monotonic() + lease_ms / 1000 + stack.timeout
+            fence_observations = []
+            while True:
+                status = operation_status(
+                    stack,
+                    operation_id,
+                    f"python-upload-outage-fence-{len(fence_observations):02d}",
+                )
+                fence_observations.append(status)
+                if status.get("next_action") == "resubmit_same":
+                    break
+                require(
+                    status.get("next_action") == "poll",
+                    "the stalled append stays pending until it is fenced",
+                    status,
+                )
+                require(
+                    time.monotonic() < fence_deadline,
+                    "the stalled child is fenced within its activity lease plus the timeout",
+                    status,
+                )
+                time.sleep(1.0)
             (control / "second-go").touch()
             second = wait_json_file(control / "second.json", stack.timeout)
             require(
                 second.get("status") == "success",
-                "same live Python Client recovers after temporary seal-admission failure",
+                "same live Python Client completes the append once the provider recovers",
                 second,
             )
             require(
@@ -2316,22 +2357,23 @@ def python_same_client_admission_recovery(stack):
     exact_body(
         stack,
         workbench,
-        b"python-bound-seed\nadmission-recovered\n",
-        "python-admission-recovered-body",
+        b"python-bound-seed\n" + delta,
+        "python-upload-outage-recovered-body",
     )
     replay = replay_unchanged(
         stack,
         workbench,
         operation_id,
-        b"admission-recovered\n",
+        delta,
         second["result"],
-        "python-admission-cli-replay",
+        "python-upload-outage-cli-replay",
         max_size=1024 * 1024,
     )
     return {
         "same_client_process": json.loads(process.stdout),
         "injected_503_requests": faults,
-        "unadmitted_status_after_failure": absent,
+        "first_attempt": first,
+        "fence_observations": fence_observations,
         "replay": replay,
     }
 
@@ -2509,7 +2551,7 @@ def python_metadata_status(stack):
         "Python mismatch exposes stable cause and identity",
         mismatch,
     )
-    admission_recovery = python_same_client_admission_recovery(stack)
+    upload_outage_recovery = python_same_client_upload_outage_recovery(stack)
     return case_result(
         safety="PASS",
         completion="PASS",
@@ -2523,7 +2565,7 @@ def python_metadata_status(stack):
         metadata_only_append_replay=metadata_only_replay,
         metadata_only_status=result,
         mismatch=mismatch,
-        same_client_admission_recovery=admission_recovery,
+        same_client_upload_outage_recovery=upload_outage_recovery,
     )
 
 
