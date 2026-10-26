@@ -196,7 +196,9 @@ not for installing the SDK.
   The manifest is the checkpoint commit point, so incomplete shard sets are not
   discoverable as committed checkpoints.
 - `nokv.torch` is an optional `torch.distributed.checkpoint` adapter. Import it
-  explicitly after installing the `torch` extra.
+  explicitly after installing the `torch` extra. New DCP metadata and shard
+  payloads use versioned, non-executable formats. Legacy pickle checkpoints
+  are rejected on load; re-save them from a trusted original state to migrate.
 
 The fsspec adapter supports byte modes `r`, `rb`, `w`, `wb`, `x`, and `xb`.
 Append, update, text, permissions, inode/dentry identity, mounts, recursive
