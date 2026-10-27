@@ -100,7 +100,9 @@ impl PythonWorkspaceClient {
         read_timeout_ms = 30_000,
         write_timeout_ms = 30_000,
         handshake_timeout_ms = 5_000,
-        workbench_root = None
+        workbench_root = None,
+        retry_backoff_ms = 0,
+        max_retry_backoff_ms = 2_000
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -114,6 +116,8 @@ impl PythonWorkspaceClient {
         write_timeout_ms: u64,
         handshake_timeout_ms: u64,
         workbench_root: Option<String>,
+        retry_backoff_ms: u64,
+        max_retry_backoff_ms: u64,
     ) -> PyResult<Self> {
         let root_id = RootIdentity(parse_fixed_hex("root_id", root_id)?);
         let transport = FramedTcpTransport::new(FramedTcpOptions {
@@ -127,9 +131,13 @@ impl PythonWorkspaceClient {
         let resolver = py
             .detach(move || routing.build(root_id))
             .map_err(|error| configuration_failure(py, error))?;
-        let client =
-            WorkspaceClient::new(root_id, transport, resolver, ClientOptions { max_attempts })
-                .map_err(|error| configuration_failure(py, error))?;
+        let options = ClientOptions {
+            max_attempts,
+            retry_backoff: Duration::from_millis(retry_backoff_ms),
+            max_retry_backoff: Duration::from_millis(max_retry_backoff_ms),
+        };
+        let client = WorkspaceClient::new(root_id, transport, resolver, options)
+            .map_err(|error| configuration_failure(py, error))?;
         py.detach(|| client.preflight(std::iter::empty()))
             .map_err(|error| runtime_client_failure(py, error, IdempotencyScope::ReadOnly))?;
         Ok(Self {

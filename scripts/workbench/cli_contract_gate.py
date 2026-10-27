@@ -579,6 +579,69 @@ def workbench_tool_operation_id_replays(stack: Stack) -> dict[str, Any]:
             "append": [appended, appended_again]}
 
 
+def session_backoff_bridges_owner_restart(stack: Stack) -> dict[str, Any]:
+    """S10: a `workbench-session` started with bounded retry backoff completes a
+    write sent while the owner is down, once the owner is back."""
+    workbench = "s10-session-backoff"
+    stack.workbench(workbench)
+    argv = [str(stack.binary), *stack.route, "--agent-id", stack.ids["agent"], *stack.objects,
+            "--max-attempts", "16", "--retry-backoff-ms", "250", "--max-retry-backoff-ms", "2000",
+            "workbench-session"]
+    session = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, env=stack.env)
+    transcript: list[dict[str, Any]] = []
+
+    def send(index: int) -> None:
+        request = {"id": str(index), "tool": "workbench_put_file", "arguments": {
+            "id": workbench, "section": "outputs", "path": f"session-{index}.txt",
+            "text": f"session {index}", "replace": False}}
+        session.stdin.write(json.dumps(request) + "\n")
+        session.stdin.flush()
+        transcript.append({"label": f"s10-send-{index}", "request": request, "at": time.time()})
+
+    def receive(index: int) -> dict[str, Any]:
+        line = session.stdout.readline()
+        reply = json.loads(line) if line else {"error": "the session closed its output"}
+        transcript.append({"label": f"s10-reply-{index}", "reply": reply, "at": time.time()})
+        return reply
+
+    def connections() -> int:
+        with stack.proxy._lock:
+            return stack.proxy.connections
+
+    try:
+        send(1)
+        before = receive(1)
+        require("result" in before, "s10: the session writes while the owner is up", before)
+        stack.kill_owner()
+        down = connections()
+        send(2)
+        # 250 ms, then 500 ms: at least two spaced attempts fall in this window,
+        # while 16 immediate attempts would all have failed within it.
+        time.sleep(1.0)
+        attempts_while_down = connections() - down
+        stack.start_owner()
+        after = receive(2)
+    finally:
+        session.stdin.close()
+        session.wait(timeout=stack.timeout)
+        stderr = session.stderr.read()
+    for entry in transcript:
+        stack.write("cli-transcript.jsonl", {"session": "s10", **entry})
+    require(session.returncode == 0 and not stderr,
+            "s10: the session exits 0 at end of input without complaints", [session.returncode, stderr])
+    require("result" in after and after["result"].get("generation") == 1,
+            "s10: the write sent during the outage lands once the owner is back", after)
+    require(2 <= attempts_while_down < 16,
+            "s10: the session spaced its attempts over the outage within its budget", attempts_while_down)
+    stat = stack.stat("s10-landed", workbench, "session-2.txt")
+    require(stat.get("exists") is True and stat.get("generation") == 1,
+            "s10: the live path is the session's write", [stat, after])
+    require(stack.body("s10-body", workbench, "session-2.txt") == b"session 2",
+            "s10: the live body is the session's text")
+    return {"before": before, "after": after, "attempts_while_down": attempts_while_down}
+
+
 def usage_error_sends_no_request(stack: Stack) -> dict[str, Any]:
     """S7: an invalid command fails typed before it reaches the owner."""
     cases = {
@@ -609,6 +672,7 @@ SCENARIOS = {
     "s5_unknown_outcome_query_then_retry": unknown_outcome_query_then_retry,
     "s7_usage_error_sends_no_request": usage_error_sends_no_request,
     "s9_workbench_tool_operation_id_replays": workbench_tool_operation_id_replays,
+    "s10_session_backoff_bridges_owner_restart": session_backoff_bridges_owner_restart,
 }
 
 

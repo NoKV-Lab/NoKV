@@ -81,6 +81,32 @@ without `--operation-id`) may apply twice if repeated, so its unknown outcome
 says `reread_then_retry`.
 A read never reports an unknown outcome.
 
+## Retries
+
+A command repeats an attempt that failed before it could take effect: a
+refused or dropped connection, or an owner answer marked `retryable`. A
+request that reached a changed owner is re-routed and repeated at once; every
+other repeat waits first, `--retry-backoff-ms` before the second attempt,
+doubling per further attempt and never longer than `--max-retry-backoff-ms`.
+The defaults are three attempts (`--max-attempts`, 1 to 16) with no pause,
+which an owner restart of a few seconds exhausts. A `workbench-session` that
+must outlive such a restart starts with `--max-attempts 16
+--retry-backoff-ms 250`: it waits about 26 seconds in all before giving up. A
+backoff above its bound is `invalid_input`. The Python SDK takes the same
+options as `Client(..., max_attempts=3, retry_backoff_ms=0,
+max_retry_backoff_ms=2000)`.
+
+Exhausted attempts fail with class `transient` when no attempt can have
+taken effect and `outcome_unknown` when the last one may have reached the
+owner; both are resolved as described above. A caller that repeats a
+create-only `workbench_put_file` after an unknown outcome gives it an
+`operation_id` so an applied first attempt replays its receipt; without one,
+`precondition_failed` (`AlreadyExists`) on the repeat may be its own earlier
+write, and the caller reads the path back before deciding. An identified
+write that was in flight when the owner died may answer `in_progress` after
+the restart while the owner still holds its earlier attempt; the client does
+not wait that out, so the caller follows `poll` and resubmits the same call.
+
 ## Identity
 
 | Command | Identity | Replay |

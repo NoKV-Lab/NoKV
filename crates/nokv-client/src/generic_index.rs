@@ -736,7 +736,10 @@ mod tests {
             route.root_id,
             transport,
             StaticRouteResolver::new(route, "127.0.0.1:43119".parse().unwrap()).unwrap(),
-            ClientOptions { max_attempts: 2 },
+            ClientOptions {
+                max_attempts: 2,
+                ..ClientOptions::default()
+            },
         )
         .unwrap()
     }
@@ -749,7 +752,10 @@ mod tests {
             route.root_id,
             transport,
             StaticRouteResolver::new(route, "127.0.0.1:43120".parse().unwrap()).unwrap(),
-            ClientOptions { max_attempts: 2 },
+            ClientOptions {
+                max_attempts: 2,
+                ..ClientOptions::default()
+            },
         )
         .unwrap()
     }
