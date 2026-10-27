@@ -205,7 +205,7 @@ jobs:
                   --dependency "etcd=sha256:e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9"
                   --dependency "object-store=oci:rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
                   --evidence "qualification=$evidence_root/qualification.json"
-                  --evidence "mcp-transcript=$evidence_root/mcp-transcript.jsonl"
+                  --evidence "cli-transcript=$evidence_root/cli-transcript.jsonl"
                 )
                 producer_args+=(
                   --nokv-bin "$product_binary"

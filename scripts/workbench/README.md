@@ -9,12 +9,14 @@ These assets validate the same 18-tool Workbench semantics exported by
 `crates/nokv-agent`. The native full CLI is the primary integration surface,
 and the direct Python SDK is second for embedded callers.
 
-Several runners here still reach the 18 tools through a `nokv mcp` child
+The live Workbench and object-namespace runners drive the 18 tools through
+`nokv workbench <tool>` processes graded against `docs/cli-contract.md`. The
+restore-composition runner still reaches them through a `nokv mcp` child
 process. That sidecar is deprecated and is not a supported NoKV integration
-surface: it survives only as this harness's transport, evidence produced over
+surface: it survives only as that runner's transport, evidence produced over
 it qualifies that transport alone, and nothing here makes MCP a deployment
 component or defines a runtime-specific metadata layout, capability alias,
-migration helper, or filesystem frontend. Re-pointing these runners at
+migration helper, or filesystem frontend. Re-pointing that runner at
 `nokv workbench <tool>` is tracked work, not a documentation change.
 
 The checked-in integration assets are deliberately small:
@@ -23,13 +25,14 @@ The checked-in integration assets are deliberately small:
   migration-decision ledger for the pre-#423 recovery effort;
   `pre423_contract_ledger.py` and its unit test keep stable ids, class and
   disposition policy, evidence, ownership, and required gates complete.
-- `workbench_contract.py` verifies an MCP `tools/list` response against the
-  exact Rust-owned schema at
-  `crates/nokv-agent/workbench_contract_schema.json`.
+- `workbench_contract.py` verifies the tool definitions that `nokv schema`
+  prints, or an MCP `tools/list` response, against the exact Rust-owned schema
+  at `crates/nokv-agent/workbench_contract_schema.json`.
 - `workbench_contract_test.py` tests normalization and exact surface matching.
 - `live_workbench.py` provisions one root, starts one explicit metadata
-  owner and the flat `nokv mcp` command, then records a real
-  scientific reconstruction workflow through all 18 tools.
+  owner, then records a real scientific reconstruction workflow through all 18
+  tools, each call its own `nokv workbench <tool>` process graded against
+  `docs/cli-contract.md`.
 - `live_workbench_test.py` checks exact coverage/order, flat commands,
   secret redaction, dry-run evidence, and fail-closed qualification.
 - `local_wal_recovery_gate.py` starts an isolated real etcd process and proves
@@ -159,10 +162,11 @@ an interrupted `Recovering` epoch. It does not qualify another directory, a
 copied/rolled-back namespace, cross-host failover, or a non-empty shared
 checkpoint/log frontier. The harness always calls `nokv provision`, starts
 `nokv serve` with exactly one of `--metadata-create` or `--metadata-reopen`,
-and starts `nokv ... --agent-id {stable-id} --workbench-root
-/agents/{agent-name}/wb mcp`. `--agent-id` is the durable Root admission
-identity and must not be derived from the presentation name or path;
-`--agent-name` only selects the human-facing projection. The scientific
+and runs each tool as `nokv ... --agent-id {stable-id} workbench <tool>
+'<json>'`. `--agent-id` is the durable Root admission identity and must not be
+derived from the presentation name or path; `--agent-name` only selects the
+human-facing projection, and `provision --workbench-root
+/agents/{agent-name}/wb` binds it once. The scientific
 step uses the explicit `materialize` and `collect` commands; its local sandbox
 is not a NoKV namespace. Keep the configured Workbench root stable across
 restarts because canonical v1 manifest presentation paths are replay-bound;
@@ -179,10 +183,11 @@ and no gate exercises it. Until shared checkpoint compaction exists the segment
 chain is bounded by the Control record size, and a shard that reaches that
 bound loses its owner fence and stops accepting writes.
 
-The deterministic evidence directory contains `plan.json`, exact paired
-requests/responses in `mcp-transcript.jsonl`, `processes.jsonl` and process
-logs, build/config facts in `environment.json`, validated schema evidence in
-`contract.json`, and explicit statuses in `qualification.json`.
+The deterministic evidence directory contains `plan.json`, every tool call
+with its arguments, exit code, stdout, and stderr in `cli-transcript.jsonl`,
+`processes.jsonl` and process logs, build/config facts in `environment.json`,
+validated `nokv schema` evidence in `contract.json`, and explicit statuses in
+`qualification.json`.
 
 Exit status `3` means a required live dependency is absent and the workflow is
 `NOT QUALIFIED`, never a pass. Exit status `2` means a configured live boundary
