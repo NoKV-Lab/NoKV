@@ -1014,7 +1014,6 @@ fn validate_cleanup_update(
     if expected.artifact_revision_id != next.artifact_revision_id
         || expected.object_sequence != next.object_sequence
         || expected.object_key != next.object_key
-        || expected.multipart_upload_id != next.multipart_upload_id
         || expected.expected_length != next.expected_length
         || expected.expected_digest_uri != next.expected_digest_uri
         || next.provider_state != StagedProviderState::Aborted
@@ -1044,10 +1043,6 @@ fn validate_staged_update(
         || expected.object_key != next.object_key
         || expected.expected_length != next.expected_length
         || expected.expected_digest_uri != next.expected_digest_uri
-        || expected
-            .multipart_upload_id
-            .as_ref()
-            .is_some_and(|id| next.multipart_upload_id.as_ref() != Some(id))
         || !valid_provider_transition(expected.provider_state, next.provider_state)
         || !valid_cleanup_transition(expected.cleanup_state, next.cleanup_state)
     {
@@ -1064,12 +1059,6 @@ fn valid_provider_transition(expected: StagedProviderState, next: StagedProvider
             (expected, next),
             (
                 StagedProviderState::Planned,
-                StagedProviderState::Uploading
-                    | StagedProviderState::Uploaded
-                    | StagedProviderState::AbortPending
-                    | StagedProviderState::Ambiguous
-            ) | (
-                StagedProviderState::Uploading,
                 StagedProviderState::Uploaded
                     | StagedProviderState::AbortPending
                     | StagedProviderState::Ambiguous
@@ -5324,7 +5313,6 @@ mod tests {
                         artifact_revision_id,
                         u64::from(sequence),
                     ),
-                    multipart_upload_id: None,
                     expected_length: 1,
                     expected_digest_uri: format!("sha256:{sequence:064x}"),
                     provider_state: StagedProviderState::Planned,
@@ -8058,7 +8046,7 @@ mod tests {
 
         for next in [
             StagedObjectRecord {
-                provider_state: StagedProviderState::Uploading,
+                provider_state: StagedProviderState::Planned,
                 ..persisted.clone()
             },
             StagedObjectRecord {

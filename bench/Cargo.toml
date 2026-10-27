@@ -16,7 +16,6 @@ restore-crash-test-support = [
     "nokv-server/restore-crash-test-support",
     "dep:libc",
     "dep:nokv-client",
-    "dep:nokv-object",
     "dep:sha2",
 ]
 
@@ -27,7 +26,7 @@ nokv-control = { workspace = true, features = ["etcd"] }
 nokv-meta.workspace = true
 nokv-meta-holt = { workspace = true, features = ["test-support"] }
 nokv-meta-store.workspace = true
-nokv-object = { workspace = true, optional = true }
+nokv-object.workspace = true
 nokv-protocol.workspace = true
 nokv-server.workspace = true
 nokv-types.workspace = true

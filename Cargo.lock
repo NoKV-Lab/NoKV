@@ -1228,6 +1228,7 @@ name = "nokv"
 version = "0.12.1"
 dependencies = [
  "base64 0.23.1",
+ "getrandom 0.3.4",
  "nokv-agent",
  "nokv-client",
  "nokv-control",
@@ -1237,6 +1238,7 @@ dependencies = [
  "nokv-types",
  "nokv-workbench-projection",
  "rcgen",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",
@@ -1353,6 +1355,7 @@ dependencies = [
 name = "nokv-python"
 version = "0.12.1"
 dependencies = [
+ "getrandom 0.3.4",
  "nokv-agent",
  "nokv-client",
  "nokv-object",
@@ -1360,6 +1363,7 @@ dependencies = [
  "nokv-types",
  "nokv-workbench-projection",
  "pyo3",
+ "rustix",
  "serde_json",
  "tempfile",
 ]

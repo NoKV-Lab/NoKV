@@ -843,7 +843,6 @@ durable_enum! {
     /// Provider-observed state for one staged immutable object.
     pub enum StagedProviderState {
         Planned = 1,
-        Uploading = 2,
         Uploaded = 3,
         AbortPending = 4,
         Aborted = 5,
@@ -1477,7 +1476,6 @@ mod tests {
         ]);
         assert_durable_registry(&[
             (StagedProviderState::Planned, 1),
-            (StagedProviderState::Uploading, 2),
             (StagedProviderState::Uploaded, 3),
             (StagedProviderState::AbortPending, 4),
             (StagedProviderState::Aborted, 5),

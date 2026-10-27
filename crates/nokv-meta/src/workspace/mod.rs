@@ -167,8 +167,8 @@ pub use publish_operation_records::{
     ArtifactManifestRow, ManifestPosition, PublishAuthority, PublishClaim, PublishOperationRecord,
     PublishRecordError, PublishResult, PublishTerminalError, PublishTerminalErrorKind,
     PublishTransition, StagedObjectRecord, MAX_APPEND_SEGMENTS, MAX_MANIFEST_ROWS,
-    MAX_MULTIPART_ID_BYTES, MAX_STAGED_OBJECTS, MAX_TERMINAL_ERROR_BYTES,
-    PUBLISH_OPERATION_VALUE_FORMAT_VERSION, PUBLISH_VALUE_FORMAT_VERSION,
+    MAX_STAGED_OBJECTS, MAX_TERMINAL_ERROR_BYTES, PUBLISH_OPERATION_VALUE_FORMAT_VERSION,
+    PUBLISH_VALUE_FORMAT_VERSION, STAGED_OBJECT_VALUE_FORMAT_VERSION,
 };
 pub use query::{
     aggregate_paths_at, catalog_fields_at, find_workspaces_at, get_current_workspace,

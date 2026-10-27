@@ -539,27 +539,14 @@ pub struct StagedObject {
     pub object_identity: ObjectIdentity,
     pub expected_length: u64,
     pub expected_digest: DigestUri,
-    pub multipart_token: Option<Vec<u8>>,
 }
 
 impl StagedObject {
-    pub const MAX_MULTIPART_TOKEN_BYTES: usize = 4_096;
-
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.expected_length == 0 {
             return Err(ProtocolError::invalid(
                 "staged_object.expected_length",
                 "must be greater than zero",
-            ));
-        }
-        if self
-            .multipart_token
-            .as_ref()
-            .is_some_and(|token| token.len() > Self::MAX_MULTIPART_TOKEN_BYTES)
-        {
-            return Err(ProtocolError::invalid(
-                "staged_object.multipart_token",
-                format!("exceeds {} bytes", Self::MAX_MULTIPART_TOKEN_BYTES),
             ));
         }
         Ok(())
