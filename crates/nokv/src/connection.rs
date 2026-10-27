@@ -8,6 +8,7 @@
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(feature = "control")]
 use nokv_client::ControlRouteResolver;
@@ -186,6 +187,8 @@ fn workspace_client(
         routes,
         ClientOptions {
             max_attempts: config.max_attempts,
+            retry_backoff: Duration::from_millis(config.retry_backoff_ms),
+            max_retry_backoff: Duration::from_millis(config.max_retry_backoff_ms),
         },
     )
     .map_err(ConnectionError::from)

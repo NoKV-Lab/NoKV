@@ -69,6 +69,13 @@ not for installing the SDK.
   `expected`) with nothing written. Callers that omit the argument keep the
   0.11.0 behaviour; a server older than 0.11.1 rejects a fenced request as an
   invalid argument instead of ignoring the fence.
+- `Client(root_id, routing, ..., max_attempts=3, retry_backoff_ms=0,
+  max_retry_backoff_ms=2000)` repeats a request whose failure left nothing
+  applied up to `max_attempts` times (1 to 16), pausing `retry_backoff_ms`
+  before the second attempt and doubling per further attempt up to
+  `max_retry_backoff_ms`. The default repeats at once, so a client that must
+  outlive an owner restart passes `max_attempts=16, retry_backoff_ms=250`; a
+  backoff above its bound raises `ValueError`.
 - `Client.put_bytes(workbench, path, data, operation_id, ...)` is native
   `workspace-path put`: one whole-body publication under a caller-chosen
   operation identity (32 lowercase hex, for example a UUIDv7 without hyphens).

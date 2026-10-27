@@ -247,7 +247,10 @@ fn workspace_client(config: &ClientRouteConfig) -> Result<EtcdWorkspaceClient, S
         config.root_id,
         transport,
         routes,
-        ClientOptions { max_attempts: 3 },
+        ClientOptions {
+            max_attempts: 3,
+            ..ClientOptions::default()
+        },
     )
     .map_err(|error| error.to_string())
 }

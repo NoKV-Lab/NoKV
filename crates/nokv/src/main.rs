@@ -1637,6 +1637,14 @@ AGENT PRESENTATION:
   append returns the original publication receipt on replay; retain the id and incarnation across restarts
   append limits the delta with --max-artifact-bytes; --max-logical-size optionally limits the resulting body
 
+CLIENT RETRIES:
+  --max-attempts N (1..16, default 3): attempts per request, counting the first; an attempt that failed before it
+    could take effect (a refused or dropped connection, a retryable owner answer) is repeated, and a request that
+    reached a changed owner is re-routed and repeated at once
+  --retry-backoff-ms N (default 0) --max-retry-backoff-ms N (default 2000): the pause before the second attempt,
+    doubling per further attempt up to the bound; 0 repeats at once, and a backoff above its bound is invalid_input
+  a workbench-session that must outlive an owner restart starts with --max-attempts 16 --retry-backoff-ms 250
+
 OWNER:
   provision binds RootId to an explicit AgentId and a Workbench root, then creates namespace, shard, and affinity
   --adopt-legacy-agent-binding is a one-time explicit migration for a verified legacy root

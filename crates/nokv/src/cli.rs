@@ -23,6 +23,7 @@ pub const DEFAULT_ETCD_LEASE_TTL_SECONDS: i64 = 10;
 pub const DEFAULT_LIFECYCLE_INTERVAL_MILLIS: u64 = 1_000;
 pub const DEFAULT_APPEND_ACTIVITY_LEASE_MS: u64 = 1_800_000;
 pub const DEFAULT_HANDSHAKE_TIMEOUT_MILLIS: u64 = 5_000;
+pub const DEFAULT_MAX_RETRY_BACKOFF_MILLIS: u64 = 2_000;
 pub const DEFAULT_MAX_INFLIGHT_CONNECTIONS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +31,8 @@ pub struct ClientConfig {
     pub root_id: Option<String>,
     pub routing: RoutingConfig,
     pub max_attempts: u32,
+    pub retry_backoff_ms: u64,
+    pub max_retry_backoff_ms: u64,
     pub max_artifact_bytes: usize,
     pub object: ObjectConfig,
     pub tls: Option<ClientTlsConfig>,
@@ -432,6 +435,8 @@ impl Default for ClientConfig {
             root_id: None,
             routing: RoutingConfig::Static(StaticRoutingConfig::default()),
             max_attempts: 3,
+            retry_backoff_ms: 0,
+            max_retry_backoff_ms: DEFAULT_MAX_RETRY_BACKOFF_MILLIS,
             max_artifact_bytes: DEFAULT_MAX_ARTIFACT_BYTES,
             object: ObjectConfig::default(),
             tls: None,
@@ -573,6 +578,16 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             "--max-attempts" => {
                 client.max_attempts =
                     parse_number("--max-attempts", next_value(&mut arguments, &argument)?)?;
+            }
+            "--retry-backoff-ms" => {
+                client.retry_backoff_ms =
+                    parse_number("--retry-backoff-ms", next_value(&mut arguments, &argument)?)?;
+            }
+            "--max-retry-backoff-ms" => {
+                client.max_retry_backoff_ms = parse_number(
+                    "--max-retry-backoff-ms",
+                    next_value(&mut arguments, &argument)?,
+                )?;
             }
             "--max-artifact-bytes" => {
                 client.max_artifact_bytes = parse_number(
@@ -757,6 +772,12 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
         && client.tls.is_none()
     {
         return Err(CliError::MissingOption("--agent-id"));
+    }
+    if client.retry_backoff_ms > client.max_retry_backoff_ms {
+        return Err(CliError::InvalidOption {
+            option: "--retry-backoff-ms",
+            value: client.retry_backoff_ms.to_string(),
+        });
     }
     Ok(Invocation {
         client,
@@ -3053,5 +3074,69 @@ mod tests {
             Err(CliError::UnexpectedArgument(argument))
                 if argument == "--adopt-legacy-agent-binding"
         ));
+    }
+
+    const SESSION_ROUTE: [&str; 6] = [
+        "--root-id",
+        "01",
+        "--agent-id",
+        "44444444444444444444444444444444",
+        "--control-dir",
+        "/control",
+    ];
+
+    #[test]
+    fn parses_client_retry_backoff_options() {
+        let parsed = parse(args(
+            &[
+                &SESSION_ROUTE[..],
+                &[
+                    "--max-attempts",
+                    "16",
+                    "--retry-backoff-ms",
+                    "250",
+                    "--max-retry-backoff-ms",
+                    "2000",
+                    "workbench-session",
+                ],
+            ]
+            .concat(),
+        ))
+        .unwrap();
+        assert_eq!(parsed.client.max_attempts, 16);
+        assert_eq!(parsed.client.retry_backoff_ms, 250);
+        assert_eq!(parsed.client.max_retry_backoff_ms, 2_000);
+        assert_eq!(parsed.command, Command::WorkbenchSession);
+
+        let defaults = parse(args(&[&SESSION_ROUTE[..], &["workbench-session"]].concat())).unwrap();
+        assert_eq!(defaults.client.max_attempts, 3);
+        assert_eq!(defaults.client.retry_backoff_ms, 0);
+        assert_eq!(defaults.client.max_retry_backoff_ms, 2_000);
+    }
+
+    #[test]
+    fn rejects_a_retry_backoff_above_its_bound() {
+        let Err(error) = parse(args(
+            &[
+                &SESSION_ROUTE[..],
+                &[
+                    "--retry-backoff-ms",
+                    "3000",
+                    "--max-retry-backoff-ms",
+                    "2000",
+                    "workbench-session",
+                ],
+            ]
+            .concat(),
+        )) else {
+            panic!("a backoff above its bound must be rejected");
+        };
+        assert_eq!(
+            error,
+            CliError::InvalidOption {
+                option: "--retry-backoff-ms",
+                value: "3000".to_owned(),
+            }
+        );
     }
 }

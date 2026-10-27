@@ -3420,7 +3420,10 @@ mod tests {
             route.root_id,
             FramedTcpTransport::new(FramedTcpOptions::default()).unwrap(),
             resolver,
-            ClientOptions { max_attempts: 1 },
+            ClientOptions {
+                max_attempts: 1,
+                ..ClientOptions::default()
+            },
         )
         .unwrap();
         (
