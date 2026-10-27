@@ -12,10 +12,10 @@ native full CLI, the secondary direct Python SDK, metadata semantics, object
 publication, root routing, recovery, and garbage collection must run against
 the same workspace format.
 
-The `nokv mcp` sidecar is a deprecated transport, not a qualified surface. It
-is named in this document only because several live runners still drive the
-product through it. Evidence produced over that transport qualifies neither the
-CLI nor the Python SDK path.
+The `nokv mcp` sidecar is a deprecated transport, not a qualified surface. No
+runner in this document drives the product through it; every live runner runs
+its Workbench tool calls as `nokv workbench <tool>` processes. Evidence
+produced over the sidecar qualifies neither the CLI nor the Python SDK path.
 Passing a codec or Holt microbenchmark alone does not qualify the product.
 
 Every applicable gate reports exactly one status:
@@ -52,12 +52,13 @@ Workbench semantics through the primary native CLI boundary. The direct Python
 SDK must independently exercise its supported programmatic path. The existing
 black-box runner,
 [`scripts/workbench/live_workbench.py`](../../scripts/workbench/live_workbench.py),
-reaches the 18 tools through a `nokv mcp` child process and therefore qualifies
-that deprecated transport only. Its dry-run proves only command construction
-and tool coverage; a live run retains exact transport and process evidence. It
-cannot substitute for native CLI or Python SDK evidence. Absent
-etcd, S3-compatible storage, or the requested binary is `NOT QUALIFIED`, never
-`PASS`.
+runs every tool call as its own `nokv workbench <tool>` process, grades each
+result or failure against [`docs/cli-contract.md`](../cli-contract.md), and
+checks the tool definitions `nokv schema` prints against the frozen Rust-owned
+schema. Its dry-run proves only command construction and tool coverage; a live
+run retains the CLI transcript and process evidence. It does not substitute
+for Python SDK evidence. Absent etcd, S3-compatible storage, or the requested
+binary is `NOT QUALIFIED`, never `PASS`.
 
 Required evidence:
 
@@ -79,13 +80,11 @@ The bounded live Workbench runner uses a minimum one-day snapshot lease. Even
 when its 18-tool workflow passes, Gate 0 remains `NOT QUALIFIED` until separate
 retained evidence observes expiry and the terminal `reaped` state.
 
-A second, independent reason Gate 0 cannot report `PASS` today: the frozen
-pre-#423 ledger's `native-workbench-e2e` expectation profile admits only the
-`live-workbench` producer, whose required evidence roles include
-`mcp-transcript`. That producer's transport is the deprecated sidecar, so the
-gate is unsatisfiable as specified. Admitting a CLI-driven producer is a
-ledger-policy change, not a documentation change, and the ledger is digest
-pinned.
+The frozen pre-#423 ledger's `native-workbench-e2e` expectation profile admits
+only the `live-workbench` producer, whose required evidence roles are
+`producer-result`, `qualification`, and `cli-transcript`. Admitting the
+CLI-driven transcript was a ledger-policy change made when the runner moved off
+the sidecar; the ledger's policy digest was re-pinned with it.
 
 Workbench responses must not expose storage keys, owner addresses, internal
 incarnations, or host-filesystem identities.
@@ -287,9 +286,10 @@ Required evidence:
   DFT relaxation, thermodynamic fields, and their provenance digest across
   owner and provider restarts.
 - restore crash qualification records exact socket readiness, lease-session
-  loss, bounded MCP `ClientFailure`, controlled exit, both binary digests, and
-  the two authoritative publication reads; its access-key identifier and
-  secret value are both redacted;
+  loss, the bounded CLI `ClientFailure` of class `outcome_unknown` with
+  `next_action: resubmit_same` and the exit code of that class, controlled
+  exit, both binary digests, and the two authoritative publication reads; its
+  access-key identifier and secret value are both redacted;
 - within this workspace, `restore-crash-test-support` is enabled only by the
   Cargo-publish-disabled bench package. The feature exists on `nokv-server` so
   the bench can install its exact-operation barrier, while default server and

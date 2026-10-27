@@ -14,6 +14,7 @@ from pathlib import Path
 
 import live_workbench as harness
 import pre423_contract_ledger
+from cli_contract import Call, contract_tables
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -141,12 +142,13 @@ class LiveWorkbenchTest(unittest.TestCase):
         self.assertEqual(current.workbench_root, "/agents/display-only/wb")
         for command in (
             harness.provision_command(current),
-            harness.mcp_command(current),
+            harness.workbench_tool_command(current, "workbench_stat", "{}"),
             harness.materialize_command(current, Path(directory) / "input.json"),
             harness.collect_command(current, Path(directory) / "output.json"),
         ):
             self.assertEqual(command[command.index("--agent-id") + 1], "aa" * 16)
         self.assertNotIn("--agent-id", harness.server_command(current))
+        self.assertNotIn("--agent-id", harness.schema_command(current))
 
     def test_agent_identity_must_be_canonical_fixed_hex(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -180,8 +182,8 @@ class LiveWorkbenchTest(unittest.TestCase):
         harness.validate(peer, live=False)
         for command in (
             harness.provision_command(peer),
-            harness.mcp_command(peer),
-            harness.mcp_command(mismatch),
+            harness.workbench_tool_command(peer, "workbench_read", "{}"),
+            harness.workbench_tool_command(mismatch, "workbench_read", "{}"),
         ):
             self.assertIn("--agent-id", command)
 
@@ -397,12 +399,15 @@ class LiveWorkbenchTest(unittest.TestCase):
                 "items": [{"value": {"state": "post-snapshot"}}],
             },
         }
-        mismatch = subprocess.CompletedProcess(
-            harness.mcp_command(harness.authority_configs(current)[1]),
-            1,
-            stdout="",
-            stderr="root is already bound to another Agent\n",
-        )
+        mismatch = {
+            "status": "error",
+            "code": "AgentBindingMismatch",
+            "message": "root RootId(11111111) is already bound to another Agent",
+            "retryable": False,
+            "details": {},
+            "class": "invalid_input",
+            "next_action": "fix_input",
+        }
         evidence = harness.assert_authority_results(results, mismatch, current, peer)
         self.assertEqual(evidence["status"], "PASS")
         self.assertEqual(evidence["workbench_id"], current.workbench)
@@ -414,6 +419,87 @@ class LiveWorkbenchTest(unittest.TestCase):
         }
         with self.assertRaisesRegex(harness.WorkflowFailure, "RootId isolation"):
             harness.assert_authority_results(results, mismatch, current, peer)
+        results["primary-read-after-peer-write"]["items"][0]["value"] = {
+            "state": "post-snapshot"
+        }
+        disclosed = dict(mismatch, message=f"{current.agent_id} is already bound to another Agent")
+        with self.assertRaisesRegex(harness.WorkflowFailure, "disclosed"):
+            harness.assert_authority_results(results, disclosed, current, peer)
+
+    def test_tool_calls_are_graded_against_the_cli_contract(self) -> None:
+        contract = contract_tables((REPO / "docs" / "cli-contract.md").read_text())
+        exits, _ = contract
+        success = harness.ToolStep("create", "workbench_create", {"id": "wb"})
+        result = {"status": "success", "workbench_id": "wb"}
+        self.assertEqual(
+            harness.grade_tool_call(success, Call("create", 0, json.dumps(result), ""), contract),
+            result,
+        )
+        leaked = dict(result, workspace_incarnation_id="internal")
+        with self.assertRaisesRegex(harness.WorkflowFailure, "internal keys"):
+            harness.grade_tool_call(success, Call("create", 0, json.dumps(leaked), ""), contract)
+        with self.assertRaisesRegex(harness.WorkflowFailure, "succeeds"):
+            harness.grade_tool_call(success, Call("create", 4, "", "{}\n"), contract)
+
+        replay = harness.ToolStep(
+            "implicit-put-replay",
+            "workbench_put_file",
+            {"id": "wb"},
+            "AlreadyExists",
+            "precondition_failed",
+            "reread_then_retry",
+        )
+        envelope = {
+            "status": "error",
+            "code": "AlreadyExists",
+            "message": "path exists",
+            "retryable": False,
+            "details": {"current_generation": 1},
+            "class": "precondition_failed",
+            "next_action": "reread_then_retry",
+        }
+        failed = Call("implicit-put-replay", exits["precondition_failed"], "", json.dumps(envelope) + "\n")
+        self.assertEqual(harness.grade_tool_call(replay, failed, contract), envelope)
+        other_code = dict(envelope, code="Conflict")
+        with self.assertRaisesRegex(harness.WorkflowFailure, "did not return AlreadyExists"):
+            harness.grade_tool_call(
+                replay,
+                Call("implicit-put-replay", exits["precondition_failed"], "", json.dumps(other_code) + "\n"),
+                contract,
+            )
+        with self.assertRaisesRegex(harness.WorkflowFailure, "exits with the code"):
+            harness.grade_tool_call(
+                replay, Call("implicit-put-replay", 1, "", json.dumps(envelope) + "\n"), contract
+            )
+        unclassified = harness.ToolStep("probe", "workbench_read", {"id": "wb"}, "NotFound")
+        with self.assertRaisesRegex(harness.WorkflowFailure, "without a contract class"):
+            harness.grade_tool_call(unclassified, failed, contract)
+
+    def test_expected_failures_in_the_plan_name_their_contract_class(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            steps = harness.tool_plan(config(Path(directory) / "evidence"))
+        expected = {
+            step.label: (step.error_code, step.error_class, step.error_next_action)
+            for step in steps
+            if step.error_code is not None
+        }
+        self.assertEqual(
+            expected,
+            {
+                "implicit-put-replay": ("AlreadyExists", "precondition_failed", "reread_then_retry"),
+                "create-only-error": ("AlreadyExists", "precondition_failed", "reread_then_retry"),
+            },
+        )
+
+    def test_harness_drives_the_product_through_the_native_cli_only(self) -> None:
+        source = (REPO / "scripts/workbench/live_workbench.py").read_text()
+        for sidecar in ('"mcp"', "nokv mcp", "jsonrpc", "tools/call", "tools/list"):
+            with self.subTest(sidecar=sidecar):
+                self.assertNotIn(sidecar, source)
+        self.assertEqual(
+            harness.TYPED_EVIDENCE_ROLES,
+            ("producer-result", "qualification", "cli-transcript"),
+        )
 
     def test_flat_commands_and_plan_have_no_superseded_surface(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -421,7 +507,8 @@ class LiveWorkbenchTest(unittest.TestCase):
             commands = [
                 harness.provision_command(current),
                 harness.server_command(current),
-                harness.mcp_command(current),
+                harness.schema_command(current),
+                harness.workbench_tool_command(current, "workbench_stat", "{}"),
                 harness.materialize_command(current, Path(directory) / "input.json"),
                 harness.collect_command(current, Path(directory) / "output.json"),
             ]
@@ -439,7 +526,7 @@ class LiveWorkbenchTest(unittest.TestCase):
     def test_secret_values_are_redacted_without_an_offline_verifier(self) -> None:
         secret = "do-not-record-this-secret"
         redacted = harness.redact_argv(
-            ["nokv", "--object-secret-access-key", secret, "mcp"]
+            ["nokv", "--object-secret-access-key", secret, "workbench", "workbench_stat", "{}"]
         )
         self.assertNotIn(secret, redacted)
         self.assertEqual(redacted[2], "<redacted>")
@@ -456,8 +543,8 @@ class LiveWorkbenchTest(unittest.TestCase):
                 return self.returncode
 
         harness.require_running("serve", Process(None))
-        with self.assertRaisesRegex(harness.WorkflowFailure, "mcp exited"):
-            harness.require_running("mcp", Process(1))
+        with self.assertRaisesRegex(harness.WorkflowFailure, "serve exited"):
+            harness.require_running("serve", Process(1))
 
     def test_nested_internal_storage_identity_is_rejected(self) -> None:
         with self.assertRaises(harness.WorkflowFailure):

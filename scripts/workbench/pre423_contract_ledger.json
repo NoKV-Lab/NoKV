@@ -63,7 +63,7 @@
       "description": "Shipping NoKV client and server across real metadata and object boundaries.",
       "evidence_kinds": ["live"],
       "command": {"kind": "python-script", "entrypoint": "scripts/workbench/live_workbench.py", "result_argument": "--qualification-result", "binary_argument": "--nokv-bin", "forbidden_arguments": ["--dry-run"]},
-      "required_evidence_roles": ["producer-result", "qualification", "mcp-transcript"],
+      "required_evidence_roles": ["producer-result", "qualification", "cli-transcript"],
       "required_subjects": ["product_binary", "dependencies"],
       "required_dependencies": {"etcd": ["sha256"], "object-store": ["oci"]}
     },
