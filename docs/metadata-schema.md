@@ -541,7 +541,11 @@ Workbench id, so root- and workspace-scoped feeds point-read that exact marker
 and verify its incarnation instead of scanning every marker at each event
 version. Repeated events for one Workbench in one commit share the marker
 result. An `after_commit_version` newer than the fenced root version fails
-closed.
+closed. A page holds at most 64 events (`MAX_CHANGE_PAGE_LIMIT`), below the
+256 of the other paged reads: the feed is polled while writers run, and one
+reader tailing full 256-event pages at full speed cost eight concurrent
+writers 74% of their throughput on the reference stack, while 64-event pages
+cost them 8% to 17%.
 
 Both scopes currently seek the root-wide `ChangeEvent` keyspace. A
 workspace-scoped feed filters on the embedded stable Workbench id after that
