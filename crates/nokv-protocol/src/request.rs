@@ -47,8 +47,14 @@ pub const MAX_GENERIC_INDEX_VALUES_PER_FIELD: usize = 1_024;
 pub const MAX_GENERIC_INDEX_APPEND_ROWS: usize = 240;
 /// Maximum generation rows removed by one Generic custom-index abort RPC.
 pub const MAX_GENERIC_INDEX_ABORT_ROWS: u32 = 120;
-/// Maximum page size accepted by metadata query, catalog, discovery, and event RPCs.
+/// Maximum page size accepted by metadata query, catalog, and discovery RPCs.
 pub const MAX_QUERY_PAGE_LIMIT: u32 = 256;
+/// Maximum events in one `ReadChanges` page. The feed is polled while writers
+/// run: one reader tailing full 256-event pages at full speed cost eight
+/// concurrent writers 74% of their throughput on the reference stack, and at
+/// 64 events per page they lose 8% to 17%.
+pub const MAX_CHANGE_PAGE_LIMIT: u32 = 64;
+const _: () = assert!(MAX_CHANGE_PAGE_LIMIT <= MAX_QUERY_PAGE_LIMIT);
 pub(crate) const MAX_PARENT_COMMITS: usize = 32;
 const MAX_RESTORE_MANIFEST_BYTES: u64 = 1024 * 1024;
 const _: () = assert!(MAX_QUERY_PAGE_LIMIT <= PageRequest::MAX_LIMIT);
@@ -1681,7 +1687,7 @@ impl SearchRequest {
             sort.validate()?;
         }
         validate_field_ids("search.facets", &self.facets, MAX_FACET_FIELDS)?;
-        validate_query_page(&self.page, "search.page")
+        validate_page_within(&self.page, "search.page", MAX_QUERY_PAGE_LIMIT)
     }
 }
 
@@ -1764,7 +1770,7 @@ impl AggregateRequest {
         for sort in &self.sort {
             sort.validate()?;
         }
-        validate_query_page(&self.page, "aggregate.page")
+        validate_page_within(&self.page, "aggregate.page", MAX_QUERY_PAGE_LIMIT)
     }
 }
 
@@ -1813,7 +1819,7 @@ impl CatalogRequest {
                 }
             }
         }
-        validate_query_page(&self.page, "catalog.page")
+        validate_page_within(&self.page, "catalog.page", MAX_QUERY_PAGE_LIMIT)
     }
 }
 
@@ -1826,10 +1832,12 @@ pub struct FindWorkspacesRequest {
 
 impl FindWorkspacesRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        validate_query_page(&self.page, "find_workspaces.page")
+        validate_page_within(&self.page, "find_workspaces.page", MAX_QUERY_PAGE_LIMIT)
     }
 }
 
+/// One page of the root's change feed: at most `MAX_CHANGE_PAGE_LIMIT`
+/// events, so a tailing reader bounds the owner's work under one read.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ChangePageRequest {
@@ -1846,15 +1854,19 @@ impl ChangePageRequest {
                 "must be greater than zero",
             ));
         }
-        validate_query_page(&self.page, "read_changes.page")
+        validate_page_within(&self.page, "read_changes.page", MAX_CHANGE_PAGE_LIMIT)
     }
 }
 
-fn validate_query_page(page: &PageRequest, field: &'static str) -> Result<(), ProtocolError> {
-    if !(1..=MAX_QUERY_PAGE_LIMIT).contains(&page.limit) {
+fn validate_page_within(
+    page: &PageRequest,
+    field: &'static str,
+    max_limit: u32,
+) -> Result<(), ProtocolError> {
+    if !(1..=max_limit).contains(&page.limit) {
         return Err(ProtocolError::invalid(
             field,
-            format!("limit must be between 1 and {MAX_QUERY_PAGE_LIMIT}"),
+            format!("limit must be between 1 and {max_limit}"),
         ));
     }
     page.validate(field)
@@ -2084,15 +2096,38 @@ mod tests {
                 }),
                 "find_workspaces.page",
             ),
-            (
-                WorkspaceRequest::ReadChanges(ChangePageRequest {
-                    after_commit_version: None,
-                    workbench: None,
-                    page: page(),
-                }),
-                "read_changes.page",
-            ),
         ]
+    }
+
+    const EXPECTED_CHANGE_PAGE_LIMIT: u32 = 64;
+
+    fn change_request(limit: u32) -> WorkspaceRequest {
+        WorkspaceRequest::ReadChanges(ChangePageRequest {
+            after_commit_version: None,
+            workbench: None,
+            page: PageRequest {
+                cursor: None,
+                limit,
+            },
+        })
+    }
+
+    #[test]
+    fn change_pages_are_capped_below_query_pages() {
+        assert_eq!(MAX_CHANGE_PAGE_LIMIT, EXPECTED_CHANGE_PAGE_LIMIT);
+        change_request(EXPECTED_CHANGE_PAGE_LIMIT)
+            .validate()
+            .unwrap();
+
+        let ProtocolError::InvalidField { field, reason } =
+            change_request(EXPECTED_CHANGE_PAGE_LIMIT + 1)
+                .validate()
+                .unwrap_err()
+        else {
+            panic!("a change page above the cap must fail as invalid input");
+        };
+        assert_eq!(field, "read_changes.page");
+        assert!(reason.contains("64"), "{reason}");
     }
 
     #[test]

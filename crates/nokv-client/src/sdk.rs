@@ -584,6 +584,10 @@ where
             .map(expect_workspaces)
     }
 
+    /// Reads one page of the root's change feed. A page holds at most
+    /// `nokv_protocol::MAX_CHANGE_PAGE_LIMIT` events, fewer than the other
+    /// paged reads, so a reader tailing the feed while writers run bounds the
+    /// work the owner does under one read.
     pub fn read_changes(
         &self,
         request: ChangePageRequest,
