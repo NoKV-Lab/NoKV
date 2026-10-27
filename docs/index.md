@@ -92,7 +92,8 @@ SPDX-License-Identifier: Apache-2.0
   [Workbench Contract](./workbench-contract.md), and
   [CLI Contract](./cli-contract.md).
 - Storage and distribution: [Metadata Schema](./metadata-schema.md),
-  [Object Layout](./object-layout.md), and
+  [Object Layout](./object-layout.md),
+  [Object Store Credentials](./object-credentials.md), and
   [RustFS Provider Profile](./rustfs.md).
 - Workloads and evidence: [AI Training Workload](./ai-training.md),
   [Benchmarks](./benchmarks.md),

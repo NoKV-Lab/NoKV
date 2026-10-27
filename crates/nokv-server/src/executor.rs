@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nokv_meta::workspace as meta;
+use nokv_object::{ArtifactObjectStore, ImmutableCreateOutcome, ObjectError, ObjectKey};
 use nokv_protocol as protocol;
 use nokv_types as types;
 use sha2::{Digest as _, Sha256};
@@ -163,6 +164,9 @@ impl RestorePreparationCoordinator {
 #[derive(Clone)]
 pub struct MetadataWorkspaceRequestExecutor {
     meta: Arc<meta::MetaShard>,
+    /// Where the owner writes uploaded artifact objects with its own
+    /// credentials; clients never write objects themselves.
+    objects: Arc<dyn ArtifactObjectStore>,
     append_activity_lease_ms: u64,
     restore_preparations: Arc<RestorePreparationCoordinator>,
     #[cfg(feature = "restore-crash-test-support")]
@@ -172,9 +176,10 @@ pub struct MetadataWorkspaceRequestExecutor {
 }
 
 impl MetadataWorkspaceRequestExecutor {
-    pub fn new(meta: Arc<meta::MetaShard>) -> Self {
+    pub fn new(meta: Arc<meta::MetaShard>, objects: Arc<dyn ArtifactObjectStore>) -> Self {
         Self {
             meta,
+            objects,
             append_activity_lease_ms: PUBLISH_ACTIVITY_LEASE_MS,
             restore_preparations: Arc::new(RestorePreparationCoordinator::default()),
             #[cfg(feature = "restore-crash-test-support")]
@@ -250,8 +255,8 @@ impl MetadataWorkspaceRequestExecutor {
             protocol::WorkspaceRequest::StageArtifactObjects(stage) => {
                 self.stage_artifact_objects(request, stage)
             }
-            protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(mark) => {
-                self.mark_artifact_objects_uploaded(request, mark)
+            protocol::WorkspaceRequest::UploadArtifactObject(upload) => {
+                self.upload_artifact_object(request, upload)
             }
             protocol::WorkspaceRequest::StageArtifactManifest(stage) => {
                 self.stage_artifact_manifest(request, stage)
@@ -328,21 +333,24 @@ impl MetadataWorkspaceRequestExecutor {
         &self,
         request: &AuthorizedRequest<'_>,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
-        if mutates_metadata(&request.operation) {
+        match sequencing(&request.operation) {
             // Plan and apply inside one sequenced session so an unrelated
             // writer cannot invalidate this request's read version; the
             // session returns only after its commands are acknowledged.
-            retry_internal_metadata_conflicts(|| {
+            Sequencing::WriteSession => retry_internal_metadata_conflicts(|| {
                 self.meta
                     .write_session(|| self.execute_request(request))
                     .map_err(meta_failure)?
-            })
-        } else {
-            let executed = retry_internal_metadata_conflicts(|| self.execute_request(request));
-            // A read may have observed another session's applied but not yet
-            // acknowledged commands; do not let it leave the shard before them.
-            self.meta.durability_barrier().map_err(meta_failure)?;
-            executed
+            }),
+            // The handler opens its own sessions, each acknowledged on exit.
+            Sequencing::OwnSessions => self.execute_request(request),
+            Sequencing::Read => {
+                let executed = retry_internal_metadata_conflicts(|| self.execute_request(request));
+                // A read may have observed another session's applied but not yet
+                // acknowledged commands; do not let it leave the shard before them.
+                self.meta.durability_barrier().map_err(meta_failure)?;
+                executed
+            }
         }
     }
 
@@ -2327,7 +2335,6 @@ impl MetadataWorkspaceRequestExecutor {
                 artifact_revision_id: operation.artifact_revision_id,
                 object_sequence: object.sequence,
                 object_key: object.object_identity.as_str().to_owned(),
-                multipart_upload_id: object.multipart_token.clone(),
                 expected_length: object.expected_length,
                 expected_digest_uri: object.expected_digest.as_str().to_owned(),
                 provider_state: types::StagedProviderState::Planned,
@@ -2344,74 +2351,150 @@ impl MetadataWorkspaceRequestExecutor {
         publish_operation_response(outcome)
     }
 
-    fn mark_artifact_objects_uploaded(
+    /// Write one staged object with the owner's credentials and record it.
+    ///
+    /// The body must match the staged object's sealed length and digest and
+    /// must be the next object the publication has not recorded. The request
+    /// sequences itself: two short write sessions admit the block and record
+    /// it, and the provider create between them holds no metadata lock, so
+    /// the shard keeps serving every other request while a block is in
+    /// flight. The durable record advances only after the object exists, so
+    /// a reply lost after the write is resolved by resending the same block,
+    /// which the store replays byte for byte.
+    fn upload_artifact_object(
         &self,
         rpc: &AuthorizedRequest<'_>,
-        request: &protocol::MarkArtifactObjectsUploadedRequest,
+        request: &protocol::UploadArtifactObjectRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
-        self.claim_mutation(rpc)?;
-        self.mark_claimed_artifact_objects_uploaded(rpc, request)
+        // Both digests read the whole body; neither needs the gate.
+        let fingerprint = mutation_fingerprint(rpc)?;
+        let body_digest =
+            protocol::sha256_digest_uri(protocol::Digest(Sha256::digest(&request.body).into()));
+        let step_id = derived_request_id(rpc.request_id, b"publish-upload-object", 0);
+        let admission = retry_internal_metadata_conflicts(|| {
+            self.meta
+                .write_session(|| {
+                    self.admit_upload(rpc, request, fingerprint, &body_digest, step_id)
+                })
+                .map_err(meta_failure)?
+        })?;
+        let expected = match admission {
+            UploadAdmission::Recorded(outcome) => return publish_operation_response(*outcome),
+            UploadAdmission::Pending(expected) => expected,
+        };
+        let object_key = ObjectKey::new(expected.object_key)
+            .map_err(|error| internal(format!("durable staged object key is invalid: {error}")))?;
+        match self.objects.create_immutable(&object_key, &request.body) {
+            Ok(ImmutableCreateOutcome::Created | ImmutableCreateOutcome::Replayed) => {}
+            Err(error) => return Err(object_write_failure(error)),
+        }
+        retry_internal_metadata_conflicts(|| {
+            self.meta
+                .write_session(|| self.record_uploaded_object(rpc, request, step_id))
+                .map_err(meta_failure)?
+        })
     }
 
-    fn mark_claimed_artifact_objects_uploaded(
+    /// An upload's first session: bind the request id, prove the operation is
+    /// current and the caller holds its token, and refuse a body that is not
+    /// the sealed one before the owner pays for a provider write.
+    fn admit_upload(
         &self,
         rpc: &AuthorizedRequest<'_>,
-        request: &protocol::MarkArtifactObjectsUploadedRequest,
-    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
-        let step_id = derived_request_id(rpc.request_id, b"publish-mark-uploaded", 0);
+        request: &protocol::UploadArtifactObjectRequest,
+        fingerprint: [u8; types::SHA256_BYTES],
+        body_digest: &protocol::DigestUri,
+        step_id: types::RequestId,
+    ) -> Result<UploadAdmission, protocol::RpcFailure> {
+        self.claim_fingerprinted_mutation(rpc, fingerprint)?;
         if let Some(outcome) = self.replayed_publish(rpc.route, step_id)? {
-            return publish_operation_response(outcome);
+            return Ok(UploadAdmission::Recorded(Box::new(outcome)));
         }
         let operation = self.heartbeat_publish_operation(
             rpc,
             request.token,
-            b"publish-heartbeat-mark-uploaded",
+            b"publish-heartbeat-upload-object",
         )?;
         let context = self.publication_context(rpc, step_id)?;
-        let mut updates = Vec::with_capacity(request.objects.len());
-        for proof in &request.objects {
-            let key = meta::staged_object_key(
-                context.root_id,
-                operation.operation_id,
-                u64::from(proof.sequence),
-            );
-            let payload = self
-                .meta
-                .read_at(
-                    context.root_id,
-                    context.placement_generation,
-                    context.owner_epoch,
-                    meta::MetadataFamily::StagedObject,
-                    &key,
-                    context.read_version,
-                )
-                .map_err(meta_failure)?
-                .ok_or_else(|| not_found("staged object does not exist"))?;
-            let expected = meta::StagedObjectRecord::decode(&payload).map_err(|error| {
-                internal(format!("invalid durable staged-object record: {error}"))
-            })?;
-            if expected.expected_length != proof.observed_length
-                || expected.expected_digest_uri != proof.observed_digest.as_str()
-            {
-                return Err(failure(
-                    protocol::ErrorCode::ObjectUnavailable,
-                    "uploaded object proof does not match the sealed object",
-                    false,
-                    None,
-                ));
-            }
-            let mut next = expected.clone();
-            next.provider_state = types::StagedProviderState::Uploaded;
-            updates.push(meta::StagedObjectUpdate { expected, next });
+        let expected =
+            self.staged_object_awaiting_upload(&context, &operation, request.sequence)?;
+        if expected.expected_length != request.body.len() as u64
+            || expected.expected_digest_uri != body_digest.as_str()
+        {
+            return Err(invalid_argument(
+                "uploaded body does not match the staged object's sealed length and digest",
+            ));
         }
+        Ok(UploadAdmission::Pending(expected))
+    }
+
+    /// An upload's last session: with the object in the provider, advance its
+    /// staged record under a fresh read version. The token was checked when
+    /// the block was admitted and this request's own heartbeat may have moved
+    /// the operation since, so the record is fenced on the operation as it
+    /// is now. A duplicate of this request that recorded first answers with
+    /// its outcome.
+    fn record_uploaded_object(
+        &self,
+        rpc: &AuthorizedRequest<'_>,
+        request: &protocol::UploadArtifactObjectRequest,
+        step_id: types::RequestId,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        if let Some(outcome) = self.replayed_publish(rpc.route, step_id)? {
+            return publish_operation_response(outcome);
+        }
+        let context = self.publication_context(rpc, step_id)?;
+        let operation = self.load_publish_operation(
+            rpc.route,
+            context.read_version,
+            request.token.operation_id,
+        )?;
+        let expected =
+            self.staged_object_awaiting_upload(&context, &operation, request.sequence)?;
+        let mut next = expected.clone();
+        next.provider_state = types::StagedProviderState::Uploaded;
         let outcome = meta::PublicationService::new(&self.meta)
             .mark_objects_uploaded_batch(meta::MarkObjectsUploadedBatchRequest {
                 context,
                 expected_operation: operation,
-                staged_object_updates: updates,
+                staged_object_updates: vec![meta::StagedObjectUpdate { expected, next }],
             })
             .map_err(publication_failure)?;
         publish_operation_response(outcome)
+    }
+
+    /// The staged record of `sequence` in `operation`, which must still await
+    /// its provider write.
+    fn staged_object_awaiting_upload(
+        &self,
+        context: &meta::PublicationContext,
+        operation: &meta::PublishOperationRecord,
+        sequence: u32,
+    ) -> Result<meta::StagedObjectRecord, protocol::RpcFailure> {
+        let key =
+            meta::staged_object_key(context.root_id, operation.operation_id, u64::from(sequence));
+        let payload = self
+            .meta
+            .read_at(
+                context.root_id,
+                context.placement_generation,
+                context.owner_epoch,
+                meta::MetadataFamily::StagedObject,
+                &key,
+                context.read_version,
+            )
+            .map_err(meta_failure)?
+            .ok_or_else(|| not_found("staged object does not exist"))?;
+        let record = meta::StagedObjectRecord::decode(&payload)
+            .map_err(|error| internal(format!("invalid durable staged-object record: {error}")))?;
+        if record.provider_state == types::StagedProviderState::Uploaded {
+            return Err(conflict(
+                protocol::ConflictKind::OperationState,
+                "the staged object is already recorded as uploaded; resume from the operation's progress",
+                None,
+            ));
+        }
+        Ok(record)
     }
 
     fn stage_artifact_manifest(
@@ -2522,17 +2605,6 @@ impl MetadataWorkspaceRequestExecutor {
         self.claim_mutation(rpc)?;
         let mut token = request.token;
         let mut replayed = false;
-        if !request.uploaded_objects.is_empty() {
-            let marked = self.mark_claimed_artifact_objects_uploaded(
-                rpc,
-                &protocol::MarkArtifactObjectsUploadedRequest {
-                    token,
-                    objects: request.uploaded_objects.clone(),
-                },
-            )?;
-            token = running_publication_token(&marked)?;
-            replayed |= marked.replayed;
-        }
         if !request.manifest_rows.is_empty() {
             let staged = self.stage_claimed_artifact_manifest(
                 rpc,
@@ -3174,7 +3246,6 @@ impl MetadataWorkspaceRequestExecutor {
                 expected_length: row.expected_length,
                 expected_digest: protocol::DigestUri::new(row.expected_digest_uri)
                     .map_err(|e| internal(e.to_string()))?,
-                multipart_token: row.multipart_upload_id,
             });
         }
         Ok(ExecutedRequest {
@@ -3586,13 +3657,17 @@ impl MetadataWorkspaceRequestExecutor {
         &self,
         request: &AuthorizedRequest<'_>,
     ) -> Result<bool, protocol::RpcFailure> {
-        request
-            .validate()
-            .map_err(|error| invalid_argument(error.to_string()))?;
-        // The authenticated principal is part of the fingerprint: another
-        // principal reusing this request id replays nothing.
-        let request_digest = request_fingerprint(request, request.authority.principal)
-            .map_err(|error| invalid_argument(error.to_string()))?;
+        let request_digest = mutation_fingerprint(request)?;
+        self.claim_fingerprinted_mutation(request, request_digest)
+    }
+
+    /// Bind this request id to `request_digest`, or report that it is already
+    /// bound to the same one and the request replays.
+    fn claim_fingerprinted_mutation(
+        &self,
+        request: &AuthorizedRequest<'_>,
+        request_digest: [u8; types::SHA256_BYTES],
+    ) -> Result<bool, protocol::RpcFailure> {
         let request_id: types::RequestId = request.request_id.into();
         if let Some(existing) = self.lookup_request(request.route, request_id)? {
             if existing.deterministic_result == request_digest {
@@ -4764,6 +4839,28 @@ fn restore_state_digest(
         .encode()
         .map_err(|error| internal(format!("cannot encode restore operation token: {error}")))?;
     Ok(protocol::Digest(Sha256::digest(encoded).into()))
+}
+
+/// What an upload's first session decided.
+enum UploadAdmission {
+    /// This request already recorded its object; answer with that outcome.
+    Recorded(Box<meta::PublishCommandOutcome>),
+    /// The staged record the provider write must satisfy.
+    Pending(meta::StagedObjectRecord),
+}
+
+/// Validate a mutating request and fingerprint it for request-id replay.
+///
+/// The authenticated principal is part of the fingerprint: another principal
+/// reusing this request id replays nothing.
+fn mutation_fingerprint(
+    request: &AuthorizedRequest<'_>,
+) -> Result<[u8; types::SHA256_BYTES], protocol::RpcFailure> {
+    request
+        .validate()
+        .map_err(|error| invalid_argument(error.to_string()))?;
+    request_fingerprint(request, request.authority.principal)
+        .map_err(|error| invalid_argument(error.to_string()))
 }
 
 fn publish_operation_response(
@@ -6552,29 +6649,42 @@ fn meta_failure(error: meta::MetaError) -> protocol::RpcFailure {
     }
 }
 
-/// Whether a request may execute metadata commands. Read-only requests share
-/// the command gate and pay only a durability barrier; every other request
-/// runs as one write session. Misclassifying a read as a write costs
-/// concurrency, never correctness: a command outside a session acknowledges
-/// before it returns.
-fn mutates_metadata(operation: &protocol::WorkspaceRequest) -> bool {
-    !matches!(
-        operation,
+/// How a request is sequenced against the shard's other requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sequencing {
+    /// Shares the command gate with every other read and pays only a
+    /// durability barrier on the way out.
+    Read,
+    /// Runs as one write session: planned and applied under the exclusive
+    /// gate, acknowledged when the session ends.
+    WriteSession,
+    /// Opens its own write sessions around a provider write that must hold
+    /// no metadata lock: under the gate, that write would stall every other
+    /// request of the shard for as long as the provider takes.
+    OwnSessions,
+}
+
+/// Misclassifying a read as a write session costs concurrency, never
+/// correctness: a command outside a session acknowledges before it returns.
+fn sequencing(operation: &protocol::WorkspaceRequest) -> Sequencing {
+    match operation {
         protocol::WorkspaceRequest::Preflight(_)
-            | protocol::WorkspaceRequest::GetWorkspace(_)
-            | protocol::WorkspaceRequest::GetPath(_)
-            | protocol::WorkspaceRequest::ListPaths(_)
-            | protocol::WorkspaceRequest::GetSnapshot(_)
-            | protocol::WorkspaceRequest::ListSnapshots(_)
-            | protocol::WorkspaceRequest::GetOperation(_)
-            | protocol::WorkspaceRequest::InspectAppendCleanup(_)
-            | protocol::WorkspaceRequest::GetGenericIndexRegistration(_)
-            | protocol::WorkspaceRequest::Search(_)
-            | protocol::WorkspaceRequest::Aggregate(_)
-            | protocol::WorkspaceRequest::Catalog(_)
-            | protocol::WorkspaceRequest::FindWorkspaces(_)
-            | protocol::WorkspaceRequest::ReadChanges(_)
-    )
+        | protocol::WorkspaceRequest::GetWorkspace(_)
+        | protocol::WorkspaceRequest::GetPath(_)
+        | protocol::WorkspaceRequest::ListPaths(_)
+        | protocol::WorkspaceRequest::GetSnapshot(_)
+        | protocol::WorkspaceRequest::ListSnapshots(_)
+        | protocol::WorkspaceRequest::GetOperation(_)
+        | protocol::WorkspaceRequest::InspectAppendCleanup(_)
+        | protocol::WorkspaceRequest::GetGenericIndexRegistration(_)
+        | protocol::WorkspaceRequest::Search(_)
+        | protocol::WorkspaceRequest::Aggregate(_)
+        | protocol::WorkspaceRequest::Catalog(_)
+        | protocol::WorkspaceRequest::FindWorkspaces(_)
+        | protocol::WorkspaceRequest::ReadChanges(_) => Sequencing::Read,
+        protocol::WorkspaceRequest::UploadArtifactObject(_) => Sequencing::OwnSessions,
+        _ => Sequencing::WriteSession,
+    }
 }
 
 fn internal_metadata_conflict(failure: &protocol::RpcFailure) -> bool {
@@ -6672,6 +6782,30 @@ fn conflict(
     let mut failure = failure(protocol::ErrorCode::Conflict, message, false, Some(kind));
     failure.current_generation = current_generation;
     failure
+}
+
+/// The owner could not write an uploaded object. A provider that may have
+/// applied the write is retried with the same bytes: an immutable create of
+/// the same bytes replays, so an ambiguous outcome is retryable here even
+/// though the provider error itself is not.
+fn object_write_failure(error: ObjectError) -> protocol::RpcFailure {
+    match error {
+        ObjectError::ProviderAdmissionRequired | ObjectError::ProviderAdmissionFailed(_) => {
+            internal(format!(
+                "the owner's object store is not admitted for writes: {error}"
+            ))
+        }
+        error => {
+            let retryable =
+                error.retryable() || matches!(error, ObjectError::CreateAmbiguous { .. });
+            failure(
+                protocol::ErrorCode::ObjectUnavailable,
+                format!("the owner could not write the uploaded object: {error}"),
+                retryable,
+                None,
+            )
+        }
+    }
 }
 
 /// The request continues an operation another principal began.
@@ -6823,6 +6957,12 @@ mod tests {
     }
 
     fn ready_executor() -> (Arc<meta::MetaShard>, MetadataWorkspaceRequestExecutor) {
+        ready_executor_with(Arc::new(nokv_object::MemoryArtifactStore::new()))
+    }
+
+    fn ready_executor_with(
+        objects: Arc<dyn ArtifactObjectStore>,
+    ) -> (Arc<meta::MetaShard>, MetadataWorkspaceRequestExecutor) {
         let store = crate::test_support::meta_shard(shard());
         store.advance_owner_epoch(None, owner(1)).unwrap();
         store
@@ -6844,7 +6984,7 @@ mod tests {
                 owner(1),
             ))
             .unwrap();
-        let executor = MetadataWorkspaceRequestExecutor::new(Arc::clone(&store));
+        let executor = MetadataWorkspaceRequestExecutor::new(Arc::clone(&store), objects);
         (store, executor)
     }
 
@@ -6951,7 +7091,10 @@ mod tests {
     fn preflight_uses_no_workspace_state_and_reports_the_exact_route() {
         let store = crate::test_support::meta_shard(shard());
         let version_before = store.current_read_version().unwrap();
-        let executor = MetadataWorkspaceRequestExecutor::new(Arc::clone(&store));
+        let executor = MetadataWorkspaceRequestExecutor::new(
+            Arc::clone(&store),
+            Arc::new(nokv_object::MemoryArtifactStore::new()),
+        );
         let request = protocol::WorkspaceRpcRequest {
             route: route(41),
             request_id: protocol::RequestIdentity([91; types::FIXED_ID_BYTES]),
@@ -9066,7 +9209,7 @@ mod tests {
     /// The sealed one-object, one-row plan of a one-byte artifact.
     struct OneBytePlan {
         staged_objects: Vec<protocol::StagedObject>,
-        upload_proofs: Vec<protocol::ObjectUploadProof>,
+        body: Vec<u8>,
         manifest_rows: Vec<protocol::ArtifactManifestRow>,
         seals: protocol::ArtifactPublishPlanSeal,
         artifact: protocol::ArtifactDescriptor,
@@ -9092,7 +9235,6 @@ mod tests {
                 object_identity: protocol::ObjectIdentity::new(object_key.clone()).unwrap(),
                 expected_length: length,
                 expected_digest: body_digest.clone(),
-                multipart_token: None,
             }];
             let manifest_rows = vec![protocol::ArtifactManifestRow {
                 object_index: 0,
@@ -9122,15 +9264,22 @@ mod tests {
             };
             Self {
                 staged_objects,
-                upload_proofs: vec![protocol::ObjectUploadProof {
-                    sequence: 0,
-                    observed_length: length,
-                    observed_digest: body_digest,
-                }],
+                body: body.to_vec(),
                 manifest_rows,
                 seals,
                 artifact,
             }
+        }
+
+        /// The owner-mediated upload of the plan's one object.
+        fn upload_request(&self, token: protocol::OperationToken) -> protocol::WorkspaceRequest {
+            protocol::WorkspaceRequest::UploadArtifactObject(
+                protocol::UploadArtifactObjectRequest {
+                    token,
+                    sequence: 0,
+                    body: self.body.clone(),
+                },
+            )
         }
 
         fn begin(
@@ -9168,7 +9317,25 @@ mod tests {
         OneBytePlan,
         protocol::BeginArtifactPublishRequest,
     ) {
-        let (store, executor) = ready_executor();
+        fused_publication_fixture_with(
+            name,
+            fill,
+            Arc::new(nokv_object::MemoryArtifactStore::new()),
+        )
+    }
+
+    /// The fused fixture over the object store the owner writes through.
+    fn fused_publication_fixture_with(
+        name: &str,
+        fill: u8,
+        objects: Arc<dyn ArtifactObjectStore>,
+    ) -> (
+        Arc<meta::MetaShard>,
+        MetadataWorkspaceRequestExecutor,
+        OneBytePlan,
+        protocol::BeginArtifactPublishRequest,
+    ) {
+        let (store, executor) = ready_executor_with(objects);
         let workbench = protocol::WorkbenchName::new(name).unwrap();
         executor
             .execute(
@@ -9219,11 +9386,423 @@ mod tests {
     ) -> protocol::WorkspaceRequest {
         protocol::WorkspaceRequest::FinishArtifactPublish(protocol::FinishArtifactPublishRequest {
             token,
-            uploaded_objects: plan.upload_proofs.clone(),
             manifest_rows: plan.manifest_rows.clone(),
             dependency_owner_revision_ids: Vec::new(),
             artifact: plan.artifact.clone(),
         })
+    }
+
+    /// Upload the plan's one object through the owner; the token it answers
+    /// with feeds the next step.
+    fn upload_object(
+        executor: &MetadataWorkspaceRequestExecutor,
+        fill: u8,
+        plan: &OneBytePlan,
+        token: protocol::OperationToken,
+    ) -> protocol::OperationToken {
+        executed_operation(
+            &executor
+                .execute(
+                    &restore_rpc(fill, plan.upload_request(token)),
+                    RequestAuthority::TRUSTED,
+                )
+                .unwrap(),
+        )
+        .token
+    }
+
+    /// An object store whose first create answers ambiguously, as a provider
+    /// that applied a write but lost the response to it.
+    struct AmbiguousOnceStore {
+        inner: nokv_object::MemoryArtifactStore,
+        creates: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ArtifactObjectStore for AmbiguousOnceStore {
+        fn capabilities(&self) -> nokv_object::ArtifactStoreCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn create_immutable(
+            &self,
+            key: &ObjectKey,
+            bytes: &[u8],
+        ) -> Result<ImmutableCreateOutcome, ObjectError> {
+            let outcome = self.inner.create_immutable(key, bytes)?;
+            if self
+                .creates
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                return Err(ObjectError::CreateAmbiguous {
+                    key: key.clone(),
+                    detail: "injected response loss".to_owned(),
+                });
+            }
+            Ok(outcome)
+        }
+
+        fn read(
+            &self,
+            key: &ObjectKey,
+            range: Option<nokv_object::ObjectRange>,
+        ) -> Result<Vec<u8>, ObjectError> {
+            self.inner.read(key, range)
+        }
+
+        fn head(&self, key: &ObjectKey) -> Result<Option<nokv_object::ObjectInfo>, ObjectError> {
+            self.inner.head(key)
+        }
+
+        fn delete(&self, key: &ObjectKey) -> Result<nokv_object::ObjectDeleteOutcome, ObjectError> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn an_ambiguous_owner_write_is_retryable_and_the_same_bytes_replay() {
+        let objects = Arc::new(AmbiguousOnceStore {
+            inner: nokv_object::MemoryArtifactStore::new(),
+            creates: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (_store, executor, plan, begin) = fused_publication_fixture_with(
+            "owner-upload-ambiguous",
+            0xa0,
+            Arc::clone(&objects) as Arc<dyn ArtifactObjectStore>,
+        );
+        let operation_id = begin.operation_id;
+        let prepared = executor
+            .execute(
+                &restore_rpc(
+                    0xa1,
+                    protocol::WorkspaceRequest::PrepareArtifactPublish(
+                        protocol::PrepareArtifactPublishRequest {
+                            begin,
+                            objects: plan.staged_objects.clone(),
+                        },
+                    ),
+                ),
+                RequestAuthority::TRUSTED,
+            )
+            .unwrap();
+        let token = executed_operation(&prepared).token;
+        // The provider applied the block but answered ambiguously: the owner
+        // records nothing and tells the client to send the same block again.
+        let refused = executor
+            .execute(
+                &restore_rpc(0xa2, plan.upload_request(token)),
+                RequestAuthority::TRUSTED,
+            )
+            .unwrap_err();
+        assert_eq!(refused.code, protocol::ErrorCode::ObjectUnavailable);
+        assert!(refused.retryable, "{refused:?}");
+        let status = executed_operation(
+            &executor
+                .execute(
+                    &restore_rpc(
+                        0xa3,
+                        protocol::WorkspaceRequest::GetOperation(protocol::GetOperationRequest {
+                            operation_id,
+                        }),
+                    ),
+                    RequestAuthority::TRUSTED,
+                )
+                .unwrap(),
+        );
+        assert_eq!(status.progress.completed_rows, 1);
+        // The retried upload replays the provider's write and records it.
+        let uploaded = executor
+            .execute(
+                &restore_rpc(0xa4, plan.upload_request(token)),
+                RequestAuthority::TRUSTED,
+            )
+            .unwrap();
+        assert_eq!(executed_operation(&uploaded).progress.completed_rows, 2);
+        let key =
+            ObjectKey::new(plan.staged_objects[0].object_identity.as_str().to_owned()).unwrap();
+        assert_eq!(objects.inner.read(&key, None).unwrap(), plan.body);
+        assert_eq!(objects.creates.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A store that holds every create until the test releases it, so a test
+    /// can observe what the owner still serves while a block is in flight to
+    /// the provider.
+    struct HeldCreateStore {
+        inner: nokv_object::MemoryArtifactStore,
+        arrivals: std::sync::mpsc::Sender<()>,
+        released: (std::sync::Mutex<bool>, std::sync::Condvar),
+    }
+
+    impl HeldCreateStore {
+        fn new() -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
+            let (arrivals, arrived) = std::sync::mpsc::channel();
+            let store = Arc::new(Self {
+                inner: nokv_object::MemoryArtifactStore::new(),
+                arrivals,
+                released: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+            });
+            (store, arrived)
+        }
+
+        fn release(&self) {
+            *self.released.0.lock().unwrap() = true;
+            self.released.1.notify_all();
+        }
+    }
+
+    impl ArtifactObjectStore for HeldCreateStore {
+        fn capabilities(&self) -> nokv_object::ArtifactStoreCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn create_immutable(
+            &self,
+            key: &ObjectKey,
+            bytes: &[u8],
+        ) -> Result<ImmutableCreateOutcome, ObjectError> {
+            self.arrivals.send(()).unwrap();
+            let mut released = self.released.0.lock().unwrap();
+            while !*released {
+                released = self.released.1.wait(released).unwrap();
+            }
+            drop(released);
+            self.inner.create_immutable(key, bytes)
+        }
+
+        fn read(
+            &self,
+            key: &ObjectKey,
+            range: Option<nokv_object::ObjectRange>,
+        ) -> Result<Vec<u8>, ObjectError> {
+            self.inner.read(key, range)
+        }
+
+        fn head(&self, key: &ObjectKey) -> Result<Option<nokv_object::ObjectInfo>, ObjectError> {
+            self.inner.head(key)
+        }
+
+        fn delete(&self, key: &ObjectKey) -> Result<nokv_object::ObjectDeleteOutcome, ObjectError> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// How long a request that must not wait for the provider may take.
+    const PROVIDER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Execute `request` on its own thread and wait at most `patience` for it.
+    fn execute_within(
+        executor: &Arc<MetadataWorkspaceRequestExecutor>,
+        request: protocol::WorkspaceRpcRequest,
+        patience: std::time::Duration,
+    ) -> Option<Result<ExecutedRequest, protocol::RpcFailure>> {
+        let (done, outcome) = std::sync::mpsc::channel();
+        let executor = Arc::clone(executor);
+        std::thread::spawn(move || {
+            let _ = done.send(executor.execute(&request, RequestAuthority::TRUSTED));
+        });
+        outcome.recv_timeout(patience).ok()
+    }
+
+    /// An upload fixture whose provider holds every create: the executor, the
+    /// plan, the prepared operation's token, and the channel that reports
+    /// each create reaching the provider.
+    fn held_upload_fixture(
+        name: &str,
+        fill: u8,
+    ) -> (
+        Arc<HeldCreateStore>,
+        std::sync::mpsc::Receiver<()>,
+        Arc<MetadataWorkspaceRequestExecutor>,
+        OneBytePlan,
+        protocol::OperationToken,
+    ) {
+        let (objects, arrived) = HeldCreateStore::new();
+        let (_store, executor, plan, begin) = fused_publication_fixture_with(
+            name,
+            fill,
+            Arc::clone(&objects) as Arc<dyn ArtifactObjectStore>,
+        );
+        let executor = Arc::new(executor);
+        let prepared = executor
+            .execute(
+                &restore_rpc(
+                    fill.wrapping_add(3),
+                    protocol::WorkspaceRequest::PrepareArtifactPublish(
+                        protocol::PrepareArtifactPublishRequest {
+                            begin,
+                            objects: plan.staged_objects.clone(),
+                        },
+                    ),
+                ),
+                RequestAuthority::TRUSTED,
+            )
+            .unwrap();
+        let token = executed_operation(&prepared).token;
+        (objects, arrived, executor, plan, token)
+    }
+
+    #[test]
+    fn a_block_in_flight_to_the_provider_holds_no_shard_gate() {
+        let (objects, arrived, executor, plan, token) = held_upload_fixture("held-upload", 0x50);
+        let uploading = {
+            let executor = Arc::clone(&executor);
+            let upload = restore_rpc(0x55, plan.upload_request(token));
+            std::thread::spawn(move || executor.execute(&upload, RequestAuthority::TRUSTED))
+        };
+        arrived
+            .recv_timeout(PROVIDER_PATIENCE)
+            .expect("the admitted block reaches the provider");
+        // With the block in flight, the shard still answers reads and applies
+        // writes instead of queueing them behind the provider.
+        let read = execute_within(
+            &executor,
+            restore_rpc(
+                0x56,
+                protocol::WorkspaceRequest::GetWorkspace(protocol::GetWorkspaceRequest {
+                    workbench: protocol::WorkbenchName::new("held-upload").unwrap(),
+                }),
+            ),
+            PROVIDER_PATIENCE,
+        )
+        .expect("a read must not wait for the provider write");
+        assert!(read.is_ok(), "{read:?}");
+        let written = execute_within(
+            &executor,
+            restore_rpc(
+                0x57,
+                protocol::WorkspaceRequest::CreateWorkspace(protocol::CreateWorkspaceRequest {
+                    workbench: protocol::WorkbenchName::new("held-upload-neighbour").unwrap(),
+                    workspace_incarnation_id: protocol::WorkspaceIdentity(
+                        [0x58; types::FIXED_ID_BYTES],
+                    ),
+                }),
+            ),
+            PROVIDER_PATIENCE,
+        )
+        .expect("a write must not wait for the provider write");
+        assert!(written.is_ok(), "{written:?}");
+        objects.release();
+        let uploaded = uploading.join().unwrap().unwrap();
+        assert!(!uploaded.replayed);
+        assert_eq!(executed_operation(&uploaded).progress.completed_rows, 2);
+        let key =
+            ObjectKey::new(plan.staged_objects[0].object_identity.as_str().to_owned()).unwrap();
+        assert_eq!(objects.inner.read(&key, None).unwrap(), plan.body);
+    }
+
+    #[test]
+    fn concurrent_duplicates_of_one_upload_record_the_object_once() {
+        let (objects, arrived, executor, plan, token) =
+            held_upload_fixture("duplicate-upload", 0x60);
+        // Both duplicates are admitted and reach the provider before either
+        // records: the second to record finds the first's outcome.
+        let workers = (0..2)
+            .map(|_| {
+                let executor = Arc::clone(&executor);
+                let upload = restore_rpc(0x65, plan.upload_request(token));
+                std::thread::spawn(move || executor.execute(&upload, RequestAuthority::TRUSTED))
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..2 {
+            arrived
+                .recv_timeout(PROVIDER_PATIENCE)
+                .expect("both duplicates reach the provider");
+        }
+        objects.release();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes.iter().filter(|outcome| !outcome.replayed).count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert_eq!(outcomes[0].commit_version, outcomes[1].commit_version);
+        assert_eq!(
+            executed_operation(&outcomes[0]),
+            executed_operation(&outcomes[1])
+        );
+        assert_eq!(executed_operation(&outcomes[0]).progress.completed_rows, 2);
+        let key =
+            ObjectKey::new(plan.staged_objects[0].object_identity.as_str().to_owned()).unwrap();
+        assert_eq!(objects.inner.read(&key, None).unwrap(), plan.body);
+    }
+
+    #[test]
+    fn the_owner_writes_an_uploaded_object_and_records_it() {
+        let objects = Arc::new(nokv_object::MemoryArtifactStore::new());
+        let (_store, executor, plan, begin) = fused_publication_fixture_with(
+            "owner-upload",
+            0x30,
+            Arc::clone(&objects) as Arc<dyn ArtifactObjectStore>,
+        );
+        let prepared = executor
+            .execute(
+                &restore_rpc(
+                    0x33,
+                    protocol::WorkspaceRequest::PrepareArtifactPublish(
+                        protocol::PrepareArtifactPublishRequest {
+                            begin,
+                            objects: plan.staged_objects.clone(),
+                        },
+                    ),
+                ),
+                RequestAuthority::TRUSTED,
+            )
+            .unwrap();
+        let token = executed_operation(&prepared).token;
+        let key =
+            ObjectKey::new(plan.staged_objects[0].object_identity.as_str().to_owned()).unwrap();
+        // A body that is not the sealed one is refused before any write.
+        let refused = executor
+            .execute(
+                &restore_rpc(
+                    0x34,
+                    protocol::WorkspaceRequest::UploadArtifactObject(
+                        protocol::UploadArtifactObjectRequest {
+                            token,
+                            sequence: 0,
+                            body: vec![0x31, 0x31],
+                        },
+                    ),
+                ),
+                RequestAuthority::TRUSTED,
+            )
+            .unwrap_err();
+        assert_eq!(refused.code, protocol::ErrorCode::InvalidArgument);
+        assert!(objects.head(&key).unwrap().is_none());
+        // The owner writes the object and records the upload in one step.
+        let upload = restore_rpc(0x35, plan.upload_request(token));
+        let uploaded = executor
+            .execute(&upload, RequestAuthority::TRUSTED)
+            .unwrap();
+        let status = executed_operation(&uploaded);
+        assert!(!uploaded.replayed);
+        assert_eq!(status.progress.completed_rows, 2);
+        assert_eq!(objects.read(&key, None).unwrap(), plan.body);
+        // The same request replays; a new request for the recorded object is
+        // a conflict that leaves the object as it is.
+        assert!(
+            executor
+                .execute(&upload, RequestAuthority::TRUSTED)
+                .unwrap()
+                .replayed
+        );
+        let again = executor
+            .execute(
+                &restore_rpc(0x36, plan.upload_request(status.token)),
+                RequestAuthority::TRUSTED,
+            )
+            .unwrap_err();
+        assert_eq!(again.code, protocol::ErrorCode::Conflict);
+        let finished = executor
+            .execute(
+                &restore_rpc(0x37, finish_request(&plan, status.token)),
+                RequestAuthority::TRUSTED,
+            )
+            .unwrap();
+        assert_eq!(executed_publication(&finished).generation, 1);
     }
 
     #[test]
@@ -9252,7 +9831,8 @@ mod tests {
         assert!(replayed.replayed);
         assert_eq!(executed_operation(&replayed), status);
 
-        let finish = restore_rpc(0x44, finish_request(&plan, status.token));
+        let token = upload_object(&executor, 0x4a, &plan, status.token);
+        let finish = restore_rpc(0x44, finish_request(&plan, token));
         let finished = executor
             .execute(&finish, RequestAuthority::TRUSTED)
             .unwrap();
@@ -9669,12 +10249,10 @@ mod tests {
                 RequestAuthority::TRUSTED,
             )
             .unwrap();
+        let token = upload_object(&executor, 0x8a, &plan, executed_operation(&prepared).token);
         executor
             .execute(
-                &restore_rpc(
-                    0x84,
-                    finish_request(&plan, executed_operation(&prepared).token),
-                ),
+                &restore_rpc(0x84, finish_request(&plan, token)),
                 RequestAuthority::TRUSTED,
             )
             .unwrap();
@@ -9702,11 +10280,12 @@ mod tests {
             .unwrap();
         let (inline_records, inline_bytes) = recovery_log_since(&store, before);
 
-        // Prepare logs its claim, Begin, and the staged plan; Finish logs its
-        // claim, the upload proof, the manifest, the Finalizing transition,
-        // and the publication. The inline request logs its claim, Begin, the
-        // transition, and the publication with the body.
-        assert_eq!(object_records, 8);
+        // Prepare logs its claim, Begin, and the staged plan; the upload logs
+        // its claim and the recorded object; Finish logs its claim, the
+        // manifest, the Finalizing transition, and the publication. The
+        // inline request logs its claim, Begin, the transition, and the
+        // publication with the body.
+        assert_eq!(object_records, 9);
         assert_eq!(inline_records, 4);
         assert!(
             inline_bytes < object_bytes,
@@ -9843,9 +10422,10 @@ mod tests {
         assert_eq!(status.progress.completed_rows, 1);
         assert_eq!(status.token, staged.token);
 
+        let token = upload_object(&executor, 0x57, &plan, status.token);
         let finished = executor
             .execute(
-                &restore_rpc(0x56, finish_request(&plan, status.token)),
+                &restore_rpc(0x56, finish_request(&plan, token)),
                 RequestAuthority::TRUSTED,
             )
             .unwrap();
@@ -9879,9 +10459,10 @@ mod tests {
         assert_eq!(status.state, protocol::OperationState::Running);
         assert_eq!(status.progress.completed_rows, 1);
         assert!(resumed.replayed);
+        let token = upload_object(&executor, 0x65, &plan, status.token);
         let finished = executor
             .execute(
-                &restore_rpc(0x64, finish_request(&plan, status.token)),
+                &restore_rpc(0x64, finish_request(&plan, token)),
                 RequestAuthority::TRUSTED,
             )
             .unwrap();
@@ -9889,7 +10470,7 @@ mod tests {
     }
 
     #[test]
-    fn finish_replay_completes_a_composite_cut_after_marking_uploads() {
+    fn finish_replay_completes_a_composite_cut_after_staging_the_manifest() {
         let (_store, executor, plan, begin) = fused_publication_fixture("fused-finish-cut", 0x68);
         let prepared = executor
             .execute(
@@ -9905,22 +10486,21 @@ mod tests {
                 RequestAuthority::TRUSTED,
             )
             .unwrap();
-        let finish = restore_rpc(
-            0x6c,
-            finish_request(&plan, executed_operation(&prepared).token),
-        );
+        let token = upload_object(&executor, 0x6d, &plan, executed_operation(&prepared).token);
+        let finish = restore_rpc(0x6c, finish_request(&plan, token));
         // The durable prefix a crash can leave: the composite claim and the
-        // upload proofs, without the manifest or the completion.
+        // staged manifest, without the completion.
         assert!(!executor.claim_mutation(&trusted(&finish)).unwrap());
         let protocol::WorkspaceRequest::FinishArtifactPublish(request) = &finish.operation else {
             unreachable!();
         };
         executor
-            .mark_claimed_artifact_objects_uploaded(
+            .stage_claimed_artifact_manifest(
                 &trusted(&finish),
-                &protocol::MarkArtifactObjectsUploadedRequest {
+                &protocol::StageArtifactManifestRequest {
                     token: request.token,
-                    objects: request.uploaded_objects.clone(),
+                    rows: request.manifest_rows.clone(),
+                    dependency_owner_revision_ids: request.dependency_owner_revision_ids.clone(),
                 },
             )
             .unwrap();
@@ -9947,9 +10527,16 @@ mod tests {
         let prepared = executor
             .execute(&prepare, RequestAuthority::TRUSTED)
             .unwrap();
+        let upload = restore_rpc(
+            0xcf,
+            plan.upload_request(executed_operation(&prepared).token),
+        );
+        let uploaded = executor
+            .execute(&upload, RequestAuthority::TRUSTED)
+            .unwrap();
         let finish = restore_rpc(
             0xc4,
-            finish_request(&plan, executed_operation(&prepared).token),
+            finish_request(&plan, executed_operation(&uploaded).token),
         );
         let finished = executor
             .execute(&finish, RequestAuthority::TRUSTED)
@@ -9977,7 +10564,12 @@ mod tests {
 
         // The owner restarts, so every retry arrives under a new owner epoch.
         store.advance_owner_epoch(Some(owner(1)), owner(2)).unwrap();
-        for (request, original) in [(prepare, prepared), (finish, finished), (inline, published)] {
+        for (request, original) in [
+            (prepare, prepared),
+            (upload, uploaded),
+            (finish, finished),
+            (inline, published),
+        ] {
             let retried = executor
                 .execute(
                     &protocol::WorkspaceRpcRequest {
@@ -10111,12 +10703,10 @@ mod tests {
         let prepared = executor
             .execute(&prepare(0x80, begin.clone()), RequestAuthority::TRUSTED)
             .unwrap();
+        let token = upload_object(&executor, 0x8f, &plan, executed_operation(&prepared).token);
         executor
             .execute(
-                &restore_rpc(
-                    0x81,
-                    finish_request(&plan, executed_operation(&prepared).token),
-                ),
+                &restore_rpc(0x81, finish_request(&plan, token)),
                 RequestAuthority::TRUSTED,
             )
             .unwrap();
@@ -10188,24 +10778,10 @@ mod tests {
                 RequestAuthority::TRUSTED,
             )
             .unwrap();
-        let marked = executor
-            .execute(
-                &restore_rpc(
-                    0x74,
-                    protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
-                        protocol::MarkArtifactObjectsUploadedRequest {
-                            token: executed_operation(&prepared).token,
-                            objects: plan.upload_proofs.clone(),
-                        },
-                    ),
-                ),
-                RequestAuthority::TRUSTED,
-            )
-            .unwrap();
+        let token = upload_object(&executor, 0x74, &plan, executed_operation(&prepared).token);
         let finish = protocol::WorkspaceRequest::FinishArtifactPublish(
             protocol::FinishArtifactPublishRequest {
-                token: executed_operation(&marked).token,
-                uploaded_objects: Vec::new(),
+                token,
                 manifest_rows: plan.manifest_rows.clone(),
                 dependency_owner_revision_ids: Vec::new(),
                 artifact: plan.artifact.clone(),
@@ -10300,12 +10876,7 @@ mod tests {
                 .execute(
                     &restore_rpc(
                         first_request_fill.wrapping_add(2),
-                        protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
-                            protocol::MarkArtifactObjectsUploadedRequest {
-                                token: status.token,
-                                objects: plan.upload_proofs.clone(),
-                            },
-                        ),
+                        plan.upload_request(status.token),
                     ),
                     RequestAuthority::TRUSTED,
                 )
@@ -12339,7 +12910,6 @@ mod tests {
             object_identity: protocol::ObjectIdentity::new(object_key.clone()).unwrap(),
             expected_length: 1,
             expected_digest: body_digest.clone(),
-            multipart_token: None,
         }];
         let manifest_rows = vec![protocol::ArtifactManifestRow {
             object_index: 0,
@@ -12598,7 +13168,6 @@ mod tests {
                 expected_digest: protocol::sha256_digest_uri(protocol::Digest(
                     [sequence as u8; 32],
                 )),
-                multipart_token: None,
             })
             .collect();
         let seals =
@@ -13497,7 +14066,6 @@ mod tests {
             object_identity: protocol::ObjectIdentity::new(object_key.clone()).unwrap(),
             expected_length: 1,
             expected_digest: body_digest.clone(),
-            multipart_token: None,
         }];
         let manifest_rows = vec![protocol::ArtifactManifestRow {
             object_index: 0,
@@ -13581,14 +14149,11 @@ mod tests {
                 .execute(
                     &rpc(
                         0x76,
-                        protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
-                            protocol::MarkArtifactObjectsUploadedRequest {
+                        protocol::WorkspaceRequest::UploadArtifactObject(
+                            protocol::UploadArtifactObjectRequest {
                                 token: status.token,
-                                objects: vec![protocol::ObjectUploadProof {
-                                    sequence: 0,
-                                    observed_length: 1,
-                                    observed_digest: body_digest,
-                                }],
+                                sequence: 0,
+                                body: vec![0x61],
                             },
                         ),
                     ),

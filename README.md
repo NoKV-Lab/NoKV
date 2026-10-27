@@ -69,7 +69,7 @@ NoKV closes that window as one artifact lifecycle:
 produce bytes
     |
     v
-upload immutable blocks + verify provider admission
+hand each immutable block to the shard owner, which verifies and writes it
     |
     v
 one final bounded metadata command makes the revision visible
@@ -235,8 +235,8 @@ real-service acceptance gate is still **not qualified**.
 | --- | --- | --- |
 | `nokv version --json` | Report the exact NoKV revision, lockfile identity, Holt source/version/checksum, schema, and tool count. | Identity/readback only. |
 | `nokv schema` | Emit the exact 18 normalized Workbench input schemas. | Contract inventory, not a live health check. |
-| `nokv materialize` | Copy a verified workspace artifact to a new local path. | The destination is disposable scratch, not a namespace or mount. |
-| `nokv collect` | Publish one bounded regular local file, create-only or generation-fenced replace. | Symlinks and unbounded/non-regular inputs fail closed. With `--operation-id` it publishes like `workspace-path put`. |
+| `nokv materialize` | Copy a verified workspace artifact to a new local path. | The destination is disposable scratch, not a namespace or mount. Parents are opened without following symlinks; publication is create-only and atomic. |
+| `nokv collect` | Publish one bounded regular local file, create-only or generation-fenced replace. | Symlinks in the file or its parents and unbounded/non-regular inputs fail closed. With `--operation-id` it publishes like `workspace-path put`. |
 | `nokv workspace-path put` | Publish one whole body, create-only or pinned to `--expected-generation`, under a caller `--operation-id`. | A retry with the same id and inputs from any process returns the original receipt; other inputs are an `identity_conflict`. |
 | `nokv workspace-path stat` | Read a path's incarnation, workspace revision, generation, and artifact revision in one metadata read. | Read-only; no object-store connection. |
 | `nokv workspace-path rename` / `nokv workspace-path remove` | Apply an explicit generation- and request-id-fenced path mutation. | Custom CLI surface; not one of the 18 Workbench tools. |
@@ -627,6 +627,9 @@ nokv \
 Credentials use the provider's normal chain or
 `--object-access-key-id`, `--object-secret-access-key`, and optional
 `--object-session-token`; never embed them in Workbench content or manifests.
+Agents need only read access under the root's prefix; see
+[Object Store Credentials](docs/object-credentials.md) for the keys each role
+touches and example policies.
 
 To carry workspace RPC over TLS 1.3, start the owner with `--rpc-tls-cert` and
 `--rpc-tls-key`, and give each client `--rpc-tls-ca`, `--rpc-tls-cert`,
@@ -635,8 +638,10 @@ clients whose certificate is a current credential of the tenant bound to its
 roots (`nokv identity`). Every request then needs a role on its root:
 reader, writer, or operator. Over TLS the CLI needs no `--agent-id`, so many
 agents can share a root, and once a root is bound to a tenant only a TLS owner
-serves it. The control plane and object store still need a trusted network.
-The Python SDK cannot yet connect to an owner that requires TLS.
+serves it. Agents never write objects: each block goes to the owner, which
+writes it, so an agent's object credentials can be read-only under the root's
+prefix. The control plane still needs a trusted network. The Python SDK cannot
+yet connect to an owner that requires TLS.
 
 ## Architecture and Ownership
 

@@ -172,8 +172,8 @@ with the same request id. Failed or abandoned uploads remain invisible and are
 recovered from a durable staged-object ledger.
 
 Whole-artifact replacement is the generic write primitive. Logs use immutable
-append segments plus a conditional stream-head advance. Range reads and
-multipart uploads remain first-class SDK operations.
+append segments plus a conditional stream-head advance. Range reads remain a
+first-class SDK operation.
 
 ## Discovery And Provenance
 

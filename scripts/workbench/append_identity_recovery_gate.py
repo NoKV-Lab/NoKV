@@ -94,7 +94,9 @@ def unpack(data):
 
 # A body of at most this many bytes that fits one block publishes inline in
 # one PublishInlineArtifact request; anything larger uploads objects through
-# the fused Prepare/Finish pair, or the stepwise requests past one batch.
+# the fused Prepare/Finish pair, or the stepwise requests past one batch. Both
+# shapes carry each object block to the owner in its own UploadArtifactObject
+# request between the plan and the manifest, so that request names no shape.
 # Mirrors MAX_INLINE_ARTIFACT_BODY_BYTES in crates/nokv-types.
 MAX_INLINE_BODY_BYTES = 16 * 1024
 
@@ -104,7 +106,6 @@ PUBLICATION_SHAPES = {
     "finish_artifact_publish": "fused",
     "begin_artifact_publish": "stepwise",
     "stage_artifact_objects": "stepwise",
-    "mark_artifact_objects_uploaded": "stepwise",
     "stage_artifact_manifest": "stepwise",
     "complete_artifact_publish": "stepwise",
 }

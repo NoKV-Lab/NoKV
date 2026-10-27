@@ -977,7 +977,10 @@ mod tests {
         registry
             .install(
                 installed,
-                Arc::new(crate::MetadataWorkspaceRequestExecutor::new(meta)),
+                Arc::new(crate::MetadataWorkspaceRequestExecutor::new(
+                    meta,
+                    Arc::new(nokv_object::MemoryArtifactStore::new()),
+                )),
             )
             .unwrap();
 
@@ -1018,7 +1021,10 @@ mod tests {
             registry
                 .install(
                     installed,
-                    Arc::new(crate::MetadataWorkspaceRequestExecutor::new(meta)),
+                    Arc::new(crate::MetadataWorkspaceRequestExecutor::new(
+                        meta,
+                        Arc::new(nokv_object::MemoryArtifactStore::new()),
+                    )),
                 )
                 .unwrap();
 
@@ -1070,7 +1076,10 @@ mod tests {
         registry
             .install(
                 installed,
-                Arc::new(crate::MetadataWorkspaceRequestExecutor::new(meta)),
+                Arc::new(crate::MetadataWorkspaceRequestExecutor::new(
+                    meta,
+                    Arc::new(nokv_object::MemoryArtifactStore::new()),
+                )),
             )
             .unwrap();
 

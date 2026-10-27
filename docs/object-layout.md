@@ -124,26 +124,25 @@ AWS S3, RustFS, MinIO, and Ceph RGW can use the same provider-neutral
 interface, but a provider brand or static capability flag is not evidence that
 a concrete endpoint satisfies the contract.
 
-Before business publication, write-conformance admission performs actual
-writes under reserved, unreferenced system keys and verifies:
+Only the shard owner writes objects. Before it serves, and when a root is
+provisioned, write-conformance admission performs actual writes under
+reserved, unreferenced system keys and verifies:
 
 - a fresh single-PUT create-if-absent;
 - exact-byte replay and different-byte collision;
 - exact whole-object readback and ranged readback;
-- a concurrent different-byte create race with exactly one stored winner.
+- a concurrent different-byte create race with exactly one stored winner;
+- monotonic sealing of an immutable object.
 
 The resulting receipt is bound to the exact provider handle and admitted
-single-PUT size profile. A receipt from another handle, a missing receipt, or a
-block larger than the admitted maximum fails before object or metadata
-publication. Admission v1 deliberately does not qualify multipart creation,
-completion, or abort; those paths cannot inherit a single-PUT receipt.
+single-PUT size profile; the owner's recovery writes check it. Admission v1
+deliberately does not qualify multipart creation, completion, or abort; those
+paths cannot inherit a single-PUT receipt.
 
-The native CLI admits its provider handle at the first object write of a
-process or `workbench-session` and keeps only a successful receipt. A command
-that writes no objects, such as a read or a publication stored inline, never
-probes the provider. A failed probe fails that write with
-`ProviderAdmissionFailed` before the publication's first request; the next
-write probes again.
+Agent processes never probe the provider: their credentials only read. A
+client hands each planned block to the owner in one request bounded by one
+block size, and the owner verifies the block against the staged record before
+writing it.
 
 The provider interface also retains idempotent deletion with explicit
 ambiguous-outcome handling. Public provider-admission errors and ambiguous
