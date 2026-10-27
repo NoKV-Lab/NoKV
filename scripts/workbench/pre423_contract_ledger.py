@@ -28,7 +28,7 @@ ALLOWED_EVIDENCE_KINDS = frozenset({"static", "unit", "integration", "live"})
 EXPECTED_GATE_REFERENCES = 137
 EXPECTED_SCENARIOS = 172
 QUALIFICATION_POLICY_SHA256 = (
-    "37097b9e0e5a1417b331772938ace2ab1ef09dec1a133b2b6065ead5e04a1109"
+    "4e97cce9db8935a4ed82ce096a4439e07dfdb33ca9917d81853c74e5e0c6a85a"
 )
 ALLOWED_PRODUCER_SUBJECTS = frozenset(
     {"product_binary", "dependencies", "rust_toolchain"}

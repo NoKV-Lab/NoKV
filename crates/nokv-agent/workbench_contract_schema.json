@@ -176,6 +176,10 @@
         "id": {
           "type": "string"
         },
+        "operation_id": {
+          "pattern": "^[0-9a-f]{32}$",
+          "type": "string"
+        },
         "path": {
           "type": "string"
         },
@@ -287,6 +291,10 @@
           "type": "string"
         },
         "old_string": {
+          "type": "string"
+        },
+        "operation_id": {
+          "pattern": "^[0-9a-f]{32}$",
           "type": "string"
         },
         "path": {
@@ -482,6 +490,10 @@
           "type": "integer"
         },
         "id": {
+          "type": "string"
+        },
+        "operation_id": {
+          "pattern": "^[0-9a-f]{32}$",
           "type": "string"
         },
         "path": {
