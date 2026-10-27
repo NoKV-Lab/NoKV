@@ -75,9 +75,10 @@ running; the session process itself exits `0` at end of input.
 An unknown outcome is resolved through the command's identity. With a caller
 operation id, query it. With a caller request id or a content-derived identity,
 repeat the same command: it replays or applies once. A command that mints a
-fresh identity per call (`workbench_put_file`, `workbench_append`,
-`workbench_edit`, `workbench_snapshot`, and `collect` without `--operation-id`)
-may apply twice if repeated, so its unknown outcome says `reread_then_retry`.
+fresh identity per call (`workbench_put_file`, `workbench_append`, and
+`workbench_edit` without `operation_id`, `workbench_snapshot`, and `collect`
+without `--operation-id`) may apply twice if repeated, so its unknown outcome
+says `reread_then_retry`.
 A read never reports an unknown outcome.
 
 ## Identity
@@ -86,6 +87,7 @@ A read never reports an unknown outcome.
 | --- | --- | --- |
 | `workspace-path put`, `collect --operation-id` | `--operation-id HEX32` | Same id and inputs from any process return the original receipt with `replayed: true`. |
 | `workspace-path append` | `--operation-id HEX32` | As above, over fenced attempts. |
+| `workbench_put_file`, `workbench_append`, `workbench_edit` | optional `operation_id` argument (HEX32) | Same id and inputs from any process return the original receipt with `idempotent_replay: true`; other inputs are `identity_conflict` ([Workbench Contract](./workbench-contract.md#operation-identity)). |
 | `workspace-path rename`, `remove` | `--request-id HEX32` | Same id and arguments replay, including after an owner restart. |
 | `workbench_commit`, `workbench_restore` | Derived from the content | Repeating the same content replays. |
 | `workbench_create`, `snapshot_renew`, `snapshot_retire` | None | Repeating converges. |

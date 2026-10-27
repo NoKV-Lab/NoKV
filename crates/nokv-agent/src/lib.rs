@@ -613,6 +613,11 @@ fn matches_pattern(pattern: &str, value: &str) -> Result<bool, String> {
             && value[7..]
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))),
+        // A caller-chosen operation identity.
+        "^[0-9a-f]{32}$" => Ok(value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))),
         _ => Err(format!("contract contains unsupported pattern {pattern:?}")),
     }
 }
@@ -704,6 +709,40 @@ mod tests {
             &json!({"id": "run-42", "section": "other", "path": "a.txt"})
         )
         .is_err());
+    }
+
+    #[test]
+    fn validator_enforces_the_operation_id_pattern_on_every_mutation_tool() {
+        let valid = "0123456789abcdef0123456789abcdef";
+        for (tool, extra) in [
+            ("workbench_put_file", json!({"text": "x"})),
+            ("workbench_append", json!({"text": "x"})),
+            (
+                "workbench_edit",
+                json!({"old_string": "a", "new_string": "b"}),
+            ),
+        ] {
+            let mut arguments = json!({"id": "wb", "section": "outputs", "path": "f.txt"});
+            for (key, value) in extra.as_object().unwrap() {
+                arguments[key] = value.clone();
+            }
+            arguments["operation_id"] = json!(valid);
+            assert!(
+                validate_tool_arguments(tool, &arguments).is_ok(),
+                "{tool} accepts a lowercase hex32 operation_id"
+            );
+            for bad in [
+                "ABCDEF0123456789ABCDEF0123456789",
+                "0123",
+                7.to_string().as_str(),
+            ] {
+                arguments["operation_id"] = json!(bad);
+                assert!(
+                    validate_tool_arguments(tool, &arguments).is_err(),
+                    "{tool} rejects operation_id {bad:?}"
+                );
+            }
+        }
     }
 
     #[test]

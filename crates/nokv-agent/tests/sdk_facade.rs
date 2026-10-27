@@ -55,6 +55,9 @@ struct FakeState {
     append_calls: usize,
     append_conflicts: usize,
     append_requests: Vec<AppendRequest>,
+    /// Receipts recorded under caller operation identities: (intent, outcome).
+    publications: BTreeMap<[u8; 16], (Vec<u8>, PublishOutcome)>,
+    appends: BTreeMap<[u8; 16], (Vec<u8>, AppendOutcome)>,
     create_error: Option<BackendError>,
     stat_views: Vec<ReadView>,
     list_requests: Vec<ListRequest>,
@@ -342,6 +345,23 @@ impl WorkbenchBackend for FakeBackend {
             state.publish_conflicts -= 1;
             return Err(BackendError::conflict("injected publication conflict"));
         }
+        let intent = publish_intent(
+            &request.path,
+            &request.body,
+            &request.content_type,
+            &request.condition,
+        );
+        if let Some(operation_id) = request.operation_id {
+            if let Some((recorded, outcome)) = state.publications.get(&operation_id) {
+                if *recorded == intent {
+                    return Ok(PublishOutcome {
+                        idempotent_replay: true,
+                        ..outcome.clone()
+                    });
+                }
+                return Err(identity_conflict(operation_id));
+            }
+        }
         let key = path_key(&request.path);
         let current = state.files.get(&key);
         let created = current.is_none();
@@ -386,7 +406,38 @@ impl WorkbenchBackend for FakeBackend {
                 bytes: request.body,
             },
         );
-        Ok(PublishOutcome { metadata, created })
+        let outcome = PublishOutcome {
+            metadata,
+            created,
+            idempotent_replay: false,
+        };
+        if let Some(operation_id) = request.operation_id {
+            state
+                .publications
+                .insert(operation_id, (intent, outcome.clone()));
+        }
+        Ok(outcome)
+    }
+
+    fn replay_publication(
+        &self,
+        request: PublicationReplayRequest,
+    ) -> Result<Option<PublishOutcome>, BackendError> {
+        let state = self.lock();
+        let intent = publish_intent(
+            &request.path,
+            &request.body,
+            &request.content_type,
+            &request.condition,
+        );
+        Ok(state
+            .publications
+            .get(&request.operation_id)
+            .filter(|(recorded, _)| *recorded == intent)
+            .map(|(_, outcome)| PublishOutcome {
+                idempotent_replay: true,
+                ..outcome.clone()
+            }))
     }
 
     fn append(&self, request: AppendRequest) -> Result<AppendOutcome, BackendError> {
@@ -396,6 +447,18 @@ impl WorkbenchBackend for FakeBackend {
         if state.append_conflicts > 0 {
             state.append_conflicts -= 1;
             return Err(BackendError::conflict("injected append conflict"));
+        }
+        let intent = append_intent(&request);
+        if let Some(operation_id) = request.operation_id {
+            if let Some((recorded, outcome)) = state.appends.get(&operation_id) {
+                if *recorded == intent {
+                    return Ok(AppendOutcome {
+                        idempotent_replay: true,
+                        ..outcome.clone()
+                    });
+                }
+                return Err(identity_conflict(operation_id));
+            }
         }
         let key = path_key(&request.path);
         let (mut bytes, base_size, generation, content_type, created) = match state.files.get(&key)
@@ -450,7 +513,17 @@ impl WorkbenchBackend for FakeBackend {
                 bytes,
             },
         );
-        Ok(AppendOutcome { metadata, created })
+        let outcome = AppendOutcome {
+            metadata,
+            created,
+            idempotent_replay: false,
+        };
+        if let Some(operation_id) = request.operation_id {
+            state
+                .appends
+                .insert(operation_id, (intent, outcome.clone()));
+        }
+        Ok(outcome)
     }
 
     fn grep_candidates(
@@ -1739,6 +1812,7 @@ fn generic_stat_retries_instead_of_mixing_a_fenced_card_with_replaced_structured
             },
             body: br#"[{"old":1}]"#.to_vec(),
             content_type: "application/json".to_owned(),
+            operation_id: None,
             condition: PublishCondition::CreateOnly,
         },
     )
@@ -1806,6 +1880,7 @@ fn generic_stat_restores_admitted_root_directory_summary() {
             },
             body: br#"{"score":7}"#.to_vec(),
             content_type: "application/json".to_owned(),
+            operation_id: None,
             condition: PublishCondition::CreateOnly,
         },
     )
@@ -1965,6 +2040,7 @@ fn generic_find_and_aggregate_require_a_directory_at_the_query_read_version() {
                 },
                 body: path.as_bytes().to_vec(),
                 content_type: "text/plain".to_owned(),
+                operation_id: None,
                 condition: PublishCondition::CreateOnly,
             },
         )
@@ -2023,6 +2099,7 @@ fn generic_paths_round_trip_out_of_band_artifacts_and_workbench_stat_uses_list_t
                 },
                 body: body.to_vec(),
                 content_type: "text/plain".to_owned(),
+                operation_id: None,
                 condition: PublishCondition::CreateOnly,
             },
         )
@@ -2359,6 +2436,7 @@ fn generic_read_exact_section_root_artifact_wins_over_the_virtual_section() {
             },
             body: b"exact outputs".to_vec(),
             content_type: "text/plain".to_owned(),
+            operation_id: None,
             condition: PublishCondition::CreateOnly,
         },
     )
@@ -2514,6 +2592,7 @@ fn generic_grep_exact_artifact_wins_over_descendants_for_both_recursion_modes() 
                     },
                     body: body.to_vec(),
                     content_type: "text/plain".to_owned(),
+                    operation_id: None,
                     condition: PublishCondition::CreateOnly,
                 },
             )
@@ -2593,6 +2672,7 @@ fn generic_grep_accepts_an_exact_reserved_section_root_across_scopes_and_glob() 
                 },
                 body: b"needle exact section root\n".to_vec(),
                 content_type: "text/plain".to_owned(),
+                operation_id: None,
                 condition: PublishCondition::CreateOnly,
             },
         )
@@ -2608,6 +2688,7 @@ fn generic_grep_accepts_an_exact_reserved_section_root_across_scopes_and_glob() 
                     },
                     body: b"needle descendant must not leak\n".to_vec(),
                     content_type: "text/plain".to_owned(),
+                    operation_id: None,
                     condition: PublishCondition::CreateOnly,
                 },
             )
@@ -2647,6 +2728,7 @@ fn generic_grep_v4_cursor_round_trips_an_exact_section_root_and_rejects_marker_t
             },
             body: b"needle one\nneedle two\n".to_vec(),
             content_type: "text/plain".to_owned(),
+            operation_id: None,
             condition: PublishCondition::CreateOnly,
         },
     )
@@ -3031,6 +3113,7 @@ fn generic_grep_pending_cursor_rejects_scope_recursive_and_glob_tampering_before
                 },
                 body: b"needle one\nneedle two\n".to_vec(),
                 content_type: "text/plain".to_owned(),
+                operation_id: None,
                 condition: PublishCondition::CreateOnly,
             },
         )
@@ -3098,6 +3181,7 @@ fn generic_grep_pending_cursor_rejects_replace_prepend_and_authority_aba() {
                 path: path.clone(),
                 body: b"needle one\nneedle two\n".to_vec(),
                 content_type: "text/plain".to_owned(),
+                operation_id: None,
                 condition: PublishCondition::CreateOnly,
             },
         )
@@ -3129,6 +3213,7 @@ fn generic_grep_pending_cursor_rejects_replace_prepend_and_authority_aba() {
                         path: path.clone(),
                         body: b"needle replacement\nneedle two\n".to_vec(),
                         content_type: "text/plain".to_owned(),
+                        operation_id: None,
                         condition: PublishCondition::ReplaceOnly {
                             expected_generation: 1,
                         },
@@ -3147,6 +3232,7 @@ fn generic_grep_pending_cursor_rejects_replace_prepend_and_authority_aba() {
                         },
                         body: b"needle prepended\n".to_vec(),
                         content_type: "text/plain".to_owned(),
+                        operation_id: None,
                         condition: PublishCondition::CreateOnly,
                     },
                 )
@@ -3235,6 +3321,7 @@ fn generic_grep_skips_nul_bodies_and_decodes_other_invalid_utf8_lossily() {
                 },
                 body: bytes,
                 content_type: "text/plain".to_owned(),
+                operation_id: None,
                 condition: PublishCondition::CreateOnly,
             },
         )
@@ -3310,6 +3397,7 @@ fn generic_grep_budget_boundaries_return_progress_cursors_and_only_oversize_file
                 },
                 body: b"no match\n".to_vec(),
                 content_type: "text/plain".to_owned(),
+                operation_id: None,
                 condition: PublishCondition::CreateOnly,
             },
         )
@@ -3357,6 +3445,7 @@ fn generic_grep_budget_boundaries_return_progress_cursors_and_only_oversize_file
                 },
                 body: body.to_vec(),
                 content_type: "text/plain".to_owned(),
+                operation_id: None,
                 condition: PublishCondition::CreateOnly,
             },
         )
@@ -3403,6 +3492,7 @@ fn generic_grep_budget_boundaries_return_progress_cursors_and_only_oversize_file
             },
             body: b"six!!!".to_vec(),
             content_type: "text/plain".to_owned(),
+            operation_id: None,
             condition: PublishCondition::CreateOnly,
         },
     )
@@ -3438,6 +3528,7 @@ fn generic_ls_catalog_and_stat_never_turn_a_deleted_last_child_into_an_empty_suc
                 },
                 body: b"only child".to_vec(),
                 content_type: "text/plain".to_owned(),
+                operation_id: None,
                 condition: PublishCondition::CreateOnly,
             },
         )
@@ -3495,6 +3586,7 @@ fn generic_stat_and_catalog_keep_exact_artifact_catalogs_empty() {
                 },
                 body: path.as_bytes().to_vec(),
                 content_type: "text/plain".to_owned(),
+                operation_id: None,
                 condition: PublishCondition::CreateOnly,
             },
         )
@@ -4933,4 +5025,176 @@ fn backend_errors_keep_typed_code_retryability_and_details() {
     assert_eq!(error.message, "owner is moving");
     assert!(error.retryable);
     assert_eq!(error.details["retry_after_ms"], 25);
+}
+
+fn publish_intent(
+    path: &ScopedPath,
+    body: &[u8],
+    content_type: &str,
+    condition: &PublishCondition,
+) -> Vec<u8> {
+    let mut intent = format!("{:?}|{}|{:?}|", path_key(path), content_type, condition).into_bytes();
+    intent.extend_from_slice(body);
+    intent
+}
+
+fn append_intent(request: &AppendRequest) -> Vec<u8> {
+    let mut intent = format!(
+        "{:?}|{:?}|{}|",
+        path_key(&request.path),
+        request.content_type,
+        request.create_content_type
+    )
+    .into_bytes();
+    intent.extend_from_slice(&request.delta);
+    intent
+}
+
+fn identity_conflict(operation_id: [u8; 16]) -> BackendError {
+    let hex = operation_id
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    BackendError::new(
+        BackendErrorKind::Other("RequestReplayMismatch".to_owned()),
+        "operation id was reused with other inputs",
+        false,
+        json!({"operation_id": hex}),
+    )
+    .with_class(nokv_types::ErrorClass::IdentityConflict)
+}
+
+const OPERATION_A: &str = "0123456789abcdef0123456789abcdef";
+const OPERATION_B: &str = "fedcba9876543210fedcba9876543210";
+const OPERATION_C: &str = "00112233445566778899aabbccddeeff";
+
+#[test]
+fn put_file_with_an_operation_id_replays_the_same_inputs_and_refuses_other_inputs() {
+    let backend = FakeBackend::default();
+    let workbench = test_handler(backend.clone());
+    run(&workbench, "workbench_create", json!({"id": "wb-main"})).unwrap();
+    let arguments = json!({
+        "id": "wb-main", "section": "outputs", "path": "result.txt",
+        "text": "v1", "operation_id": OPERATION_A,
+    });
+    let first = run(&workbench, "workbench_put_file", arguments.clone()).unwrap();
+    assert_eq!(first["generation"], 1);
+    assert_eq!(first["operation_id"], OPERATION_A);
+    assert_eq!(first["idempotent_replay"], false);
+    let again = run(&workbench, "workbench_put_file", arguments).unwrap();
+    assert_eq!(again["generation"], 1);
+    assert_eq!(again["idempotent_replay"], true);
+    assert_eq!(
+        backend.publish_calls(),
+        2,
+        "a replay still reaches the backend once"
+    );
+    let other = run(
+        &workbench,
+        "workbench_put_file",
+        json!({
+            "id": "wb-main", "section": "outputs", "path": "result.txt",
+            "text": "v2", "operation_id": OPERATION_A,
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(other.code, "RequestReplayMismatch", "{other:?}");
+    assert_eq!(other.class, Some(nokv_types::ErrorClass::IdentityConflict));
+    let stat = run(
+        &workbench,
+        "workbench_stat",
+        json!({"id": "wb-main", "section": "outputs", "path": "result.txt"}),
+    )
+    .unwrap();
+    assert_eq!(
+        stat["card"]["generation"], 1,
+        "a refused identity changes nothing"
+    );
+}
+
+#[test]
+fn edit_with_an_operation_id_replays_after_its_publication_was_applied() {
+    let backend = FakeBackend::default();
+    let workbench = test_handler(backend.clone());
+    run(&workbench, "workbench_create", json!({"id": "wb-main"})).unwrap();
+    run(
+        &workbench,
+        "workbench_put_file",
+        json!({"id": "wb-main", "section": "outputs", "path": "notes.txt", "text": "alpha beta"}),
+    )
+    .unwrap();
+    let arguments = json!({
+        "id": "wb-main", "section": "outputs", "path": "notes.txt",
+        "old_string": "beta", "new_string": "gamma", "operation_id": OPERATION_B,
+    });
+    let first = run(&workbench, "workbench_edit", arguments.clone()).unwrap();
+    assert_eq!(first["generation"], 2);
+    assert_eq!(first["replacements"], 1);
+    assert_eq!(first["idempotent_replay"], false);
+    // The reply of the first call was lost: the caller repeats the same edit.
+    // The file already holds the edited text, so a fresh edit would report
+    // NoMatch; the recorded publication under the same identity replays.
+    let again = run(&workbench, "workbench_edit", arguments).unwrap();
+    assert_eq!(again["generation"], 2);
+    assert_eq!(again["idempotent_replay"], true);
+    assert_eq!(again["replacements"], Value::Null);
+    let read = run(
+        &workbench,
+        "workbench_read",
+        json!({"id": "wb-main", "section": "outputs", "path": "notes.txt", "format": "bytes"}),
+    )
+    .unwrap();
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(read["bytes"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(body, b"alpha gamma");
+}
+
+#[test]
+fn append_with_an_operation_id_replays_the_same_delta_once() {
+    let backend = FakeBackend::default();
+    let workbench = test_handler(backend.clone());
+    run(&workbench, "workbench_create", json!({"id": "wb-main"})).unwrap();
+    let arguments = json!({
+        "id": "wb-main", "section": "logs", "path": "events.log",
+        "text": "one\n", "operation_id": OPERATION_C,
+    });
+    let first = run(&workbench, "workbench_append", arguments.clone()).unwrap();
+    assert_eq!(first["size_bytes"], 4);
+    assert_eq!(first["idempotent_replay"], false);
+    let again = run(&workbench, "workbench_append", arguments).unwrap();
+    assert_eq!(again["size_bytes"], 4, "the delta is appended once");
+    assert_eq!(again["generation"], first["generation"]);
+    assert_eq!(again["idempotent_replay"], true);
+    let other = run(
+        &workbench,
+        "workbench_append",
+        json!({
+            "id": "wb-main", "section": "logs", "path": "events.log",
+            "text": "two\n", "operation_id": OPERATION_C,
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(
+        other.class,
+        Some(nokv_types::ErrorClass::IdentityConflict),
+        "{other:?}"
+    );
+}
+
+#[test]
+fn an_operation_id_must_be_thirty_two_lowercase_hex_characters() {
+    let backend = FakeBackend::default();
+    let workbench = test_handler(backend.clone());
+    run(&workbench, "workbench_create", json!({"id": "wb-main"})).unwrap();
+    for bad in ["ABCDEF0123456789ABCDEF0123456789", "0123", ""] {
+        let error = run(
+            &workbench,
+            "workbench_put_file",
+            json!({"id": "wb-main", "section": "outputs", "path": "x.txt", "text": "x", "operation_id": bad}),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "InvalidArguments", "{bad:?} -> {error:?}");
+    }
+    assert_eq!(backend.publish_calls(), 0);
 }

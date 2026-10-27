@@ -831,6 +831,29 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
         let workspace = self
             .create_or_observe_workbench(&request.path.workbench_id)?
             .workspace;
+        if let Some(operation_id) = request.operation_id {
+            let options = nokv_client::IdempotentPublishOptions::new(
+                wire::OperationIdentity(operation_id),
+                workspace_path(&request.path)?,
+                condition,
+                content_type,
+            );
+            let receipt = match self
+                .client
+                .replay_idempotent_publish(&options, &request.body)
+                .map_err(map_idempotent_publish_error)?
+            {
+                Some(receipt) => receipt,
+                None => self
+                    .publish_idempotent(&options, &request.body)
+                    .map_err(map_idempotent_publish_error)?,
+            };
+            return Ok(identified_publish_outcome(
+                &receipt,
+                request.content_type,
+                matches!(condition, wire::PublishCondition::CreateOnly),
+            ));
+        }
         let operation_id = wire::OperationIdentity(self.fresh_fixed_identity(
             b"nokv.cli.artifact-operation\0",
             &[
@@ -869,7 +892,36 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                 indexed_fields: BTreeMap::new(),
             },
             created,
+            idempotent_replay: false,
         })
+    }
+
+    fn replay_publication(
+        &self,
+        request: agent::PublicationReplayRequest,
+    ) -> Result<Option<agent::PublishOutcome>, agent::BackendError> {
+        let condition = match request.condition {
+            agent::PublishCondition::CreateOnly => wire::PublishCondition::CreateOnly,
+            agent::PublishCondition::ReplaceOnly {
+                expected_generation,
+            } => wire::PublishCondition::ReplaceOnly {
+                expected_generation,
+            },
+        };
+        let content_type =
+            wire::ContentType::new(request.content_type.clone()).map_err(protocol_input)?;
+        let options = nokv_client::IdempotentPublishOptions::new(
+            wire::OperationIdentity(request.operation_id),
+            workspace_path(&request.path)?,
+            condition,
+            content_type,
+        );
+        let created = matches!(condition, wire::PublishCondition::CreateOnly);
+        Ok(self
+            .client
+            .replay_idempotent_publish(&options, &request.body)
+            .map_err(map_idempotent_publish_error)?
+            .map(|receipt| identified_publish_outcome(&receipt, request.content_type, created)))
     }
 
     fn append(
@@ -894,6 +946,38 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
         let workspace = self
             .create_or_observe_workbench(&request.path.workbench_id)?
             .workspace;
+        if let Some(operation_id) = request.operation_id {
+            let mut options = IdempotentAppendOptions::new(
+                wire::OperationIdentity(operation_id),
+                workspace_path(&request.path)?,
+                workspace.workspace_incarnation_id,
+                create_content_type.clone(),
+            );
+            if let Some(content_type) = content_type.clone() {
+                options = options.with_content_type(content_type);
+            }
+            options.max_logical_size = request.max_logical_size;
+            let call = self.append_idempotent(options, &request.delta)?;
+            let result = call.value;
+            let content_type = content_type
+                .as_ref()
+                .map(wire::ContentType::as_str)
+                .unwrap_or(create_content_type.as_str())
+                .to_owned();
+            return Ok(agent::AppendOutcome {
+                metadata: agent::ArtifactMetadata {
+                    generation: result.generation,
+                    size_bytes: result.logical_size,
+                    digest_uri: result.body_digest.as_str().to_owned(),
+                    content_type,
+                    producer: None,
+                    manifest_id: None,
+                    indexed_fields: BTreeMap::new(),
+                },
+                created: result.generation == 1,
+                idempotent_replay: call.replayed,
+            });
+        }
         let delta_digest: [u8; 32] = Sha256::digest(&request.delta).into();
         let content_type_identity = content_type
             .as_ref()
@@ -951,6 +1035,7 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                     .collect(),
             },
             created: outcome.created,
+            idempotent_replay: false,
         })
     }
 
@@ -2809,6 +2894,60 @@ pub(crate) fn map_client_error(error: ClientError) -> agent::BackendError {
     map_client_error_shape(error).with_class(class)
 }
 
+/// The outcome of a publication identified by the caller.
+fn identified_publish_outcome(
+    receipt: &nokv_client::IdempotentPublishReceipt,
+    content_type: String,
+    created: bool,
+) -> agent::PublishOutcome {
+    let publication = &receipt.publication;
+    agent::PublishOutcome {
+        metadata: agent::ArtifactMetadata {
+            generation: publication.generation,
+            size_bytes: publication.logical_size,
+            digest_uri: publication.body_digest.as_str().to_owned(),
+            content_type,
+            producer: None,
+            manifest_id: None,
+            indexed_fields: BTreeMap::new(),
+        },
+        created,
+        idempotent_replay: receipt.replayed,
+    }
+}
+
+/// The same codes and classes `workspace-path put` reports for these failures.
+fn map_idempotent_publish_error(error: nokv_client::IdempotentPublishError) -> agent::BackendError {
+    let class = error.class();
+    let attempt = error.attempt();
+    let mut mapped = match error {
+        nokv_client::IdempotentPublishError::Client { source, .. } => map_client_error(*source),
+        nokv_client::IdempotentPublishError::IdentityConflict { .. } => agent::BackendError::new(
+            agent::BackendErrorKind::Other("RequestReplayMismatch".to_owned()),
+            error.to_string(),
+            false,
+            json!({}),
+        )
+        .with_class(class),
+        nokv_client::IdempotentPublishError::InProgress { .. } => agent::BackendError::new(
+            agent::BackendErrorKind::Other("PublicationInProgress".to_owned()),
+            error.to_string(),
+            true,
+            json!({}),
+        )
+        .with_class(class),
+        nokv_client::IdempotentPublishError::Quarantined { .. } => agent::BackendError::new(
+            agent::BackendErrorKind::Other("Quarantined".to_owned()),
+            error.to_string(),
+            false,
+            json!({}),
+        )
+        .with_class(class),
+    };
+    mapped.details["attempt"] = json!(attempt);
+    mapped
+}
+
 fn map_client_error_shape(error: ClientError) -> agent::BackendError {
     if let ClientError::AppendCleanupUnresolved {
         operation_id,
@@ -3510,6 +3649,7 @@ mod tests {
             body: br#"{"status":"ok"}"#.to_vec(),
             content_type: JSON_CONTENT_TYPE.to_owned(),
             condition,
+            operation_id: None,
         }
     }
 
@@ -3524,6 +3664,7 @@ mod tests {
             content_type: None,
             create_content_type: "application/jsonl".to_owned(),
             max_logical_size: None,
+            operation_id: None,
         }
     }
 

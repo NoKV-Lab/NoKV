@@ -538,6 +538,47 @@ def unknown_outcome_query_then_retry(stack: Stack) -> dict[str, Any]:
     return {"failure": envelope, "status": observed, "replay": retry, "effects": 1}
 
 
+def workbench_tool_operation_id_replays(stack: Stack) -> dict[str, Any]:
+    """S9: the Workbench mutation tools replay exactly under a caller operation id
+    across processes, and refuse the id for other inputs."""
+    workbench = "s9-workbench-identity"
+    stack.workbench(workbench)
+    target = {"id": workbench, "section": "outputs", "path": "notes.txt"}
+
+    def tool(label: str, name: str, arguments: dict[str, Any]) -> Call:
+        return stack.run(label, ["workbench", name, json.dumps(arguments)])
+
+    put_id, edit_id, append_id = new_id(), new_id(), new_id()
+    put = {**target, "text": "alpha beta", "operation_id": put_id}
+    first = stack.success(tool("s9-put", "workbench_put_file", put))
+    again = stack.success(tool("s9-put-again", "workbench_put_file", put))
+    require(first.get("idempotent_replay") is False and again.get("idempotent_replay") is True
+            and again.get("generation") == first.get("generation") == 1
+            and again.get("operation_id") == put_id,
+            "s9: the same put under the same id replays its receipt", [first, again])
+    other = stack.failure(tool("s9-put-other", "workbench_put_file", {**put, "text": "other"}),
+                          "identity_conflict", "do_not_retry")
+    edit = {**target, "old_string": "beta", "new_string": "gamma", "operation_id": edit_id}
+    edited = stack.success(tool("s9-edit", "workbench_edit", edit))
+    edited_again = stack.success(tool("s9-edit-again", "workbench_edit", edit))
+    require(edited.get("generation") == 2 and edited.get("replacements") == 1
+            and edited_again.get("idempotent_replay") is True and edited_again.get("generation") == 2
+            and edited_again.get("replacements") is None,
+            "s9: a repeated edit replays the recorded generation instead of NoMatch",
+            [edited, edited_again])
+    append = {**target, "text": " delta", "operation_id": append_id}
+    appended = stack.success(tool("s9-append", "workbench_append", append))
+    appended_again = stack.success(tool("s9-append-again", "workbench_append", append))
+    require(appended.get("idempotent_replay") is False and appended_again.get("idempotent_replay") is True
+            and appended_again.get("size_bytes") == appended.get("size_bytes")
+            and appended_again.get("generation") == appended.get("generation") == 3,
+            "s9: the same append under the same id is applied once", [appended, appended_again])
+    body = stack.body("s9-body", workbench, "notes.txt")
+    require(body == b"alpha gamma delta", "s9: the body holds one edit and one append", body)
+    return {"put": [first, again, other], "edit": [edited, edited_again],
+            "append": [appended, appended_again]}
+
+
 def usage_error_sends_no_request(stack: Stack) -> dict[str, Any]:
     """S7: an invalid command fails typed before it reaches the owner."""
     cases = {
@@ -567,6 +608,7 @@ SCENARIOS = {
     "s4_same_id_other_payload": same_id_other_payload,
     "s5_unknown_outcome_query_then_retry": unknown_outcome_query_then_retry,
     "s7_usage_error_sends_no_request": usage_error_sends_no_request,
+    "s9_workbench_tool_operation_id_replays": workbench_tool_operation_id_replays,
 }
 
 

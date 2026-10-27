@@ -127,9 +127,9 @@ write tools cannot address them.
 | Tool | Stable behavior | Required core capability |
 | --- | --- | --- |
 | `workbench_create` | Create one workbench and expose the five standard sections. Exact retries converge. | Atomic workspace marker create. |
-| `workbench_put_file` | `replace=false` is create-only; `replace=true` is replace-only. It is never upsert. | Publish create-only or replace-if-generation. |
-| `workbench_append` | Create when missing, otherwise append after generation CAS; retry write conflicts; return the new size and generation. The returned `digest` identifies the appended delta, not the whole resulting body. | Immutable segment publish plus conditional head advance. |
-| `workbench_edit` | UTF-8 exact-string replacement; require one match unless `replace_all=true`; revalidate after a conflict; a byte-identical result does not publish a new generation. | Read with generation plus replace-if-generation. |
+| `workbench_put_file` | `replace=false` is create-only; `replace=true` is replace-only. It is never upsert. An optional `operation_id` makes the call replayable (see [Operation Identity](#operation-identity)). | Publish create-only or replace-if-generation. |
+| `workbench_append` | Create when missing, otherwise append after generation CAS; retry write conflicts; return the new size and generation. The returned `digest` identifies the appended delta, not the whole resulting body. An optional `operation_id` appends the delta exactly once. | Immutable segment publish plus conditional head advance. |
+| `workbench_edit` | UTF-8 exact-string replacement; require one match unless `replace_all=true`; revalidate after a conflict; a byte-identical result does not publish a new generation. An optional `operation_id` lets a repeated edit replay its recorded publication. | Read with generation plus replace-if-generation. |
 | `workbench_list` | Non-recursive, cursor-paginated listing at live state or a snapshot id/name. | Delimited path scan at one exact snapshot version or one stable live workspace incarnation/revision. |
 | `workbench_stat` | Compact metadata card without reading the body, at live state or a snapshot. | Exact path read at one version. |
 | `workbench_read` | Structured JSON/YAML/text shaping or base64 byte ranges; `if_none_match` uses generation; snapshot reads remain frozen. | Versioned stat and range read. |
@@ -182,6 +182,33 @@ appended bytes.
 Workbench responses do not contain `inode`, `source_root`, or
 `destination_root`. Those names are not Workbench identities, routing inputs,
 conditional-write tokens, provenance fields, or result projections.
+
+## Operation Identity
+
+Without an identity, every `workbench_put_file`, `workbench_edit`, and
+`workbench_append` call mints a fresh operation, so a caller whose reply was
+lost cannot tell "applied" from "not applied": repeating a create-only put
+answers `AlreadyExists`, repeating an edit answers `NoMatch`, repeating an
+append appends twice.
+
+The three tools therefore accept an optional `operation_id`, 32 lowercase
+hexadecimal characters chosen by the caller, with the semantics of
+`workspace-path put --operation-id`:
+
+- The same id with the same inputs returns the recorded receipt from any
+  process and after an owner restart; the response carries
+  `"operation_id"` and `"idempotent_replay": true`, and nothing is written.
+- The same id with other inputs fails with class `identity_conflict`
+  (code `RequestReplayMismatch`) and changes nothing.
+- The inputs of a put are the target, the body, the content type, and the
+  condition (`replace` and the generation it pins or observes). The inputs of
+  an append are the target, the delta, and the content types. For an edit they
+  are the target, `old_string`, `new_string`, `replace_all`, and the text the
+  edit read: a repeated edit whose `old_string` no longer matches first asks
+  whether the publication under its id produced the current text, and then
+  replays that receipt with `"replacements": null` instead of reporting
+  `NoMatch`.
+- Responses without `operation_id` are unchanged.
 
 ## Commit Identity
 

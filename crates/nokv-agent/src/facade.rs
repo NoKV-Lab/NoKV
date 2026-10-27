@@ -270,12 +270,31 @@ pub struct PublishRequest {
     pub body: Vec<u8>,
     pub content_type: String,
     pub condition: PublishCondition,
+    /// The caller's logical operation identity. `None` lets the backend mint
+    /// one, so a retry cannot be told from a new write; `Some` replays the
+    /// recorded receipt for the same inputs and refuses other inputs.
+    pub operation_id: Option<[u8; 16]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PublishOutcome {
     pub metadata: ArtifactMetadata,
     pub created: bool,
+    /// The receipt was recorded by an earlier attempt under the caller's
+    /// operation identity; this call wrote nothing.
+    pub idempotent_replay: bool,
+}
+
+/// Look up the receipt of a whole-body publication under a caller's operation
+/// identity without writing anything: the body, content type and condition
+/// must be the ones that publication used.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PublicationReplayRequest {
+    pub path: ScopedPath,
+    pub operation_id: [u8; 16],
+    pub body: Vec<u8>,
+    pub content_type: String,
+    pub condition: PublishCondition,
 }
 
 /// One logical immutable-segment append delegated to the SDK boundary.
@@ -290,12 +309,16 @@ pub struct AppendRequest {
     /// Optional lower-layer policy; the Workbench tool leaves this unset and
     /// limits only the appended payload.
     pub max_logical_size: Option<u64>,
+    /// The caller's logical append identity; see [`PublishRequest::operation_id`].
+    pub operation_id: Option<[u8; 16]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppendOutcome {
     pub metadata: ArtifactMetadata,
     pub created: bool,
+    /// See [`PublishOutcome::idempotent_replay`].
+    pub idempotent_replay: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -751,6 +774,16 @@ pub trait WorkbenchBackend: Send + Sync {
             .map(|artifact| artifact.map(|artifact| ArtifactInspection { artifact }))
     }
     fn publish(&self, request: PublishRequest) -> Result<PublishOutcome, BackendError>;
+    /// The recorded receipt of `request` if that publication already
+    /// succeeded under its operation identity, else `None`. A backend without
+    /// caller identities answers `None`.
+    fn replay_publication(
+        &self,
+        request: PublicationReplayRequest,
+    ) -> Result<Option<PublishOutcome>, BackendError> {
+        let _ = request;
+        Ok(None)
+    }
     fn append(&self, request: AppendRequest) -> Result<AppendOutcome, BackendError>;
     fn grep_candidates(
         &self,
@@ -974,6 +1007,7 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
             .to_owned();
         let replace = optional_bool(arguments, "replace")?.unwrap_or(false);
         let expected_generation = optional_u64(arguments, "expected_generation")?;
+        let operation_id = optional_operation_id(arguments)?;
         let condition = match (replace, expected_generation) {
             (false, None) => PublishCondition::CreateOnly,
             (false, Some(_)) => {
@@ -1004,6 +1038,32 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
                     .stat(&path, &ReadView::Live)?
                     .ok_or_else(|| not_found(&path))?;
                 let artifact = current.artifact.ok_or_else(|| not_artifact(&path))?;
+                // A repeated identified replace observes the generation its
+                // first attempt produced; that attempt's receipt is the answer.
+                if let Some(operation_id) = operation_id {
+                    if artifact.generation >= 2 {
+                        if let Some(outcome) =
+                            self.backend.replay_publication(PublicationReplayRequest {
+                                path: path.clone(),
+                                operation_id,
+                                body: body.clone(),
+                                content_type: content_type.clone(),
+                                condition: PublishCondition::ReplaceOnly {
+                                    expected_generation: artifact.generation - 1,
+                                },
+                            })?
+                        {
+                            let mut result = publish_result(
+                                &path,
+                                &self.projected_path(&path),
+                                &outcome,
+                                replace,
+                            );
+                            annotate_operation(&mut result, operation_id, true);
+                            return Ok(result);
+                        }
+                    }
+                }
                 PublishCondition::ReplaceOnly {
                     expected_generation: artifact.generation,
                 }
@@ -1014,19 +1074,20 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
             body,
             content_type,
             condition,
+            operation_id,
         })?;
-        Ok(publish_result(
-            &path,
-            &self.projected_path(&path),
-            &outcome,
-            replace,
-        ))
+        let mut result = publish_result(&path, &self.projected_path(&path), &outcome, replace);
+        if let Some(operation_id) = operation_id {
+            annotate_operation(&mut result, operation_id, outcome.idempotent_replay);
+        }
+        Ok(result)
     }
 
     fn append(&self, arguments: &Value) -> Result<Value, AgentError> {
         let path = parse_write_path(arguments)?;
         let (delta, default_content_type) = parse_payload(arguments, self.max_bytes)?;
         let requested_content_type = optional_string(arguments, "content_type")?.map(str::to_owned);
+        let operation_id = optional_operation_id(arguments)?;
         let appended_bytes = delta.len();
         let delta_digest = digest_uri(&delta);
         let outcome = self.backend.append(AppendRequest {
@@ -1035,8 +1096,9 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
             content_type: requested_content_type,
             create_content_type: default_content_type.to_owned(),
             max_logical_size: None,
+            operation_id,
         })?;
-        Ok(json!({
+        let mut result = json!({
             "status": "success",
             "workbench_id": path.workbench_id.as_str(),
             "section": path.section.map(Section::as_str),
@@ -1047,7 +1109,11 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
             "generation": outcome.metadata.generation,
             "created": outcome.created,
             "digest": delta_digest,
-        }))
+        });
+        if let Some(operation_id) = operation_id {
+            annotate_operation(&mut result, operation_id, outcome.idempotent_replay);
+        }
+        Ok(result)
     }
 
     fn edit(&self, arguments: &Value) -> Result<Value, AgentError> {
@@ -1060,6 +1126,7 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
         }
         let new_string = required_string(arguments, "new_string")?;
         let replace_all = optional_bool(arguments, "replace_all")?.unwrap_or(false);
+        let operation_id = optional_operation_id(arguments)?;
         for attempt in 1..=self.edit_conflict_attempts {
             let current = self
                 .backend
@@ -1081,6 +1148,38 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
             })?;
             let matches = text.match_indices(old_string).count();
             if matches == 0 {
+                // A repeated identified edit reads the text its first attempt
+                // produced; if that attempt's publication is recorded under
+                // the id, its receipt is the answer rather than NoMatch.
+                if let Some(operation_id) = operation_id {
+                    if current.metadata.generation >= 2 {
+                        if let Some(outcome) =
+                            self.backend.replay_publication(PublicationReplayRequest {
+                                path: path.clone(),
+                                operation_id,
+                                body: text.clone().into_bytes(),
+                                content_type: current.metadata.content_type.clone(),
+                                condition: PublishCondition::ReplaceOnly {
+                                    expected_generation: current.metadata.generation - 1,
+                                },
+                            })?
+                        {
+                            let mut result = json!({
+                                "status": "success",
+                                "workbench_id": path.workbench_id.as_str(),
+                                "section": path.section.map(Section::as_str),
+                                "relative_path": relative_path_value(&path),
+                                "path": self.projected_path(&path),
+                                "replacements": Value::Null,
+                                "size_bytes": outcome.metadata.size_bytes,
+                                "generation": outcome.metadata.generation,
+                                "no_change": false,
+                            });
+                            annotate_operation(&mut result, operation_id, true);
+                            return Ok(result);
+                        }
+                    }
+                }
                 return Err(AgentError::backend(
                     "NoMatch",
                     "old_string was not found",
@@ -1126,9 +1225,10 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
                 condition: PublishCondition::ReplaceOnly {
                     expected_generation: current.metadata.generation,
                 },
+                operation_id,
             }) {
                 Ok(outcome) => {
-                    return Ok(json!({
+                    let mut result = json!({
                         "status": "success",
                         "workbench_id": path.workbench_id.as_str(),
                         "section": path.section.map(Section::as_str),
@@ -1138,7 +1238,11 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
                         "size_bytes": outcome.metadata.size_bytes,
                         "generation": outcome.metadata.generation,
                         "no_change": false,
-                    }));
+                    });
+                    if let Some(operation_id) = operation_id {
+                        annotate_operation(&mut result, operation_id, outcome.idempotent_replay);
+                    }
+                    return Ok(result);
                 }
                 Err(error) if error.is_conflict() && attempt < self.edit_conflict_attempts => {}
                 Err(error) if error.is_conflict() => {
@@ -2221,6 +2325,35 @@ pub(crate) fn optional_bool(arguments: &Value, name: &str) -> Result<Option<bool
             "{name} must be a boolean or null"
         ))),
     }
+}
+
+/// The caller's `operation_id`: 32 lowercase hexadecimal characters, or absent.
+fn optional_operation_id(arguments: &Value) -> Result<Option<[u8; 16]>, AgentError> {
+    let Some(value) = optional_string(arguments, "operation_id")? else {
+        return Ok(None);
+    };
+    let bytes = value.as_bytes();
+    if bytes.len() != 32
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err(AgentError::invalid_arguments(
+            "operation_id must be 32 lowercase hexadecimal characters",
+        ));
+    }
+    let mut id = [0_u8; 16];
+    for (index, pair) in bytes.chunks(2).enumerate() {
+        let hex = std::str::from_utf8(pair).expect("ascii hex pair");
+        id[index] = u8::from_str_radix(hex, 16).expect("validated hex pair");
+    }
+    Ok(Some(id))
+}
+
+/// Record the caller's identity and whether this call replayed on a mutation result.
+fn annotate_operation(result: &mut Value, operation_id: [u8; 16], idempotent_replay: bool) {
+    result["operation_id"] = Value::String(lowercase_hex(&operation_id));
+    result["idempotent_replay"] = Value::Bool(idempotent_replay);
 }
 
 pub(crate) fn optional_u64(arguments: &Value, name: &str) -> Result<Option<u64>, AgentError> {
