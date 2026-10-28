@@ -254,21 +254,30 @@ where
 {
     /// The stored receipt of `body`'s publication under the caller's
     /// operation identity, read without a mutation or an object store. `None`
-    /// means an attempt still has to publish, which
-    /// [`Self::publish_idempotent`] does.
+    /// means no attempt has a receipt yet, because none was admitted or one
+    /// is still running or being aborted; [`Self::publish_idempotent`] waits
+    /// that out and publishes.
     pub fn replay_idempotent_publish(
         &self,
         options: &IdempotentPublishOptions,
         body: &[u8],
     ) -> Result<Option<IdempotentPublishReceipt>, IdempotentPublishError> {
         require_whole_body_condition(options)?;
-        match self.observe_attempt_chain(options, options.intent_digest(body), body)? {
-            AttemptChain::Succeeded(receipt) => Ok(Some(receipt)),
-            AttemptChain::Next(_) | AttemptChain::Running(_) => Ok(None),
+        match self.observe_attempt_chain(options, options.intent_digest(body), body) {
+            Ok(AttemptChain::Succeeded(receipt)) => Ok(Some(receipt)),
+            Ok(AttemptChain::Next(_) | AttemptChain::Running(_))
+            | Err(IdempotentPublishError::InProgress { .. }) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
     /// Publish `body` once under the caller's operation identity.
+    ///
+    /// An attempt that an owner left running or aborting when it died is
+    /// waited out with the client's retry budget when a backoff is set: the
+    /// restarted owner aborts that attempt on its own, and the next attempt
+    /// then publishes. The `InProgress` error is returned once the budget is
+    /// spent, or at once without a backoff.
     pub fn publish_idempotent(
         &self,
         store: &dyn ArtifactObjectStore,
@@ -277,6 +286,28 @@ where
     ) -> Result<IdempotentPublishReceipt, IdempotentPublishError> {
         require_whole_body_condition(options)?;
         let intent = options.intent_digest(body);
+        for round in 1..=self.max_attempts() {
+            match self.publish_idempotent_round(store, options, intent, body) {
+                Err(IdempotentPublishError::InProgress { .. })
+                    if round < self.max_attempts() && self.waits_between_retries() =>
+                {
+                    self.pause_before_retry(round);
+                }
+                result => return result,
+            }
+        }
+        unreachable!("validated max_attempts is non-zero")
+    }
+
+    /// One observation of the attempt chain and, when it ends at an attempt
+    /// still to be published, that publication.
+    fn publish_idempotent_round(
+        &self,
+        store: &dyn ArtifactObjectStore,
+        options: &IdempotentPublishOptions,
+        intent: Digest,
+        body: &[u8],
+    ) -> Result<IdempotentPublishReceipt, IdempotentPublishError> {
         let attempt = match self.observe_attempt_chain(options, intent, body)? {
             AttemptChain::Succeeded(receipt) => return Ok(receipt),
             AttemptChain::Next(attempt) | AttemptChain::Running(attempt) => attempt,

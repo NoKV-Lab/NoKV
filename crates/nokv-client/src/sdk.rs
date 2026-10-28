@@ -67,7 +67,7 @@ impl ClientOptions {
 
     /// The pause after `attempt` failed: the backoff doubled per earlier
     /// failed attempt, bounded by `max_retry_backoff`.
-    fn retry_delay(self, attempt: u32) -> Duration {
+    pub(crate) fn retry_delay(self, attempt: u32) -> Duration {
         let doublings = attempt.saturating_sub(1).min(31);
         self.retry_backoff
             .checked_mul(1 << doublings)
@@ -177,9 +177,16 @@ where
         self.options.max_attempts
     }
 
+    /// Whether a repeat waits before it runs. Without a backoff, repeating
+    /// an observation at once cannot change what it sees, so the workflows
+    /// that wait out another owner's attempt report it at once instead.
+    pub(crate) fn waits_between_retries(&self) -> bool {
+        !self.options.retry_backoff.is_zero()
+    }
+
     /// Waits out the bounded backoff after `attempt` failed without taking
     /// effect, so the repeat does not hit an owner that is still coming back.
-    fn pause_before_retry(&self, attempt: u32) {
+    pub(crate) fn pause_before_retry(&self, attempt: u32) {
         let delay = self.options.retry_delay(attempt);
         if !delay.is_zero() {
             std::thread::sleep(delay);
