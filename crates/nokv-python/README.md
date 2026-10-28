@@ -75,7 +75,9 @@ not for installing the SDK.
   before the second attempt and doubling per further attempt up to
   `max_retry_backoff_ms`. The default repeats at once, so a client that must
   outlive an owner restart passes `max_attempts=16, retry_backoff_ms=250`; a
-  backoff above its bound raises `ValueError`.
+  backoff above its bound raises `ValueError`. With a backoff set, the same
+  budget waits out an attempt a dead owner left running under the caller's
+  `operation_id`.
 - `Client.put_bytes(workbench, path, data, operation_id, ...)` is native
   `workspace-path put`: one whole-body publication under a caller-chosen
   operation identity (32 lowercase hex, for example a UUIDv7 without hyphens).

@@ -236,9 +236,11 @@ class Stack:
         """The object-store options an invocation of `command` runs with."""
         return self.objects
 
-    def run(self, label: str, arguments: list[str]) -> Call:
+    def run(self, label: str, arguments: list[str], client_options: list[str] = ()) -> Call:
+        """Run one command; `client_options` are connection options such as the
+        retry budget, which the CLI takes before the command."""
         prefix = [*self.route, "--agent-id", self.ids["agent"], *self.object_options(arguments[0])]
-        argv = [str(self.binary), *prefix, *arguments]
+        argv = [str(self.binary), *prefix, *client_options, *arguments]
         with self.proxy._lock:
             connections, requests = self.proxy.connections, len(self.proxy.requests)
         started = time.monotonic()
@@ -274,7 +276,7 @@ class Stack:
         if call.exit != 0:
             raise NotQualified(f"provision failed: {call.stderr[-600:]}")
 
-    def start_owner(self) -> None:
+    def start_owner(self, *serve_args: str) -> None:
         metadata = "--metadata-reopen" if self.owner_starts else "--metadata-create"
         self.owner_starts += 1
         argv = [
@@ -282,7 +284,7 @@ class Stack:
             "--bind", f"127.0.0.1:{self.owner_port}",
             "--advertise-endpoint", f"127.0.0.1:{self.proxy.port}",
             "--node-id", "cli-contract-owner",
-            metadata, str(self.metadata),
+            metadata, str(self.metadata), *serve_args,
             "serve",
         ]
         self.owner = subprocess.Popen(
@@ -642,6 +644,36 @@ def session_backoff_bridges_owner_restart(stack: Stack) -> dict[str, Any]:
     return {"before": before, "after": after, "attempts_while_down": attempts_while_down}
 
 
+def in_flight_identified_write_survives_owner_restart(stack: Stack) -> dict[str, Any]:
+    """S11: a caller-identified put whose owner died after admitting its attempt is
+    finished by the same command against the restarted owner: the client waits
+    out the orphaned attempt the owner aborts, then publishes the next attempt."""
+    workbench, operation_id = "s11-in-flight", new_id()
+    body = hashlib.sha256(b"s11").hexdigest().encode() * (MAX_INLINE_BODY_BYTES // 64 + 1)
+    stack.workbench(workbench)
+    arguments = stack.put_arguments("s11", workbench, "s11.bin", operation_id, body)
+    first = stack.failure(stack.faulted("s11-first", arguments, "prepare_artifact_publish"),
+                          "outcome_unknown", "query_same")
+    # A long lifecycle interval keeps the aborted attempt non-terminal for
+    # seconds after the restart, so the retry has to wait rather than find it
+    # already failed.
+    stack.start_owner("--lifecycle-interval-millis", "4000")
+    started = time.monotonic()
+    retry = stack.run("s11-retry", arguments, ["--max-attempts", "16", "--retry-backoff-ms", "250"])
+    waited = time.monotonic() - started
+    receipt = stack.success(retry)
+    require(receipt.get("replayed") is False and receipt.get("attempt") == 1
+            and receipt.get("generation") == 1 and receipt.get("operation_id") == operation_id,
+            "s11: the retry publishes its next attempt once the orphaned one is aborted", receipt)
+    require(waited >= 2.0, "s11: the retry waited out the aborting attempt", waited)
+    stack.assert_live("s11", workbench, "s11.bin", body, receipt)
+    status = stack.success(stack.run("s11-status", ["operation", "status", operation_id]))
+    require(status.get("state") == "failed", "s11: the orphaned first attempt ended failed", status)
+    stack.restart_owner()
+    return {"failure": first, "receipt": receipt, "waited_s": round(waited, 2),
+            "first_attempt": status, "effects": 1}
+
+
 def usage_error_sends_no_request(stack: Stack) -> dict[str, Any]:
     """S7: an invalid command fails typed before it reaches the owner."""
     cases = {
@@ -673,6 +705,7 @@ SCENARIOS = {
     "s7_usage_error_sends_no_request": usage_error_sends_no_request,
     "s9_workbench_tool_operation_id_replays": workbench_tool_operation_id_replays,
     "s10_session_backoff_bridges_owner_restart": session_backoff_bridges_owner_restart,
+    "s11_in_flight_identified_write_survives_owner_restart": in_flight_identified_write_survives_owner_restart,
 }
 
 

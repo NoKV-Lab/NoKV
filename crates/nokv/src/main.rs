@@ -1644,6 +1644,9 @@ CLIENT RETRIES:
   --retry-backoff-ms N (default 0) --max-retry-backoff-ms N (default 2000): the pause before the second attempt,
     doubling per further attempt up to the bound; 0 repeats at once, and a backoff above its bound is invalid_input
   a workbench-session that must outlive an owner restart starts with --max-attempts 16 --retry-backoff-ms 250
+  with a backoff set, an identified write the owner left running when it died is re-observed with the same budget
+    until the restarted owner has aborted it and the next attempt publishes; in_progress is answered when the
+    budget runs out, or at once without a backoff
 
 OWNER:
   provision binds RootId to an explicit AgentId and a Workbench root, then creates namespace, shard, and affinity

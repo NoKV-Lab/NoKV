@@ -103,9 +103,11 @@ create-only `workbench_put_file` after an unknown outcome gives it an
 `operation_id` so an applied first attempt replays its receipt; without one,
 `precondition_failed` (`AlreadyExists`) on the repeat may be its own earlier
 write, and the caller reads the path back before deciding. An identified
-write that was in flight when the owner died may answer `in_progress` after
-the restart while the owner still holds its earlier attempt; the client does
-not wait that out, so the caller follows `poll` and resubmits the same call.
+write that was in flight when the owner died is re-observed with the same
+budget when a backoff is set: the restarted owner aborts the attempt it did
+not admit, and the command then publishes the next attempt under the same
+id. `in_progress` is answered when the budget runs out, or at once without a
+backoff, and the caller then follows `poll`.
 
 ## Identity
 
