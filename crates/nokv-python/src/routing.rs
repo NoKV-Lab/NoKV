@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use nokv_client::{
-    ClientError, ControlRouteResolver, EtcdRouteOptions, RouteResolver, StaticRouteResolver,
+    ClientError, ControlRouteResolver, EtcdRouteOptions, EtcdTlsConfig, RouteResolver,
+    StaticRouteResolver,
 };
 use nokv_protocol::{LogicalShardIdentity, ObjectNamespaceIdentity, RootIdentity, RootRoute};
 use pyo3::exceptions::PyValueError;
@@ -75,17 +76,58 @@ impl PythonRoutingConfig {
         })
     }
 
-    /// Discover placement and ownership from the authoritative etcd control plane.
+    /// Discover placement and ownership from the authoritative etcd control
+    /// plane. With `tls_ca_pem`, `tls_cert_pem` and `tls_key_pem` (PEM bytes,
+    /// given together), this process authenticates to etcd over mutual TLS
+    /// as the certificate's Common Name, and every endpoint must be an
+    /// `https://` URL; `https://` endpoints require them.
     #[staticmethod]
     #[pyo3(signature = (
         endpoints,
         key_prefix = "/nokv/control",
-        lease_ttl_seconds = 10
+        lease_ttl_seconds = 10,
+        tls_ca_pem = None,
+        tls_cert_pem = None,
+        tls_key_pem = None
     ))]
-    fn etcd(endpoints: Vec<String>, key_prefix: &str, lease_ttl_seconds: i64) -> PyResult<Self> {
-        let options = EtcdRouteOptions::new(endpoints)
+    fn etcd(
+        endpoints: Vec<String>,
+        key_prefix: &str,
+        lease_ttl_seconds: i64,
+        tls_ca_pem: Option<Vec<u8>>,
+        tls_cert_pem: Option<Vec<u8>>,
+        tls_key_pem: Option<Vec<u8>>,
+    ) -> PyResult<Self> {
+        let mut options = EtcdRouteOptions::new(endpoints)
             .with_key_prefix(key_prefix)
             .with_lease_ttl_seconds(lease_ttl_seconds);
+        let identity = [
+            ("tls_ca_pem", tls_ca_pem),
+            ("tls_cert_pem", tls_cert_pem),
+            ("tls_key_pem", tls_key_pem),
+        ];
+        if identity.iter().any(|(_, pem)| pem.is_some()) {
+            let mut pems = Vec::with_capacity(3);
+            for (name, pem) in identity {
+                pems.push(pem.ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "{name} is required: tls_ca_pem, tls_cert_pem and tls_key_pem are given \
+                         together"
+                    ))
+                })?);
+            }
+            let [ca, certificate, key] =
+                <[Vec<u8>; 3]>::try_from(pems).expect("three PEM documents were collected");
+            options = options.with_tls(EtcdTlsConfig::new(ca, certificate, key));
+        } else if options
+            .endpoints()
+            .iter()
+            .any(|endpoint| endpoint.trim_start().starts_with("https://"))
+        {
+            return Err(PyValueError::new_err(
+                "an https:// etcd endpoint requires tls_ca_pem, tls_cert_pem and tls_key_pem",
+            ));
+        }
         options.validate().map_err(value_error)?;
         Ok(Self {
             routing: ConfiguredRouting::Etcd(options),
@@ -250,7 +292,63 @@ mod tests {
     #[test]
     fn etcd_configuration_validates_without_connecting() {
         Python::initialize();
-        let error = PythonRoutingConfig::etcd(Vec::new(), "/nokv/control", 10).unwrap_err();
+        let error = PythonRoutingConfig::etcd(Vec::new(), "/nokv/control", 10, None, None, None)
+            .unwrap_err();
         assert!(error.to_string().contains("at least one etcd endpoint"));
+    }
+
+    #[test]
+    fn etcd_tls_identity_is_complete_and_binds_https_endpoints() {
+        Python::initialize();
+        let pem = |text: &str| Some(text.as_bytes().to_vec());
+        let secured = PythonRoutingConfig::etcd(
+            vec!["https://127.0.0.1:2379".to_owned()],
+            "/nokv/control",
+            10,
+            pem("ca"),
+            pem("secret-cert"),
+            pem("secret-key"),
+        )
+        .unwrap();
+        assert!(!format!("{secured:?}").contains("secret"));
+
+        let partial = PythonRoutingConfig::etcd(
+            vec!["https://127.0.0.1:2379".to_owned()],
+            "/nokv/control",
+            10,
+            pem("ca"),
+            pem("cert"),
+            None,
+        )
+        .unwrap_err();
+        assert!(partial.to_string().contains("tls_key_pem"), "{partial}");
+
+        let plaintext_with_identity = PythonRoutingConfig::etcd(
+            vec!["http://127.0.0.1:2379".to_owned()],
+            "/nokv/control",
+            10,
+            pem("ca"),
+            pem("cert"),
+            pem("key"),
+        )
+        .unwrap_err();
+        assert!(
+            plaintext_with_identity.to_string().contains("https://"),
+            "{plaintext_with_identity}"
+        );
+
+        let https_without_identity = PythonRoutingConfig::etcd(
+            vec!["https://127.0.0.1:2379".to_owned()],
+            "/nokv/control",
+            10,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            https_without_identity.to_string().contains("tls_ca_pem"),
+            "{https_without_identity}"
+        );
     }
 }

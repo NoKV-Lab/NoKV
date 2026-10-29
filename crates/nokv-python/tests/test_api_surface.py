@@ -50,6 +50,16 @@ def test_versioned_workbench_surface():
     assert nokv.WorkspaceIncarnationMismatch("m", "a" * 32).expected == "a" * 32
     assert hasattr(nokv.RoutingConfig, "static")
     assert hasattr(nokv.RoutingConfig, "etcd")
+    etcd = inspect.signature(nokv.RoutingConfig.etcd).parameters
+    assert list(etcd) == [
+        "endpoints",
+        "key_prefix",
+        "lease_ttl_seconds",
+        "tls_ca_pem",
+        "tls_cert_pem",
+        "tls_key_pem",
+    ]
+    assert all(etcd[name].default is None for name in ("tls_ca_pem", "tls_cert_pem", "tls_key_pem"))
     assert hasattr(nokv.Client, "create_workspace")
     assert hasattr(nokv.Client, "stat")
     assert hasattr(nokv.Client, "list")

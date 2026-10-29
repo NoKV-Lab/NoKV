@@ -93,6 +93,18 @@ not for installing the SDK.
   `workbench_root` argument must then equal the binding, and raises
   `ValueError` otherwise; it is required only over static routing, which has
   no control plane to ask.
+- `RoutingConfig.etcd(endpoints, key_prefix="/nokv/control",
+  lease_ttl_seconds=10, tls_ca_pem=None, tls_cert_pem=None, tls_key_pem=None)`
+  discovers the owner through etcd. With the three PEM `bytes` arguments,
+  given together, the client authenticates to etcd over mutual TLS as the
+  certificate's Common Name, which etcd maps to a user when it runs with
+  `--client-cert-auth`; every endpoint must then be an `https://` URL, and
+  `https://` endpoints require them, or `ValueError` is raised before any
+  connection. The PEM bytes stay in memory and are never printed. An etcd
+  that rejects the certificate raises with `error_class="unauthenticated"`;
+  one whose roles do not grant a key the route needs raises with
+  `error_class="permission_denied"`; `docs/control-plane-credentials.md`
+  lists the keys an Agent's role needs.
 - `Client(root_id, routing, ..., max_attempts=3, retry_backoff_ms=0,
   max_retry_backoff_ms=2000)` repeats a request whose failure left nothing
   applied up to `max_attempts` times (1 to 16), pausing `retry_backoff_ms`
