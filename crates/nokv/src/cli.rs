@@ -77,6 +77,19 @@ pub struct EtcdRoutingConfig {
     pub endpoints: Vec<String>,
     pub key_prefix: String,
     pub lease_ttl_seconds: i64,
+    /// This process's identity towards etcd; required with `https://`
+    /// endpoints.
+    pub tls: Option<EtcdTlsFiles>,
+}
+
+/// The PEM files behind `--etcd-tls-ca`, `--etcd-tls-cert` and
+/// `--etcd-tls-key`: the roots that sign etcd's certificate, and this
+/// process's certificate chain and private key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EtcdTlsFiles {
+    pub trusted_ca: PathBuf,
+    pub certificate: PathBuf,
+    pub key: PathBuf,
 }
 
 /// Single-host control directory shared by the owner and its clients.
@@ -453,6 +466,7 @@ impl Default for EtcdRoutingConfig {
             endpoints: Vec::new(),
             key_prefix: DEFAULT_ETCD_KEY_PREFIX.to_owned(),
             lease_ttl_seconds: DEFAULT_ETCD_LEASE_TTL_SECONDS,
+            tls: None,
         }
     }
 }
@@ -502,6 +516,9 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     let mut append_activity_lease_explicit = false;
     let mut static_routing = StaticRoutingConfig::default();
     let mut etcd_routing = EtcdRoutingConfig::default();
+    let mut etcd_tls_ca = None;
+    let mut etcd_tls_cert = None;
+    let mut etcd_tls_key = None;
     let mut control_directory = None;
     let mut routing_kind = None;
     let mut agent_id = None;
@@ -552,6 +569,18 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             "--etcd-key-prefix" => {
                 select_routing(&mut routing_kind, RoutingKind::Etcd)?;
                 etcd_routing.key_prefix = next_value(&mut arguments, &argument)?;
+            }
+            "--etcd-tls-ca" | "--etcd-tls-cert" | "--etcd-tls-key" => {
+                select_routing(&mut routing_kind, RoutingKind::Etcd)?;
+                let slot = match argument.as_str() {
+                    "--etcd-tls-ca" => &mut etcd_tls_ca,
+                    "--etcd-tls-cert" => &mut etcd_tls_cert,
+                    _ => &mut etcd_tls_key,
+                };
+                if slot.is_some() {
+                    return Err(CliError::UnexpectedArgument(argument));
+                }
+                *slot = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
             }
             "--control-dir" => {
                 select_routing(&mut routing_kind, RoutingKind::Local)?;
@@ -725,7 +754,10 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     }
     client.routing = match routing_kind.unwrap_or(RoutingKind::Static) {
         RoutingKind::Static => RoutingConfig::Static(static_routing),
-        RoutingKind::Etcd => RoutingConfig::Etcd(etcd_routing),
+        RoutingKind::Etcd => {
+            etcd_routing.tls = etcd_tls_files(etcd_tls_ca, etcd_tls_cert, etcd_tls_key)?;
+            RoutingConfig::Etcd(etcd_routing)
+        }
         RoutingKind::Local => RoutingConfig::Local(LocalRoutingConfig {
             directory: control_directory.ok_or(CliError::MissingOption("--control-dir"))?,
         }),
@@ -780,6 +812,22 @@ enum RoutingKind {
     Static,
     Etcd,
     Local,
+}
+
+/// The three etcd TLS files are given together or not at all.
+fn etcd_tls_files(
+    trusted_ca: Option<PathBuf>,
+    certificate: Option<PathBuf>,
+    key: Option<PathBuf>,
+) -> Result<Option<EtcdTlsFiles>, CliError> {
+    if trusted_ca.is_none() && certificate.is_none() && key.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(EtcdTlsFiles {
+        trusted_ca: trusted_ca.ok_or(CliError::MissingOption("--etcd-tls-ca"))?,
+        certificate: certificate.ok_or(CliError::MissingOption("--etcd-tls-cert"))?,
+        key: key.ok_or(CliError::MissingOption("--etcd-tls-key"))?,
+    }))
 }
 
 fn select_routing(
@@ -2618,6 +2666,83 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, CliError::UnexpectedArgument("unexpected".to_owned()));
+    }
+
+    #[test]
+    fn etcd_tls_options_are_complete_and_select_etcd_routing() {
+        let parsed = parse(args(&[
+            "--etcd-endpoint",
+            "https://127.0.0.1:2379",
+            "--etcd-tls-ca",
+            "ca.pem",
+            "--etcd-tls-cert",
+            "client.pem",
+            "--etcd-tls-key",
+            "client.key",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "workbench-session",
+        ]))
+        .unwrap();
+        let RoutingConfig::Etcd(route) = parsed.client.routing else {
+            panic!("etcd route expected");
+        };
+        assert_eq!(
+            route.tls,
+            Some(EtcdTlsFiles {
+                trusted_ca: PathBuf::from("ca.pem"),
+                certificate: PathBuf::from("client.pem"),
+                key: PathBuf::from("client.key"),
+            })
+        );
+
+        let plaintext = parse(args(&[
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "workbench-session",
+        ]))
+        .unwrap();
+        let RoutingConfig::Etcd(route) = plaintext.client.routing else {
+            panic!("etcd route expected");
+        };
+        assert_eq!(route.tls, None);
+
+        assert_eq!(
+            parse(args(&[
+                "--etcd-endpoint",
+                "https://127.0.0.1:2379",
+                "--etcd-tls-ca",
+                "ca.pem",
+                "--etcd-tls-cert",
+                "client.pem",
+                "workbench-session",
+            ])),
+            Err(CliError::MissingOption("--etcd-tls-key"))
+        );
+        assert_eq!(
+            parse(args(&[
+                "--control-dir",
+                "/tmp/nokv-control",
+                "--etcd-tls-ca",
+                "ca.pem",
+                "workbench-session",
+            ])),
+            Err(CliError::MixedRoutingOptions)
+        );
+        assert_eq!(
+            parse(args(&[
+                "--etcd-endpoint",
+                "https://127.0.0.1:2379",
+                "--etcd-tls-ca",
+                "a.pem",
+                "--etcd-tls-ca",
+                "b.pem",
+                "workbench-session",
+            ])),
+            Err(CliError::UnexpectedArgument("--etcd-tls-ca".to_owned()))
+        );
     }
 
     #[test]

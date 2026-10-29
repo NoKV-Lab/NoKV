@@ -71,7 +71,7 @@ fn private_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
     })
 }
 
-fn read_pem(option: &str, path: &Path) -> Result<Vec<u8>, String> {
+pub(crate) fn read_pem(option: &str, path: &Path) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     File::open(path)
         .and_then(|file| file.take(MAX_PEM_FILE_BYTES + 1).read_to_end(&mut bytes))

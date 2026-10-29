@@ -5,8 +5,9 @@ use crate::identity::IdentityState;
 use crate::types::endpoint_is_canonical;
 use crate::{
     CheckpointRef, ControlError, LogRef, LogicalShardId, LogicalShardLease, LogicalShardRecord,
-    LogicalShardState, NodeId, OwnerEpoch, RecoveryPublication, RecoveryUploadIntent,
-    RootAgentBinding, RootId, RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle,
+    LogicalShardRoute, LogicalShardState, NodeId, OwnerEpoch, RecoveryPublication,
+    RecoveryUploadIntent, RootAgentBinding, RootId, RootObjectNamespaceBinding, RootPlacement,
+    RootPlacementLifecycle,
 };
 
 /// Maximum opaque object plan retained in one logical-shard control record.
@@ -78,6 +79,18 @@ pub trait ControlStore: Send + Sync {
         &self,
         logical_shard_id: &LogicalShardId,
     ) -> Result<Option<LogicalShardRecord>, ControlError>;
+    /// The routing fields of a logical shard, for a client resolving its
+    /// owner: never the recovery frontier or the owner session, which only
+    /// the owner reads. A backend that stores those apart reads the routing
+    /// record alone, so a client's credentials need no access to the rest.
+    fn get_logical_shard_route(
+        &self,
+        logical_shard_id: &LogicalShardId,
+    ) -> Result<Option<LogicalShardRoute>, ControlError> {
+        Ok(self
+            .get_logical_shard(logical_shard_id)?
+            .map(|record| record.route()))
+    }
     fn list_logical_shards(&self) -> Result<Vec<LogicalShardRecord>, ControlError>;
 
     /// Install the first owner epoch. This succeeds only for a never-owned
