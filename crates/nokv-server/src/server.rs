@@ -219,6 +219,27 @@ impl WorkspaceServer {
 
     /// Runtime lease-renewal hook. A failed renewal uninstalls that owner's
     /// complete root-route set before the error is returned.
+    /// Mount a root provisioned after the owner started onto the owner of
+    /// its shard; see [`ShardOwner::mount_root`].
+    pub fn mount_root(
+        &self,
+        placement: &nokv_control::RootPlacement,
+        root: crate::RootAttach,
+    ) -> Result<nokv_protocol::RootRoute, ServerError> {
+        require_owner_retained(&self.owner_loss)?;
+        let owner = self
+            .ownership
+            .iter()
+            .find(|owner| owner.shard_id() == placement.logical_shard_id)
+            .ok_or_else(|| {
+                ServerError::InvalidOptions(format!(
+                    "no owner of logical shard {:?} is served here",
+                    placement.logical_shard_id
+                ))
+            })?;
+        owner.mount_root(placement, root)
+    }
+
     pub fn renew_ownership(&self) -> Result<(), ServerError> {
         for owner in &self.ownership {
             if let Err(error) = owner.renew_or_uninstall() {
