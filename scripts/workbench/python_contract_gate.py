@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Direct Python SDK contract qualification on one host.
 
-The gate runs the stack of the native CLI contract gate: one root on a
+The gate runs the stack of the native CLI contract gate: two roots on a
 `--control-dir` control store and one owner behind a frame-level proxy, with
 objects on an existing S3 endpoint or on a moto server the gate starts. Every
 scenario drives the SDK installed in `--python-executable`, one fresh
@@ -11,6 +11,13 @@ interpreter per call, and grades its results and exceptions against
 docs/cli-contract.md. Durable state is read back through the native `nokv`
 binary. A scenario that injects a fault first proves the fault fired; if it
 did not, the scenario is NOT QUALIFIED rather than PASS.
+
+With `--tls` the gate runs the workspace RPC TLS gate's stack instead: the
+two roots belong to one tenant, the owner serves them over TLS, the SDK
+presents the tenant's writer certificate through `TlsConfig`, and every Agent
+process reads objects through a read-only endpoint. The frame-level proxy
+cannot read TLS records, so the two scenarios that depend on it (the dropped
+reply, and the request count of a usage error) are not applicable there.
 """
 
 from __future__ import annotations
@@ -25,7 +32,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 import cli_contract_gate as cli
-from cli_contract_gate import ContractFailure, NotQualified, Stack, new_id, require
+from cli_contract_gate import ContractFailure, NotQualified, new_id, require
+from cli_contract_gate import Stack
+from rpc_tls_gate import SERVER_NAME, TlsStack
 
 SCHEMA = "nokv.python_contract_gate.v1"
 # Attributes every SDK exception is graded on.
@@ -41,20 +50,29 @@ FAILURE_FIELDS = (
 # Call metadata a replay or a later observation may change.
 VOLATILE = {"replayed", "commit_version"}
 
-PYTHON_PROGRAM = r"""
+# The SDK program and the session program share this prologue.
+PROLOGUE = r"""
 import json, os, sys
+from pathlib import Path
 import nokv
 request = json.load(sys.stdin)
 stack = request["stack"]
-objects = None if request["metadata_only"] else nokv.ObjectStoreConfig.s3(
+objects = None if request.get("metadata_only") else nokv.ObjectStoreConfig.s3(
     stack["bucket"], region=stack["region"], root=stack["root"],
     endpoint=stack["endpoint"], access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
     secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
 )
+tls = nokv.TlsConfig(
+    Path(stack["tls"]["ca"]).read_bytes(), Path(stack["tls"]["cert"]).read_bytes(),
+    Path(stack["tls"]["key"]).read_bytes(), stack["tls"]["server_name"],
+) if stack.get("tls") else None
+"""
+
+PYTHON_PROGRAM = PROLOGUE + r"""
 try:
     client = nokv.Client(
         stack["root_id"], nokv.RoutingConfig.local(stack["control_dir"]),
-        object_store=objects, workbench_root=stack["workbench_root"],
+        object_store=objects, workbench_root=stack["workbench_root"], tls=tls,
     )
     arguments = dict(request["arguments"])
     if "data_hex" in arguments:
@@ -67,6 +85,35 @@ except Exception as error:
         "status": "error", "type": type(error).__name__, "message": str(error),
         **{field: getattr(error, field, None) for field in request["fields"]},
     }))
+"""
+
+# One session, a client per root, interleaved writes, and the Workbench root
+# each client learned from the control plane.
+SESSION_PROGRAM = PROLOGUE + r"""
+import threading
+session = nokv.Session(nokv.RoutingConfig.local(stack["control_dir"]), object_store=objects, tls=tls)
+outcome = {"roots": {}, "mismatch": None}
+clients = {root: session.client(root) for root in request["roots"]}
+for root, client in clients.items():
+    outcome["roots"][root] = {"workbench_root": client.workbench_root,
+                              "session_workbench_root": session.workbench_root(root), "puts": [], "stats": []}
+def work(root, client):
+    client.create_workspace(request["workbench"])
+    for index, operation_id in enumerate(request["operation_ids"][root]):
+        put = client.put_bytes(request["workbench"], f"outputs/file-{index}.bin", bytes.fromhex(request["body_hex"]) + root.encode(), operation_id)
+        outcome["roots"][root]["puts"].append({k: put.get(k) for k in ("status", "state", "generation", "replayed")})
+    for index in range(len(request["operation_ids"][root])):
+        outcome["roots"][root]["stats"].append(client.stat(request["workbench"], f"outputs/file-{index}.bin"))
+workers = [threading.Thread(target=work, args=(root, client)) for root, client in clients.items()]
+for worker in workers:
+    worker.start()
+for worker in workers:
+    worker.join()
+try:
+    session.client(request["roots"][0], workbench_root="/agents/other/wb")
+except ValueError as error:
+    outcome["mismatch"] = {"message": str(error), "error_class": getattr(error, "error_class", None)}
+print(json.dumps({"status": "success", "result": outcome}))
 """
 
 IDENTITY_PROGRAM = r"""
@@ -82,16 +129,19 @@ print(json.dumps({
 
 
 class PythonStack(Stack):
-    """The CLI gate's stack, driven through the installed Python SDK."""
+    """The CLI gate's stack with a second root, driven through the installed
+    Python SDK."""
 
     def __init__(self, args: argparse.Namespace, evidence: Path) -> None:
         super().__init__(args, evidence)
         # A virtual environment's interpreter is a symlink to its base; the
         # link itself selects the environment, so it is not resolved.
         self.python = Path(args.python_executable).absolute()
-        objects = dict(zip(self.objects[::2], self.objects[1::2]))
+        self.ids["other_root"] = new_id()
+        objects = dict(zip(self.sdk_objects()[::2], self.sdk_objects()[1::2]))
         self.sdk_stack = {
             "root_id": self.ids["root"],
+            "roots": [self.ids["root"], self.ids["other_root"]],
             "control_dir": str(self.control),
             "workbench_root": cli.WORKBENCH_ROOT,
             "bucket": objects["--object-bucket"],
@@ -100,6 +150,29 @@ class PythonStack(Stack):
             "region": objects["--object-region"],
         }
         self.connect_requests: list[str] | None = None
+
+    def sdk_objects(self) -> list[str]:
+        """The object-store options the SDK program runs with."""
+        return self.objects
+
+    def session(self, label: str, workbench: str, operation_ids: dict[str, list[str]], body: bytes) -> dict[str, Any]:
+        """The session program, in a fresh interpreter."""
+        request = {"stack": self.sdk_stack, "workbench": workbench, "roots": self.sdk_stack["roots"],
+                   "operation_ids": operation_ids, "body_hex": body.hex()}
+        started = time.monotonic()
+        done = subprocess.run(
+            [str(self.python), "-c", SESSION_PROGRAM],
+            input=json.dumps(request), capture_output=True, text=True, env=self.env, timeout=self.timeout * 4,
+        )
+        self.write("python-transcript.jsonl", {
+            "label": label, "method": "session", "exit": done.returncode, "stdout": done.stdout,
+            "stderr": done.stderr[-2000:], "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+        })
+        require(done.returncode == 0, f"{label}: the session program reports its outcome instead of crashing",
+                [done.returncode, done.stderr[-800:]])
+        call = json.loads(done.stdout)
+        call["label"] = label
+        return call
 
     def sdk_identity(self) -> dict[str, Any]:
         done = subprocess.run(
@@ -205,6 +278,44 @@ class PythonStack(Stack):
             path=f"outputs/{path}", data_hex=body.hex(), operation_id=operation_id, **options,
         )
 
+    def prepare(self) -> None:
+        """Provision both roots; the owner starts afterwards."""
+        self.provision()
+        self.provision(self.ids["other_root"])
+
+
+class TlsPythonStack(PythonStack, TlsStack):
+    """The TLS gate's stack, driven through the installed Python SDK as the
+    tenant's writer principal, with both roots bound to the tenant. The SDK
+    reads objects the way an Agent does, through the read-only endpoint; its
+    writes go through the owner."""
+
+    def __init__(self, args: argparse.Namespace, evidence: Path) -> None:
+        super().__init__(args, evidence)
+        certificate, key = self.clients["agent"]
+        self.sdk_stack["tls"] = {
+            "ca": str(self.pki.directory / "ca.pem"),
+            "cert": str(certificate),
+            "key": str(key),
+            "server_name": SERVER_NAME,
+        }
+
+    def sdk_objects(self) -> list[str]:
+        return self.agent_objects
+
+    def prepare(self) -> None:
+        super().prepare()
+        self.register_tenant()
+
+    def register_tenant(self) -> None:
+        """One tenant that owns both roots, with the writer principal whose
+        certificate the SDK presents."""
+        self.identity("tenant", "tenant", "create", self.tenant)
+        self.identity("principal-agent", "principal", "create", self.tenant, self.principals["agent"])
+        self.register("agent", "agent")
+        self.role("grant", "agent", "writer", ["--tenant-wide"])
+        for root in self.sdk_stack["roots"]:
+            self.identity(f"bind-{root[:8]}", "root", "bind", root, self.tenant)
 
 def stable(result: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in result.items() if key not in VOLATILE}
@@ -401,6 +512,37 @@ def stale_generation_and_fences_fail_typed(stack: PythonStack) -> dict[str, Any]
     return {"stale": stale, "create_only": create_only, "fenced": fenced, "absent": absent}
 
 
+def one_session_serves_two_roots_with_the_bound_workbench_root(stack: PythonStack) -> dict[str, Any]:
+    """P7: one Session derives a client per root of the tenant; both learn the
+    Workbench root the control plane binds, write and read back concurrently
+    through one connection pool, and a workbench_root that disagrees with the
+    binding is refused."""
+    workbench = "p7-session"
+    operation_ids = {root: [new_id() for _ in range(4)] for root in stack.sdk_stack["roots"]}
+    body = b"p7 session body\n"
+    outcome = stack.sdk_success(stack.session("p7", workbench, operation_ids, body))
+    for root in stack.sdk_stack["roots"]:
+        result = outcome["roots"][root]
+        require(result["workbench_root"] == cli.WORKBENCH_ROOT and result["session_workbench_root"] == cli.WORKBENCH_ROOT,
+                f"p7: the client of {root[:8]} learned the bound Workbench root", result)
+        require(len(result["puts"]) == 4 and all(put["state"] == "committed" and put["replayed"] is False and put["generation"] == 1
+                                                 for put in result["puts"]),
+                f"p7: every put on {root[:8]} committed once", result["puts"])
+        require(all(stat.get("generation") == 1 and stat.get("path") == f"outputs/file-{index}.bin"
+                    for index, stat in enumerate(result["stats"])),
+                f"p7: every path on {root[:8]} reads back", result["stats"])
+        # The CLI, as the same principal, reads the session's writes on each root.
+        for index in range(4):
+            native = stack.success(stack.run(f"p7-stat-{root[:8]}-{index}",
+                                             ["workspace-path", "stat", workbench, "outputs", f"file-{index}.bin"], root=root))
+            require(native.get("exists") is True and native.get("generation") == 1,
+                    f"p7: the CLI sees the session's write on {root[:8]}", native)
+    require(outcome["mismatch"] and outcome["mismatch"]["error_class"] == "invalid_input"
+            and "differs from the Workbench root" in outcome["mismatch"]["message"],
+            "p7: a workbench_root that disagrees with the binding is refused", outcome["mismatch"])
+    return outcome
+
+
 def invalid_input_is_fixed_before_any_request(stack: PythonStack) -> dict[str, Any]:
     """P5: an invalid call fails with invalid_input and fix_input before any
     request beyond the client's own connection, including an append, which
@@ -497,6 +639,9 @@ def commit_and_restore_report_their_stored_receipts(stack: PythonStack) -> dict[
     return {"commit": commit, "status": status, "restore": restored, "restore_status": restore_status}
 
 
+# Graded through the frame-level proxy, which a TLS owner bypasses.
+PROXY_SCENARIOS = {"p2_lost_reply_is_queried_then_replayed", "p5_invalid_input_is_fixed_before_any_request"}
+
 SCENARIOS: dict[str, Callable[[PythonStack], dict[str, Any]]] = {
     "p1_put_replays_across_processes_owners_and_surfaces": put_replays_across_processes_owners_and_surfaces,
     "p2_lost_reply_is_queried_then_replayed": lost_reply_is_queried_then_replayed,
@@ -504,6 +649,8 @@ SCENARIOS: dict[str, Callable[[PythonStack], dict[str, Any]]] = {
     "p4_stale_generation_and_fences_fail_typed": stale_generation_and_fences_fail_typed,
     "p5_invalid_input_is_fixed_before_any_request": invalid_input_is_fixed_before_any_request,
     "p6_commit_and_restore_report_their_stored_receipts": commit_and_restore_report_their_stored_receipts,
+    "p7_one_session_serves_two_roots_with_the_bound_workbench_root":
+        one_session_serves_two_roots_with_the_bound_workbench_root,
 }
 
 
@@ -520,6 +667,8 @@ def main() -> int:
     parser.add_argument("--object-root")
     parser.add_argument("--timeout", type=float, default=45)
     parser.add_argument("--scenario", action="append", choices=sorted(SCENARIOS))
+    parser.add_argument("--tls", action="store_true",
+                        help="serve over TLS and drive the SDK as the tenant's writer principal")
     args = parser.parse_args()
     evidence = Path(args.evidence_dir).resolve()
     evidence.mkdir(parents=True, exist_ok=False)
@@ -537,12 +686,16 @@ def main() -> int:
     }
     stack = None
     try:
-        stack = PythonStack(args, evidence)
+        stack = (TlsPythonStack if args.tls else PythonStack)(args, evidence)
         report["python_sdk"] = stack.sdk_identity()
+        report["tls"] = args.tls
         stack.proxy.start()
-        stack.provision()
+        stack.prepare()
         stack.start_owner()
-        for name in args.scenario or SCENARIOS:
+        applicable = [name for name in SCENARIOS if not (args.tls and name in PROXY_SCENARIOS)]
+        report["not_applicable"] = {name: "needs the frame-level proxy, which cannot read TLS records"
+                                    for name in SCENARIOS if name not in applicable}
+        for name in args.scenario or applicable:
             report["scenarios"][name] = cli.run_scenario(stack, SCENARIOS[name])
             print(f"{name}: {report['scenarios'][name]['status']}", flush=True)
         report["overall_status"] = cli.verdict(report["scenarios"], "pass")

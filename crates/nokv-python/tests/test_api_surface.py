@@ -1,6 +1,7 @@
 """Installed Python surface checks for the Workbench-scoped SDK."""
 
 import inspect
+import types
 from pathlib import Path
 
 import nokv
@@ -29,10 +30,22 @@ def test_versioned_workbench_surface():
         "Client",
         "ObjectStoreConfig",
         "RoutingConfig",
+        "Session",
+        "TlsConfig",
         "WorkbenchFileSystem",
         "WorkspaceIncarnationMismatch",
         "checkpoint",
     ]
+    session = inspect.signature(nokv.Session).parameters
+    assert list(session)[:3] == ["routing", "object_store", "tls"]
+    assert "retry_backoff_ms" in session and "max_attempts" in session
+    client_of = inspect.signature(nokv.Session.client).parameters
+    assert list(client_of) == ["self", "root_id", "workbench_root"]
+    assert hasattr(nokv.Session, "workbench_root")
+    assert "tls" in inspect.signature(nokv.Client).parameters
+    assert list(inspect.signature(nokv.TlsConfig).parameters) == ["ca_pem", "cert_pem", "key_pem", "server_name"]
+    # A native getter is a descriptor, read like a property.
+    assert isinstance(nokv.Client.workbench_root, types.GetSetDescriptorType)
     assert issubclass(nokv.WorkspaceIncarnationMismatch, RuntimeError)
     assert nokv.WorkspaceIncarnationMismatch("m", "a" * 32).expected == "a" * 32
     assert hasattr(nokv.RoutingConfig, "static")
