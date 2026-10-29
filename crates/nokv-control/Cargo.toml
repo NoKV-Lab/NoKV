@@ -15,7 +15,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-etcd = ["dep:etcd-client", "dep:tokio"]
+etcd = ["dep:etcd-client", "dep:tokio", "dep:tonic", "etcd-client/tls"]
 
 [dependencies]
 etcd-client = { workspace = true, optional = true }
@@ -23,6 +23,7 @@ nokv-types.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 tokio = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

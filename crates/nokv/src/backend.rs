@@ -3015,6 +3015,9 @@ fn map_client_error_shape(error: ClientError) -> agent::BackendError {
             ClientError::InvalidOptions(_) | ClientError::InvalidRoute(_) => {
                 agent::BackendErrorKind::InvalidState
             }
+            ClientError::ControlRefusal { class, .. } => {
+                agent::BackendErrorKind::Other(control_refusal_code(*class).to_owned())
+            }
             ClientError::ArtifactPublishFailed { .. } | ClientError::RetryExhausted { .. } => {
                 agent::BackendErrorKind::Other("ClientFailure".to_owned())
             }
@@ -3123,6 +3126,16 @@ fn map_lifecycle_error_shape(
             }
             map_client_error((*error).into_client_error())
         }
+    }
+}
+
+/// The code a control-plane refusal reports: the same names an owner's
+/// refusal carries, so callers branch on one vocabulary.
+fn control_refusal_code(class: ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::Unauthenticated => "Unauthenticated",
+        ErrorClass::PermissionDenied => "PermissionDenied",
+        _ => "ControlPlaneRefused",
     }
 }
 

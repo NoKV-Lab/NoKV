@@ -1682,6 +1682,16 @@ RPC TLS:
     that interval plus the request in flight
   over RPC TLS, --agent-id is not needed and the AgentId binding is not checked
 
+CONTROL PLANE TLS:
+  --etcd-tls-ca PEM --etcd-tls-cert PEM --etcd-tls-key PEM: with https:// --etcd-endpoint URLs, the roots that
+    sign etcd's certificate, and this process's certificate chain and key; the three are given together, and
+    https:// endpoints require them
+  etcd started with --client-cert-auth authenticates the certificate's Common Name as its user, and that user's
+    roles decide which keys this process may read or write: an owner reads and writes only its shard, an Agent
+    reads only its root's routing keys (docs/control-plane-credentials.md lists the keys per role)
+  a certificate etcd does not accept fails as unauthenticated, and a key its roles do not grant as
+    permission_denied, before any request reaches an owner
+
 TENANT IDENTITY:
   identity tenant create <tenant-id-hex32>
   identity principal create <tenant-id-hex32> <principal-id-hex32>

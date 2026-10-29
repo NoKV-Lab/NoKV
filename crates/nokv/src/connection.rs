@@ -46,6 +46,8 @@ pub enum ConnectionError {
     StaticControl,
     /// An `--rpc-tls-*` file or name cannot be used.
     RpcTls(String),
+    /// An `--etcd-tls-*` file cannot be used.
+    EtcdTls(String),
     Control(nokv_control::ControlError),
     Transport(TransportError),
     Client(ClientError),
@@ -59,7 +61,8 @@ impl ConnectionError {
             Self::MissingOption(_)
             | Self::InvalidIdentity { .. }
             | Self::StaticControl
-            | Self::RpcTls(_) => ErrorClass::InvalidInput,
+            | Self::RpcTls(_)
+            | Self::EtcdTls(_) => ErrorClass::InvalidInput,
             #[cfg(not(feature = "etcd"))]
             Self::FeatureDisabled { .. } => ErrorClass::InvalidInput,
             Self::Control(error) => error.class(),
@@ -86,6 +89,7 @@ impl fmt::Display for ConnectionError {
                 "static routes have no durable control store; use --etcd-endpoint or --control-dir",
             ),
             Self::RpcTls(message) => write!(formatter, "cannot configure RPC TLS: {message}"),
+            Self::EtcdTls(message) => write!(formatter, "cannot configure etcd TLS: {message}"),
             Self::Control(error) => write!(formatter, "cannot open control store: {error}"),
             Self::Transport(error) => write!(formatter, "cannot configure RPC transport: {error}"),
             Self::Client(error) => write!(formatter, "cannot configure workspace client: {error}"),
@@ -102,7 +106,8 @@ impl Error for ConnectionError {
             Self::MissingOption(_)
             | Self::InvalidIdentity { .. }
             | Self::StaticControl
-            | Self::RpcTls(_) => None,
+            | Self::RpcTls(_)
+            | Self::EtcdTls(_) => None,
             #[cfg(not(feature = "etcd"))]
             Self::FeatureDisabled { .. } => None,
         }
@@ -274,7 +279,7 @@ fn static_route_resolver(
 fn etcd_store(
     config: &EtcdRoutingConfig,
 ) -> Result<nokv_control::EtcdControlStore, ConnectionError> {
-    let options = etcd_options(config);
+    let options = etcd_options(config)?;
     options.validate().map_err(ConnectionError::Control)?;
     nokv_control::EtcdControlStore::connect(options).map_err(ConnectionError::Control)
 }
@@ -289,11 +294,26 @@ fn etcd_store(
     })
 }
 
+/// The control options the CLI's etcd routing names. The TLS files are read
+/// here, once, into the options; a file that cannot be read is a usage error.
 #[cfg(feature = "etcd")]
-fn etcd_options(config: &EtcdRoutingConfig) -> nokv_control::EtcdControlStoreOptions {
-    nokv_control::EtcdControlStoreOptions::new(config.endpoints.clone())
+fn etcd_options(
+    config: &EtcdRoutingConfig,
+) -> Result<nokv_control::EtcdControlStoreOptions, ConnectionError> {
+    let mut options = nokv_control::EtcdControlStoreOptions::new(config.endpoints.clone())
         .with_key_prefix(config.key_prefix.clone())
-        .with_lease_ttl_seconds(config.lease_ttl_seconds)
+        .with_lease_ttl_seconds(config.lease_ttl_seconds);
+    if let Some(files) = &config.tls {
+        let read = |option: &str, path: &std::path::Path| {
+            crate::rpc_tls::read_pem(option, path).map_err(ConnectionError::EtcdTls)
+        };
+        options = options.with_tls(nokv_control::EtcdTlsConfig::new(
+            read("--etcd-tls-ca", &files.trusted_ca)?,
+            read("--etcd-tls-cert", &files.certificate)?,
+            read("--etcd-tls-key", &files.key)?,
+        ));
+    }
+    Ok(options)
 }
 
 #[cfg(unix)]
@@ -529,13 +549,52 @@ mod tests {
             ],
             key_prefix: "/nokv/test-control".to_owned(),
             lease_ttl_seconds: 27,
-        });
+            tls: None,
+        })
+        .unwrap();
         assert_eq!(
             options.endpoints(),
             ["http://127.0.0.1:2379", "http://127.0.0.1:22379"]
         );
         assert_eq!(options.key_prefix(), "/nokv/test-control");
         assert_eq!(options.lease_ttl_seconds(), 27);
+        assert!(options.tls().is_none());
+    }
+
+    #[cfg(feature = "etcd")]
+    #[test]
+    fn etcd_tls_files_are_read_once_into_the_control_options() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = |name: &str, body: &[u8]| {
+            let path = directory.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+        let config = EtcdRoutingConfig {
+            endpoints: vec!["https://127.0.0.1:2379".to_owned()],
+            key_prefix: "/nokv/test-control".to_owned(),
+            lease_ttl_seconds: 10,
+            tls: Some(crate::cli::EtcdTlsFiles {
+                trusted_ca: file("ca.pem", b"-----BEGIN CERTIFICATE-----\nca"),
+                certificate: file("client.pem", b"-----BEGIN CERTIFICATE-----\nclient"),
+                key: file("client.key", b"-----BEGIN PRIVATE KEY-----\nsecret"),
+            }),
+        };
+        let options = etcd_options(&config).unwrap();
+        assert!(options.tls().is_some());
+        assert!(!format!("{options:?}").contains("secret"));
+
+        let missing = EtcdRoutingConfig {
+            tls: Some(crate::cli::EtcdTlsFiles {
+                key: directory.path().join("absent.key"),
+                ..config.tls.clone().unwrap()
+            }),
+            ..config
+        };
+        let error = etcd_options(&missing).unwrap_err();
+        assert!(matches!(error, ConnectionError::EtcdTls(_)), "{error}");
+        assert_eq!(error.class(), nokv_types::ErrorClass::InvalidInput);
+        assert!(error.to_string().contains("--etcd-tls-key"), "{error}");
     }
 
     #[cfg(not(feature = "etcd"))]
@@ -546,6 +605,7 @@ mod tests {
             endpoints: vec!["http://127.0.0.1:2379".to_owned()],
             key_prefix: "/nokv/control".to_owned(),
             lease_ttl_seconds: 10,
+            tls: None,
         });
         let error = match connect(&config, None) {
             Ok(_) => panic!("etcd routing must not fall back without its feature"),
@@ -569,6 +629,7 @@ mod tests {
             endpoints: Vec::new(),
             key_prefix: "/nokv/control".to_owned(),
             lease_ttl_seconds: 10,
+            tls: None,
         });
         assert!(matches!(
             connect(&config, None),

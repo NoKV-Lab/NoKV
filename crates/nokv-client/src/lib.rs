@@ -47,6 +47,8 @@ pub use idempotent_publish::{
     publish_attempt_identity, IdempotentPublishError, IdempotentPublishOptions,
     IdempotentPublishReceipt, PublishAttemptIdentity, MAX_IDEMPOTENT_PUBLISH_ATTEMPTS,
 };
+#[cfg(feature = "etcd")]
+pub use nokv_control::EtcdTlsConfig;
 pub use operation_status::{operation_observation, OperationObservation, OperationObservedState};
 #[cfg(feature = "control")]
 pub use route::ControlRouteResolver;

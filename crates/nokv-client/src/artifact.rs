@@ -3153,6 +3153,7 @@ fn is_append_retry_error(error: &ClientError) -> bool {
         }
         | ClientError::InvalidOptions(_)
         | ClientError::InvalidRoute(_)
+        | ClientError::ControlRefusal { .. }
         | ClientError::Transport(_)
         | ClientError::Protocol(_)
         | ClientError::ResponseMismatch(_)

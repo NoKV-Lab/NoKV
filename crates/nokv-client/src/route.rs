@@ -11,10 +11,12 @@ use std::sync::{Arc, RwLock};
 #[cfg(feature = "control")]
 use nokv_control::{ControlStore, LogicalShardState, RootPlacementLifecycle};
 #[cfg(feature = "etcd")]
-use nokv_control::{EtcdControlStore, EtcdControlStoreOptions};
+use nokv_control::{EtcdControlStore, EtcdControlStoreOptions, EtcdTlsConfig};
 #[cfg(feature = "control")]
 use nokv_protocol::{LogicalShardIdentity, ObjectNamespaceIdentity};
 use nokv_protocol::{RootIdentity, RootRoute};
+#[cfg(feature = "control")]
+use nokv_types::ErrorClass;
 #[cfg(feature = "control")]
 use nokv_types::RootId;
 
@@ -187,7 +189,7 @@ impl ControlRouteResolver {
 
         let shard = self
             .store
-            .get_logical_shard(&placement.logical_shard_id)
+            .get_logical_shard_route(&placement.logical_shard_id)
             .map_err(control_error)?
             .ok_or_else(|| invalid_route("logical shard record does not exist"))?;
         if shard.logical_shard_id != placement.logical_shard_id {
@@ -284,6 +286,17 @@ impl EtcdRouteOptions {
         self
     }
 
+    /// Authenticate to etcd over mutual TLS; every endpoint must then be an
+    /// `https://` URL.
+    pub fn with_tls(mut self, tls: EtcdTlsConfig) -> Self {
+        self.control = self.control.with_tls(tls);
+        self
+    }
+
+    pub fn tls(&self) -> Option<&EtcdTlsConfig> {
+        self.control.tls()
+    }
+
     pub fn endpoints(&self) -> &[String] {
         self.control.endpoints()
     }
@@ -307,9 +320,27 @@ impl EtcdRouteOptions {
     }
 }
 
+/// A control-plane refusal of this client keeps its class, so that a caller
+/// stops; any other control failure is an unresolvable route.
 #[cfg(feature = "control")]
-fn control_error(error: impl std::fmt::Display) -> ClientError {
-    invalid_route(format!("control-plane lookup failed: {error}"))
+fn control_error(error: nokv_control::ControlError) -> ClientError {
+    use nokv_control::ControlError;
+    match error {
+        ControlError::Unauthenticated(message) => ClientError::ControlRefusal {
+            class: ErrorClass::Unauthenticated,
+            message,
+        },
+        ControlError::PermissionDenied(message) => ClientError::ControlRefusal {
+            class: ErrorClass::PermissionDenied,
+            message,
+        },
+        // The control options cannot work as given (for example, the CA
+        // does not sign etcd's certificate): a usage error, not a route.
+        ControlError::InvalidOptions(message) => {
+            ClientError::InvalidOptions(format!("control plane: {message}"))
+        }
+        error => invalid_route(format!("control-plane lookup failed: {error}")),
+    }
 }
 
 #[cfg(feature = "control")]
@@ -320,6 +351,44 @@ fn invalid_route(message: impl Into<String>) -> ClientError {
 #[cfg(all(test, feature = "control"))]
 mod control_tests {
     use super::*;
+    use nokv_control::ControlError;
+    use nokv_types::ErrorClass;
+
+    #[test]
+    fn control_refusals_keep_their_class() {
+        for (error, class) in [
+            (
+                ControlError::PermissionDenied("etcd: permission denied".to_owned()),
+                ErrorClass::PermissionDenied,
+            ),
+            (
+                ControlError::Unauthenticated("etcd: user name not found".to_owned()),
+                ErrorClass::Unauthenticated,
+            ),
+        ] {
+            let mapped = control_error(error);
+            assert!(
+                matches!(&mapped, ClientError::ControlRefusal { .. }),
+                "{mapped}"
+            );
+            assert_eq!(mapped.class(), class);
+            assert_eq!(mapped.class().for_read(), class);
+            assert!(!mapped.retryable());
+        }
+        assert!(matches!(
+            control_error(ControlError::Backend("etcd: leader changed".to_owned())),
+            ClientError::InvalidRoute(_)
+        ));
+        let misconfigured = control_error(ControlError::InvalidOptions(
+            "etcd's certificate is not signed by the configured etcd TLS CA".to_owned(),
+        ));
+        assert!(
+            matches!(&misconfigured, ClientError::InvalidOptions(_)),
+            "{misconfigured}"
+        );
+        assert_eq!(misconfigured.class(), ErrorClass::InvalidInput);
+        assert!(misconfigured.to_string().contains("etcd TLS CA"));
+    }
     use nokv_control::{
         InMemoryControlStore, LogicalShardId, NodeId, PlacementGeneration, RecoveryPublication,
         RootObjectNamespaceBinding, RootPlacement,
