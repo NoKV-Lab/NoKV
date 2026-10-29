@@ -60,7 +60,9 @@ responsibilities:
   batches, WAL acknowledgement, reopen, poison handling, and diagnostics.
 
 `bootstrap_shard` opens one `MetaShard` for a logical-shard owner and attaches
-all Active roots found at startup. The server constructs the Holt adapter and
+all Active roots found at startup; `ShardOwner::mount_root` attaches a root
+provisioned on the shard later, through the same fence installation and
+registry install. The server constructs the Holt adapter and
 injects it as `Arc<dyn TxnStore>`. `nokv-meta` has no production Holt import.
 Its dev-only workspace tests compose the Holt adapter through test support.
 
@@ -555,13 +557,18 @@ keeps retries idempotent and prevents the epoch-gap strand where control moves
 to `E+2` while the local authority remains at `E`.
 
 Lifecycle work remains root-scoped because each runner owns root-specific
-cursors. Every attached root gets one supervised lifecycle runner. Runtime
-root attachment stays private until the server can install and supervise that
-runner with the route.
+cursors. Every attached root gets one supervised lifecycle runner, whether it
+was attached at bootstrap or mounted while the owner runs.
 
-The CLI attaches every Active placement found for the shard at startup. A root
-that becomes Active later requires an owner restart until runtime attachment is
-implemented.
+The CLI attaches every Active placement found for the shard at startup, and
+its root mounter lists the shard's Active placements every
+`--lifecycle-interval-millis` and mounts, under the same checks, each root it
+does not serve yet: the object namespace must be the shard's, a plaintext
+owner needs the root's AgentId binding and refuses a tenant-bound root, and a
+TLS owner mounts only roots of the tenant it serves. A refusal is logged once
+per reason and re-evaluated every cycle. Roots are never unmounted while the
+owner runs; Draining and Retired placements are left to the next owner
+generation, as before.
 
 The current Holt-only bootstrap admits a first `New` owner, an epoch-zero
 `Existing` retry, an exact live-session `Resume`, same-namespace `Existing`

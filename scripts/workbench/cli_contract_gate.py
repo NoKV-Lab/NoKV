@@ -236,10 +236,15 @@ class Stack:
         """The object-store options an invocation of `command` runs with."""
         return self.objects
 
-    def run(self, label: str, arguments: list[str], client_options: list[str] = ()) -> Call:
+    def run(self, label: str, arguments: list[str], client_options: list[str] = (), *,
+            root: str | None = None) -> Call:
         """Run one command; `client_options` are connection options such as the
-        retry budget, which the CLI takes before the command."""
-        prefix = [*self.route, "--agent-id", self.ids["agent"], *self.object_options(arguments[0])]
+        retry budget, which the CLI takes before the command. `root` runs it
+        against another root of the same control plane."""
+        route = list(self.route)
+        if root is not None:
+            route[route.index("--root-id") + 1] = root
+        prefix = [*route, "--agent-id", self.ids["agent"], *self.object_options(arguments[0])]
         argv = [str(self.binary), *prefix, *client_options, *arguments]
         with self.proxy._lock:
             connections, requests = self.proxy.connections, len(self.proxy.requests)
@@ -271,8 +276,10 @@ class Stack:
         )
         return call
 
-    def provision(self) -> None:
-        call = self.run("provision", ["provision", self.ids["shard"], "--workbench-root", WORKBENCH_ROOT])
+    def provision(self, root: str | None = None) -> None:
+        """Provision the stack's root, or another root on the same shard."""
+        label = "provision" if root is None else f"provision-{root[:8]}"
+        call = self.run(label, ["provision", self.ids["shard"], "--workbench-root", WORKBENCH_ROOT], root=root)
         if call.exit != 0:
             raise NotQualified(f"provision failed: {call.stderr[-600:]}")
 
@@ -674,6 +681,33 @@ def in_flight_identified_write_survives_owner_restart(stack: Stack) -> dict[str,
             "first_attempt": status, "effects": 1}
 
 
+def root_provisioned_after_owner_start_is_served(stack: Stack) -> dict[str, Any]:
+    """S12: a root provisioned on the owner's shard after the owner started is
+    served by that owner, without a restart, within its lifecycle interval."""
+    root = new_id()
+    starts = stack.owner_starts
+    stack.provision(root)
+    provisioned = time.monotonic()
+    deadline = provisioned + stack.timeout
+    probe = None
+    while time.monotonic() < deadline:
+        probe = stack.run("s12-probe", ["operation", "status", new_id()], root=root)
+        if '"NotFound"' in probe.stderr:
+            break
+        time.sleep(0.2)
+    else:
+        raise ContractFailure(f"s12: the new root was not served within {stack.timeout}s: {probe.stderr[-300:]}")
+    served_after = round(time.monotonic() - provisioned, 3)
+    require(stack.owner_starts == starts and stack.owner.poll() is None, "s12: the same owner serves it", starts)
+    stack.success(stack.run("s12-create", ["workbench", "workbench_create", json.dumps({"id": "s12"})], root=root))
+    put = stack.success(stack.run("s12-put", stack.put_arguments("s12-put", "s12", "mounted.txt", new_id(), b"mounted"),
+                                  root=root))
+    stat = stack.success(stack.run("s12-stat", ["workspace-path", "stat", "s12", "outputs", "mounted.txt"], root=root))
+    require(stat.get("exists") is True and stat.get("generation") == put.get("generation"),
+            "s12: the path published on the new root reads back", [put, stat])
+    return {"root": root, "served_after_seconds": served_after, "put": put}
+
+
 def usage_error_sends_no_request(stack: Stack) -> dict[str, Any]:
     """S7: an invalid command fails typed before it reaches the owner."""
     cases = {
@@ -706,6 +740,7 @@ SCENARIOS = {
     "s9_workbench_tool_operation_id_replays": workbench_tool_operation_id_replays,
     "s10_session_backoff_bridges_owner_restart": session_backoff_bridges_owner_restart,
     "s11_in_flight_identified_write_survives_owner_restart": in_flight_identified_write_survives_owner_restart,
+    "s12_root_provisioned_after_owner_start_is_served": root_provisioned_after_owner_start_is_served,
 }
 
 
