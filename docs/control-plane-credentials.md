@@ -114,10 +114,11 @@ both `--rpc-tls-*` and `--etcd-tls-*`. The two are configured separately
 because they need not be the same.
 
 The Rust SDK configures the same identity with
-`EtcdRouteOptions::new(endpoints).with_tls(EtcdTlsConfig::new(ca_pem, cert_pem, key_pem))`.
-The PEM bytes are held in memory, shared between clones, and never printed by
-`Debug`. The Python SDK's `RoutingConfig.etcd` does not take a TLS identity
-yet.
+`EtcdRouteOptions::new(endpoints).with_tls(EtcdTlsConfig::new(ca_pem, cert_pem, key_pem))`,
+and the Python SDK with
+`RoutingConfig.etcd(endpoints, tls_ca_pem=..., tls_cert_pem=..., tls_key_pem=...)`
+(PEM `bytes`, given together). In both, the PEM bytes are held in memory,
+shared between clones, and never printed.
 
 ## Failures
 
