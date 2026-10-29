@@ -232,15 +232,16 @@ class TlsStack(Stack):
         ]
 
     def run(self, label: str, arguments: list[str], *, tls: str | None = "agent",
-            server_name: str = SERVER_NAME, agent_id: str | None = None) -> Call:
+            server_name: str = SERVER_NAME, agent_id: str | None = None,
+            root: str | None = None) -> Call:
         # provision and identity write the control store and never connect.
         connects = arguments[0] not in ("provision", "identity")
         options = self.tls_options(tls, server_name) if connects else []
         if agent_id is None:
-            return super().run(label, [*options, *arguments])
+            return super().run(label, [*options, *arguments], root=root)
         configured, self.ids["agent"] = self.ids["agent"], agent_id
         try:
-            return super().run(label, [*options, *arguments])
+            return super().run(label, [*options, *arguments], root=root)
         finally:
             self.ids["agent"] = configured
 
@@ -577,6 +578,43 @@ def multi_block_publish_through_the_owner_with_read_only_agent_credentials(stack
     }
 
 
+def roots_provisioned_later_follow_the_tenant_boundary(stack: TlsStack) -> dict[str, Any]:
+    """T15: a root provisioned on the shard after the owner started is served
+    once it is bound to the owner's tenant; a root bound to another tenant is
+    left unmounted, and the owner says why, once."""
+    same, other, other_tenant = new_id(), new_id(), new_id()
+    starts = stack.owner_starts
+    stack.provision(same)
+    stack.provision(other)
+    stack.identity("t15-tenant", "tenant", "create", other_tenant)
+    stack.identity("t15-bind-other", "root", "bind", other, other_tenant)
+    stack.identity("t15-bind-same", "root", "bind", same, stack.tenant)
+    bound = time.monotonic()
+    deadline = bound + stack.timeout
+    probe = None
+    while time.monotonic() < deadline:
+        probe = stack.run("t15-probe", ["operation", "status", new_id()], root=same)
+        if '"NotFound"' in probe.stderr:
+            break
+        time.sleep(0.2)
+    else:
+        raise ContractFailure(f"t15: the root of this tenant was not served within {stack.timeout}s: {probe.stderr[-300:]}")
+    served_after = round(time.monotonic() - bound, 3)
+    require(stack.owner_starts == starts, "t15: the same owner serves it", starts)
+    stack.success(stack.run("t15-create", ["workbench", "workbench_create", json.dumps({"id": "t15"})], root=same))
+    time.sleep(2.5)
+    log = (stack.evidence / f"owner-{stack.owner_starts}.log").read_text(errors="replace")
+    refusal = f"root {other} not mounted"
+    require(log.count(refusal) == 1 and "this owner serves tenant" in log, "t15: the other tenant's root is refused once",
+            [line for line in log.splitlines() if "mounted" in line][-6:])
+    require(f"mounted root {same}" in log, "t15: the root of this tenant is mounted", log[-600:])
+    refused = stack.run("t15-other", ["operation", "status", new_id()], root=other)
+    require(refused.exit != 0 and '"NotFound"' not in refused.stderr, "t15: the other tenant's root is not served",
+            [refused.exit, refused.stderr[-300:]])
+    return {"same": same, "other": other, "served_after_seconds": served_after,
+            "other_refusal_class": json.loads(refused.stderr.strip() or "{}").get("class")}
+
+
 SCENARIOS: dict[str, Callable[[TlsStack], dict]] = {
     "t1_registered_client_round_trip": registered_client_round_trip,
     "t2_unregistered_certificate_refused": unregistered_certificate_refused,
@@ -594,6 +632,7 @@ SCENARIOS: dict[str, Callable[[TlsStack], dict]] = {
     "t13_four_principals_write_one_root_concurrently": four_principals_write_one_root_concurrently,
     "t14_multi_block_publish_through_the_owner_with_read_only_agent_credentials":
         multi_block_publish_through_the_owner_with_read_only_agent_credentials,
+    "t15_roots_provisioned_later_follow_the_tenant_boundary": roots_provisioned_later_follow_the_tenant_boundary,
 }
 
 

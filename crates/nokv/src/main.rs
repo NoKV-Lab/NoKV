@@ -1606,6 +1606,8 @@ OWNER:
   --adopt-legacy-agent-binding is a one-time explicit migration for a verified legacy root
   --adopt-legacy-object-namespace is a one-time explicit migration after verifying bucket/prefix
   serve validates every active root's Agent binding; it does not require or compare one shard-wide AgentId
+  serve mounts a root provisioned on its shard after it started, at --lifecycle-interval-millis and under the same
+    checks; a root bound to another tenant or object namespace is not mounted, and the refusal is logged once
   a root bound to a tenant is served only over RPC TLS: a plaintext serve refuses to start
   --root-id HEX32 (--etcd-endpoint URL | --control-dir PATH) --node-id ID
   --append-activity-lease-ms N: serve only, range 1000..=86400000, default 1800000; clock-skew grace is additional
@@ -1901,6 +1903,189 @@ fn refuse_plaintext_for_tenant_roots(
     Ok(())
 }
 
+/// A fresh idempotency key for one durable root-fence step of this owner
+/// process: unique per process, instant and sequence.
+#[cfg(feature = "control")]
+fn bootstrap_request_id(domain: &[u8], root: nokv_control::RootId) -> nokv_types::RequestId {
+    use sha2::{Digest, Sha256};
+
+    static REQUEST_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.owner.bootstrap\0");
+    hasher.update(domain);
+    hasher.update(root.as_bytes());
+    hasher.update(std::process::id().to_be_bytes());
+    hasher.update(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_be_bytes(),
+    );
+    hasher.update(
+        REQUEST_SEQUENCE
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_be_bytes(),
+    );
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    nokv_types::RequestId::from_bytes(id)
+}
+
+/// What a root must satisfy to be served by this owner, checked the same way
+/// for the bootstrap roots and for roots provisioned while the owner runs.
+#[cfg(feature = "control")]
+struct RootMountChecks {
+    control: Arc<dyn nokv_control::ControlStore>,
+    identity: Arc<dyn nokv_control::IdentityStore>,
+    expected_namespace: nokv_types::ObjectNamespaceId,
+    /// The tenant a TLS owner serves; `None` for a plaintext owner.
+    served_tenant: Option<nokv_types::TenantId>,
+}
+
+#[cfg(feature = "control")]
+impl RootMountChecks {
+    /// Why an Active placement of this shard cannot be mounted, or `None`
+    /// when it can. A plaintext owner needs the root's AgentId binding and
+    /// refuses a tenant-bound root; a TLS owner mounts only roots of the one
+    /// tenant it serves; every root must share the shard's object namespace.
+    fn refusal(&self, placement: &nokv_control::RootPlacement) -> Result<Option<String>, String> {
+        let root = encode_lowercase_hex(placement.root_id.as_bytes());
+        match self
+            .control
+            .get_root_object_namespace_binding(&placement.root_id)
+            .map_err(|error| error.to_string())?
+        {
+            None => return Ok(Some(format!("root {root} has no object namespace binding"))),
+            Some(binding) if binding.object_namespace_id != self.expected_namespace => {
+                return Ok(Some(format!(
+                    "root {root} is bound to another object namespace than this shard"
+                )));
+            }
+            Some(_) => {}
+        }
+        match self.served_tenant {
+            None => {
+                if let Err(failure) =
+                    load_root_agent_binding(self.control.as_ref(), placement.root_id)
+                {
+                    return Ok(Some(failure.message()));
+                }
+                if let Err(reason) = refuse_plaintext_for_tenant_roots(
+                    self.identity.as_ref(),
+                    std::slice::from_ref(placement),
+                ) {
+                    return Ok(Some(reason));
+                }
+            }
+            Some(served) => match self
+                .identity
+                .get_root_tenant(&placement.root_id)
+                .map_err(|error| error.to_string())?
+            {
+                None => return Ok(Some(format!("root {root} is not bound to a tenant"))),
+                Some(binding) if binding.tenant_id != served => {
+                    return Ok(Some(format!(
+                        "root {root} is bound to tenant {}; this owner serves tenant {}",
+                        encode_lowercase_hex(binding.tenant_id.as_bytes()),
+                        encode_lowercase_hex(served.as_bytes())
+                    )));
+                }
+                Some(_) => {}
+            },
+        }
+        Ok(None)
+    }
+}
+
+/// Mount roots provisioned on the owner's shard after it started, every
+/// `interval`, until `stopped`, `shutdown`, or owner loss. Each mounted root
+/// gets its own lifecycle worker through `start_lifecycle`. A refusal is
+/// logged once per reason, and a mount failure is retried on the next cycle.
+#[cfg(feature = "control")]
+#[allow(clippy::too_many_arguments)]
+fn mount_roots_until(
+    stopped: &std::sync::atomic::AtomicBool,
+    shutdown: &std::sync::atomic::AtomicBool,
+    interval: std::time::Duration,
+    server: &nokv_server::WorkspaceServer,
+    checks: &RootMountChecks,
+    seed: &nokv_control::RootPlacement,
+    mut mounted: std::collections::BTreeSet<nokv_control::RootId>,
+    start_lifecycle: &dyn Fn(nokv_protocol::RootRoute) -> Result<(), String>,
+) {
+    use std::sync::atomic::Ordering;
+
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    let owner_loss = server.owner_loss_signal();
+    let mut refusals = std::collections::BTreeMap::new();
+    let stopping = || {
+        stopped.load(Ordering::Acquire) || shutdown.load(Ordering::Acquire) || owner_loss.is_lost()
+    };
+    'cycles: loop {
+        let due = std::time::Instant::now() + interval;
+        while std::time::Instant::now() < due {
+            if stopping() {
+                break 'cycles;
+            }
+            std::thread::sleep(POLL);
+        }
+        let candidates = match active_shard_placements(checks.control.as_ref(), seed) {
+            Ok(placements) => placements,
+            Err(reason) => {
+                eprintln!("root mounter: cannot list placements: {reason}");
+                continue;
+            }
+        };
+        let pending = candidates
+            .into_iter()
+            .filter(|placement| !mounted.contains(&placement.root_id))
+            .collect::<Vec<_>>();
+        for placement in &pending {
+            let root = encode_lowercase_hex(placement.root_id.as_bytes());
+            match checks.refusal(placement) {
+                Ok(None) => {}
+                Ok(Some(reason)) => {
+                    if refusals.insert(placement.root_id, reason.clone()) != Some(reason.clone()) {
+                        eprintln!("root {root} not mounted: {reason}");
+                    }
+                    continue;
+                }
+                Err(reason) => {
+                    eprintln!("root mounter: cannot check root {root}: {reason}");
+                    continue;
+                }
+            }
+            let attach = nokv_server::RootAttach {
+                root_id: placement.root_id,
+                object_namespace_id: checks.expected_namespace,
+                install_id: bootstrap_request_id(b"install", placement.root_id),
+                bind_object_namespace_id: bootstrap_request_id(
+                    b"bind-object-namespace",
+                    placement.root_id,
+                ),
+                activate_id: bootstrap_request_id(b"activate", placement.root_id),
+            };
+            match server
+                .mount_root(placement, attach)
+                .map_err(|error| error.to_string())
+                .and_then(|route| start_lifecycle(route).map(|()| route))
+            {
+                Ok(route) => {
+                    mounted.insert(placement.root_id);
+                    refusals.remove(&placement.root_id);
+                    eprintln!(
+                        "mounted root {root} at placement generation {} under owner epoch {}",
+                        route.placement_generation, route.owner_epoch
+                    );
+                }
+                Err(reason) => eprintln!("root {root} not mounted: {reason}"),
+            }
+        }
+    }
+}
+
 #[cfg(feature = "control")]
 fn join_lifecycle_workers(
     workers: Vec<std::thread::JoinHandle<Result<(), nokv_server::LifecycleError>>>,
@@ -1917,8 +2102,8 @@ fn join_lifecycle_workers(
 
 #[cfg(feature = "control")]
 fn run_server(invocation: &Invocation) -> Result<(), String> {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use nokv_control::{NodeId, RecoveryPublication, RootId};
     use nokv_server::{
@@ -1927,10 +2112,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         RootOwnerRegistry, RpcServerTls, ServerOptions, ShardBoot, TenantAccess, WorkspaceServer,
         DEFAULT_MAX_POLICY_AGE,
     };
-    use nokv_types::RequestId;
-    use sha2::{Digest, Sha256};
 
-    static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
     const NON_EXPIRING_SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
     fn install_shutdown_signal() -> Result<Arc<AtomicBool>, String> {
@@ -1943,30 +2125,6 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
                 .map_err(|error| format!("cannot install {name} shutdown handler: {error}"))?;
         }
         Ok(shutdown)
-    }
-
-    fn request_id(domain: &[u8], root: RootId) -> RequestId {
-        let mut hasher = Sha256::new();
-        hasher.update(b"nokv.owner.bootstrap\0");
-        hasher.update(domain);
-        hasher.update(root.as_bytes());
-        hasher.update(std::process::id().to_be_bytes());
-        hasher.update(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                .to_be_bytes(),
-        );
-        hasher.update(
-            REQUEST_SEQUENCE
-                .fetch_add(1, Ordering::Relaxed)
-                .to_be_bytes(),
-        );
-        let digest: [u8; 32] = hasher.finalize().into();
-        let mut id = [0_u8; 16];
-        id.copy_from_slice(&digest[..16]);
-        RequestId::from_bytes(id)
     }
 
     let shutdown = install_shutdown_signal()?;
@@ -2058,11 +2216,23 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
             "one shard owner cannot serve roots bound to different object namespaces".to_owned(),
         );
     }
+    // Roots mounted after the start pass the same checks as these did.
+    let mount_checks = RootMountChecks {
+        control: Arc::clone(&control),
+        identity: Arc::clone(&identity),
+        expected_namespace,
+        served_tenant: match &invocation.server.tls {
+            None => None,
+            Some(_) => Some(served_tenant(identity.as_ref(), &placements)?),
+        },
+    };
     // TLS is loaded and checked before metadata open or ownership acquisition.
     let rpc_tls = match &invocation.server.tls {
         None => None,
         Some(tls) => {
-            let tenant_id = served_tenant(identity.as_ref(), &placements)?;
+            let tenant_id = mount_checks
+                .served_tenant
+                .expect("a TLS owner serves exactly one tenant");
             // On etcd the copy may serve as long as the owner's lease would;
             // past that the owner has lost the right to serve anyway.
             let max_policy_age = match &invocation.client.routing {
@@ -2109,12 +2279,12 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
                 .map(|placement| RootAttach {
                     root_id: placement.root_id,
                     object_namespace_id: expected_namespace,
-                    install_id: request_id(b"install", placement.root_id),
-                    bind_object_namespace_id: request_id(
+                    install_id: bootstrap_request_id(b"install", placement.root_id),
+                    bind_object_namespace_id: bootstrap_request_id(
                         b"bind-object-namespace",
                         placement.root_id,
                     ),
-                    activate_id: request_id(b"activate", placement.root_id),
+                    activate_id: bootstrap_request_id(b"activate", placement.root_id),
                 })
                 .collect(),
         },
@@ -2204,13 +2374,85 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         }
     }
 
-    let server_result = server.run_until_shutdown(shutdown.as_ref());
+    // Roots provisioned on this shard while the owner runs are mounted on
+    // the lifecycle cadence; their lifecycle workers join the bootstrap ones.
+    let mounted_workers = std::sync::Mutex::new(Vec::new());
+    let mounter_stopped = AtomicBool::new(false);
+    let server_result = std::thread::scope(|scope| {
+        let mounter = std::thread::Builder::new()
+            .name("nokv-root-mounter".to_owned())
+            .spawn_scoped(scope, || {
+                mount_roots_until(
+                    &mounter_stopped,
+                    shutdown.as_ref(),
+                    Duration::from_millis(invocation.server.lifecycle_interval_millis),
+                    &server,
+                    &mount_checks,
+                    &placement,
+                    placements
+                        .iter()
+                        .map(|placement| placement.root_id)
+                        .collect(),
+                    &|route| {
+                        let lifecycle = LifecycleRunner::new(
+                            Arc::clone(&meta),
+                            Arc::clone(&registry),
+                            route,
+                            owner_loss.clone(),
+                            Arc::clone(&lifecycle_objects),
+                            recovery.clone(),
+                            LifecycleRunnerOptions {
+                                poll_interval: Duration::from_millis(
+                                    invocation.server.lifecycle_interval_millis,
+                                ),
+                                ..LifecycleRunnerOptions::default()
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
+                        let worker_owner_loss = owner_loss.clone();
+                        let worker_shutdown = Arc::clone(&shutdown);
+                        let worker = std::thread::Builder::new()
+                            .name(format!(
+                                "nokv-workspace-lifecycle-{}",
+                                encode_lowercase_hex(&route.root_id.0)
+                            ))
+                            .spawn(move || {
+                                let result = lifecycle
+                                    .run_until_owner_loss_or_shutdown(worker_shutdown.as_ref());
+                                if result.is_err() {
+                                    worker_owner_loss.fail_closed();
+                                }
+                                result
+                            })
+                            .map_err(|error| error.to_string())?;
+                        mounted_workers
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(worker);
+                        Ok(())
+                    },
+                )
+            })
+            .map_err(|error| format!("cannot start root mounter: {error}"));
+        let server_result = server.run_until_shutdown(shutdown.as_ref());
+        mounter_stopped.store(true, Ordering::Release);
+        if let Ok(mounter) = mounter {
+            let _ = mounter.join();
+        }
+        server_result
+    });
     if server_result.is_err() {
         owner_loss.fail_closed();
     }
 
     let mut failures = Vec::new();
     join_lifecycle_workers(lifecycle_workers, &mut failures);
+    join_lifecycle_workers(
+        mounted_workers
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        &mut failures,
+    );
     let release_result = server.release_ownership();
     if let Err(error) = server_result {
         failures.push(format!("RPC server stopped: {error}"));
@@ -2682,6 +2924,127 @@ mod tests {
     #[test]
     fn help_text_no_longer_documents_an_mcp_command() {
         assert!(!HELP_TEXT.to_ascii_lowercase().contains("mcp"));
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn mount_checks_admit_only_roots_this_owner_may_serve() {
+        use nokv_control::{
+            ControlStore, IdentityStore, InMemoryControlStore, PlacementGeneration, RootPlacement,
+            RootPlacementLifecycle, RootTenantBinding, TenantRecord,
+        };
+
+        let store = Arc::new(InMemoryControlStore::new());
+        let shard = nokv_control::LogicalShardId::from_bytes([2; 16]);
+        let namespace = nokv_types::ObjectNamespaceId::from_bytes([8; 16]);
+        let other_namespace = nokv_types::ObjectNamespaceId::from_bytes([9; 16]);
+        let tenant = nokv_types::TenantId::from_bytes([5; 16]);
+        let other_tenant = nokv_types::TenantId::from_bytes([6; 16]);
+        store.create_logical_shard(shard).unwrap();
+        for tenant_id in [tenant, other_tenant] {
+            store.create_tenant(TenantRecord { tenant_id }).unwrap();
+        }
+        let root = |fill: u8| nokv_control::RootId::from_bytes([fill; 16]);
+        let placement = |fill: u8| -> RootPlacement {
+            let provisioning = store
+                .create_root_placement(RootPlacement {
+                    root_id: root(fill),
+                    logical_shard_id: shard,
+                    placement_generation: PlacementGeneration::new(1).unwrap(),
+                    lifecycle: RootPlacementLifecycle::Provisioning,
+                })
+                .unwrap();
+            let active = RootPlacement {
+                placement_generation: PlacementGeneration::new(2).unwrap(),
+                lifecycle: RootPlacementLifecycle::Active,
+                ..provisioning.clone()
+            };
+            store
+                .compare_and_set_root_placement(&provisioning, active)
+                .unwrap()
+        };
+        let bind_namespace = |fill: u8, object_namespace_id| {
+            store
+                .create_root_object_namespace_binding(nokv_control::RootObjectNamespaceBinding {
+                    root_id: root(fill),
+                    object_namespace_id,
+                })
+                .unwrap();
+        };
+        let bind_agent = |fill: u8| {
+            store
+                .create_root_agent_binding(nokv_control::RootAgentBinding {
+                    root_id: root(fill),
+                    agent_id: nokv_types::AgentId::from_bytes([4; 16]),
+                })
+                .unwrap();
+        };
+        let bind_tenant = |fill: u8, tenant_id| {
+            store
+                .bind_root_tenant(RootTenantBinding {
+                    root_id: root(fill),
+                    tenant_id,
+                })
+                .unwrap();
+        };
+        // 1: a plain agent root; 2: no namespace binding; 3: another
+        // namespace; 4: no agent binding; 5: bound to the served tenant;
+        // 6: bound to another tenant; 7: tenant-bound root of a plaintext owner.
+        bind_namespace(1, namespace);
+        bind_agent(1);
+        bind_namespace(3, other_namespace);
+        bind_agent(3);
+        bind_namespace(4, namespace);
+        bind_namespace(5, namespace);
+        bind_agent(5);
+        bind_tenant(5, tenant);
+        bind_namespace(6, namespace);
+        bind_agent(6);
+        bind_tenant(6, other_tenant);
+        bind_namespace(7, namespace);
+        bind_agent(7);
+        bind_tenant(7, tenant);
+        let placements: Vec<RootPlacement> = (1..=7).map(placement).collect();
+
+        let plaintext = RootMountChecks {
+            control: store.clone(),
+            identity: store.clone(),
+            expected_namespace: namespace,
+            served_tenant: None,
+        };
+        let secured = RootMountChecks {
+            served_tenant: Some(tenant),
+            control: store.clone(),
+            identity: store.clone(),
+            expected_namespace: namespace,
+        };
+        let verdict = |checks: &RootMountChecks, index: usize| {
+            checks.refusal(&placements[index - 1]).unwrap()
+        };
+        assert_eq!(verdict(&plaintext, 1), None);
+        assert!(verdict(&plaintext, 2)
+            .unwrap()
+            .contains("no object namespace binding"));
+        assert!(verdict(&plaintext, 3)
+            .unwrap()
+            .contains("another object namespace"));
+        assert!(
+            verdict(&plaintext, 4).is_some(),
+            "a plaintext owner needs the AgentId binding"
+        );
+        assert!(verdict(&plaintext, 7)
+            .unwrap()
+            .contains("served only over RPC TLS"));
+        assert_eq!(verdict(&secured, 5), None);
+        assert!(verdict(&secured, 6)
+            .unwrap()
+            .contains("this owner serves tenant"));
+        assert!(verdict(&secured, 1)
+            .unwrap()
+            .contains("not bound to a tenant"));
+        assert!(verdict(&secured, 3)
+            .unwrap()
+            .contains("another object namespace"));
     }
 
     #[test]

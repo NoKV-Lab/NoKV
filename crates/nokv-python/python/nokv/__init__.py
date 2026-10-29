@@ -6,7 +6,7 @@ from importlib.metadata import PackageNotFoundError, version as _distribution_ve
 
 from . import checkpoint
 from ._errors import AppendError, WorkspaceIncarnationMismatch
-from ._native import Client, RoutingConfig, ObjectStoreConfig
+from ._native import Client, RoutingConfig, ObjectStoreConfig, Session, TlsConfig
 from .fsspec import WorkbenchFileSystem
 
 API_VERSION = 1
@@ -25,6 +25,8 @@ __all__ = [
     "Client",
     "ObjectStoreConfig",
     "RoutingConfig",
+    "Session",
+    "TlsConfig",
     "WorkbenchFileSystem",
     "WorkspaceIncarnationMismatch",
     "checkpoint",

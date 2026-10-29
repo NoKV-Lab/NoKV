@@ -705,6 +705,35 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Qualify the direct Python SDK contract over TLS
+        id: python_contract_tls
+        shell: bash
+        env:
+          PYTHON_CONTRACT_TLS_EVIDENCE_DIR: ${{ runner.temp }}/python-contract-tls
+          AWS_ACCESS_KEY_ID: rustfsadmin
+          AWS_SECRET_ACCESS_KEY: rustfsadmin
+        run: |
+          set -euo pipefail
+          python3 scripts/workbench/python_contract_gate.py \
+            --tls \
+            --nokv-bin target/debug/nokv \
+            --python-executable "$RUNNER_TEMP/python-contract-venv/bin/python" \
+            --evidence-dir "$PYTHON_CONTRACT_TLS_EVIDENCE_DIR" \
+            --object-endpoint http://127.0.0.1:9000 \
+            --object-bucket nokv-local-wal-recovery-gate \
+            --object-root "python-contract-tls-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --timeout 45
+          jq -e '.overall_status == "PASS"' "$PYTHON_CONTRACT_TLS_EVIDENCE_DIR/qualification.json"
+
+      - name: Upload direct Python SDK TLS contract evidence
+        if: ${{ always() && steps.python_contract_tls.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: python-contract-tls-${{ github.sha }}
+          path: ${{ runner.temp }}/python-contract-tls
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Qualify restored Workbench composition
         id: restore_composition
         shell: bash

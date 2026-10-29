@@ -320,6 +320,11 @@ pub struct ShardOwner {
     serving: LogicalShardRecord,
     meta: Arc<meta::MetaShard>,
     recovery: Arc<RecoveryPublisher>,
+    /// The executor every root of this shard dispatches through; a root
+    /// mounted later shares it.
+    executor: Arc<dyn WorkspaceRequestExecutor>,
+    /// The one object namespace every root of this shard is bound to.
+    object_namespace_id: ObjectNamespaceId,
     routes: Vec<RootRoute>,
     owner_lease_renew_interval: Option<std::time::Duration>,
     bootstrap_keepalive: BootstrapLeaseKeepalive,
@@ -342,8 +347,52 @@ impl ShardOwner {
         &self.meta
     }
 
+    /// The routes attached at bootstrap. A root mounted later is reported
+    /// by [`Self::mount_root`] instead.
     pub fn routes(&self) -> &[RootRoute] {
         &self.routes
+    }
+
+    /// Attach a root provisioned on this shard after the owner started: the
+    /// same fence installation and registry install the bootstrap roots
+    /// went through, under this owner's lease and executor. The placement
+    /// must be Active on this shard and bound to the shard's object
+    /// namespace; mounting an already mounted root changes nothing.
+    pub fn mount_root(
+        &self,
+        placement: &RootPlacement,
+        root: RootAttach,
+    ) -> Result<RootRoute, ServerError> {
+        if root.root_id != placement.root_id {
+            return Err(ServerError::InvalidBootstrap(format!(
+                "root {:?} attach names placement {:?}",
+                root.root_id, placement.root_id
+            )));
+        }
+        if placement.logical_shard_id != self.shard_id() {
+            return Err(ServerError::InvalidBootstrap(format!(
+                "root {:?} belongs to logical shard {:?}, this owner serves {:?}",
+                placement.root_id,
+                placement.logical_shard_id,
+                self.shard_id()
+            )));
+        }
+        validate_serving_placement(placement)?;
+        if root.object_namespace_id != self.object_namespace_id {
+            return Err(ServerError::InvalidBootstrap(format!(
+                "root {:?} is bound to another object namespace than this shard",
+                placement.root_id
+            )));
+        }
+        attach_root(
+            &self.meta,
+            &self.registry,
+            &self.executor,
+            &self.recovery,
+            placement,
+            &self.lease,
+            &root,
+        )
     }
 
     pub fn recovery_publisher(&self) -> &Arc<RecoveryPublisher> {
@@ -763,6 +812,8 @@ pub fn bootstrap_shard(
         serving,
         meta,
         recovery,
+        executor,
+        object_namespace_id: expected_namespace,
         routes,
         owner_lease_renew_interval,
         bootstrap_keepalive,
@@ -2284,6 +2335,66 @@ mod tests {
             lease_renew_interval: Duration::from_millis(10),
             max_inflight_connections: 8,
         }
+    }
+
+    #[test]
+    fn a_root_provisioned_after_bootstrap_mounts_onto_the_running_owner() {
+        let temporary = TempDir::new().unwrap();
+        let control = active_control(&[root(1)]);
+        let registry = Arc::new(RootOwnerRegistry::new());
+        let owner = bootstrap_shard(
+            as_control(&control),
+            Arc::clone(&registry),
+            acquire_boot(temporary.path().join("metadata"), &[root(1)]),
+        )
+        .unwrap();
+        assert_eq!(registry.installed_root_count().unwrap(), 1);
+
+        // Provisioned on this shard after the owner started.
+        add_active_root(control.as_ref(), root(2), shard());
+        let placement = control.get_root_placement(&root(2)).unwrap().unwrap();
+        let route = owner
+            .mount_root(&placement, root_attach(root(2), 9))
+            .unwrap();
+        assert_eq!(route.root_id, RootIdentity::from(root(2)));
+        assert_eq!(route.owner_epoch, owner.lease().owner_epoch.get());
+        assert_eq!(route.placement_generation, 2);
+        assert!(registry.contains_exact(route).unwrap());
+        assert_eq!(registry.installed_root_count().unwrap(), 2);
+        // The durable fence outlives the call: mounting again changes nothing.
+        let again = owner
+            .mount_root(&placement, root_attach(root(2), 9))
+            .unwrap();
+        assert_eq!(again, route);
+        assert_eq!(registry.installed_root_count().unwrap(), 2);
+
+        // A root of another shard, and a placement that is no longer Active,
+        // are refused before any fence is written.
+        control.create_logical_shard(other_shard()).unwrap();
+        add_active_root(control.as_ref(), root(3), other_shard());
+        let elsewhere = control.get_root_placement(&root(3)).unwrap().unwrap();
+        let refused = owner
+            .mount_root(&elsewhere, root_attach(root(3), 12))
+            .unwrap_err();
+        assert!(
+            matches!(refused, ServerError::InvalidBootstrap(_)),
+            "{refused}"
+        );
+        let draining = RootPlacement {
+            placement_generation: PlacementGeneration::new(3).unwrap(),
+            lifecycle: RootPlacementLifecycle::Draining,
+            ..placement.clone()
+        };
+        let refused = owner
+            .mount_root(&draining, root_attach(root(2), 9))
+            .unwrap_err();
+        assert!(
+            matches!(refused, ServerError::InvalidBootstrap(_)),
+            "{refused}"
+        );
+        assert_eq!(registry.installed_root_count().unwrap(), 2);
+        assert!(owner.meta().root_fence(root(3)).unwrap().is_none());
+        owner.release().unwrap();
     }
 
     #[test]

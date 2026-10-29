@@ -108,6 +108,21 @@ impl PythonRoutingConfig {
 }
 
 impl PythonRoutingConfig {
+    /// One resolver for every root of a control-backed configuration, which
+    /// a session shares between its clients; `None` for a static route,
+    /// which pins one root and is built per client.
+    pub(crate) fn shared_resolver(&self) -> Result<Option<Arc<dyn RouteResolver>>, ClientError> {
+        match &self.routing {
+            ConfiguredRouting::Static { .. } => Ok(None),
+            ConfiguredRouting::Etcd(options) => Ok(Some(Arc::new(
+                ControlRouteResolver::connect_etcd(options.clone())?,
+            ))),
+            ConfiguredRouting::Local(directory) => Ok(Some(Arc::new(
+                ControlRouteResolver::open_local(directory.clone())?,
+            ))),
+        }
+    }
+
     pub(crate) fn build(
         &self,
         root_id: RootIdentity,
@@ -200,6 +215,36 @@ mod tests {
             .unwrap();
         let error = resolver.resolve(root_id, true).unwrap_err();
         assert!(error.to_string().contains("root placement does not exist"));
+    }
+
+    #[test]
+    fn control_backed_configurations_share_one_resolver_and_static_ones_pin_one_root() {
+        Python::initialize();
+        let directory = tempfile::tempdir().unwrap();
+        let local = PythonRoutingConfig::local(directory.path().join("control")).unwrap();
+        let shared = local
+            .shared_resolver()
+            .unwrap()
+            .expect("a control directory serves every root");
+        let first = RootIdentity([0x11; 16]);
+        let second = RootIdentity([0x12; 16]);
+        for root_id in [first, second] {
+            let error = shared.resolve(root_id, true).unwrap_err();
+            assert!(
+                error.to_string().contains("root placement does not exist"),
+                "{error}"
+            );
+        }
+
+        let pinned = PythonRoutingConfig::static_route(
+            "127.0.0.1:17750",
+            &"22".repeat(16),
+            &"33".repeat(16),
+            7,
+            9,
+        )
+        .unwrap();
+        assert!(pinned.shared_resolver().unwrap().is_none());
     }
 
     #[test]
