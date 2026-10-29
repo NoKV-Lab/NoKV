@@ -10,11 +10,11 @@
 > Current product guidance is in [Product Design](../product-design.md) and the
 > [Workbench contract](../workbench-contract.md).
 >
-> Update (2026-08): the optional Workbench MCP sidecar described on this page
-> is deprecated and is not a supported NoKV integration surface. The stable
-> boundary was and remains the 18-tool Workbench semantic contract, reached
-> through the native full CLI and the direct Python SDK. The historical scope
-> below is retained for reference.
+> Update (2026-10): the optional Workbench MCP sidecar described on this page
+> was deprecated in 2026-08 and has since been removed; NoKV ships no MCP
+> transport. The stable boundary was and remains the 18-tool Workbench
+> semantic contract, reached through the native full CLI and the direct
+> Python SDK. The historical scope below is retained for reference.
 
 This announcement marks the start of the design-partner collaboration between
 **NoKV** and **LingTai**

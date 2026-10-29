@@ -114,7 +114,7 @@ pub fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, ProjectionError> {
 
 /// The canonical inputs one Workbench commit is built from.
 ///
-/// Every caller -- CLI, MCP, Python SDK -- must derive these the same way:
+/// Every caller -- CLI, Python SDK, Rust SDK -- must derive these the same way:
 /// the manifest digest and the stable commit id both feed the durable commit
 /// identity and the operation's idempotency, so two callers that shape them
 /// differently would write two commits for one intent.

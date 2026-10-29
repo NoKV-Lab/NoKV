@@ -10,10 +10,10 @@ These assets validate the same 18-tool Workbench semantics exported by
 and the direct Python SDK is second for embedded callers.
 
 Every live runner here drives the 18 tools through `nokv workbench <tool>`
-processes graded against `docs/cli-contract.md`. The deprecated `nokv mcp`
-sidecar has no caller in this directory; nothing here makes MCP a deployment
-component or defines a runtime-specific metadata layout, capability alias,
-migration helper, or filesystem frontend.
+processes graded against `docs/cli-contract.md`. NoKV ships no MCP
+transport; nothing here makes MCP a deployment component or defines a
+runtime-specific metadata layout, capability alias, migration helper, or
+filesystem frontend.
 
 The checked-in integration assets are deliberately small:
 
@@ -22,8 +22,8 @@ The checked-in integration assets are deliberately small:
   `pre423_contract_ledger.py` and its unit test keep stable ids, class and
   disposition policy, evidence, ownership, and required gates complete.
 - `workbench_contract.py` verifies the tool definitions that `nokv schema`
-  prints, or an MCP `tools/list` response, against the exact Rust-owned schema
-  at `crates/nokv-agent/workbench_contract_schema.json`.
+  prints against the exact Rust-owned schema at
+  `crates/nokv-agent/workbench_contract_schema.json`.
 - `workbench_contract_test.py` tests normalization and exact surface matching.
 - `live_workbench.py` provisions one root, starts one explicit metadata
   owner, then records a real scientific reconstruction workflow through all 18
@@ -112,8 +112,8 @@ PYTHONPATH=scripts/workbench python3 -m unittest \
 python3 scripts/workbench/fork_restore_recovery_gate_test.py
 ```
 
-The runners below invoke the built binary directly; do not register it in an
-Agent runtime as an MCP command.
+The runners below invoke the built binary directly; it has no MCP transport to
+register in an Agent runtime.
 
 The deployment must provide one persisted `RootId` placement, its
 `LogicalShardId`, current placement generation and owner epoch, a reachable

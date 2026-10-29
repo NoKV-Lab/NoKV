@@ -27,7 +27,7 @@ QUALIFICATION_ROLE = "qualification"
 # A live producer retains the exact requests and responses of its transport
 # under one of these roles, in `<role>.jsonl` beside its result. The native
 # CLI transport writes `cli-transcript`; `mcp-transcript` remains the role of
-# the deprecated sidecar transport and of the historical LingTai gap.
+# the historical LingTai gap declaration, which runs nothing.
 TRANSCRIPT_ROLES = ("cli-transcript", "mcp-transcript")
 
 

@@ -96,10 +96,9 @@ The release-level epoch proof is the real-etcd fence-before/fence-after
 `SIGKILL` runner in
 [`scripts/workbench/local_wal_recovery_gate.py`](../scripts/workbench/local_wal_recovery_gate.py);
 a normal reopen alone does not cover interrupted `Recovering` retries.
-`live_workbench.py` currently drives the 18 tools through a `nokv mcp` child
-process. That sidecar is deprecated and is not a supported NoKV integration
-surface; it remains only as this harness's transport, and evidence produced
-over it qualifies neither the CLI nor the Python SDK path.
+`live_workbench.py` drives the 18 tools as `nokv workbench <tool>` processes
+graded against [`docs/cli-contract.md`](cli-contract.md) and retains
+`cli-transcript.jsonl`; NoKV ships no MCP transport.
 The Workbench root is durable presentation configuration because canonical v1
 manifests contain its projected paths. `nokv provision --workbench-root` binds
 it to the root once, and Agent-facing commands read it from the control plane,

@@ -55,7 +55,7 @@ const fn base64_encoded_upper_bound(raw_bytes: usize) -> usize {
     raw_bytes.saturating_add(2) / 3 * 4
 }
 
-/// Concrete Workbench backend used by the custom CLI and MCP adapter.
+/// Concrete Workbench backend used by the custom CLI.
 #[derive(Clone)]
 pub struct CliWorkbenchBackend {
     client: CliWorkspaceClient,
