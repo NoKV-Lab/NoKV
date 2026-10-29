@@ -126,19 +126,24 @@ the classes of the [CLI contract](cli-contract.md):
 
 | What happened | `class` | Exit |
 | --- | --- | --- |
-| etcd rejected the certificate in the TLS handshake: it is not signed by etcd's trusted CA, or no certificate was presented | `unauthenticated` | 10 |
+| etcd rejected the certificate in the TLS handshake (not signed by etcd's trusted CA, or none presented) and the client received etcd's alert | `unauthenticated` | 10 |
+| The same rejection, but the connection closed before the alert reached the client | `transient` | 5 |
 | The certificate is trusted, but its Common Name is no etcd user, or the user's roles do not grant the key the command needs | `permission_denied` | 11 |
 | etcd's own certificate is not signed by `--etcd-tls-ca` | `invalid_input` | 2 |
 | etcd is unreachable, or an `http://` endpoint names a TLS listener | `transient` | 5 |
 
 etcd answers a trusted certificate with no user the same way as a user whose
 role lacks the key, "permission denied", so NoKV reports both as
-`permission_denied`; etcd's audit of the request tells them apart. The
-handshake alert etcd sends (`UnknownCA`, `BadCertificate`) is named in the
-`unauthenticated` message. A plaintext endpoint against a TLS listener is a
-reset connection to the client, which cannot tell it from an unreachable
-server. Deleting a user, or revoking its role, denies that user's next
-request.
+`permission_denied`; etcd's audit of the request tells them apart. When etcd
+rejects the certificate itself it sends a TLS alert (`UnknownCA`,
+`BadCertificate`) and closes the connection; whether the client reads the
+alert or the closed connection first depends on the platform and timing, so
+the same rejection is `unauthenticated`, naming the alert, or `transient`.
+Both leave nothing applied and reach no owner; a `transient` answer that
+repeats on every attempt with the same certificate is this rejection, and
+etcd's log names it. A plaintext endpoint against a TLS listener is a reset
+connection to the client, which cannot tell it from an unreachable server.
+Deleting a user, or revoking its role, denies that user's next request.
 
 ## Scope
 

@@ -411,25 +411,33 @@ def role_matrix_holds(stack: ControlStack) -> dict[str, Any]:
 def unaccepted_identities_are_refused(stack: ControlStack) -> dict[str, Any]:
     """C5: a trusted certificate whose Common Name is no etcd user holds no
     role, so etcd answers permission denied; a certificate etcd does not
-    trust is rejected in the handshake, as unauthenticated; a CA that does
-    not sign etcd's certificate is a usage error; a plaintext endpoint
-    against the TLS listener is an unreachable server. None reveals an
-    owner, and none reaches one."""
+    trust is rejected in the handshake, which the client reports as
+    unauthenticated when etcd's alert reaches it and as transient when the
+    connection closes first; a CA that does not sign etcd's certificate is a
+    usage error; a plaintext endpoint against the TLS listener is an
+    unreachable server. None reveals an owner, and none reaches one."""
     status = ["operation", "status", new_id()]
     plaintext = ["--etcd-endpoint", f"http://127.0.0.1:{stack.etcd_port}", "--etcd-key-prefix", stack.prefix]
+    outsider = stack.run("c5-outsider", status, identity="outsider", rpc="agent")
+    # Which of the two the client sees depends on whether the TLS alert is
+    # read before the closed connection is; both are refusals before any key.
+    handshake = "unauthenticated" if '"unauthenticated"' in outsider.stderr else "transient"
     observed = {
         "unregistered-cn": stack.refused("c5-nobody", status, "permission_denied", identity="nobody", rpc="agent"),
-        "untrusted-certificate": stack.refused("c5-outsider", status, "unauthenticated", identity="outsider",
-                                               rpc="agent"),
+        "untrusted-certificate": stack.failure(
+            outsider, handshake, "operator" if handshake == "unauthenticated" else "resubmit_same"),
         "wrong-ca": stack.failure(stack.run("c5-wrong-ca", status, etcd=stack.etcd_options("agent", ca="other-ca")),
                                   "invalid_input", "fix_input"),
         "plaintext": stack.failure(stack.run("c5-plaintext", status, etcd=plaintext), "transient", "resubmit_same"),
     }
-    require("UnknownCA" in observed["untrusted-certificate"]["message"], "c5: the handshake alert is named",
-            observed["untrusted-certificate"])
+    if handshake == "unauthenticated":
+        require("UnknownCA" in observed["untrusted-certificate"]["message"], "c5: the handshake alert is named",
+                observed["untrusted-certificate"])
+    require(outsider.connections == 0, "c5-outsider: no owner connection", outsider.connections)
     for name, envelope in observed.items():
         require(f"127.0.0.1:{stack.owner_port}" not in envelope.get("message", ""), f"c5-{name}: no route leaks",
                 envelope)
+    observed["untrusted-certificate-class"] = handshake
     return observed
 
 
