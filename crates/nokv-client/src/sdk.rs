@@ -51,7 +51,9 @@ impl Default for ClientOptions {
 }
 
 impl ClientOptions {
-    pub(crate) fn validate(self) -> Result<(), ClientError> {
+    /// The bounds every client enforces: 1 to 16 attempts, and a backoff
+    /// within its bound.
+    pub fn validate(self) -> Result<(), ClientError> {
         if !(1..=16).contains(&self.max_attempts) {
             return Err(ClientError::InvalidOptions(
                 "max_attempts must be between 1 and 16".to_owned(),
