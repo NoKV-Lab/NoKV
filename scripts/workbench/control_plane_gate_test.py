@@ -40,8 +40,9 @@ class ControlPkiTest(unittest.TestCase):
                 certificate, key = pki.pair(name)
                 self.assertTrue(key.exists())
                 self.assertIn("OK", openssl("verify", "-CAfile", ca, str(certificate)))
-                subject = openssl("x509", "-in", str(certificate), "-noout", "-subject")
-                self.assertEqual(subject.strip().split("CN=")[-1].strip(), name)
+                # RFC 2253 spells the subject the same on every OpenSSL build.
+                subject = openssl("x509", "-in", str(certificate), "-noout", "-subject", "-nameopt", "RFC2253")
+                self.assertEqual(subject.strip().removeprefix("subject="), f"CN={name}")
             outsider, _ = pki.pair("outsider")
             verify = subprocess.run(["openssl", "verify", "-CAfile", ca, str(outsider)], capture_output=True, text=True)
             self.assertNotEqual(verify.returncode, 0)
