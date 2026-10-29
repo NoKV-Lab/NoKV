@@ -30,6 +30,7 @@ import hashlib
 import http.client
 import http.server
 import json
+import socket
 import subprocess
 import sys
 import threading
@@ -615,6 +616,320 @@ def roots_provisioned_later_follow_the_tenant_boundary(stack: TlsStack) -> dict[
             "other_refusal_class": json.loads(refused.stderr.strip() or "{}").get("class")}
 
 
+
+LEAK_MARKERS = ("route_hint", "endpoint", "owner_epoch", "placement_generation", "commit_version", "advertise")
+
+
+def reader_is_refused_every_write_verb(stack: TlsStack) -> dict[str, Any]:
+    """T16: a reader can call every read tool, and every write verb the CLI
+    offers is refused as permission_denied before it takes effect: the
+    Workbench mutation tools, the snapshot and restore tools, and the
+    workspace-path put, append, rename and remove commands."""
+    stack.success(stack.put("t16-seed", WORKBENCH, "t16.txt", new_id(), b"seed"))
+    stack.success(tool(stack, "t16-mint", "workbench_snapshot", {"id": WORKBENCH, "name": "t16", "ttl_days": 1}))
+    listed = stack.success(tool(stack, "t16-list-before", "workbench_list", {"id": WORKBENCH}))
+    snapshots = stack.success(tool(stack, "t16-snapshots-before", "workbench_snapshot_list", {"id": WORKBENCH}))
+    reads = {
+        "workbench_read": {"id": WORKBENCH, "section": "outputs", "path": "t16.txt"},
+        "workbench_stat": {"id": WORKBENCH, "section": "outputs", "path": "t16.txt"},
+        "workbench_list": {"id": WORKBENCH},
+        "workbench_grep": {"id": WORKBENCH, "pattern": "seed", "recursive": True},
+        "workbench_snapshot_list": {"id": WORKBENCH},
+        "workbench_catalog": {"id": WORKBENCH},
+        "workbench_find": {},
+    }
+    for name, arguments in reads.items():
+        stack.success(tool(stack, f"t16-reader-{name}", name, arguments, tls="reader"))
+    digest = "sha256:" + hashlib.sha256(b"t16").hexdigest()
+    writes = {
+        "workbench_create": tool(stack, "t16-reader-create", "workbench_create", {"id": "t16-new"}, tls="reader"),
+        "workbench_put_file": tool(stack, "t16-reader-put-file", "workbench_put_file",
+                                   {"id": WORKBENCH, "section": "outputs", "path": "t16-put.txt", "text": "x"},
+                                   tls="reader"),
+        "workbench_edit": tool(stack, "t16-reader-edit", "workbench_edit",
+                               {"id": WORKBENCH, "section": "outputs", "path": "t16.txt",
+                                "old_string": "seed", "new_string": "x"}, tls="reader"),
+        "workbench_append": tool(stack, "t16-reader-append", "workbench_append",
+                                 {"id": WORKBENCH, "section": "outputs", "path": "t16.txt", "text": "x"},
+                                 tls="reader"),
+        "workbench_commit": tool(stack, "t16-reader-commit", "workbench_commit",
+                                 {"id": WORKBENCH, "manifest": {"t": "16"}, "content_digest_uri": digest,
+                                  "replace": True}, tls="reader"),
+        "workbench_snapshot": tool(stack, "t16-reader-snapshot", "workbench_snapshot",
+                                   {"id": WORKBENCH, "name": "t16-reader", "ttl_days": 1}, tls="reader"),
+        "workbench_snapshot_renew": tool(stack, "t16-reader-renew", "workbench_snapshot_renew",
+                                         {"id": WORKBENCH, "name": "t16", "ttl_days": 2}, tls="reader"),
+        "workbench_snapshot_retire": tool(stack, "t16-reader-retire", "workbench_snapshot_retire",
+                                          {"id": WORKBENCH, "name": "t16"}, tls="reader"),
+        "workbench_restore": tool(stack, "t16-reader-restore", "workbench_restore",
+                                  {"id": WORKBENCH, "destination_id": "t16-restored", "at_snapshot": "t16"},
+                                  tls="reader"),
+        "workspace-path put": stack.run("t16-reader-path-put",
+                                        stack.put_arguments("t16-reader-path-put", WORKBENCH, "t16-path-put.txt",
+                                                            new_id(), b"x"), tls="reader"),
+        "workspace-path append": stack.run("t16-reader-path-append",
+                                           ["workspace-path", "append", WORKBENCH, "outputs", "t16.txt",
+                                            "--operation-id", new_id(), "--text", "x"], tls="reader"),
+        "workspace-path rename": stack.run("t16-reader-path-rename",
+                                           ["workspace-path", "rename", WORKBENCH, "outputs", "t16.txt",
+                                            "t16-renamed.txt", "--expected-generation", "1",
+                                            "--request-id", new_id()], tls="reader"),
+        "workspace-path remove": stack.run("t16-reader-path-remove",
+                                           ["workspace-path", "remove", WORKBENCH, "outputs", "t16.txt",
+                                            "--expected-generation", "1", "--request-id", new_id()],
+                                           tls="reader"),
+    }
+    refusals = {}
+    for verb, call in writes.items():
+        envelope = stack.failure(call, "permission_denied", "operator")
+        require(call.exit == 11 and "Writer" in envelope.get("message", ""),
+                f"t16: {verb} by a reader is refused for want of the Writer role", envelope)
+        refusals[verb] = envelope["message"]
+    require(stack.success(tool(stack, "t16-list-after", "workbench_list", {"id": WORKBENCH})) == listed,
+            "t16: the listing is unchanged", listed)
+    require(stack.success(tool(stack, "t16-snapshots-after", "workbench_snapshot_list", {"id": WORKBENCH}))
+            == snapshots, "t16: the snapshots are unchanged", snapshots)
+    require(stack.body("t16-body", WORKBENCH, "t16.txt") == b"seed", "t16: the seeded body is unchanged", None)
+    for path in ("t16-put.txt", "t16-path-put.txt", "t16-renamed.txt"):
+        require(stack.stat(f"t16-absent-{path}", WORKBENCH, path).get("exists") is False,
+                f"t16: {path} was not created", path)
+    for absent in ("t16-new", "t16-restored"):
+        require(tool(stack, f"t16-absent-{absent}", "workbench_list", {"id": absent}).exit != 0,
+                f"t16: workbench {absent} was not created", absent)
+    return {"reads": sorted(reads), "refused": refusals}
+
+
+def an_expired_credential_is_refused(stack: TlsStack) -> dict[str, Any]:
+    """T17: a credential serves until its expiry and not after; no revocation
+    is needed for it to stop."""
+    certificate, key = stack.pki.client("expiring")
+    stack.clients["expiring"] = (certificate, key)
+    expires_at = int(time.time()) + 5
+    added = stack.identity("t17-add", "credential", "add", stack.tenant, stack.principals["agent"],
+                           "--certificate", str(certificate), "--expires-at-unix", str(expires_at))
+    time.sleep(2.0)
+    before = stack.success(stack.run("t17-before", ["workspace-path", "stat", WORKBENCH, "outputs", "registered.txt"],
+                                     tls="expiring"))
+    time.sleep(max(0.0, expires_at - time.time()) + 2.0)
+    envelope = stack.refused("t17-expired", "expired.txt", tls="expiring")
+    require("not a current credential" in envelope["message"], "t17: the refusal names the credential", envelope)
+    return {"added": added, "before": before, "after": envelope}
+
+
+def a_credential_revoked_during_an_open_session_stops_it(stack: TlsStack) -> dict[str, Any]:
+    """T18: a workbench-session whose credential is revoked while it is open is
+    refused at its next request, and nothing it sends after that lands; the
+    session cannot reconnect with the revoked certificate."""
+    certificate, key = stack.pki.client("sessioncred")
+    stack.clients["sessioncred"] = (certificate, key)
+    added = stack.register("sessioncred", "fourth")
+    time.sleep(2.5)
+    argv = [str(stack.binary), *stack.route, *stack.agent_objects,
+            *stack.tls_options("sessioncred", SERVER_NAME), "workbench-session"]
+    session = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, env=stack.env)
+
+    def call(index: int) -> dict[str, Any]:
+        request = {"id": str(index), "tool": "workbench_put_file", "arguments": {
+            "id": WORKBENCH, "section": "outputs", "path": f"t18-{index}.txt",
+            "text": f"session {index}", "replace": False}}
+        session.stdin.write(json.dumps(request) + "\n")
+        session.stdin.flush()
+        line = session.stdout.readline()
+        return json.loads(line) if line else {"error": "the session closed its output"}
+
+    try:
+        before = call(1)
+        require("result" in before, "t18: the session writes while its credential holds", before)
+        revoked = stack.identity("t18-revoke", "credential", "revoke", stack.tenant, added["fingerprint"])
+        require(revoked.get("revoked") is True, "t18: the credential is revoked", revoked)
+        time.sleep(2.5)
+        after = call(2)
+        again = call(3)
+    finally:
+        session.stdin.close()
+        session.wait(timeout=stack.timeout)
+    for index, reply in ((2, after), (3, again)):
+        require(reply.get("class") == "unauthenticated" and "result" not in reply,
+                f"t18: request {index} after the revocation is unauthenticated", reply)
+        oracle = stack.stat(f"t18-oracle-{index}", WORKBENCH, f"t18-{index}.txt")
+        require(oracle.get("exists") is False, f"t18: request {index} left nothing", oracle)
+    return {"before": before, "after": after, "again": again}
+
+
+def a_tls_trickle_is_dropped_at_the_handshake_deadline(stack: TlsStack) -> dict[str, Any]:
+    """T19: connections that send one byte of a TLS record and then stall are
+    closed by the owner at its handshake deadline (5 s by default) and do not
+    keep a registered client from being served meanwhile."""
+    stalled = []
+    for _ in range(3):
+        connection = socket.create_connection(("127.0.0.1", stack.owner_port), timeout=stack.timeout)
+        connection.sendall(b"\x16")
+        stalled.append((connection, time.monotonic()))
+    served = stack.success(stack.run("t19-served-meanwhile",
+                                     ["workspace-path", "stat", WORKBENCH, "outputs", "registered.txt"]))
+    closed_after = []
+    for connection, opened in stalled:
+        connection.settimeout(stack.timeout)
+        try:
+            data = connection.recv(16)
+            outcome = "eof" if data == b"" else f"data:{data!r}"
+        except ConnectionResetError:
+            outcome = "reset"
+        except socket.timeout:
+            outcome = "still open"
+        closed_after.append((outcome, round(time.monotonic() - opened, 2)))
+        connection.close()
+    require(all(outcome in ("eof", "reset") and 4.0 <= seconds <= 5.0 + stack.timeout
+                for outcome, seconds in closed_after),
+            "t19: every stalled connection is closed by the owner at the handshake deadline", closed_after)
+    served_again = stack.success(stack.run("t19-served-after",
+                                           ["workspace-path", "stat", WORKBENCH, "outputs", "registered.txt"]))
+    return {"served_meanwhile": served, "closed_after": closed_after, "served_after": served_again}
+
+
+def eight_principals_race_one_file_on_two_roots(stack: TlsStack) -> dict[str, Any]:
+    """T20: eight principals, each with its own credential, write the same file
+    on two roots at once under compare-and-swap. No update is lost, every
+    operation names its initiator, no principal can present another's
+    operation with other inputs, and a revoked role stops its principal
+    within the owner's refresh interval plus one request while the others go
+    on."""
+    racers = [f"racer{index}" for index in range(8)]
+    for name in racers:
+        stack.clients[name] = stack.pki.client(name)
+        stack.principals[name] = new_id()
+        stack.identity(f"t20-principal-{name}", "principal", "create", stack.tenant, stack.principals[name])
+        stack.register(name, name)
+        stack.role("grant", name, "writer", ["--tenant-wide"])
+    second = new_id()
+    stack.provision(second)
+    stack.identity("t20-bind", "root", "bind", second, stack.tenant)
+    deadline = time.monotonic() + stack.timeout
+    while time.monotonic() < deadline:
+        if '"NotFound"' in stack.run("t20-probe", ["operation", "status", new_id()], root=second).stderr:
+            break
+        time.sleep(0.2)
+    else:
+        raise ContractFailure(f"t20: the second root was not served within {stack.timeout}s")
+    stack.success(stack.run("t20-create", ["workbench", "workbench_create", json.dumps({"id": WORKBENCH})],
+                            root=second))
+    time.sleep(2.5)
+    roots = {"first": None, "second": second}
+    for label, root in roots.items():
+        stack.success(stack.run(f"t20-seed-{label}", stack.put_arguments(f"t20-seed-{label}", WORKBENCH, "race.txt",
+                                                                          new_id(), b"seed"), root=root))
+    rounds = 3
+
+    def race(name: str, label: str) -> list[dict[str, Any]]:
+        root = roots[label]
+        successes = []
+        for round_index in range(rounds):
+            for attempt in range(60):
+                tag = f"t20-{name}-{label}-{round_index}-{attempt}"
+                current = stack.success(stack.run(f"{tag}-stat", ["workspace-path", "stat", WORKBENCH, "outputs",
+                                                                 "race.txt"], tls=name, root=root))
+                operation_id = new_id()
+                arguments = stack.put_arguments(f"{tag}-put", WORKBENCH, "race.txt", operation_id,
+                                                f"{name} {round_index}".encode(),
+                                                "--expected-generation", str(current["generation"]))
+                call = stack.run(f"{tag}-put", arguments, tls=name, root=root)
+                if call.exit == 0:
+                    successes.append({"operation_id": operation_id, "receipt": json.loads(call.stdout),
+                                      "attempts": attempt + 1})
+                    break
+                stack.failure(call, "precondition_failed", "reread_then_retry")
+            else:
+                raise ContractFailure(f"t20: {name} starved on the {label} root")
+        return successes
+
+    with ThreadPoolExecutor(max_workers=len(racers) * len(roots)) as pool:
+        futures = {(name, label): pool.submit(race, name, label) for name in racers for label in roots}
+        results = {key: future.result() for key, future in futures.items()}
+    report: dict[str, Any] = {"roots": {}, "attempts": 0}
+    for label, root in roots.items():
+        final = stack.stat(f"t20-final-{label}", WORKBENCH, "race.txt") if root is None else \
+            stack.success(stack.run(f"t20-final-{label}", ["workspace-path", "stat", WORKBENCH, "outputs", "race.txt"],
+                                    root=root))
+        landed = sum(len(results[(name, label)]) for name in racers)
+        require(final.get("generation") == 1 + landed == 1 + len(racers) * rounds,
+                f"t20: every write on the {label} root landed exactly once", [final, landed])
+        for name in racers:
+            for success in results[(name, label)]:
+                status = stack.success(stack.run(f"t20-status-{name}-{label}-{success['operation_id'][:6]}",
+                                                 ["operation", "status", success["operation_id"]], tls=name,
+                                                 root=root))
+                require(status.get("initiator") == stack.principals[name],
+                        f"t20: {name}'s operation on the {label} root names {name}", status)
+                report["attempts"] += success["attempts"]
+        report["roots"][label] = {"generation": final.get("generation"), "landed": landed}
+    # No takeover: another racer presenting a landed operation id with other
+    # inputs is refused, and the operation keeps its initiator.
+    victim = results[("racer0", "first")][0]
+    takeover = stack.failure(stack.run(
+        "t20-takeover", stack.put_arguments("t20-takeover", WORKBENCH, "race.txt", victim["operation_id"],
+                                            b"takeover", "--expected-generation", "1"), tls="racer1"),
+        "identity_conflict", "do_not_retry")
+    kept = stack.success(stack.run("t20-takeover-status", ["operation", "status", victim["operation_id"]],
+                                   tls="racer1"))
+    require(kept.get("initiator") == stack.principals["racer0"], "t20: the operation keeps its initiator", kept)
+    # Revocation latency: the refresh interval plus one request.
+    probe_started = time.monotonic()
+    stack.success(stack.run("t20-request-cost", ["workspace-path", "stat", WORKBENCH, "outputs", "race.txt"],
+                            tls="racer0"))
+    request_s = round(time.monotonic() - probe_started, 3)
+    generation = stack.stat("t20-before-revocation", WORKBENCH, "race.txt")["generation"]
+    stack.role("revoke", "racer0", "writer", ["--tenant-wide"])
+    revoked_at = time.monotonic()
+    probes = 0
+    while True:
+        # racer0 is the only writer now, so its own receipts track the generation.
+        probes += 1
+        call = stack.run(f"t20-revoked-put-{probes}",
+                         stack.put_arguments(f"t20-revoked-put-{probes}", WORKBENCH, "race.txt", new_id(),
+                                             b"after revocation", "--expected-generation", str(generation)),
+                         tls="racer0")
+        if call.exit != 0:
+            refused_after = round(time.monotonic() - revoked_at, 3)
+            stack.failure(call, "permission_denied", "operator")
+            break
+        generation = json.loads(call.stdout)["generation"]
+        if time.monotonic() - revoked_at > 10:
+            raise ContractFailure("t20: racer0 kept writing 10 s after its role was revoked")
+        time.sleep(0.05)
+    require(refused_after <= 1.0 + request_s + 1.0,
+            "t20: the revoked principal is stopped within the refresh interval plus one request (1 s tolerance)",
+            {"refused_after_s": refused_after, "request_s": request_s, "probes": probes})
+    survivor = stack.success(stack.run("t20-survivor", stack.put_arguments(
+        "t20-survivor", WORKBENCH, "race.txt", new_id(), b"racer1 after", "--expected-generation",
+        str(stack.stat("t20-survivor-stat", WORKBENCH, "race.txt")["generation"])), tls="racer1"))
+    report.update({"takeover": takeover, "revocation": {"refused_after_s": refused_after, "request_s": request_s,
+                                                        "probes": probes}, "survivor": survivor})
+    return report
+
+
+def a_principal_of_another_tenant_is_refused_without_a_route(stack: TlsStack) -> dict[str, Any]:
+    """T21: a credential that is current in another tenant is refused as
+    unauthenticated, and the refusal says nothing about the root: no route,
+    endpoint, epoch or generation."""
+    other_tenant, principal = new_id(), new_id()
+    certificate, key = stack.pki.client("foreign")
+    stack.clients["foreign"] = (certificate, key)
+    stack.identity("t21-tenant", "tenant", "create", other_tenant)
+    stack.identity("t21-principal", "principal", "create", other_tenant, principal)
+    stack.identity("t21-credential", "credential", "add", other_tenant, principal, "--certificate", str(certificate),
+                   "--expires-at-unix", str(int(time.time()) + 3600))
+    stack.identity("t21-role", "role", "grant", other_tenant, principal, "--role", "writer", "--tenant-wide")
+    time.sleep(2.5)
+    envelope = stack.refused("t21-foreign", "foreign.txt", tls="foreign")
+    require("not a current credential" in envelope["message"], "t21: the refusal names the credential", envelope)
+    leaks = [marker for marker in LEAK_MARKERS if marker in envelope.get("message", "")]
+    leaks += [key for key, value in envelope.get("details", {}).items()
+              if value is not None and any(word in key for word in ("route", "endpoint", "epoch", "generation"))]
+    require(not leaks, "t21: the refusal carries nothing about the root", [leaks, envelope])
+    return envelope
+
+
 SCENARIOS: dict[str, Callable[[TlsStack], dict]] = {
     "t1_registered_client_round_trip": registered_client_round_trip,
     "t2_unregistered_certificate_refused": unregistered_certificate_refused,
@@ -633,6 +948,14 @@ SCENARIOS: dict[str, Callable[[TlsStack], dict]] = {
     "t14_multi_block_publish_through_the_owner_with_read_only_agent_credentials":
         multi_block_publish_through_the_owner_with_read_only_agent_credentials,
     "t15_roots_provisioned_later_follow_the_tenant_boundary": roots_provisioned_later_follow_the_tenant_boundary,
+    "t16_reader_is_refused_every_write_verb": reader_is_refused_every_write_verb,
+    "t17_an_expired_credential_is_refused": an_expired_credential_is_refused,
+    "t18_a_credential_revoked_during_an_open_session_stops_it":
+        a_credential_revoked_during_an_open_session_stops_it,
+    "t19_a_tls_trickle_is_dropped_at_the_handshake_deadline": a_tls_trickle_is_dropped_at_the_handshake_deadline,
+    "t20_eight_principals_race_one_file_on_two_roots": eight_principals_race_one_file_on_two_roots,
+    "t21_a_principal_of_another_tenant_is_refused_without_a_route":
+        a_principal_of_another_tenant_is_refused_without_a_route,
 }
 
 
