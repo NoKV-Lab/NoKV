@@ -2424,12 +2424,12 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
                 )
             })
             .map_err(|error| format!("cannot start root mounter: {error}"));
-        let result = server.run_until_shutdown(shutdown.as_ref());
+        let server_result = server.run_until_shutdown(shutdown.as_ref());
         mounter_stopped.store(true, Ordering::Release);
         if let Ok(mounter) = mounter {
             let _ = mounter.join();
         }
-        result
+        server_result
     });
     if server_result.is_err() {
         owner_loss.fail_closed();
