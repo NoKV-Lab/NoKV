@@ -14,6 +14,7 @@ use nokv_protocol::{
     decode_handshake_frame, encode_handshake_frame, HandshakeKind, WorkspaceHandshake,
     HANDSHAKE_FRAME_BYTES, MAX_FRAME_BYTES, WORKSPACE_PROTOCOL_SCHEMA,
 };
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
@@ -74,6 +75,51 @@ impl fmt::Debug for RpcClientTls {
 }
 
 impl RpcClientTls {
+    /// The same identity from PEM documents held in memory: the roots that
+    /// sign the owner's certificate, this client's certificate chain, and its
+    /// private key. Errors name the document, never its bytes.
+    pub fn from_pem(
+        server_name: &str,
+        server_roots_pem: &[u8],
+        client_chain_pem: &[u8],
+        client_key_pem: &[u8],
+    ) -> Result<Self, TransportError> {
+        let server_name = ServerName::try_from(server_name.to_owned()).map_err(|_| {
+            TransportError::security(format!(
+                "invalid RPC TLS configuration: server name {server_name:?} is not a DNS name or \
+                 IP address"
+            ))
+        })?;
+        let certificates = |document: &str, pem: &[u8]| {
+            let certificates = CertificateDer::pem_slice_iter(pem)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    TransportError::security(format!(
+                        "invalid RPC TLS configuration: the {document} is not valid PEM: {error}"
+                    ))
+                })?;
+            if certificates.is_empty() {
+                return Err(TransportError::security(format!(
+                    "invalid RPC TLS configuration: the {document} contains no certificate"
+                )));
+            }
+            Ok(certificates)
+        };
+        let client_key = PrivateKeyDer::from_pem_slice(client_key_pem).map_err(|_| {
+            TransportError::security(
+                "invalid RPC TLS configuration: the client key contains no PKCS#8, PKCS#1, or \
+                 SEC1 private key"
+                    .to_owned(),
+            )
+        })?;
+        Self::new(
+            server_name,
+            certificates("server roots", server_roots_pem)?,
+            certificates("client certificate chain", client_chain_pem)?,
+            client_key,
+        )
+    }
+
     pub fn new(
         server_name: ServerName<'static>,
         server_roots: Vec<CertificateDer<'static>>,
@@ -172,6 +218,12 @@ impl FramedTcpTransport {
     /// Require TLS on every connection, with no plaintext fallback. The
     /// transport starts a new pool, so no connection admitted under other
     /// settings is reused.
+    /// Whether two handles draw on one connection pool: true for a transport
+    /// and its clones, false for two transports built separately.
+    pub fn shares_pool_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.idle, &other.idle)
+    }
+
     pub fn with_tls(self, tls: RpcClientTls) -> Self {
         Self {
             options: self.options,
@@ -611,6 +663,73 @@ mod tests {
     };
     use nokv_types::ErrorClass;
     use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+
+    #[test]
+    fn pem_documents_build_the_same_identity_as_der_inputs() {
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+        let client_key = KeyPair::generate().unwrap();
+        let client = CertificateParams::new(vec!["agent".to_owned()])
+            .unwrap()
+            .signed_by(&client_key, &ca)
+            .unwrap();
+        let tls = RpcClientTls::from_pem(
+            "owner.test",
+            ca.pem().as_bytes(),
+            client.pem().as_bytes(),
+            client_key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            tls.server_name,
+            ServerName::try_from("owner.test".to_owned()).unwrap()
+        );
+
+        for (name, roots, chain, key) in [
+            (
+                "owner.test",
+                b"not pem".as_slice(),
+                client.pem().as_bytes(),
+                client_key.serialize_pem().as_bytes(),
+            ),
+            (
+                "owner.test",
+                ca.pem().as_bytes(),
+                b"".as_slice(),
+                client_key.serialize_pem().as_bytes(),
+            ),
+            (
+                "owner.test",
+                ca.pem().as_bytes(),
+                client.pem().as_bytes(),
+                b"-----BEGIN NOTHING-----".as_slice(),
+            ),
+            (
+                "not a name!",
+                ca.pem().as_bytes(),
+                client.pem().as_bytes(),
+                client_key.serialize_pem().as_bytes(),
+            ),
+        ] {
+            let error = RpcClientTls::from_pem(name, roots, chain, key).unwrap_err();
+            assert!(
+                error.to_string().contains("invalid RPC TLS configuration"),
+                "{error}"
+            );
+        }
+        let empty_roots = RpcClientTls::from_pem(
+            "owner.test",
+            b"",
+            client.pem().as_bytes(),
+            client_key.serialize_pem().as_bytes(),
+        )
+        .unwrap_err();
+        assert!(
+            empty_roots.to_string().contains("server roots"),
+            "{empty_roots}"
+        );
+    }
     use rustls::pki_types::PrivatePkcs8KeyDer;
     use rustls::server::WebPkiClientVerifier;
     use rustls::{ServerConfig, ServerConnection};

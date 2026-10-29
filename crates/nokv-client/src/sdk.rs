@@ -51,7 +51,7 @@ impl Default for ClientOptions {
 }
 
 impl ClientOptions {
-    fn validate(self) -> Result<(), ClientError> {
+    pub(crate) fn validate(self) -> Result<(), ClientError> {
         if !(1..=16).contains(&self.max_attempts) {
             return Err(ClientError::InvalidOptions(
                 "max_attempts must be between 1 and 16".to_owned(),
@@ -171,6 +171,16 @@ where
 
     pub const fn root_id(&self) -> RootIdentity {
         self.root_id
+    }
+
+    /// The transport this client sends through; a session's clients share one.
+    pub const fn transport(&self) -> &Transport {
+        &self.transport
+    }
+
+    /// The resolver this client routes through; a session's clients share one.
+    pub const fn routes(&self) -> &Resolver {
+        &self.routes
     }
 
     pub(crate) const fn max_attempts(&self) -> u32 {
