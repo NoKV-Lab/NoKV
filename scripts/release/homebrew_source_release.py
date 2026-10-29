@@ -486,7 +486,7 @@ def render_formula(manifest: dict[str, Any], source_url: str) -> str:
 # SPDX-License-Identifier: Apache-2.0
 
 class Nokv < Formula
-  desc "Metadata control plane and Workbench MCP server for agent workspaces"
+  desc "Metadata control plane and Workbench CLI for agent workspaces"
   homepage "https://nokv.io/"
   url {_ruby_string(values["url"])}
   sha256 {_ruby_string(values["source_sha"])}

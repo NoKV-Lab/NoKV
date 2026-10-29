@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Custom CLI, MCP adapter, and shard-owner process for NoKV Agent workspaces.
+//! Custom CLI and shard-owner process for NoKV Agent workspaces.
 
 mod backend;
 mod build_info;
@@ -15,10 +15,9 @@ mod object_store;
 mod provision;
 mod rpc_tls;
 mod transfer;
-mod workbench_mcp;
 mod workbench_session;
 
-use std::io::{self, BufReader};
+use std::io;
 use std::path::Path;
 use std::process::ExitCode;
 #[cfg(feature = "control")]
@@ -28,20 +27,19 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use nokv_agent::{
     execute_tool, tool_definitions, workbench_tool_idempotency, AgentError, ReadRequest, ReadView,
-    ScopedPath, SdkGenericAgentToolHandler, SdkWorkbenchToolHandler, Section, WorkbenchBackend,
-    WorkbenchToolHandler, WORKBENCH_CONTRACT_SCHEMA,
+    ScopedPath, SdkWorkbenchToolHandler, Section, WorkbenchBackend, WorkbenchToolHandler,
+    WORKBENCH_CONTRACT_SCHEMA,
 };
 use nokv_types::{ErrorClass, IdempotencyScope, NextAction, NormalizedRelativePath, WorkbenchId};
 use serde_json::{json, Value};
 
 use backend::CliWorkbenchBackend;
-use cli::{AppendPayload, Command, Invocation, McpProfile, WorkspacePathCommand};
+use cli::{AppendPayload, Command, Invocation, WorkspacePathCommand};
 use failure_envelope::CliFailure;
 #[cfg(feature = "control")]
 use object_store::CliObjectStore;
 
 type CliHandler = SdkWorkbenchToolHandler<CliWorkbenchBackend>;
-type CliGenericAgentHandler = SdkGenericAgentToolHandler<CliWorkbenchBackend>;
 
 #[cfg(feature = "control")]
 const WORKBENCH_REQUIRED_RPC_CAPABILITIES: [nokv_protocol::WorkspaceCapability; 8] = [
@@ -76,14 +74,6 @@ fn run() -> Result<(), CliFailure> {
         ),
         error => CliFailure::invalid_input(error.to_string()),
     })?;
-    if matches!(invocation.command, Command::Mcp { .. }) {
-        // stderr only: stdout carries the line-delimited JSON-RPC stream.
-        eprintln!(
-            "warning: `nokv mcp` is deprecated and is not a supported NoKV integration \
-             surface. Use `nokv workbench <tool>` or the direct Python SDK. The sidecar is \
-             retained only as the live qualification harness transport."
-        );
-    }
     match &invocation.command {
         Command::Help => {
             print_help();
@@ -152,25 +142,6 @@ fn run() -> Result<(), CliFailure> {
                     IdempotencyScope::Unidentified,
                 )
             })
-        }
-        Command::Mcp { profile } => {
-            let input = io::stdin();
-            let output = io::stdout();
-            match profile {
-                McpProfile::Workbench => {
-                    let handler = build_handler(&invocation)?;
-                    workbench_mcp::serve(&handler, BufReader::new(input.lock()), output.lock())
-                }
-                McpProfile::Agent => {
-                    let handler = build_generic_agent_handler(&invocation)?;
-                    workbench_mcp::serve_agent(
-                        &handler,
-                        BufReader::new(input.lock()),
-                        output.lock(),
-                    )
-                }
-            }
-            .map_err(|error| CliFailure::from(format!("MCP transport failed: {error}")))
         }
         Command::Materialize {
             workbench,
@@ -484,18 +455,6 @@ fn handler_for(
         usize::try_from(invocation.client.max_attempts)
             .map_err(|_| CliFailure::invalid_input("--max-attempts does not fit this platform"))?,
         workbench_root.as_str(),
-    )
-    .map_err(|error| CliFailure::from_agent(&error, IdempotencyScope::ReadOnly))
-}
-
-fn build_generic_agent_handler(
-    invocation: &Invocation,
-) -> Result<CliGenericAgentHandler, CliFailure> {
-    let admitted = admit_root(invocation)?;
-    SdkGenericAgentToolHandler::with_max_bytes(
-        admitted.backend,
-        invocation.client.max_artifact_bytes,
-        admitted.workbench_root.as_str(),
     )
     .map_err(|error| CliFailure::from_agent(&error, IdempotencyScope::ReadOnly))
 }
@@ -1569,15 +1528,12 @@ fn encode_lowercase_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-fn print_help() {
-    println!(
-        "\
+const HELP_TEXT: &str = "\
 NoKV Agent-workspace CLI
 
 USAGE:
   nokv [connection/object options] workbench <tool> '<json arguments>'
   nokv [connection/object options] workbench-session < requests.jsonl
-  nokv [connection/object options] mcp [--profile workbench|agent]   (DEPRECATED)
   nokv [connection/object options] materialize <workbench> <section> <path> <destination>
   nokv [connection/object options] collect <workbench> <section> <source> <path> [--replace] [--expected-generation N] [--content-type TYPE] [--operation-id HEX32 [--expected-workspace-incarnation-id HEX32]]
   nokv [route/agent options] operation status (<HEX32> | --commit-identity <HEX64>)
@@ -1597,7 +1553,7 @@ USAGE:
 
 AGENT CONTROL ROUTING:
   --root-id HEX32
-  --agent-id HEX32 is required by provision, and without RPC TLS by workbench, mcp, materialize, collect,
+  --agent-id HEX32 is required by provision, and without RPC TLS by workbench, materialize, collect,
     workspace-path, and operation commands
   AgentId is a durable deployment identity used to prevent root misconfiguration; it is not an authentication credential
   --metadata-address HOST:PORT --logical-shard-id HEX32 --object-namespace-id HEX32
@@ -1612,13 +1568,10 @@ AGENT CONTROL ROUTING:
 
 AGENT PRESENTATION:
   provision --workbench-root /agents/TEAM/wb binds the root's presentation root once; workbench,
-    workbench-session, materialize, collect, and mcp read it from the control plane, so every Agent
+    workbench-session, materialize, and collect read it from the control plane, so every Agent
     of a root presents it the same way
   the presentation root is durable: it shapes responses and canonical v1 manifest paths
   RootId remains the only storage/routing identity; the presentation root never enters Holt keys
-  mcp is DEPRECATED and is not a supported NoKV integration surface: use `nokv workbench <tool>`
-  or the direct Python SDK; it is retained only as the live qualification harness transport
-  mcp defaults to the 18-tool Workbench profile; --profile agent selects the seven path tools
   workspace-path is a custom CLI surface; it does not add to the fixed 18 Workbench tools
   workspace-path rename/remove require an explicit lowercase HEX32 request id for exact cross-process replay
   workspace-path append requires a stable lowercase HEX32 logical operation id
@@ -1711,8 +1664,10 @@ OBJECT DATA:
   --object-bucket NAME [--object-endpoint URL] [--object-root PREFIX]
   [--hot-cache-dir PATH --hot-cache-bytes BYTES]
 
-NoKV exposes SDK and CLI operations. It does not expose FUSE or POSIX."
-    );
+NoKV exposes SDK and CLI operations. It does not expose FUSE or POSIX.";
+
+fn print_help() {
+    println!("{HELP_TEXT}");
 }
 
 #[cfg(feature = "control")]
@@ -2725,6 +2680,11 @@ mod tests {
     }
 
     #[test]
+    fn help_text_no_longer_documents_an_mcp_command() {
+        assert!(!HELP_TEXT.to_ascii_lowercase().contains("mcp"));
+    }
+
+    #[test]
     fn static_agent_route_fails_before_rpc_configuration() {
         let invocation = cli::parse(
             [
@@ -2734,21 +2694,14 @@ mod tests {
                 "77777777777777777777777777777777",
                 "--logical-shard-id",
                 "not-a-valid-shard-id",
-                "mcp",
-                "--profile",
-                "agent",
+                "workbench-session",
             ]
             .into_iter()
             .map(str::to_owned),
         )
         .unwrap();
 
-        assert_eq!(
-            invocation.command,
-            Command::Mcp {
-                profile: McpProfile::Agent
-            }
-        );
+        assert_eq!(invocation.command, Command::WorkbenchSession);
 
         let error = configured_agent_admission(&invocation).unwrap_err();
         assert_eq!(error.exit_code(), 2);

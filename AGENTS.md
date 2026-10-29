@@ -52,25 +52,24 @@ surface. Treat the direct Python SDK as the second-choice embedded surface.
 Downstream Agent systems should normally provide their own skills that invoke
 the CLI, or use the Python SDK when they need an in-process integration.
 
-The `nokv mcp` Workbench sidecar is deprecated. It is not a supported NoKV
-integration surface and must not be presented as one in documentation,
-examples, release guidance, or reviews. Do not accept new work that extends it,
-and do not restore MCP to any surface ordering: the order is CLI first, Python
-SDK second, Rust SDK third.
+The `nokv mcp` Workbench sidecar has been removed; NoKV ships no MCP
+transport. Do not reintroduce one, do not present MCP as an integration
+surface in documentation, examples, release guidance, or reviews, and do not
+restore MCP to any surface ordering: the order is CLI first, Python SDK
+second, Rust SDK third.
 
-No live qualification gate drives the product through the sidecar any more.
+Every live qualification gate drives the product through the native CLI.
 `scripts/workbench/live_workbench.py`,
 `scripts/workbench/object_namespace_recovery_gate.py`, and
 `scripts/workbench/restore_composition_gate.py` run every Workbench tool call
 as its own `nokv workbench <tool>` process, grade results and failures against
 `docs/cli-contract.md`, and retain `cli-transcript.jsonl`.
-`scripts/workbench/lingtai_mcp_qualification.py` is a source-bound gap
-declaration that emits a synthetic transcript stub rather than running
-anything. The sidecar's remaining callers are its own `nokv mcp` command
-(`crates/nokv/src/workbench_mcp.rs`, the `mcp` arm in `cli.rs` and `main.rs`)
-and historical documentation; deleting it is a product change for its own PR,
-not harness plumbing. The stable 18-tool Workbench contract itself is
-independent of MCP and remains authoritative.
+`scripts/workbench/lingtai_mcp_qualification.py` and the `lingtai-mcp`
+producer of the pre-#423 ledger are a historical gap declaration for LingTai's
+MCP client: the script emits a synthetic transcript stub and runs nothing.
+Retiring that evidence class is a ledger change for its own PR. The stable
+18-tool Workbench contract is independent of any transport and remains
+authoritative.
 
 ## Tenant Identity And Access Direction
 
