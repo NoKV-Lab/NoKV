@@ -235,10 +235,19 @@ class ControlStack(Stack):
 
     def provision(self) -> None:
         for root, shard in ((self.ids["root"], self.ids["shard"]), (self.ids["other_root"], self.ids["other_shard"])):
-            call = self.run(f"provision-{root[:8]}", ["provision", shard, "--workbench-root", "/agents/control/wb"],
-                            identity="root", root=root)
-            if call.exit != 0:
-                raise NotQualified(f"provision failed: {call.stderr[-600:]}")
+            # `provision` probes the object provider's admission once and
+            # reports an outage as a failure; on a shared CI object store a
+            # transient refusal of that probe is retried a few times here,
+            # with every attempt in the transcript.
+            for attempt in range(1, 4):
+                call = self.run(f"provision-{root[:8]}-{attempt}",
+                                ["provision", shard, "--workbench-root", "/agents/control/wb"],
+                                identity="root", root=root)
+                if call.exit == 0:
+                    break
+                if "admission is unavailable" not in call.stderr or attempt == 3:
+                    raise NotQualified(f"provision failed: {call.stderr[-600:]}")
+                time.sleep(2.0)
 
     def identity_admin(self, label: str, *arguments: str, identity: str = "root") -> Call:
         return self.run(label, ["identity", *arguments], identity=identity)
