@@ -185,6 +185,22 @@ impl ClientError {
         self.rpc_failure().map(|failure| failure.code)
     }
 
+    /// The class of a refusal the owner issued before dispatching the
+    /// request: a principal without the role or a current credential, or an
+    /// owner whose policy copy is stale and asks for a retry. The request was
+    /// not applied, so a mutation that ends this way has no pending outcome.
+    fn refused_before_dispatch(&self) -> Option<ErrorClass> {
+        let class = self.class();
+        let refused = matches!(
+            self.rpc_code(),
+            Some(ErrorCode::Unauthenticated | ErrorCode::PermissionDenied)
+        ) || matches!(
+            class,
+            ErrorClass::Unauthenticated | ErrorClass::PermissionDenied
+        );
+        refused.then_some(class)
+    }
+
     /// What this failure means for durable state when it ends a mutation.
     ///
     /// A failure that may follow delivery is an unknown outcome: an owner can
@@ -208,6 +224,10 @@ impl ClientError {
                 abort_failure,
                 ..
             } => {
+                if let Some(refusal) = source.refused_before_dispatch() {
+                    // A refused abort cannot make a refused request unknown.
+                    return refusal;
+                }
                 if abort_failure.is_some() {
                     // The publication's durable state was not confirmed.
                     ErrorClass::OutcomeUnknown
@@ -218,6 +238,10 @@ impl ClientError {
             Self::AppendUnresolved { state, source, .. } => {
                 if source.rpc_code() == Some(ErrorCode::RequestReplayMismatch) {
                     return ErrorClass::IdentityConflict;
+                }
+                if let Some(refusal) = source.refused_before_dispatch() {
+                    // No outcome is pending behind the append identity.
+                    return refusal;
                 }
                 match state {
                     Some(OperationState::Running | OperationState::Aborting) => {
@@ -413,6 +437,69 @@ mod tests {
             current_generation: None,
             route_hint: None,
         }
+    }
+
+    #[test]
+    fn a_refused_append_is_the_refusal_not_an_unknown_outcome() {
+        // The owner refuses an append before applying anything when the
+        // principal lacks the role or the credential is no longer current;
+        // the caller must stop, not query an outcome that cannot exist.
+        for (code, class) in [
+            (ErrorCode::PermissionDenied, ErrorClass::PermissionDenied),
+            (ErrorCode::Unauthenticated, ErrorClass::Unauthenticated),
+        ] {
+            let error = ClientError::AppendUnresolved {
+                operation_id: OperationIdentity([1; 16]),
+                state: None,
+                source: Box::new(ClientError::Rpc(refusal(code, false))),
+            };
+            assert_eq!(error.class(), class, "{code:?}");
+        }
+        let handshake = ClientError::AppendUnresolved {
+            operation_id: OperationIdentity([1; 16]),
+            state: None,
+            source: Box::new(ClientError::Transport(TransportError::unauthenticated(
+                "no credential",
+            ))),
+        };
+        assert_eq!(handshake.class(), ErrorClass::Unauthenticated);
+        // A stale policy copy asks for a retry; the append was not applied.
+        let stale = ClientError::AppendUnresolved {
+            operation_id: OperationIdentity([1; 16]),
+            state: None,
+            source: Box::new(ClientError::Rpc(refusal(ErrorCode::Unauthenticated, true))),
+        };
+        assert_eq!(stale.class(), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn a_refused_publish_is_the_refusal_even_when_its_abort_is_refused() {
+        // A principal whose role is revoked between two stages of a publish
+        // is refused at the next stage and again at the abort; the request
+        // was not applied, and only an operator can act.
+        let refused = ClientError::ArtifactPublishFailed {
+            stage: ArtifactPublishStage::Complete,
+            source: Box::new(ClientError::Rpc(refusal(
+                ErrorCode::PermissionDenied,
+                false,
+            ))),
+            abort_failure: Some(Box::new(ClientError::Rpc(refusal(
+                ErrorCode::PermissionDenied,
+                false,
+            )))),
+        };
+        assert_eq!(refused.class(), ErrorClass::PermissionDenied);
+        // A request whose answer was lost stays unknown even when the abort
+        // is then refused: the owner may have applied it.
+        let lost = ClientError::ArtifactPublishFailed {
+            stage: ArtifactPublishStage::Complete,
+            source: Box::new(ClientError::Rpc(refusal(ErrorCode::NotOwner, false))),
+            abort_failure: Some(Box::new(ClientError::Rpc(refusal(
+                ErrorCode::PermissionDenied,
+                false,
+            )))),
+        };
+        assert_eq!(lost.class(), ErrorClass::OutcomeUnknown);
     }
 
     #[test]
