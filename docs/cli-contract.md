@@ -53,6 +53,8 @@ model carries a class itself, and no new caller should read it.
 | 11 | `permission_denied` | The authenticated principal holds no role that allows the request, or it tried to continue an operation another principal began; or the control plane's roles do not grant a key the command needs. Nothing was applied. |
 <!-- exit-codes:end -->
 
+A refusal of the principal keeps its class when it ends an append or a multi-stage publish: the owner refuses before it applies anything, so an append refused as `permission_denied` or `unauthenticated` is not an unknown outcome, and a publish whose next stage and whose abort are both refused after a role change is `permission_denied`, not `outcome_unknown`. `next_action` is `operator` in both cases.
+
 A Rust panic exits `101`, outside this table. A `nokv workbench-session`
 answers each failed line with `{"id","error","class","next_action"}` and keeps
 running; the session process itself exits `0` at end of input.
