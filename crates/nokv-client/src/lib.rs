@@ -19,6 +19,7 @@ mod idempotent_publish;
 mod operation_status;
 mod route;
 mod sdk;
+mod session;
 mod snapshot_workflow;
 mod transport;
 mod workbench_lifecycle;
@@ -54,6 +55,7 @@ pub use route::ControlRouteResolver;
 pub use route::EtcdRouteOptions;
 pub use route::{ResolvedRoute, RouteRefreshMode, RouteResolver, StaticRouteResolver};
 pub use sdk::{ClientCall, ClientOptions, WorkspaceClient};
+pub use session::Session;
 pub use snapshot_workflow::{
     SnapshotMintOptions, SnapshotRenewOptions, SnapshotRetireOptions, SnapshotRetireOutcome,
 };

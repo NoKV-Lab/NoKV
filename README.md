@@ -354,7 +354,7 @@ do not expose identical method shapes.
 | --- | --- | --- |
 | Direct Python `Client` | Create/stat/exists/list/remove/rename, byte/file publish, stable append with status/inspect/recover, whole/range/batch reads, query/aggregate/catalog/find, commit/restore, snapshot lifecycle, materialize, and collect | Direct SDK, not a tool-for-tool copy of the 18-name CLI facade |
 | Python adapters | Workbench-scoped fsspec, checkpoint helpers, and optional torch Distributed Checkpoint reader/writer | Bounded to an explicit Workbench; not arbitrary-root POSIX or FUSE |
-| Rust `WorkspaceClient` | Lower-level typed workspace, publication, query, lifecycle, routing, and batch-range workflows | Recommended when the caller must own typed retry and recovery integration |
+| Rust `WorkspaceClient` | Lower-level typed workspace, publication, query, lifecycle, routing, and batch-range workflows; a `Session` derives the clients of several roots from one transport, resolver, and set of credentials | Recommended when the caller must own typed retry and recovery integration |
 | Rust-only extensions | Polling change feed, generic custom-index registration, raw non-append operation status, and phased publish/restore primitives | No native CLI or Python method today; change feed is polling, not push |
 | Metadata and server lifecycle | snapshot reap, commit/tag holds, reference-fenced GC, quarantine reconciliation, Holt reopen, and optional shared recovery records | Internal/operator mechanisms, not independent end-user commands |
 
