@@ -52,14 +52,12 @@ GENERIC_AGENT_CONTRACT = _source(
         '"checked-in generic Agent contract tool set differs"',
     ),
 )
-GENERIC_AGENT_CLI_PROFILE = _source(
+GENERIC_AGENT_SDK_PROFILE = _source(
     "l01-generic-agent-profile-is-explicitly-selectable",
-    "crates/nokv/src/cli.rs",
+    "crates/nokv-agent/src/generic.rs",
     required=(
-        "pub enum McpProfile {",
-        '"agent" => McpProfile::Agent,',
-        '"workbench" => McpProfile::Workbench,',
-        "profile: profile.unwrap_or_default(),",
+        "pub struct SdkGenericAgentToolHandler<B> {",
+        "impl<B: WorkbenchBackend> GenericAgentToolHandler for SdkGenericAgentToolHandler<B> {",
     ),
 )
 PYTHON_REPLACEMENT_DECISIONS = _source(
@@ -128,7 +126,7 @@ SCENARIOS = {
     "l01.generic-profile-restoration-contract": _scenario(
         "L01",
         GENERIC_AGENT_CONTRACT,
-        GENERIC_AGENT_CLI_PROFILE,
+        GENERIC_AGENT_SDK_PROFILE,
     ),
     "l02.workspace-client-replacement-decision": _scenario("L02", WORKSPACE_CLIENT),
     "l03.path-native-python-compatibility-contract": _scenario(

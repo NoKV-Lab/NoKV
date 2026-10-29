@@ -152,9 +152,6 @@ pub enum Command {
     },
     /// Sequential Workbench calls, one JSON line each, over one client.
     WorkbenchSession,
-    Mcp {
-        profile: McpProfile,
-    },
     Materialize {
         workbench: String,
         section: String,
@@ -267,7 +264,6 @@ impl Command {
         match self {
             Self::Workbench { .. }
             | Self::WorkbenchSession
-            | Self::Mcp { .. }
             | Self::Materialize { .. }
             | Self::Collect { .. }
             | Self::WorkspacePath(_)
@@ -283,13 +279,6 @@ impl Command {
             | Self::Help => false,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum McpProfile {
-    Agent,
-    #[default]
-    Workbench,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -758,7 +747,6 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
         &command,
         Command::Workbench { .. }
             | Command::WorkbenchSession
-            | Command::Mcp { .. }
             | Command::Materialize { .. }
             | Command::Collect { .. }
             | Command::WorkspacePath(_)
@@ -897,7 +885,6 @@ fn parse_command(
             arguments: arguments.next().unwrap_or_else(|| "{}".to_owned()),
         }),
         "workbench-session" => Ok(Command::WorkbenchSession),
-        "mcp" => parse_mcp(arguments),
         "materialize" => Ok(Command::Materialize {
             workbench: arguments
                 .next()
@@ -1031,32 +1018,6 @@ fn parse_operation_options(
             expected_state_digest,
         })
     }
-}
-
-fn parse_mcp(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
-    let mut profile = None;
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--profile" if profile.is_none() => {
-                let value = next_value(arguments, &argument)?;
-                profile = Some(match value.as_str() {
-                    "agent" => McpProfile::Agent,
-                    "workbench" => McpProfile::Workbench,
-                    _ => {
-                        return Err(CliError::InvalidOption {
-                            option: "--profile",
-                            value,
-                        });
-                    }
-                });
-            }
-            "--profile" => return Err(CliError::UnexpectedArgument(argument)),
-            _ => return Err(CliError::UnexpectedArgument(argument)),
-        }
-    }
-    Ok(Command::Mcp {
-        profile: profile.unwrap_or_default(),
-    })
 }
 
 fn parse_workspace_path(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
@@ -2264,7 +2225,7 @@ mod tests {
             "http://127.0.0.1:22379",
             "--etcd-key-prefix",
             "/nokv/production",
-            "mcp",
+            "workbench-session",
         ]))
         .unwrap();
         let RoutingConfig::Etcd(route) = parsed.client.routing else {
@@ -2276,54 +2237,7 @@ mod tests {
         );
         assert_eq!(route.key_prefix, "/nokv/production");
         assert_eq!(route.lease_ttl_seconds, 10);
-        assert_eq!(
-            parsed.command,
-            Command::Mcp {
-                profile: McpProfile::Workbench
-            }
-        );
-    }
-
-    #[test]
-    fn mcp_profile_is_explicit_and_defaults_to_workbench() {
-        let prefix = ["--agent-id", "44444444444444444444444444444444"];
-        for (suffix, expected) in [
-            (&["mcp"][..], McpProfile::Workbench),
-            (
-                &["mcp", "--profile", "workbench"][..],
-                McpProfile::Workbench,
-            ),
-            (&["mcp", "--profile", "agent"][..], McpProfile::Agent),
-        ] {
-            let parsed = parse(args(&prefix).into_iter().chain(args(suffix))).unwrap();
-            assert_eq!(parsed.command, Command::Mcp { profile: expected });
-        }
-
-        let invalid = parse(
-            args(&prefix)
-                .into_iter()
-                .chain(args(&["mcp", "--profile", "legacy"])),
-        )
-        .unwrap_err();
-        assert_eq!(
-            invalid,
-            CliError::InvalidOption {
-                option: "--profile",
-                value: "legacy".to_owned(),
-            }
-        );
-        let duplicate = parse(args(&prefix).into_iter().chain(args(&[
-            "mcp",
-            "--profile",
-            "agent",
-            "--profile",
-            "workbench",
-        ])))
-        .unwrap_err();
-        assert_eq!(
-            duplicate,
-            CliError::UnexpectedArgument("--profile".to_owned())
-        );
+        assert_eq!(parsed.command, Command::WorkbenchSession);
     }
 
     #[test]
@@ -2714,7 +2628,7 @@ mod tests {
                 "127.0.0.1:7750",
                 "--etcd-endpoint",
                 "http://127.0.0.1:2379",
-                "mcp",
+                "workbench-session",
             ])),
             Err(CliError::MixedRoutingOptions)
         );
@@ -2932,7 +2846,7 @@ mod tests {
     #[test]
     fn unknown_options_fail_closed() {
         assert!(matches!(
-            parse(args(&["--mount", "3", "mcp"])),
+            parse(args(&["--mount", "3", "workbench-session"])),
             Err(CliError::UnknownOption(option)) if option == "--mount"
         ));
     }
@@ -2960,7 +2874,7 @@ mod tests {
                 "44444444444444444444444444444444",
                 "--workbench-root",
                 "/agents/test/wb",
-                "mcp",
+                "workbench-session",
             ]),
             args(&[
                 "--workbench-root",
@@ -2979,9 +2893,28 @@ mod tests {
     }
 
     #[test]
-    fn agent_commands_and_provision_require_an_explicit_agent_id() {
+    fn mcp_is_not_a_command() {
         for arguments in [
             args(&["mcp"]),
+            args(&[
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "mcp",
+                "--profile",
+                "agent",
+            ]),
+        ] {
+            assert_eq!(
+                parse(arguments),
+                Err(CliError::UnknownCommand("mcp".to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn agent_commands_and_provision_require_an_explicit_agent_id() {
+        for arguments in [
+            args(&["workbench-session"]),
             args(&["workbench", "workbench_create", r#"{"id":"run-1"}"#]),
             args(&[
                 "materialize",
@@ -3068,7 +3001,7 @@ mod tests {
             parse(args(&[
                 "--agent-id",
                 "44444444444444444444444444444444",
-                "mcp",
+                "workbench-session",
                 "--adopt-legacy-agent-binding",
             ])),
             Err(CliError::UnexpectedArgument(argument))

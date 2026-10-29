@@ -242,7 +242,7 @@ class Pre423ContractLedgerTest(unittest.TestCase):
             "scenarios": ["l01.generic-profile-api-absence"],
         }
         del item["gate_expectations"]["native-workbench-e2e"]
-        with self.assertRaisesRegex(ledger.LedgerError, "generic Agent MCP profile"):
+        with self.assertRaisesRegex(ledger.LedgerError, "generic Agent profile"):
             ledger.validate_ledger(changed)
 
     def test_operational_recovery_oracle_cannot_be_collapsed_to_a_decision(

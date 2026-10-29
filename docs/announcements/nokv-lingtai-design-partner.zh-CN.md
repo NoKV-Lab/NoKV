@@ -9,9 +9,10 @@
 > 当前产品指导请参见[产品设计](../product-design.md)与
 > [Workbench 契约](../workbench-contract.md)。
 >
-> 2026-08 更新：本文提到的可选 Workbench MCP sidecar 已废弃，不是受支持的
-> NoKV 接入面。稳定边界过去是、现在仍然是 18-tool Workbench 语义契约，
-> 经由原生全量 CLI 与 Python SDK 使用。以下保留历史合作范围供参考。
+> 2026-10 更新：本文提到的可选 Workbench MCP sidecar 已于 2026-08 废弃、现已
+> 删除，NoKV 不再提供 MCP transport。稳定边界过去是、现在仍然是 18-tool
+> Workbench 语义契约，经由原生全量 CLI 与 Python SDK 使用。以下保留历史合作
+> 范围供参考。
 
 本文记录 **NoKV** 与 **LingTai**（[Lingtai-AI/lingtai](https://github.com/Lingtai-AI/lingtai)）启动 **design-partner（设计共建伙伴）合作**的起点。
 

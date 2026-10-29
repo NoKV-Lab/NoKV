@@ -27,7 +27,7 @@ use super::cli::{
 const FIXED_ID_BYTES: usize = 16;
 const FIXED_ID_HEX_BYTES: usize = FIXED_ID_BYTES * 2;
 
-/// Concrete workspace SDK used by every CLI and MCP command.
+/// Concrete workspace SDK used by every CLI command that reaches an owner.
 pub type CliWorkspaceClient = WorkspaceClient<FramedTcpTransport, Arc<dyn RouteResolver>>;
 
 /// Configuration failure while constructing the root-routed SDK.

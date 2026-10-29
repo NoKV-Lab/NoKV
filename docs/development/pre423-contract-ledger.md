@@ -15,10 +15,9 @@ It is not an inventory or qualification claim for every pre-#423 feature, and
 
 This ledger preserves historical MCP and LingTai evidence classes; it does not
 set current delivery priority. Current integrations use the native full CLI
-first and the direct Python SDK second. The `nokv mcp` sidecar is deprecated
-and is not a supported integration surface; the MCP and LingTai rows below are
-retained evidence history, and a transport-specific receipt qualifies only that
-transport.
+first and the direct Python SDK second. The `nokv mcp` sidecar has been
+removed; the MCP and LingTai rows below are retained evidence history, and a
+transport-specific receipt qualifies only that transport.
 
 Each stable item records:
 
@@ -44,7 +43,7 @@ Class C requires an explicit replacement contract. Class D is excluded from
 the recovery backlog. For this recovery ledger, only `L07` FUSE/POSIX may be
 excluded; the Python byte/range, Workbench-scoped fsspec, checkpoint, and torch
 DCP behaviors in `L03` through `L06` must be replaced and live-tested rather
-than retired. The generic seven-tool Agent MCP profile in `L01` must coexist
+than retired. The generic seven-tool Agent profile in `L01` must coexist
 with the 18-tool Workbench profile, and the operational outcomes in `L08` must
 be rebuilt rather than satisfied by an API-decision document.
 

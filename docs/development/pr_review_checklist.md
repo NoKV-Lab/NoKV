@@ -173,8 +173,8 @@ boundaries, or Workbench behavior.
 ## Workbench Contract
 
 - Do public docs and examples present the native full CLI first, the Python SDK
-  second, and the Rust SDK third, without presenting the deprecated `nokv mcp`
-  sidecar as a supported integration surface?
+  second, and the Rust SDK third, without presenting MCP or any other sidecar
+  as an integration surface?
 - Do all 18 tool names and normalized input schemas remain stable?
 - Does golden-transcript validation cover observable result and error behavior,
   rather than treating input-schema validation as equivalent?

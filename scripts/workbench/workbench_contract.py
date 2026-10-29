@@ -2,7 +2,7 @@
 # Copyright 2024-2026 The NoKV Authors.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Frozen semantic contract for NoKV's Workbench MCP surface."""
+"""Frozen semantic contract for NoKV's 18-tool Workbench surface."""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ SCHEMA_VALUE_KEYWORDS = frozenset(
 
 
 class WorkbenchContractError(ValueError):
-    """A live MCP surface cannot satisfy the NoKV Workbench contract."""
+    """A tool surface cannot satisfy the NoKV Workbench contract."""
 
 
 def canonical_json(value: Any) -> str:
@@ -175,24 +175,6 @@ def _load_frozen_input_schemas() -> dict[str, dict[str, Any]]:
 FROZEN_INPUT_SCHEMAS = _load_frozen_input_schemas()
 
 
-def extract_raw_tools(response: Any) -> list[dict[str, Any]]:
-    if not isinstance(response, dict):
-        raise WorkbenchContractError("tools/list response must be a JSON object")
-    if response.get("jsonrpc") != "2.0" or response.get("id") != 1:
-        raise WorkbenchContractError(
-            "tools/list response has the wrong JSON-RPC envelope"
-        )
-    result = response.get("result")
-    if not isinstance(result, dict):
-        raise WorkbenchContractError("tools/list response lacks a result object")
-    tools = result.get("tools")
-    if not isinstance(tools, list):
-        raise WorkbenchContractError("tools/list result lacks a tools array")
-    if not all(isinstance(tool, dict) for tool in tools):
-        raise WorkbenchContractError("tools/list contains a non-object tool")
-    return tools
-
-
 def _schema(tool: dict[str, Any], schema_key: str) -> dict[str, Any]:
     schema = tool.get(schema_key)
     if not isinstance(schema, dict):
@@ -208,9 +190,9 @@ def validate_tool_contract(
 ) -> None:
     names = [tool.get("name") for tool in tools]
     if any(not isinstance(name, str) or not name for name in names):
-        raise WorkbenchContractError("tools/list contains a tool without a string name")
+        raise WorkbenchContractError("tool surface contains a tool without a string name")
     if len(set(names)) != len(names):
-        raise WorkbenchContractError("tools/list contains duplicate tool names")
+        raise WorkbenchContractError("tool surface contains duplicate tool names")
 
     actual = set(names)
     if actual != WORKBENCH_TOOLS:
