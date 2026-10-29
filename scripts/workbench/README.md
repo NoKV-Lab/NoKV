@@ -25,6 +25,12 @@ The checked-in integration assets are deliberately small:
   prints against the exact Rust-owned schema at
   `crates/nokv-agent/workbench_contract_schema.json`.
 - `workbench_contract_test.py` tests normalization and exact surface matching.
+- `control_plane_gate.py` starts an etcd that authenticates clients by
+  certificate with RBAC enabled, creates the operator, owner and Agent users
+  and roles that `docs/control-plane-credentials.md` prescribes, and proves
+  that the native CLI routes and serves through them while every identity is
+  denied the keys outside its role; `control_plane_gate_test.py` keeps its
+  certificates and the documented key families in step.
 - `live_workbench.py` provisions one root, starts one explicit metadata
   owner, then records a real scientific reconstruction workflow through all 18
   tools, each call its own `nokv workbench <tool>` process graded against

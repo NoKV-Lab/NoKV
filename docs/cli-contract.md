@@ -49,8 +49,8 @@ model carries a class itself, and no new caller should read it.
 | 7 | `identity_conflict` | The identity was already used for other inputs; nothing was applied. |
 | 8 | `incompatible` | The client and owner do not share a protocol version or capability. |
 | 9 | `operator_required` | Durable or control state needs operator action, or the client's TLS settings do not fit the owner. |
-| 10 | `unauthenticated` | The owner does not accept this client's identity: the connection has no TLS where the owner requires it, or its certificate is not a current credential of the owner's tenant. Nothing was applied. |
-| 11 | `permission_denied` | The authenticated principal holds no role that allows the request, or it tried to continue an operation another principal began. Nothing was applied. |
+| 10 | `unauthenticated` | The owner does not accept this client's identity: the connection has no TLS where the owner requires it, or its certificate is not a current credential of the owner's tenant; or the control plane rejected the client's certificate. Nothing was applied. |
+| 11 | `permission_denied` | The authenticated principal holds no role that allows the request, or it tried to continue an operation another principal began; or the control plane's roles do not grant a key the command needs. Nothing was applied. |
 <!-- exit-codes:end -->
 
 A refusal of the principal keeps its class when it ends an append or a multi-stage publish: the owner refuses before it applies anything, so an append refused as `permission_denied` or `unauthenticated` is not an unknown outcome, and a publish whose next stage and whose abort are both refused after a role change is `permission_denied`, not `outcome_unknown`. `next_action` is `operator` in both cases.
@@ -185,3 +185,11 @@ continues any operation. The owner that cannot refresh its tenant policy
 answers `transient` with `resubmit_same`. Without RPC TLS the owner
 authenticates nobody: every client of a root shares its identity namespace,
 and the `unauthenticated` and `permission_denied` classes do not occur.
+
+The control plane has the same two classes of its own. An etcd that
+authenticates clients by certificate (`--etcd-tls-ca`, `--etcd-tls-cert`,
+`--etcd-tls-key`) rejects a certificate it does not trust as
+`unauthenticated`, and denies a key that the certificate's etcd user may not
+read or write as `permission_denied`; both happen before any request reaches
+an owner. [Control plane credentials](control-plane-credentials.md) lists the
+keys each role needs.

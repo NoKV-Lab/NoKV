@@ -109,6 +109,12 @@ pub enum ControlError {
         version: u8,
         supported: u8,
     },
+    /// The control plane does not accept this process's identity: its
+    /// certificate names no user, or authentication failed. Nothing ran.
+    Unauthenticated(String),
+    /// The control plane's roles do not grant the key this operation needs.
+    /// Nothing ran.
+    PermissionDenied(String),
     Codec(String),
     Backend(String),
 }
@@ -144,6 +150,8 @@ impl ControlError {
             | Self::RecoveryUploadConflict { .. }
             | Self::Backend(_) => ErrorClass::Transient,
             Self::UnsupportedRecordVersion { .. } => ErrorClass::Incompatible,
+            Self::Unauthenticated(_) => ErrorClass::Unauthenticated,
+            Self::PermissionDenied(_) => ErrorClass::PermissionDenied,
             Self::RootPlacementNotFound(_)
             | Self::LogicalShardNotFound(_)
             | Self::RootPlacementRequired(_)
@@ -322,6 +330,12 @@ impl fmt::Display for ControlError {
                  versions up to {supported}, so this client or owner must be upgraded before it \
                  can use this control plane"
             ),
+            Self::Unauthenticated(reason) => {
+                write!(formatter, "control plane does not accept this identity: {reason}")
+            }
+            Self::PermissionDenied(reason) => {
+                write!(formatter, "control plane denies this operation: {reason}")
+            }
             Self::Codec(reason) => write!(formatter, "control store codec error: {reason}"),
             Self::Backend(reason) => write!(formatter, "control store backend error: {reason}"),
         }

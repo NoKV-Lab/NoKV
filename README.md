@@ -388,7 +388,10 @@ methods. Use Rust for provider, routing, change-feed, or recovery-aware work.
 
 Every agent-facing CLI command requires self-refreshing control routing:
 `--control-dir PATH` when the owner and its clients share one host,
-`--etcd-endpoint URL` when they span hosts. Static route pins remain an
+`--etcd-endpoint URL` when they span hosts, with `--etcd-tls-ca`,
+`--etcd-tls-cert` and `--etcd-tls-key` when etcd authenticates its clients by
+certificate ([control plane credentials](docs/control-plane-credentials.md)
+lists the keys each role may touch). Static route pins remain an
 SDK/testing option and are rejected by the agent-facing CLI. Without RPC TLS,
 the CLI also requires the durable `RootId` to `AgentId` binding, a CLI-only
 misconfiguration check that is not authorization. Over RPC TLS, the owner

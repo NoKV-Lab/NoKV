@@ -2,10 +2,11 @@ use std::collections::BTreeMap;
 use std::future::Future;
 
 use etcd_client::{
-    Client, Compare, CompareOp, ConnectOptions, GetOptions, GetResponse, KeyValue, PutOptions, Txn,
-    TxnOp, TxnOpResponse,
+    Certificate, Client, Compare, CompareOp, ConnectOptions, GetOptions, GetResponse, Identity,
+    KeyValue, PutOptions, TlsOptions, Txn, TxnOp, TxnOpResponse,
 };
 use tokio::runtime::{Builder, Runtime};
+use tonic::Code;
 
 use crate::codec::{
     decode_logical_shard_record_value, decode_logical_shard_recovery_state, decode_owner_session,
@@ -23,8 +24,8 @@ use crate::store::{
 };
 use crate::{
     ControlError, EtcdControlStoreOptions, LogicalShardId, LogicalShardLease, LogicalShardRecord,
-    NodeId, OwnerEpoch, RecoveryPublication, RecoveryUploadIntent, RootAgentBinding, RootId,
-    RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle,
+    LogicalShardRoute, NodeId, OwnerEpoch, RecoveryPublication, RecoveryUploadIntent,
+    RootAgentBinding, RootId, RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle,
 };
 
 pub struct EtcdControlStore {
@@ -119,9 +120,22 @@ impl EtcdControlStore {
             })?;
         // Every call is bounded, so a partitioned etcd fails an owner's
         // renewal or a policy refresh instead of stalling it.
-        let connect_options = ConnectOptions::new()
+        let mut connect_options = ConnectOptions::new()
             .with_connect_timeout(options.connect_timeout())
             .with_timeout(options.request_timeout());
+        if let Some(tls) = options.tls() {
+            // Mutual TLS: etcd's certificate must chain to the configured
+            // roots, and this process presents its own certificate, whose
+            // Common Name etcd authenticates as its user.
+            connect_options = connect_options.with_tls(
+                TlsOptions::new()
+                    .ca_certificate(Certificate::from_pem(tls.trusted_ca_pem.as_ref()))
+                    .identity(Identity::from_pem(
+                        tls.certificate_pem.as_ref(),
+                        tls.private_key_pem.as_ref(),
+                    )),
+            );
+        }
         let client = runtime
             .block_on(Client::connect(options.endpoints(), Some(connect_options)))
             .map_err(etcd_backend)?;
@@ -404,6 +418,18 @@ impl ControlStore for EtcdControlStore {
                     .await?
                     .map(|stored| stored.record),
             )
+        })
+    }
+
+    fn get_logical_shard_route(
+        &self,
+        logical_shard_id: &LogicalShardId,
+    ) -> Result<Option<LogicalShardRoute>, ControlError> {
+        let mut client = self.client.clone();
+        let options = self.options.clone();
+        let logical_shard_id = *logical_shard_id;
+        self.block_on(async move {
+            fetch_logical_shard_route(&mut client, &options, &logical_shard_id).await
         })
     }
 
@@ -1022,6 +1048,38 @@ async fn fetch_logical_shard(
     )
 }
 
+/// Read only the routing value of one logical shard. A client resolving an
+/// owner needs nothing else, so its etcd role can stop at this key: the
+/// recovery frontier and the owner session stay unreadable to it.
+async fn fetch_logical_shard_route(
+    client: &mut Client,
+    options: &EtcdControlStoreOptions,
+    logical_shard_id: &LogicalShardId,
+) -> Result<Option<LogicalShardRoute>, ControlError> {
+    let record_key = options.logical_shard_record_key(logical_shard_id);
+    let response = client
+        .get(record_key.clone(), None)
+        .await
+        .map_err(etcd_backend)?;
+    let Some(kv) = response.kvs().first() else {
+        return Ok(None);
+    };
+    if kv.key() != record_key.as_slice() {
+        return Err(ControlError::Codec(
+            "logical shard key and value identities differ".to_owned(),
+        ));
+    }
+    // Both wire kinds carry the routing fields in this value; a legacy
+    // combined value also carries recovery state, which the route drops.
+    let decoded = decode_logical_shard_record_value(kv.value())?;
+    if decoded.record.logical_shard_id != *logical_shard_id {
+        return Err(ControlError::Codec(
+            "logical shard key and value identities differ".to_owned(),
+        ));
+    }
+    Ok(Some(decoded.record.route()))
+}
+
 /// Decode one logical shard from its routing and recovery reads taken at one
 /// etcd revision.
 fn parse_logical_shard(
@@ -1559,8 +1617,58 @@ fn lease_id_i64(lease_id: u64) -> Result<i64, ControlError> {
         .map_err(|_| ControlError::Codec(format!("etcd lease id {lease_id} exceeds i64")))
 }
 
+/// Classify an etcd failure. A refusal of this process's identity or of the
+/// key it touched is typed so that callers stop instead of retrying; every
+/// other failure stays a transient backend error.
 pub(crate) fn etcd_backend(error: etcd_client::Error) -> ControlError {
+    if let etcd_client::Error::GRpcStatus(status) = &error {
+        let message = status.message();
+        let names_identity =
+            message.contains("user name") || message.contains("authentication failed");
+        match status.code() {
+            Code::PermissionDenied => {
+                return ControlError::PermissionDenied(format!("etcd: {message}"));
+            }
+            Code::Unauthenticated => {
+                return ControlError::Unauthenticated(format!("etcd: {message}"));
+            }
+            Code::InvalidArgument | Code::FailedPrecondition if names_identity => {
+                return ControlError::Unauthenticated(format!("etcd: {message}"));
+            }
+            // A failed TLS handshake surfaces as a transport error (while
+            // connecting, or on the request that first used the connection)
+            // whose text names the cause. An alert etcd sent rejects this
+            // process's certificate; a peer certificate this process rejects
+            // means the configured CA does not sign etcd's certificate.
+            Code::Unknown | Code::Unavailable => {
+                let detail = format!("{status:?}");
+                if let Some(alert) = tls_alert(&detail) {
+                    return ControlError::Unauthenticated(format!(
+                        "etcd rejected this certificate: {alert}"
+                    ));
+                }
+                if detail.contains("invalid peer certificate") {
+                    return ControlError::InvalidOptions(format!(
+                        "etcd's certificate is not signed by the configured etcd TLS CA: {error}"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
     ControlError::Backend(format!("etcd: {error}"))
+}
+
+/// The TLS alert named in a transport failure, if the peer sent one.
+fn tls_alert(detail: &str) -> Option<&str> {
+    let start = detail.find("received fatal alert: ")?;
+    let alert = &detail[start..];
+    let end = alert
+        .find(|character: char| {
+            !(character.is_ascii_alphanumeric() || character == ' ' || character == ':')
+        })
+        .unwrap_or(alert.len());
+    Some(alert[..end].trim_end())
 }
 
 // The `#[ignore]` tests below run only against a real etcd:
@@ -1578,6 +1686,97 @@ pub(crate) mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use nokv_types::ErrorClass;
+    use tonic::{Code, Status};
+
+    fn classify(code: Code, message: &str) -> ControlError {
+        etcd_backend(etcd_client::Error::GRpcStatus(Status::new(code, message)))
+    }
+
+    #[test]
+    fn tls_handshake_failures_name_their_cause() {
+        let transport = |detail: &str| {
+            let io = std::io::Error::new(std::io::ErrorKind::InvalidData, detail.to_owned());
+            etcd_backend(etcd_client::Error::GRpcStatus(Status::from_error(
+                Box::new(io),
+            )))
+        };
+        let rejected = transport("received fatal alert: UnknownCA");
+        assert!(
+            matches!(rejected, ControlError::Unauthenticated(_)),
+            "{rejected}"
+        );
+        assert!(rejected.to_string().contains("UnknownCA"), "{rejected}");
+        let untrusted = transport("invalid peer certificate: UnknownIssuer");
+        assert!(
+            matches!(untrusted, ControlError::InvalidOptions(_)),
+            "{untrusted}"
+        );
+        assert_eq!(untrusted.class(), ErrorClass::InvalidInput);
+        // Rejecting etcd's certificate fails the connection itself, which
+        // tonic reports as unavailable with the cause in the message.
+        let at_connect = classify(Code::Unavailable, "invalid peer certificate: UnknownIssuer");
+        assert!(
+            matches!(at_connect, ControlError::InvalidOptions(_)),
+            "{at_connect}"
+        );
+        let unavailable = classify(
+            Code::Unavailable,
+            "error trying to connect: connection refused",
+        );
+        assert!(
+            matches!(unavailable, ControlError::Backend(_)),
+            "{unavailable}"
+        );
+        let reset = transport("connection reset");
+        assert!(matches!(reset, ControlError::Backend(_)), "{reset}");
+        assert_eq!(
+            tls_alert(
+                "hyper::Error(Io, Custom { kind: InvalidData, error: \"received fatal alert: \
+                 BadCertificate\" })"
+            ),
+            Some("received fatal alert: BadCertificate")
+        );
+    }
+
+    #[test]
+    fn etcd_statuses_classify_refusals_without_retrying_them() {
+        let denied = classify(Code::PermissionDenied, "etcdserver: permission denied");
+        assert!(
+            matches!(denied, ControlError::PermissionDenied(_)),
+            "{denied}"
+        );
+        assert_eq!(denied.class(), ErrorClass::PermissionDenied);
+        for (code, message) in [
+            (Code::Unauthenticated, "etcdserver: invalid auth token"),
+            (Code::InvalidArgument, "etcdserver: user name is empty"),
+            (
+                Code::InvalidArgument,
+                "etcdserver: authentication failed, invalid user ID or password",
+            ),
+            (Code::FailedPrecondition, "etcdserver: user name not found"),
+        ] {
+            let refused = classify(code, message);
+            assert!(
+                matches!(refused, ControlError::Unauthenticated(_)),
+                "{refused}"
+            );
+            assert_eq!(refused.class(), ErrorClass::Unauthenticated);
+        }
+        for (code, message) in [
+            (Code::Unavailable, "etcdserver: leader changed"),
+            (Code::InvalidArgument, "etcdserver: key is not provided"),
+            (
+                Code::FailedPrecondition,
+                "etcdserver: authentication is not enabled",
+            ),
+        ] {
+            let other = classify(code, message);
+            assert!(matches!(other, ControlError::Backend(_)), "{other}");
+            assert_eq!(other.class(), ErrorClass::Transient);
+        }
+    }
 
     use etcd_client::DeleteOptions;
 

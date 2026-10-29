@@ -110,6 +110,12 @@ pub enum ArtifactPublishStage {
 pub enum ClientError {
     InvalidOptions(String),
     InvalidRoute(String),
+    /// The control plane refused this client's identity, or the key its
+    /// route needs. Nothing reached an owner.
+    ControlRefusal {
+        class: ErrorClass,
+        message: String,
+    },
     Transport(TransportError),
     Protocol(ProtocolError),
     Rpc(RpcFailure),
@@ -162,6 +168,7 @@ impl ClientError {
             Self::ArtifactReadFenceChanged => true,
             Self::InvalidOptions(_)
             | Self::InvalidRoute(_)
+            | Self::ControlRefusal { .. }
             | Self::Protocol(_)
             | Self::ResponseMismatch(_)
             | Self::MissingCapabilities(_)
@@ -212,6 +219,7 @@ impl ClientError {
             Self::InvalidOptions(_) => ErrorClass::InvalidInput,
             // An unresolvable route sends nothing.
             Self::InvalidRoute(_) => ErrorClass::Transient,
+            Self::ControlRefusal { class, .. } => *class,
             Self::Transport(error) => error.refusal_class().unwrap_or(ErrorClass::OutcomeUnknown),
             Self::Protocol(_) | Self::ResponseMismatch(_) => ErrorClass::OutcomeUnknown,
             Self::Rpc(failure) => rpc_failure_class(failure),
@@ -325,6 +333,9 @@ impl fmt::Display for ClientError {
         match self {
             Self::InvalidOptions(message) => write!(formatter, "invalid client options: {message}"),
             Self::InvalidRoute(message) => write!(formatter, "invalid root route: {message}"),
+            Self::ControlRefusal { message, .. } => {
+                write!(formatter, "control plane refused this client: {message}")
+            }
             Self::Transport(error) => write!(formatter, "RPC transport failed: {error}"),
             Self::Protocol(error) => write!(formatter, "RPC protocol failed: {error}"),
             Self::Rpc(error) => write!(formatter, "workspace request failed: {}", error.message),
@@ -415,6 +426,7 @@ impl std::error::Error for ClientError {
             Self::RetryExhausted { last_error, .. } => Some(last_error.as_ref()),
             Self::InvalidOptions(_)
             | Self::InvalidRoute(_)
+            | Self::ControlRefusal { .. }
             | Self::Rpc(_)
             | Self::ResponseMismatch(_)
             | Self::MissingCapabilities(_)
