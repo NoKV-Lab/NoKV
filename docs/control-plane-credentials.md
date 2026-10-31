@@ -13,7 +13,13 @@ and limit each to the keys its role needs. This page lists those keys, the
 etcd configuration that enforces them, and how each NoKV surface presents its
 certificate. The single-host control directory (`--control-dir`) has no
 credentials of its own: the directory's file permissions are its boundary, and
-it is for one trusted host only.
+it is for one trusted host only. NoKV creates the directory and its files
+readable and writable by their owner alone, and every command refuses a
+control directory, `sessions` directory or record file that group or other
+users can write, or that belongs to a user other than the one running the
+command or root (`invalid_input`, exit 2). Every process that uses a control
+directory therefore runs as its owner; processes of different users share a
+control plane through etcd.
 
 ## What each role touches
 

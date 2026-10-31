@@ -37,9 +37,12 @@ Boundaries:
    a deployment identity (`AgentId`) that is a misconfiguration check, not an
    authentication credential; a tenant-bound root is never served in
    plaintext (`t0b`).
-2. **Any process → control store**. With a control directory there is no
-   access control beyond file permissions. With etcd, R6a binds the owner,
-   the operator and each Agent principal to an etcd user with a least-privilege
+2. **Any process → control store**. With a control directory the operating
+   system user is the boundary: NoKV creates the directory and its files for
+   their owner alone, and refuses a directory, `sessions` directory or record
+   file that group or other users can write, or that belongs to a user other
+   than the process's own or root. With etcd, R6a binds the owner, the
+   operator and each Agent principal to an etcd user with a least-privilege
    role (`c*`).
 3. **Owner → object store** with the owner's credentials; **Agent → object
    store** read-only.
@@ -60,7 +63,7 @@ Boundaries:
 | Tampering: another writer renews or retires a snapshot it did not mint | Only the minter or an operator may | `t11` |
 | Tampering: an Agent writes object bodies directly | Agent object credentials are read-only; the owner uploads every block (R5a) | `t14`, `c4` (etcd roles) |
 | Tampering: a forged commit projection in a raw RPC | The owner recomputes the projection digest from the staged state and refuses a commit whose projection disagrees | `executor` unit tests (forged inline publication) |
-| Tampering: a client of another root or tenant writes the control store | etcd roles: an Agent user cannot write `roots/`, `tenants/` or another tenant's keys; a control directory relies on file permissions and is documented as single-host | `c3`, `c4` |
+| Tampering: a client of another root or tenant writes the control store | etcd roles: an Agent user cannot write `roots/`, `tenants/` or another tenant's keys. A control directory is created owner-only (0700, files 0600), and every command refuses one that group or other users can write or another user owns (`invalid_input`, exit 2), before it reads or writes a record | `c3`, `c4`, `nokv-control` `local::tests::a_control_directory_other_users_can_write_is_refused`, `nokv` `control_directory_permissions` |
 | Tampering: an old-format store opened by a new owner | format 15 refuses to open a 0.12.x store and writes nothing; there is no migration | `nokv-meta` codec and recovery tests |
 | **R**epudiation: who made a write | Every operation records the principal that began it; `operation status` reports it to any reader of the root; a put through the Workbench tools carries the caller's operation id | `t10`, `t13`, `t20`, Pi `m1`, `m3`, Hermes `hm1` |
 | Repudiation: a write replayed by another principal | A replay returns the original receipt and keeps the original initiator | `t9`, `t12` |
@@ -78,10 +81,13 @@ Boundaries:
 
 ## Out of scope and known gaps
 
-- **Control directory deployments** have no authentication on the control
-  store; the tenant model there protects the owner's RPC surface, not the
-  files. Use etcd with mTLS (R6a) when more than one trust domain shares a
-  host.
+- **Control directory deployments** trust the directory's operating system
+  user: any process running as that user, or as root, can rewrite the
+  tenants' records, so the tenant model there protects the owner's RPC
+  surface, not the files. Processes of other users cannot use the directory.
+  Use etcd with mTLS (R6a) when Agents must not administer their tenant, or
+  when more than one trust domain shares a host. Access control lists beyond
+  the mode bits are not inspected.
 - **Object-store isolation between tenants** is by deployment (bucket and
   prefix), not enforced by NoKV.
 - **Audit log**: operations record their initiator, but there is no append-only
