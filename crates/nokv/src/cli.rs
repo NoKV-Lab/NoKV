@@ -125,6 +125,8 @@ pub struct ServerConfig {
     pub append_activity_lease_ms: u64,
     pub recovery_publication: RecoveryPublicationConfig,
     pub tls: Option<ServerTlsConfig>,
+    /// Where a TLS owner appends one JSON line per refusal.
+    pub audit_log: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -255,20 +257,6 @@ pub enum CredentialSource {
     /// The first certificate in this PEM file: the leaf of a chain.
     Certificate(PathBuf),
     Fingerprint(CredentialFingerprint),
-}
-
-/// Role names on the command line and in identity results.
-const ROLE_NAMES: [(Role, &str); 3] = [
-    (Role::Reader, "reader"),
-    (Role::Writer, "writer"),
-    (Role::Operator, "operator"),
-];
-
-pub(crate) fn role_name(role: Role) -> &'static str {
-    ROLE_NAMES
-        .iter()
-        .find_map(|(candidate, name)| (*candidate == role).then_some(*name))
-        .expect("every role has a name")
 }
 
 impl Command {
@@ -504,6 +492,7 @@ impl Default for ServerConfig {
             append_activity_lease_ms: DEFAULT_APPEND_ACTIVITY_LEASE_MS,
             recovery_publication: RecoveryPublicationConfig::LocalOnly,
             tls: None,
+            audit_log: None,
         }
     }
 }
@@ -732,6 +721,9 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             "--rpc-tls-server-name" => {
                 rpc_tls.server_name = Some(next_value(&mut arguments, &argument)?);
             }
+            "--audit-log" => {
+                server.audit_log = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
+            }
             "--help" => break Command::Help,
             "--version" => break Command::Version { json: false },
             _ => return Err(CliError::UnknownOption(argument)),
@@ -773,6 +765,13 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     if append_activity_lease_explicit && !matches!(command, Command::Serve) {
         return Err(CliError::UnexpectedArgument(
             "--append-activity-lease-ms is only valid with serve".to_owned(),
+        ));
+    }
+    if server.audit_log.is_some() && server.tls.is_none() {
+        return Err(CliError::UnexpectedArgument(
+            "--audit-log records the refusals of a TLS owner: it is only valid with serve, \
+             --rpc-tls-cert and --rpc-tls-key"
+                .to_owned(),
         ));
     }
     if matches!(
@@ -1470,9 +1469,9 @@ fn parse_role_binding(
             "--role" if role.is_none() => {
                 let value = next_value(arguments, &argument)?;
                 role = Some(
-                    ROLE_NAMES
-                        .iter()
-                        .find_map(|(role, name)| (*name == value).then_some(*role))
+                    Role::ALL
+                        .into_iter()
+                        .find(|role| role.name() == value)
                         .ok_or(CliError::InvalidOption {
                             option: "--role",
                             value,
@@ -2383,6 +2382,44 @@ mod tests {
             parse(args(&status)),
             Err(CliError::MissingOption("--agent-id"))
         );
+    }
+
+    #[test]
+    fn an_audit_log_belongs_to_a_tls_owner() {
+        let owner = [
+            "--rpc-tls-cert",
+            "owner.pem",
+            "--rpc-tls-key",
+            "owner.key",
+            "--audit-log",
+            "audit.jsonl",
+            "serve",
+        ];
+        assert_eq!(
+            parse(args(&owner)).unwrap().server.audit_log,
+            Some(PathBuf::from("audit.jsonl"))
+        );
+        assert_eq!(
+            parse(args(&owner[2..])).map(|parsed| parsed.server.audit_log),
+            Err(CliError::MissingOption("--rpc-tls-cert"))
+        );
+        for line in [
+            &["--audit-log", "audit.jsonl", "serve"][..],
+            &[
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "--audit-log",
+                "audit.jsonl",
+                "operation",
+                "status",
+                "11111111111111111111111111111111",
+            ][..],
+        ] {
+            assert!(matches!(
+                parse(args(line)),
+                Err(CliError::UnexpectedArgument(message)) if message.starts_with("--audit-log")
+            ));
+        }
     }
 
     #[test]

@@ -20,6 +20,11 @@ only GET and HEAD, as prefix-scoped read-only credentials would; the owner
 keeps the provider's full coordinates. A publication whose body spans two
 object blocks must therefore complete through the owner, and the Agent must
 read it back without one refused request.
+
+Every TLS owner keeps an audit log (`--audit-log`). Each of its lines must be
+one JSON object with the documented keys, and the refusals one scenario
+provokes must each appear with the peer, certificate, principal, root and
+request that apply.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ import http.client
 import http.server
 import json
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -58,6 +64,11 @@ WORKBENCH = "tls"
 # Two object blocks at the default block size, so the body cannot publish
 # inline and the owner must write more than one object.
 MULTI_BLOCK_BODY_BYTES = 4 * 1024 * 1024 + 17
+# The keys of every audit log line (docs/cli-contract.md).
+AUDIT_KEYS = {
+    "time_unix_ms", "event", "reason", "peer", "tenant_id", "certificate_fingerprint",
+    "principal_id", "root_id", "request", "required_role", "detail",
+}
 
 
 class ReadOnlyObjectProxy:
@@ -217,6 +228,7 @@ class TlsStack(Stack):
             name: new_id() for name in ("agent", "reader", "peer", "session", "operator", "fourth")
         }
         self.principal = self.principals["agent"]
+        self.audit_log = evidence / "owner-audit.jsonl"
 
     def object_options(self, command: str) -> list[str]:
         return self.owner_objects if command == "provision" else self.agent_objects
@@ -266,6 +278,7 @@ class TlsStack(Stack):
         tls_options = [
             "--rpc-tls-cert", str(self.pki.directory / "owner.pem"),
             "--rpc-tls-key", str(self.pki.directory / "owner.key"),
+            "--audit-log", str(self.audit_log),
         ] if tls else []
         argv = [
             str(self.binary), *self.route, *self.owner_objects, *tls_options,
@@ -299,6 +312,27 @@ class TlsStack(Stack):
         # Evidence keeps the certificates, never the private keys.
         for key in self.pki.directory.glob("*.key"):
             key.unlink()
+
+    def audit_lines(self) -> list[dict[str, Any]]:
+        """Every line the owners appended to the audit log, each checked to be
+        one JSON object with exactly the documented keys."""
+        if not self.audit_log.exists():
+            return []
+        lines = []
+        for number, text in enumerate(self.audit_log.read_text().splitlines(), 1):
+            try:
+                line = json.loads(text)
+            except json.JSONDecodeError as error:
+                raise ContractFailure(f"audit log line {number} is not JSON: {error}: {text[:200]}") from error
+            require(isinstance(line, dict) and set(line) == AUDIT_KEYS,
+                    f"audit log line {number} has the documented keys", line)
+            lines.append(line)
+        return lines
+
+    def fingerprint(self, client: str) -> str:
+        """The SHA-256 of a client certificate's DER bytes: its credential."""
+        certificate, _ = self.clients[client]
+        return hashlib.sha256(ssl.PEM_cert_to_DER_cert(certificate.read_text())).hexdigest()
 
     def refused(self, label: str, path: str, klass: str = "unauthenticated", **client: Any) -> dict[str, Any]:
         """A write by this client fails as `klass` and changes nothing."""
@@ -949,6 +983,68 @@ def a_principal_of_another_tenant_is_refused_without_a_route(stack: TlsStack) ->
     return envelope
 
 
+def every_refusal_is_audited(stack: TlsStack) -> dict[str, Any]:
+    """T22: the owner appends one audit line per refusal. A plaintext client, a
+    certificate that is no credential, a reader's write, and a broken TLS
+    handshake each appear with what the owner knew about them."""
+    started_ms = int(time.time() * 1000)
+    before = len(stack.audit_lines())
+    stack.refused("t22-plaintext", "t22-plaintext.txt", tls=None)
+    stack.refused("t22-stranger", "t22-stranger.txt", tls="stranger")
+    stack.refused("t22-reader", "t22-reader.txt", klass="permission_denied", tls="reader")
+    with socket.create_connection(("127.0.0.1", stack.owner_port), timeout=stack.timeout) as broken:
+        # A TLS record header followed by bytes that are no handshake message.
+        broken.sendall(b"\x16\x03\x01\x00\x04none")
+        with contextlib.suppress(OSError):
+            while broken.recv(4096):
+                pass
+    deadline = time.monotonic() + stack.timeout
+    while True:
+        lines = stack.audit_lines()[before:]
+        reasons = {line["reason"] for line in lines}
+        if {"tls_required", "not_a_current_credential", "permission_denied", "tls_handshake_failed"} <= reasons:
+            break
+        if time.monotonic() >= deadline:
+            raise ContractFailure(f"t22: every refusal reached the audit log: {sorted(reasons)}")
+        time.sleep(0.1)
+    finished_ms = int(time.time() * 1000)
+    for line in lines:
+        require(line["tenant_id"] == stack.tenant, "t22: each line names the owner's tenant", line)
+        require(str(line["peer"]).startswith("127.0.0.1:"), "t22: each line names the peer", line)
+        require(started_ms - 1000 <= line["time_unix_ms"] <= finished_ms + 1000,
+                "t22: each line carries the time of its refusal", [started_ms, line, finished_ms])
+
+    def only(reason: str) -> list[dict[str, Any]]:
+        return [line for line in lines if line["reason"] == reason]
+
+    plaintext = only("tls_required")
+    require(all(line["event"] == "connection_refused" and line["certificate_fingerprint"] is None
+                for line in plaintext), "t22: a plaintext client has no certificate", plaintext)
+    stranger = only("not_a_current_credential")
+    require(all(line["event"] == "connection_refused"
+                and line["certificate_fingerprint"] == stack.fingerprint("stranger")
+                and line["principal_id"] is None for line in stranger),
+            "t22: an unknown certificate is named by its fingerprint and has no principal", stranger)
+    denied = only("permission_denied")
+    require(all(line["event"] == "request_denied"
+                and line["principal_id"] == stack.principals["reader"]
+                and line["certificate_fingerprint"] == stack.fingerprint("reader")
+                and line["root_id"] == stack.ids["root"]
+                and line["required_role"] == "writer"
+                and isinstance(line["request"], str) and line["request"] for line in denied),
+            "t22: a denied request names its principal, certificate, root, RPC and the role it needs", denied)
+    broken_lines = only("tls_handshake_failed")
+    require(all(line["event"] == "connection_refused" and line["detail"] for line in broken_lines),
+            "t22: a failed handshake carries its TLS error", broken_lines)
+    everything = stack.audit_lines()
+    return {
+        "new_lines": lines,
+        "lines_in_file": len(everything),
+        "reasons_in_file": {reason: sum(line["reason"] == reason for line in everything)
+                            for reason in sorted({line["reason"] for line in everything})},
+    }
+
+
 SCENARIOS: dict[str, Callable[[TlsStack], dict]] = {
     "t1_registered_client_round_trip": registered_client_round_trip,
     "t2_unregistered_certificate_refused": unregistered_certificate_refused,
@@ -975,6 +1071,7 @@ SCENARIOS: dict[str, Callable[[TlsStack], dict]] = {
     "t20_eight_principals_race_one_file_on_two_roots": eight_principals_race_one_file_on_two_roots,
     "t21_a_principal_of_another_tenant_is_refused_without_a_route":
         a_principal_of_another_tenant_is_refused_without_a_route,
+    "t22_every_refusal_is_audited": every_refusal_is_audited,
 }
 
 

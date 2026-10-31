@@ -64,6 +64,7 @@ Boundaries:
 | Tampering: an old-format store opened by a new owner | format 15 refuses to open a 0.12.x store and writes nothing; there is no migration | `nokv-meta` codec and recovery tests |
 | **R**epudiation: who made a write | Every operation records the principal that began it; `operation status` reports it to any reader of the root; a put through the Workbench tools carries the caller's operation id | `t10`, `t13`, `t20`, Pi `m1`, `m3`, Hermes `hm1` |
 | Repudiation: a write replayed by another principal | A replay returns the original receipt and keeps the original initiator | `t9`, `t12` |
+| Repudiation: who tried what and was refused | `serve --audit-log` appends one JSON line per refused connection and per denied request: the peer, the certificate fingerprint, the principal, the root, the RPC, the role it needs, and the reason | `t22`, `nokv-server` `every_refusal_of_a_tls_owner_is_appended_to_its_audit_log` |
 | **I**nformation disclosure: probing another tenant's root for its route | The owner refuses before any request; the refusal names the credential, nothing else. Under etcd, an Agent of tenant B cannot read `roots/<root of A>` | `t21`, `c3`, Pi `m4` |
 | Information disclosure: private keys in evidence | Gates delete private keys from evidence directories on close; wrappers in the downstream harnesses never print credentials (canary check) | `TlsStack.close`, Hermes harness `credential_canary_absent` |
 | Information disclosure: object bodies readable by another tenant | Object credentials are per deployment and read-only for Agents; cross-tenant object isolation is not claimed (one bucket prefix per deployment) | documented limitation, see `docs/object-credentials.md` |
@@ -84,8 +85,9 @@ Boundaries:
   host.
 - **Object-store isolation between tenants** is by deployment (bucket and
   prefix), not enforced by NoKV.
-- **Audit log**: operations record their initiator, but there is no append-only
-  audit trail of refused requests beyond the owner's log lines.
+- **Audit log integrity**: the refusal audit log is a file the owner's user
+  can edit; it is not tamper-evident. Ship it to a store that user cannot
+  write when that matters.
 - **Forged projections** are covered by unit tests only; the live gates drive
   the CLI, which cannot send a crafted RPC.
 - **Continuing another principal's pending append** (`operation recover`)

@@ -143,6 +143,11 @@ impl TenantAccess {
         self.max_age
     }
 
+    /// The tenant whose principals this access authenticates.
+    pub fn tenant_id(&self) -> TenantId {
+        self.tenant_id
+    }
+
     /// Reload the policy when its revision moved. A failure keeps the last
     /// copy, which stops authorizing once it is older than `max_age`.
     pub fn refresh(&self) -> Result<(), ControlError> {
