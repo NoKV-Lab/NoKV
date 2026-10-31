@@ -580,13 +580,30 @@ def multi_block_publish_through_the_owner_with_read_only_agent_credentials(stack
 
 
 def roots_provisioned_later_follow_the_tenant_boundary(stack: TlsStack) -> dict[str, Any]:
-    """T15: a root provisioned on the shard after the owner started is served
-    once it is bound to the owner's tenant; a root bound to another tenant is
-    left unmounted, and the owner says why, once."""
+    """T15: a root provisioned on the shard after the owner started is left
+    unmounted while no tenant owns it, is served once it is bound to the
+    owner's tenant, and a root bound to another tenant is never mounted; the
+    owner says why once per root and reason."""
     same, other, other_tenant = new_id(), new_id(), new_id()
     starts = stack.owner_starts
+    owner_log = stack.evidence / f"owner-{stack.owner_starts}.log"
+
+    def wait_for_log(fragment: str, what: str) -> None:
+        deadline = time.monotonic() + stack.timeout
+        while time.monotonic() < deadline:
+            if fragment in owner_log.read_text(errors="replace"):
+                return
+            time.sleep(0.1)
+        raise ContractFailure(f"t15: {what} within {stack.timeout}s")
+
     stack.provision(same)
     stack.provision(other)
+    # The owner's mount pass sees both roots before any tenant owns them. It
+    # must refuse them, not serve them; waiting for that refusal also makes
+    # the order of the log lines below the same on every run.
+    for root in (same, other):
+        wait_for_log(f"root {root} not mounted: root {root} is not bound to a tenant",
+                     f"the owner did not refuse the unbound root {root}")
     stack.identity("t15-tenant", "tenant", "create", other_tenant)
     stack.identity("t15-bind-other", "root", "bind", other, other_tenant)
     stack.identity("t15-bind-same", "root", "bind", same, stack.tenant)
@@ -604,10 +621,12 @@ def roots_provisioned_later_follow_the_tenant_boundary(stack: TlsStack) -> dict[
     require(stack.owner_starts == starts, "t15: the same owner serves it", starts)
     stack.success(stack.run("t15-create", ["workbench", "workbench_create", json.dumps({"id": "t15"})], root=same))
     time.sleep(2.5)
-    log = (stack.evidence / f"owner-{stack.owner_starts}.log").read_text(errors="replace")
-    refusal = f"root {other} not mounted"
-    require(log.count(refusal) == 1 and "this owner serves tenant" in log, "t15: the other tenant's root is refused once",
-            [line for line in log.splitlines() if "mounted" in line][-6:])
+    log = owner_log.read_text(errors="replace")
+    about_other = [line for line in log.splitlines() if f"root {other}" in line]
+    require(sum("is not bound to a tenant" in line for line in about_other) == 1
+            and sum("this owner serves tenant" in line for line in about_other) == 1
+            and not any(f"mounted root {other}" in line for line in about_other),
+            "t15: the other tenant's root is refused once per reason and never mounted", about_other[-6:])
     require(f"mounted root {same}" in log, "t15: the root of this tenant is mounted", log[-600:])
     refused = stack.run("t15-other", ["operation", "status", new_id()], root=other)
     require(refused.exit != 0 and '"NotFound"' not in refused.stderr, "t15: the other tenant's root is not served",

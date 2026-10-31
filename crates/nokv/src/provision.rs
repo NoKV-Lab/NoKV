@@ -39,6 +39,32 @@ pub enum ProvisionError {
     MissingAfterConflict(&'static str),
 }
 
+impl ProvisionError {
+    /// The failure's code in the command's envelope.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Control(_) => "ControlFailure",
+            Self::LegacyAgentBindingAdoptionRequired(_) => "LegacyAgentBindingAdoptionRequired",
+            Self::PlacementGenerationExhausted(_) => "PlacementGenerationExhausted",
+            Self::PlacementNotActivatable { .. } => "PlacementNotActivatable",
+            Self::MissingAfterConflict(_) => "ProvisionRaced",
+        }
+    }
+
+    /// What the failure asks of the caller: a control-plane failure keeps its
+    /// own class; a record that a concurrent provision removed is repeated;
+    /// every other refusal needs an operator decision.
+    pub fn class(&self) -> nokv_types::ErrorClass {
+        match self {
+            Self::Control(error) => error.class(),
+            Self::MissingAfterConflict(_) => nokv_types::ErrorClass::Transient,
+            Self::LegacyAgentBindingAdoptionRequired(_)
+            | Self::PlacementGenerationExhausted(_)
+            | Self::PlacementNotActivatable { .. } => nokv_types::ErrorClass::OperatorRequired,
+        }
+    }
+}
+
 impl fmt::Display for ProvisionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -302,6 +328,49 @@ mod tests {
 
     fn shard(byte: u8) -> LogicalShardId {
         LogicalShardId::from_bytes([byte; 16])
+    }
+
+    #[test]
+    fn a_provision_failure_tells_the_caller_whether_to_repeat_or_ask_an_operator() {
+        use nokv_types::ErrorClass;
+
+        for (error, code, class) in [
+            (
+                ProvisionError::Control(ControlError::Backend("etcd unavailable".to_owned())),
+                "ControlFailure",
+                ErrorClass::Transient,
+            ),
+            (
+                ProvisionError::Control(ControlError::PermissionDenied("roots/".to_owned())),
+                "ControlFailure",
+                ErrorClass::PermissionDenied,
+            ),
+            (
+                ProvisionError::MissingAfterConflict("root placement"),
+                "ProvisionRaced",
+                ErrorClass::Transient,
+            ),
+            (
+                ProvisionError::LegacyAgentBindingAdoptionRequired(root(1)),
+                "LegacyAgentBindingAdoptionRequired",
+                ErrorClass::OperatorRequired,
+            ),
+            (
+                ProvisionError::PlacementGenerationExhausted(root(1)),
+                "PlacementGenerationExhausted",
+                ErrorClass::OperatorRequired,
+            ),
+            (
+                ProvisionError::PlacementNotActivatable {
+                    root_id: root(1),
+                    lifecycle: RootPlacementLifecycle::Retired,
+                },
+                "PlacementNotActivatable",
+                ErrorClass::OperatorRequired,
+            ),
+        ] {
+            assert_eq!((error.code(), error.class()), (code, class), "{error}");
+        }
     }
 
     fn namespace(byte: u8) -> ObjectNamespaceId {
