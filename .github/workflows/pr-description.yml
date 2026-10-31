@@ -43,5 +43,5 @@ jobs:
             "repos/$GITHUB_REPOSITORY/contents/scripts/ci/pr_description.py?ref=$POLICY_SHA" \
             --jq .content | base64 --decode > "$policy"
           gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
-            --jq '{title, body}' > "$metadata"
+            --jq '{title, body, author: .user.login}' > "$metadata"
           python3 "$policy" --pull-request-json "$metadata"
