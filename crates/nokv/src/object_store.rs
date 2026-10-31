@@ -6,7 +6,9 @@
 //! Object-provider composition for the custom Agent CLI.
 
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
+use nokv_client::ClientOptions;
 use nokv_object::{
     admit_artifact_provider, ensure_object_namespace, load_object_namespace,
     verify_object_namespace, ArtifactObjectStore, ArtifactStoreCapabilities,
@@ -16,7 +18,7 @@ use nokv_object::{
     S3ArtifactStoreOptions, TieredArtifactStore, TieredArtifactStoreOptions,
     DEFAULT_ARTIFACT_BLOCK_SIZE,
 };
-use nokv_types::ObjectNamespaceId;
+use nokv_types::{ErrorClass, ObjectNamespaceId};
 
 use super::cli::ObjectConfig;
 
@@ -110,6 +112,19 @@ impl CliObjectStore {
                 .with_append_sealing();
             admit_artifact_provider(store, profile)
         })
+    }
+
+    /// [`Self::validate_append_capabilities`] within a retry budget: a probe
+    /// that failed before it could take effect (an unreachable or
+    /// inconclusive provider) is repeated after the budget's pause; a
+    /// provider that lacks a capability is not. On failure, returns the last
+    /// attempt's cause and how many attempts ran.
+    pub fn admit_within(
+        &self,
+        options: ClientOptions,
+        sleep: impl FnMut(Duration),
+    ) -> Result<(), (ProviderAdmissionError, u32)> {
+        repeat_transient_admission(options, || self.validate_append_capabilities(), sleep)
     }
 
     fn cache_admission(
@@ -225,6 +240,26 @@ impl ArtifactObjectStore for CliObjectStore {
     }
 }
 
+fn repeat_transient_admission(
+    options: ClientOptions,
+    mut probe: impl FnMut() -> Result<(), ProviderAdmissionError>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), (ProviderAdmissionError, u32)> {
+    let mut attempt = 1;
+    loop {
+        match probe() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.class() == ErrorClass::Transient && attempt < options.max_attempts =>
+            {
+                sleep(options.retry_delay(attempt));
+                attempt += 1;
+            }
+            Err(error) => return Err((error, attempt)),
+        }
+    }
+}
+
 /// A configuration whose provider refuses connections, so an admission probe
 /// fails at once without leaving the host: nothing listens on privileged
 /// port 1, and no test can bind it.
@@ -241,8 +276,6 @@ pub(crate) fn refused_provider_config() -> ObjectConfig {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use nokv_types::ErrorClass;
 
     use super::*;
 
@@ -305,6 +338,84 @@ mod tests {
             assert_eq!(error, ProviderAdmissionError::Inconclusive);
         }
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(store.provider_admission_receipt().is_none());
+    }
+
+    fn budget(max_attempts: u32, backoff_ms: u64) -> ClientOptions {
+        ClientOptions {
+            max_attempts,
+            retry_backoff: Duration::from_millis(backoff_ms),
+            max_retry_backoff: Duration::from_millis(2_000),
+        }
+    }
+
+    #[test]
+    fn a_transient_admission_failure_is_repeated_within_the_budget() {
+        let mut outcomes = vec![
+            Err(ProviderAdmissionError::Unavailable),
+            Err(ProviderAdmissionError::Inconclusive),
+            Ok(()),
+        ]
+        .into_iter();
+        let mut pauses = Vec::new();
+        let admitted = repeat_transient_admission(
+            budget(3, 250),
+            || outcomes.next().unwrap(),
+            |pause| pauses.push(pause),
+        );
+        assert_eq!(admitted, Ok(()));
+        assert_eq!(
+            pauses,
+            [Duration::from_millis(250), Duration::from_millis(500)]
+        );
+    }
+
+    #[test]
+    fn the_last_transient_failure_is_reported_with_its_attempt_count() {
+        let mut probes = 0;
+        let mut pauses = 0;
+        let error = repeat_transient_admission(
+            budget(4, 0),
+            || {
+                probes += 1;
+                Err(ProviderAdmissionError::Unavailable)
+            },
+            |_| pauses += 1,
+        )
+        .unwrap_err();
+        assert_eq!(error, (ProviderAdmissionError::Unavailable, 4));
+        assert_eq!((probes, pauses), (4, 3));
+    }
+
+    #[test]
+    fn a_provider_without_a_required_capability_is_probed_once() {
+        let rejected = ProviderAdmissionError::Rejected {
+            capability: nokv_object::ProviderAdmissionCapability::AtomicCreateIfAbsent,
+        };
+        let mut probes = 0;
+        let error = repeat_transient_admission(
+            budget(16, 1),
+            || {
+                probes += 1;
+                Err(rejected)
+            },
+            |_| panic!("a rejected provider must not be probed again"),
+        )
+        .unwrap_err();
+        assert_eq!(error, (rejected, 1));
+        assert_eq!(error.0.class(), ErrorClass::OperatorRequired);
+        assert_eq!(probes, 1);
+    }
+
+    #[test]
+    fn a_refusing_provider_spends_the_budget_and_stays_unadmitted() {
+        let store = CliObjectStore::build(&refused_provider_config()).unwrap();
+        let mut pauses = 0;
+        let (cause, attempts) = store
+            .admit_within(budget(3, 0), |_| pauses += 1)
+            .unwrap_err();
+        assert_eq!(cause.class(), ErrorClass::Transient);
+        assert_eq!((attempts, pauses), (3, 2));
         assert!(store.provider_admission_receipt().is_none());
     }
 

@@ -11,10 +11,11 @@ inode/dentry layout.  Its oracle is the externally observable chain from
     commit A -> snapshot A -> mutate A -> restore B -> mutate B without a
     recommit -> snapshot B -> restore C -> retire snapshot B -> read C
 
-The 18-tool surface is driven through one flat ``nokv mcp`` process.  Atomic
-rename and removal are driven through the separate, Workbench-scoped
-``workspace-path`` CLI so the gate neither expands MCP nor recreates POSIX
-absolute-path semantics.
+The 18-tool surface is driven through ``nokv workbench <tool>``, one process
+per call, graded against the native CLI contract in docs/cli-contract.md.
+Atomic rename and removal are driven through the separate, Workbench-scoped
+``workspace-path`` CLI so the gate neither expands the tool surface nor
+recreates POSIX absolute-path semantics.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ import json
 import os
 import platform
 import re
-import selectors
 import shutil
 import signal
 import socket
@@ -38,6 +38,16 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Sequence, TextIO
 
+from cli_contract import (
+    Call,
+    Contract,
+    ContractFailure,
+    NotQualified as ContractTablesMissing,
+    contract_failure,
+    contract_success,
+    owner_serves,
+    published_contract,
+)
 from source_bound_producer import ProducerError, ScenarioContract
 from typed_live_qualification import load_live_context, publish_live_result
 
@@ -212,10 +222,10 @@ def commit_content_digest() -> str:
 def oracle_plan(config: Config) -> list[OracleStep]:
     del config
     return [
-        OracleStep("create-a", "mcp", "workbench_create", {"id": "composition-a"}),
+        OracleStep("create-a", "workbench", "workbench_create", {"id": "composition-a"}),
         OracleStep(
             "put-a-rename-source",
-            "mcp",
+            "workbench",
             "workbench_put_file",
             {
                 "id": "composition-a",
@@ -228,7 +238,7 @@ def oracle_plan(config: Config) -> list[OracleStep]:
         ),
         OracleStep(
             "put-a-delete-source",
-            "mcp",
+            "workbench",
             "workbench_put_file",
             {
                 "id": "composition-a",
@@ -241,7 +251,7 @@ def oracle_plan(config: Config) -> list[OracleStep]:
         ),
         OracleStep(
             "put-a-payload",
-            "mcp",
+            "workbench",
             "workbench_put_file",
             {
                 "id": "composition-a",
@@ -254,7 +264,7 @@ def oracle_plan(config: Config) -> list[OracleStep]:
         ),
         OracleStep(
             "commit-a",
-            "mcp",
+            "workbench",
             "workbench_commit",
             {
                 "id": "composition-a",
@@ -268,7 +278,7 @@ def oracle_plan(config: Config) -> list[OracleStep]:
         ),
         OracleStep(
             "snapshot-a",
-            "mcp",
+            "workbench",
             "workbench_snapshot",
             {
                 "id": "composition-a",
@@ -279,7 +289,7 @@ def oracle_plan(config: Config) -> list[OracleStep]:
         ),
         OracleStep(
             "mutate-a-after-snapshot",
-            "mcp",
+            "workbench",
             "workbench_put_file",
             {
                 "id": "composition-a",
@@ -292,7 +302,7 @@ def oracle_plan(config: Config) -> list[OracleStep]:
         ),
         OracleStep(
             "restore-b",
-            "mcp",
+            "workbench",
             "workbench_restore",
             {
                 "id": "composition-a",
@@ -302,7 +312,7 @@ def oracle_plan(config: Config) -> list[OracleStep]:
         ),
         OracleStep(
             "find-b-committed",
-            "mcp",
+            "workbench",
             "workbench_find",
             {"committed": True, "include_manifest": True, "limit": 100},
         ),
@@ -331,7 +341,7 @@ def oracle_plan(config: Config) -> list[OracleStep]:
         ),
         OracleStep(
             "publish-b",
-            "mcp",
+            "workbench",
             "workbench_put_file",
             {
                 "id": "composition-b",
@@ -344,7 +354,7 @@ def oracle_plan(config: Config) -> list[OracleStep]:
         ),
         OracleStep(
             "snapshot-b-no-recommit",
-            "mcp",
+            "workbench",
             "workbench_snapshot",
             {
                 "id": "composition-b",
@@ -355,7 +365,7 @@ def oracle_plan(config: Config) -> list[OracleStep]:
         ),
         OracleStep(
             "restore-c",
-            "mcp",
+            "workbench",
             "workbench_restore",
             {
                 "id": "composition-b",
@@ -365,13 +375,13 @@ def oracle_plan(config: Config) -> list[OracleStep]:
         ),
         OracleStep(
             "find-c-committed",
-            "mcp",
+            "workbench",
             "workbench_find",
             {"committed": True, "include_manifest": True, "limit": 100},
         ),
         OracleStep(
             "mutate-b-after-snapshot",
-            "mcp",
+            "workbench",
             "workbench_put_file",
             {
                 "id": "composition-b",
@@ -384,7 +394,7 @@ def oracle_plan(config: Config) -> list[OracleStep]:
         ),
         OracleStep(
             "retire-snapshot-b",
-            "mcp",
+            "workbench",
             "workbench_snapshot_retire",
             {
                 "id": "composition-b",
@@ -394,7 +404,7 @@ def oracle_plan(config: Config) -> list[OracleStep]:
         ),
         OracleStep(
             "read-c-after-retire",
-            "mcp",
+            "workbench",
             "workbench_read",
             {
                 "id": "composition-c",
@@ -406,7 +416,7 @@ def oracle_plan(config: Config) -> list[OracleStep]:
         ),
         OracleStep(
             "restore-c-terminal-replay",
-            "mcp",
+            "workbench",
             "workbench_restore",
             {
                 "id": "composition-b",
@@ -741,13 +751,19 @@ def validate_composition_evidence(evidence: dict[str, Any]) -> None:
                 "idempotent_replay",
                 "fault_owner_socket_ready",
                 "successor_owner_socket_ready",
-                "mcp_survived_fault_owner_exit",
             )
         )
         or fault.get("owner_exit_code") != 86
         or fault.get("operation_state_before_replay") != "running"
     ):
         raise WorkflowFailure("fault successor/replay boundary is incomplete")
+    client_exit_code = fault.get("client_exit_code")
+    if (
+        not isinstance(client_exit_code, int)
+        or isinstance(client_exit_code, bool)
+        or client_exit_code <= 0
+    ):
+        raise WorkflowFailure("fault client did not exit with a failure code")
     validate_owner_loss_error(
         fault.get("client_failure"), "fault injection client failure"
     )
@@ -1155,87 +1171,44 @@ def fault_inspect_command(
     ]
 
 
-class Mcp:
-    def __init__(
-        self,
-        process: subprocess.Popen[str],
-        evidence: Evidence,
-        timeout: float,
-    ) -> None:
-        self.process = process
-        self.evidence = evidence
-        self.timeout = timeout
-        self.next_id = 1
+class WorkbenchCli:
+    """The 18-tool surface through `nokv workbench <tool>`: one process per
+    call, recorded in cli-transcript.jsonl and graded against the native CLI
+    contract."""
 
-    def request(
-        self, method: str, params: dict[str, Any] | None = None, *, label: str
-    ) -> dict[str, Any]:
-        request_id = self.next_id
-        self.next_id += 1
-        request: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
-        if params is not None:
-            request["params"] = params
-        encoded = canonical_json(request)
-        if self.process.stdin is None or self.process.stdout is None:
-            raise WorkflowFailure("MCP stdio pipes are unavailable")
-        self.process.stdin.write(encoded + "\n")
-        self.process.stdin.flush()
-        selector = selectors.DefaultSelector()
-        selector.register(self.process.stdout, selectors.EVENT_READ)
-        try:
-            if not selector.select(self.timeout):
-                raise WorkflowFailure(f"{label} MCP response timed out")
-            raw = self.process.stdout.readline().rstrip("\n")
-        finally:
-            selector.close()
-        if not raw:
-            raise WorkflowFailure(f"{label} MCP process exited before responding")
-        try:
-            response = json.loads(raw)
-        except json.JSONDecodeError as error:
-            raise WorkflowFailure(f"{label} MCP response is not JSON") from error
+    def __init__(
+        self, config: Config, runtime: Runtime, evidence: Evidence, contract: Contract
+    ) -> None:
+        self.config, self.runtime, self.evidence = config, runtime, evidence
+        self.exits, self.actions = contract
+
+    def invoke(self, label: str, name: str, arguments: dict[str, Any]) -> Call:
+        result = run(
+            [
+                *client_args(self.config, self.runtime),
+                "workbench",
+                name,
+                canonical_json(arguments),
+            ],
+            config=self.config,
+            evidence=self.evidence,
+            label=label,
+            check=False,
+        )
         self.evidence.line(
-            "mcp-transcript.jsonl",
+            "cli-transcript.jsonl",
             {
                 "schema": SCHEMA,
                 "label": label,
                 "recorded_at": now(),
-                "request_raw": encoded,
-                "request": request,
-                "response_raw": raw,
-                "response": response,
+                "tool": name,
+                "arguments": arguments,
+                "exit": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
             },
         )
-        if response.get("jsonrpc") != "2.0" or response.get("id") != request_id:
-            raise WorkflowFailure(f"{label} MCP response envelope differs")
-        return response
-
-    def notify(self, method: str) -> None:
-        if self.process.stdin is None:
-            raise WorkflowFailure("MCP stdin is unavailable")
-        self.process.stdin.write(
-            canonical_json({"jsonrpc": "2.0", "method": method}) + "\n"
-        )
-        self.process.stdin.flush()
-
-    def initialize(self) -> None:
-        response = self.request(
-            "initialize",
-            {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "restore-composition-gate", "version": "1"},
-            },
-            label="initialize",
-        )
-        result = response.get("result")
-        if (
-            not isinstance(result, dict)
-            or result.get("serverInfo", {}).get("name") != "nokv-mcp"
-            or result.get("capabilities") != {"tools": {}}
-        ):
-            raise WorkflowFailure("MCP initialize result differs")
-        self.notify("notifications/initialized")
+        return Call(label, result.returncode, result.stdout, result.stderr)
 
     def call(
         self,
@@ -1243,63 +1216,55 @@ class Mcp:
         name: str,
         arguments: dict[str, Any],
         *,
-        expected_error: str | None = None,
+        expected_failure: tuple[str, str, str] | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
-            "tools/call", {"name": name, "arguments": arguments}, label=label
-        )
-        result = response.get("result")
-        structured = matching_mcp_structured_content(result, label)
-        is_error = result.get("isError") is True
-        if expected_error is not None:
-            if not is_error or structured.get("code") != expected_error:
-                raise WorkflowFailure(f"{label} did not return {expected_error}")
-        elif is_error or structured.get("status") != "success":
-            raise WorkflowFailure(f"{label} failed: {structured!r}")
-        return structured
+        """A tool call that prints one success result, or fails as exactly
+        `expected_failure`: the Agent error code with the contract class and
+        next action the CLI reports for it."""
+        call = self.invoke(label, name, arguments)
+        try:
+            if expected_failure is None:
+                return contract_success(call)
+            code, klass, next_action = expected_failure
+            envelope = contract_failure(call, self.exits, self.actions, klass, next_action)
+        except ContractFailure as error:
+            raise WorkflowFailure(str(error)) from None
+        if envelope.get("code") != code:
+            raise WorkflowFailure(f"{label} did not return {code}: {envelope.get('code')!r}")
+        return envelope
 
     def call_until_owner_loss(
-        self,
-        label: str,
-        name: str,
-        arguments: dict[str, Any],
-    ) -> dict[str, Any]:
-        response = self.request(
-            "tools/call", {"name": name, "arguments": arguments}, label=label
-        )
-        result = response.get("result")
-        if not isinstance(result, dict) or result.get("isError") is not True:
-            raise WorkflowFailure(
-                f"{label} did not return the bounded client failure after owner loss"
+        self, label: str, name: str, arguments: dict[str, Any]
+    ) -> tuple[dict[str, Any], int]:
+        """The restore whose owner exits at the fault barrier. The client
+        exhausts its attempts and the command reports the bounded failure of
+        docs/cli-contract.md: one stderr line, nothing on stdout, and the exit
+        code of outcome_unknown."""
+        call = self.invoke(label, name, arguments)
+        try:
+            envelope = contract_failure(
+                call, self.exits, self.actions, "outcome_unknown", "resubmit_same"
             )
-        structured = matching_mcp_structured_content(result, label)
-        validate_owner_loss_error(structured, label)
-        return structured
-
-
-def matching_mcp_structured_content(value: Any, label: str) -> dict[str, Any]:
-    structured = value.get("structuredContent") if isinstance(value, dict) else None
-    if not isinstance(structured, dict):
-        raise WorkflowFailure(f"{label} lacks structuredContent")
-    try:
-        text_value = json.loads(value["content"][0]["text"])
-    except (IndexError, KeyError, TypeError, json.JSONDecodeError) as error:
-        raise WorkflowFailure(f"{label} lacks matching JSON text content") from error
-    if text_value != structured:
-        raise WorkflowFailure(f"{label} text and structured results differ")
-    return structured
+        except ContractFailure as error:
+            raise WorkflowFailure(str(error)) from None
+        validate_owner_loss_error(envelope, label)
+        return envelope, call.exit
 
 
 def validate_owner_loss_error(value: Any, label: str) -> None:
+    """The bounded client failure after owner loss, as the CLI contract states
+    it: nokv-client exhausted its three attempts, the restore's outcome is
+    unknown, and the content-derived command is resubmitted as is."""
     details = value.get("details") if isinstance(value, dict) else None
     if (
         not isinstance(value, dict)
         or value.get("status") != "error"
         or value.get("code") != "ClientFailure"
-        or value.get("retryable") is not True
         or not isinstance(details, dict)
         or details.get("source") != "nokv-client"
         or details.get("attempts") != 3
+        or value.get("class") != "outcome_unknown"
+        or value.get("next_action") != "resubmit_same"
     ):
         raise WorkflowFailure(
             f"{label} did not return the bounded client failure after owner loss"
@@ -1338,14 +1303,16 @@ def decode_json_document(result: dict[str, Any], label: str) -> dict[str, Any]:
 
 
 def read_bytes(
-    mcp: Mcp,
+    cli: WorkbenchCli,
     label: str,
     workbench: str,
     path: str,
     *,
     expected_error: str | None = None,
 ) -> bytes | None:
-    result = mcp.call(
+    # A read never reports an unknown outcome, so an absent path is not_found
+    # with do_not_retry.
+    result = cli.call(
         label,
         "workbench_read",
         {
@@ -1355,13 +1322,17 @@ def read_bytes(
             "format": "bytes",
             "limit": 300,
         },
-        expected_error=expected_error,
+        expected_failure=(
+            None
+            if expected_error is None
+            else (expected_error, "not_found", "do_not_retry")
+        ),
     )
     return None if expected_error else decode_bytes(result, label)
 
 
-def read_manifest(mcp: Mcp, label: str, workbench: str, path: str) -> dict[str, Any]:
-    result = mcp.call(
+def read_manifest(cli: WorkbenchCli, label: str, workbench: str, path: str) -> dict[str, Any]:
+    result = cli.call(
         label,
         "workbench_read",
         {
@@ -1956,17 +1927,6 @@ def build_timeout(runtime_timeout: float) -> float:
     return max(runtime_timeout, BUILD_TIMEOUT_SECONDS)
 
 
-def close_mcp(mcp: Mcp | None) -> None:
-    if mcp is None:
-        return
-    if mcp.process.stdin is not None:
-        try:
-            mcp.process.stdin.close()
-        except OSError:
-            pass
-    stop_process(mcp.process)
-
-
 def wait_rustfs(
     config: Config,
     endpoint: str,
@@ -2020,51 +1980,43 @@ def workspace_path_capable(config: Config) -> bool:
     )
 
 
-def start_mcp(
+def load_contract(config: Config) -> Contract:
+    try:
+        return published_contract(config.repo)
+    except (OSError, ContractTablesMissing) as error:
+        raise NotQualified(f"CLI contract tables are unavailable: {error}") from error
+
+
+def start_cli(
     config: Config,
     runtime: Runtime,
     evidence: Evidence,
     owner: subprocess.Popen[str],
-    stderr: TextIO,
+    contract: Contract,
     *,
     deadline: float | None = None,
-) -> Mcp:
+) -> WorkbenchCli:
+    """The CLI once `owner` serves metadata reads: an `operation status` of an
+    unknown id answers not_found rather than a transport failure."""
     deadline = deadline or time.monotonic() + config.timeout
-    last_error = ""
+    exits, actions = contract
     while time.monotonic() < deadline:
         if owner.poll() is not None:
-            raise WorkflowFailure(
-                f"owner exited before MCP startup ({owner.returncode})"
-            )
-        process = subprocess.Popen(
-            [*client_args(config, runtime), "mcp"],
-            cwd=config.repo,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=stderr,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
+            raise WorkflowFailure(f"owner exited before serving ({owner.returncode})")
+        probe = run(
+            [*client_args(config, runtime), "operation", "status", "00" * 16],
+            config=config,
+            evidence=evidence,
+            label="owner-ready",
+            check=False,
+            timeout=min(remaining(deadline, "owner readiness"), 10),
         )
-        mcp = Mcp(process, evidence, min(remaining(deadline, "MCP startup"), 10))
-        try:
-            mcp.initialize()
-            evidence.line(
-                "processes.jsonl",
-                {
-                    "schema": SCHEMA,
-                    "label": "mcp",
-                    "argv": redact_argv([*client_args(config, runtime), "mcp"]),
-                    "pid": process.pid,
-                    "started_at": now(),
-                },
-            )
-            return mcp
-        except WorkflowFailure as error:
-            last_error = str(error)
-            stop_process(process)
-            time.sleep(0.25)
-    raise WorkflowFailure(f"MCP did not initialize: {last_error}")
+        if owner_serves(
+            Call("owner-ready", probe.returncode, probe.stdout, probe.stderr), exits, actions
+        ):
+            return WorkbenchCli(config, runtime, evidence, contract)
+        time.sleep(0.25)
+    raise WorkflowFailure("owner did not serve metadata reads before the deadline")
 
 
 def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
@@ -2127,6 +2079,7 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
         )
     binary_sha256 = digest_file(config.binary)
     fault_binary_sha256 = digest_file(config.fault_binary)
+    contract = load_contract(config)
 
     etcd_port, peer_port, s3_port, console_port, owner_port = (
         free_port() for _ in range(5)
@@ -2150,10 +2103,8 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
     environment = aws_environment(runtime.access_key, runtime.secret_key)
     etcd_log = (evidence.root / "etcd.log").open("w", encoding="utf-8")
     owner_log = (evidence.root / "owner.log").open("w", encoding="utf-8")
-    mcp_log = (evidence.root / "mcp.stderr.log").open("w", encoding="utf-8")
     etcd_process: subprocess.Popen[str] | None = None
     owner: subprocess.Popen[str] | None = None
-    mcp: Mcp | None = None
     container_created = False
     volume_created = False
     try:
@@ -2252,7 +2203,7 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
             label="initial-owner",
         )
         wait_tcp(owner, runtime.owner_port, config.timeout)
-        mcp = start_mcp(config, runtime, evidence, owner, mcp_log)
+        cli = start_cli(config, runtime, evidence, owner, contract)
 
         plan = {step.label: step for step in oracle_plan(config)}
         for label in (
@@ -2262,9 +2213,9 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
             "put-a-payload",
         ):
             step = plan[label]
-            mcp.call(step.label, step.operation, step.arguments)
+            cli.call(step.label, step.operation, step.arguments)
         commit_step = plan["commit-a"]
-        a_commit = mcp.call(
+        a_commit = cli.call(
             commit_step.label, commit_step.operation, commit_step.arguments
         )
         if (
@@ -2275,16 +2226,16 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
                 "A did not establish one fresh generation-1 commit head"
             )
         a_manifest = read_manifest(
-            mcp, "read-a-run-manifest", "composition-a", "run_manifest.json"
+            cli, "read-a-run-manifest", "composition-a", "run_manifest.json"
         )
         snapshot_step = plan["snapshot-a"]
-        snapshot_a = mcp.call(
+        snapshot_a = cli.call(
             snapshot_step.label, snapshot_step.operation, snapshot_step.arguments
         )
         if snapshot_a.get("state") != "alive":
             raise WorkflowFailure("snapshot A is not alive")
         mutate_a = plan["mutate-a-after-snapshot"]
-        mcp.call(mutate_a.label, mutate_a.operation, mutate_a.arguments)
+        cli.call(mutate_a.label, mutate_a.operation, mutate_a.arguments)
 
         snapshot_a_id = snapshot_a.get("snapshot_id")
         if (
@@ -2322,8 +2273,6 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
         )
         fault_deadline = time.monotonic() + config.timeout
         require_owner_session(config, runtime, "initial owner")
-        close_mcp(mcp)
-        mcp = None
         if stop_process(owner, signal.SIGTERM) is None:
             raise WorkflowFailure("initial owner was absent before fault-owner handoff")
         wait_owner_session_absent(config, runtime, "initial owner", fault_deadline)
@@ -2357,23 +2306,15 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
             },
         )
         require_owner_session(config, runtime, "fault owner")
-        mcp = start_mcp(
-            config,
-            runtime,
-            evidence,
-            owner,
-            mcp_log,
-            deadline=fault_deadline,
+        cli = start_cli(
+            config, runtime, evidence, owner, contract, deadline=fault_deadline
         )
         restore_b_step = plan["restore-b"]
-        fault_client_error = mcp.call_until_owner_loss(
+        fault_client_error, fault_client_exit_code = cli.call_until_owner_loss(
             "restore-b-pre-complete-crash",
             restore_b_step.operation,
             restore_b_step.arguments,
         )
-        if mcp.process.poll() is not None:
-            raise WorkflowFailure("MCP exited with the restore crash owner")
-        mcp_survived_fault_owner_exit = True
         fault_owner_exit_code = wait_exact_exit(
             owner,
             86,
@@ -2390,8 +2331,6 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
                 "recorded_at": now(),
             },
         )
-        close_mcp(mcp)
-        mcp = None
 
         barrier_envelope = load_json_object(
             barrier_file, "restore crash barrier evidence"
@@ -2431,16 +2370,11 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
             },
         )
         require_owner_session(config, runtime, "successor owner")
-        mcp = start_mcp(
-            config,
-            runtime,
-            evidence,
-            owner,
-            mcp_log,
-            deadline=fault_deadline,
+        cli = start_cli(
+            config, runtime, evidence, owner, contract, deadline=fault_deadline
         )
 
-        hidden = mcp.call(
+        hidden = cli.call(
             "find-b-hidden-before-replay",
             "workbench_find",
             {"include_manifest": False, "limit": 100},
@@ -2513,7 +2447,7 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
             raise WorkflowFailure(
                 "object inventory changed while waiting for successor reopen"
             )
-        restore_b = mcp.call(
+        restore_b = cli.call(
             restore_b_step.label,
             restore_b_step.operation,
             restore_b_step.arguments,
@@ -2528,19 +2462,19 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
         if after_b != pre_replay_inventory:
             raise WorkflowFailure("restore B exact replay changed object inventory")
         b_manifest = read_manifest(
-            mcp, "read-b-run-manifest", "composition-b", "run_manifest.json"
+            cli, "read-b-run-manifest", "composition-b", "run_manifest.json"
         )
         b_restore_manifest = read_manifest(
-            mcp, "read-b-restore-manifest", "composition-b", "restore_manifest.json"
+            cli, "read-b-restore-manifest", "composition-b", "restore_manifest.json"
         )
         b_frozen_payload = read_bytes(
-            mcp, "read-b-frozen-payload", "composition-b", "payload.txt"
+            cli, "read-b-frozen-payload", "composition-b", "payload.txt"
         )
         a_live_payload = read_bytes(
-            mcp, "read-a-live-payload", "composition-a", "payload.txt"
+            cli, "read-a-live-payload", "composition-a", "payload.txt"
         )
         assert b_frozen_payload is not None and a_live_payload is not None
-        b_find_result = mcp.call(
+        b_find_result = cli.call(
             "find-b-committed",
             "workbench_find",
             plan["find-b-committed"].arguments,
@@ -2604,7 +2538,7 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
             "owner_exit_code": fault_owner_exit_code,
             "fault_owner_socket_ready": fault_owner_socket_ready,
             "successor_owner_socket_ready": successor_owner_socket_ready,
-            "mcp_survived_fault_owner_exit": mcp_survived_fault_owner_exit,
+            "client_exit_code": fault_client_exit_code,
             "initial_owner_session_absent_before_fault": True,
             "fault_owner_session_absent_before_reopen": True,
             "destination_hidden_before_replay": True,
@@ -2669,31 +2603,31 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
             remove[remove.index("--request-id") + 1],
         )
         publish_b = plan["publish-b"]
-        mcp.call(publish_b.label, publish_b.operation, publish_b.arguments)
+        cli.call(publish_b.label, publish_b.operation, publish_b.arguments)
         read_bytes(
-            mcp,
+            cli,
             "assert-b-old-rename-absent",
             "composition-b",
             "rename-source.txt",
             expected_error="NotFound",
         )
         read_bytes(
-            mcp,
+            cli,
             "assert-b-deleted-absent",
             "composition-b",
             "delete-source.txt",
             expected_error="NotFound",
         )
-        b_renamed = read_bytes(mcp, "read-b-renamed", "composition-b", "renamed.txt")
+        b_renamed = read_bytes(cli, "read-b-renamed", "composition-b", "renamed.txt")
         b_published = read_bytes(
-            mcp, "read-b-published", "composition-b", "published.txt"
+            cli, "read-b-published", "composition-b", "published.txt"
         )
         assert b_renamed is not None and b_published is not None
         if b_renamed != renamed_payload() or b_published != published_payload():
             raise WorkflowFailure("B mutation bytes differ from the oracle")
 
         snapshot_b_step = plan["snapshot-b-no-recommit"]
-        snapshot_b = mcp.call(
+        snapshot_b = cli.call(
             snapshot_b_step.label, snapshot_b_step.operation, snapshot_b_step.arguments
         )
         if snapshot_b.get("state") != "alive":
@@ -2704,7 +2638,7 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
             config, runtime, evidence, "inventory-before-c", environment
         )
         restore_c_step = plan["restore-c"]
-        restore_c = mcp.call(
+        restore_c = cli.call(
             restore_c_step.label, restore_c_step.operation, restore_c_step.arguments
         )
         if (
@@ -2719,12 +2653,12 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
                 f"restore C must publish exactly two destination manifests, observed {len(c_changed)}"
             )
         c_manifest = read_manifest(
-            mcp, "read-c-run-manifest", "composition-c", "run_manifest.json"
+            cli, "read-c-run-manifest", "composition-c", "run_manifest.json"
         )
         c_restore_manifest = read_manifest(
-            mcp, "read-c-restore-manifest", "composition-c", "restore_manifest.json"
+            cli, "read-c-restore-manifest", "composition-c", "restore_manifest.json"
         )
-        c_find_result = mcp.call(
+        c_find_result = cli.call(
             "find-c-committed",
             "workbench_find",
             plan["find-c-committed"].arguments,
@@ -2733,57 +2667,56 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
             c_find_result, "composition-c", c_manifest.get("commit_identity")
         )
         read_bytes(
-            mcp,
+            cli,
             "assert-c-old-rename-absent",
             "composition-c",
             "rename-source.txt",
             expected_error="NotFound",
         )
         read_bytes(
-            mcp,
+            cli,
             "assert-c-deleted-absent",
             "composition-c",
             "delete-source.txt",
             expected_error="NotFound",
         )
-        c_renamed = read_bytes(mcp, "read-c-renamed", "composition-c", "renamed.txt")
+        c_renamed = read_bytes(cli, "read-c-renamed", "composition-c", "renamed.txt")
         c_published = read_bytes(
-            mcp, "read-c-published", "composition-c", "published.txt"
+            cli, "read-c-published", "composition-c", "published.txt"
         )
         assert c_renamed is not None and c_published is not None
         mutate_b = plan["mutate-b-after-snapshot"]
-        mcp.call(mutate_b.label, mutate_b.operation, mutate_b.arguments)
+        cli.call(mutate_b.label, mutate_b.operation, mutate_b.arguments)
         b_live_after_nested = read_bytes(
-            mcp, "read-b-after-nested-snapshot", "composition-b", "published.txt"
+            cli, "read-b-after-nested-snapshot", "composition-b", "published.txt"
         )
         assert b_live_after_nested is not None
         c_unchanged = read_bytes(
-            mcp, "read-c-after-b-mutation", "composition-c", "published.txt"
+            cli, "read-c-after-b-mutation", "composition-c", "published.txt"
         )
         if c_unchanged != published_payload():
             raise WorkflowFailure("C changed after a later B mutation")
         retire_step = plan["retire-snapshot-b"]
-        retire_b = mcp.call(
+        retire_b = cli.call(
             retire_step.label, retire_step.operation, retire_step.arguments
         )
         if retire_b.get("retired") is not True or retire_b.get("state") != "retired":
             raise WorkflowFailure("snapshot B did not retire")
         after_retire_step = plan["read-c-after-retire"]
-        c_after_retire_result = mcp.call(
+        c_after_retire_result = cli.call(
             after_retire_step.label,
             after_retire_step.operation,
             after_retire_step.arguments,
         )
         c_after_retire = decode_bytes(c_after_retire_result, "read-c-after-retire")
         replay_step = plan["restore-c-terminal-replay"]
-        replay_c = mcp.call(
+        replay_c = cli.call(
             replay_step.label, replay_step.operation, replay_step.arguments
         )
 
         for label, process in (
             ("etcd", etcd_process),
             ("metadata owner", owner),
-            ("MCP", mcp.process),
         ):
             if process is None or process.poll() is not None:
                 returncode = None if process is None else process.returncode
@@ -2867,10 +2800,8 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
         evidence.json("environment.json", environment)
         return record
     finally:
-        close_mcp(mcp)
         stop_process(owner)
         stop_process(etcd_process)
-        mcp_log.close()
         owner_log.close()
         etcd_log.close()
         if not config.keep_resources:
@@ -3144,14 +3075,15 @@ def main(argv: list[str] | None = None) -> int:
                 fault="NOT QUALIFIED",
                 reason=(
                     "Dry-run froze the pre-#423 command and assertion graph; no etcd, "
-                    "RustFS, metadata owner, MCP process, or workspace-path mutation ran."
+                    "RustFS, metadata owner, nokv workbench process, or workspace-path "
+                    "mutation ran."
                 ),
             )
             evidence.json("qualification.json", record)
             print(json.dumps(record, indent=2, sort_keys=True))
             return finish(0, record)
         result = execute(config, evidence)
-        transcript = digest_file(evidence.root / "mcp-transcript.jsonl")
+        transcript = digest_file(evidence.root / "cli-transcript.jsonl")
         reason = str(_mapping(result, "fault_injection")["reason"])
         record = qualification(
             composition="PASS",

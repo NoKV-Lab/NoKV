@@ -15,10 +15,9 @@ It is not an inventory or qualification claim for every pre-#423 feature, and
 
 This ledger preserves historical MCP and LingTai evidence classes; it does not
 set current delivery priority. Current integrations use the native full CLI
-first and the direct Python SDK second. The `nokv mcp` sidecar is deprecated
-and is not a supported integration surface; the MCP and LingTai rows below are
-retained evidence history, and a transport-specific receipt qualifies only that
-transport.
+first and the direct Python SDK second. The `nokv mcp` sidecar has been
+removed; the MCP and LingTai rows below are retained evidence history, and a
+transport-specific receipt qualifies only that transport.
 
 Each stable item records:
 
@@ -44,7 +43,7 @@ Class C requires an explicit replacement contract. Class D is excluded from
 the recovery backlog. For this recovery ledger, only `L07` FUSE/POSIX may be
 excluded; the Python byte/range, Workbench-scoped fsspec, checkpoint, and torch
 DCP behaviors in `L03` through `L06` must be replaced and live-tested rather
-than retired. The generic seven-tool Agent MCP profile in `L01` must coexist
+than retired. The generic seven-tool Agent profile in `L01` must coexist
 with the 18-tool Workbench profile, and the operational outcomes in `L08` must
 be rebuilt rather than satisfied by an API-decision document.
 
@@ -197,7 +196,7 @@ typed producers pass.
 | `pre423_contract_ledger.py`, `workbench_contract_test.py`, and every `*_gate_test.py` | Validate policy, checker, or harness shape only. They sign no product stable ID by themselves. |
 | `cargo test -p nokv-agent` | Candidate `nokv-agent-unit` source for schema-surface `T01`-`T04`, `C01`, `C02`, `C07`, and `L01`. |
 | `cargo test -p nokv-agent --test sdk_facade` | Candidate `nokv-agent-unit` source for the ledger's facade-contract and output-golden scenarios. Each claim still needs a direct assertion-to-scenario mapping; the broad command is not one receipt for all IDs. |
-| `live_workbench.py` | Its explicit stable checks can back native scenarios for `T08`, `C04`, `C05`, and `C15`. Its `C06` probe proves same-name read/write isolation, reconnect, and wrong-agent admission, but does not yet cover every operation required by the `C06` root-authority scenario. It is raw MCP evidence, not LingTai evidence. |
+| `live_workbench.py` | Its explicit stable checks can back native scenarios for `T08`, `C04`, `C05`, and `C15`. Its `C06` probe proves same-name read/write isolation, reconnect, and wrong-agent admission, but does not yet cover every operation required by the `C06` root-authority scenario. It is native CLI evidence, not LingTai evidence. |
 | `restore_composition_gate.py` | Can back restore-composition scenarios for `T14`, `T18`, `C20`, and `C21` where its exact A to snapshot A to B to snapshot B to C oracle asserts the scenario. It does not satisfy their independent provider, native, commit, output, or LingTai gates. |
 | `object_namespace_recovery_gate.py` | Can back the provider restart binding scenario in `C06` and the explicit object-outage read scenario in `C12`. Its commit replay, wrong-prefix, and exact-byte observations are partial evidence only for the remaining provider scenarios. |
 | `local_wal_recovery_gate.py` | Qualifies owner-epoch/local-WAL recovery, which is not one of the 47 pre-#423 stable IDs. It signs none of this ledger's scenarios. |

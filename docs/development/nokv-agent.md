@@ -22,9 +22,8 @@ native full CLI (primary)
 
 The direct Python SDK is the secondary embedded product surface and calls the
 client boundary directly. Downstream Agent frameworks should normally implement
-skills over the CLI. The `nokv mcp` sidecar is deprecated transport wiring
-retained for the live qualification harness; it is not a supported surface and
-must never become a second facade or state machine.
+skills over the CLI. There is no MCP transport, and no transport may become a
+second facade or state machine.
 
 Allowed dependencies are storage-neutral types and SDK interfaces. The crate
 must not import:

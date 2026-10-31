@@ -52,22 +52,23 @@ surface. Treat the direct Python SDK as the second-choice embedded surface.
 Downstream Agent systems should normally provide their own skills that invoke
 the CLI, or use the Python SDK when they need an in-process integration.
 
-The `nokv mcp` Workbench sidecar is deprecated. It is not a supported NoKV
-integration surface and must not be presented as one in documentation,
-examples, release guidance, or reviews. Do not accept new work that extends it,
-and do not restore MCP to any surface ordering: the order is CLI first, Python
-SDK second, Rust SDK third.
+The `nokv mcp` Workbench sidecar has been removed; NoKV ships no MCP
+transport. Do not reintroduce one, do not present MCP as an integration
+surface in documentation, examples, release guidance, or reviews, and do not
+restore MCP to any surface ordering: the order is CLI first, Python SDK
+second, Rust SDK third.
 
-The sidecar's code still ships because the live qualification harness drives
-the product through it. `scripts/workbench/live_workbench.py`,
+Every live qualification gate drives the product through the native CLI.
+`scripts/workbench/live_workbench.py`,
 `scripts/workbench/object_namespace_recovery_gate.py`, and
-`scripts/workbench/restore_composition_gate.py` launch `nokv mcp` as a child
-process and retain `mcp-transcript.jsonl` as evidence;
-`scripts/workbench/lingtai_mcp_qualification.py` is a source-bound gap
-declaration that emits a synthetic transcript stub rather than running
-anything. Treat those references as harness plumbing, not as a product claim,
-and do not delete them while they are the only executed live path. The stable
-18-tool Workbench contract itself is independent of MCP and remains
+`scripts/workbench/restore_composition_gate.py` run every Workbench tool call
+as its own `nokv workbench <tool>` process, grade results and failures against
+`docs/cli-contract.md`, and retain `cli-transcript.jsonl`.
+`scripts/workbench/lingtai_mcp_qualification.py` and the `lingtai-mcp`
+producer of the pre-#423 ledger are a historical gap declaration for LingTai's
+MCP client: the script emits a synthetic transcript stub and runs nothing.
+Retiring that evidence class is a ledger change for its own PR. The stable
+18-tool Workbench contract is independent of any transport and remains
 authoritative.
 
 ## Tenant Identity And Access Direction

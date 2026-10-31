@@ -110,6 +110,13 @@ pub enum ArtifactPublishStage {
 pub enum ClientError {
     InvalidOptions(String),
     InvalidRoute(String),
+    /// The control plane refused this client's identity, or the key its
+    /// route needs; or the local control store refused its own directory.
+    /// Nothing reached an owner.
+    ControlRefusal {
+        class: ErrorClass,
+        message: String,
+    },
     Transport(TransportError),
     Protocol(ProtocolError),
     Rpc(RpcFailure),
@@ -162,6 +169,7 @@ impl ClientError {
             Self::ArtifactReadFenceChanged => true,
             Self::InvalidOptions(_)
             | Self::InvalidRoute(_)
+            | Self::ControlRefusal { .. }
             | Self::Protocol(_)
             | Self::ResponseMismatch(_)
             | Self::MissingCapabilities(_)
@@ -185,6 +193,22 @@ impl ClientError {
         self.rpc_failure().map(|failure| failure.code)
     }
 
+    /// The class of a refusal the owner issued before dispatching the
+    /// request: a principal without the role or a current credential, or an
+    /// owner whose policy copy is stale and asks for a retry. The request was
+    /// not applied, so a mutation that ends this way has no pending outcome.
+    fn refused_before_dispatch(&self) -> Option<ErrorClass> {
+        let class = self.class();
+        let refused = matches!(
+            self.rpc_code(),
+            Some(ErrorCode::Unauthenticated | ErrorCode::PermissionDenied)
+        ) || matches!(
+            class,
+            ErrorClass::Unauthenticated | ErrorClass::PermissionDenied
+        );
+        refused.then_some(class)
+    }
+
     /// What this failure means for durable state when it ends a mutation.
     ///
     /// A failure that may follow delivery is an unknown outcome: an owner can
@@ -196,6 +220,7 @@ impl ClientError {
             Self::InvalidOptions(_) => ErrorClass::InvalidInput,
             // An unresolvable route sends nothing.
             Self::InvalidRoute(_) => ErrorClass::Transient,
+            Self::ControlRefusal { class, .. } => *class,
             Self::Transport(error) => error.refusal_class().unwrap_or(ErrorClass::OutcomeUnknown),
             Self::Protocol(_) | Self::ResponseMismatch(_) => ErrorClass::OutcomeUnknown,
             Self::Rpc(failure) => rpc_failure_class(failure),
@@ -208,6 +233,10 @@ impl ClientError {
                 abort_failure,
                 ..
             } => {
+                if let Some(refusal) = source.refused_before_dispatch() {
+                    // A refused abort cannot make a refused request unknown.
+                    return refusal;
+                }
                 if abort_failure.is_some() {
                     // The publication's durable state was not confirmed.
                     ErrorClass::OutcomeUnknown
@@ -219,6 +248,10 @@ impl ClientError {
                 if source.rpc_code() == Some(ErrorCode::RequestReplayMismatch) {
                     return ErrorClass::IdentityConflict;
                 }
+                if let Some(refusal) = source.refused_before_dispatch() {
+                    // No outcome is pending behind the append identity.
+                    return refusal;
+                }
                 match state {
                     Some(OperationState::Running | OperationState::Aborting) => {
                         ErrorClass::InProgress
@@ -229,7 +262,11 @@ impl ClientError {
                     }
                 }
             }
-            Self::AppendCleanupUnresolved { .. } => ErrorClass::OutcomeUnknown,
+            // A refused retry applied nothing; any other may have been
+            // accepted before its answer was lost.
+            Self::AppendCleanupUnresolved { source, .. } => source
+                .refused_before_dispatch()
+                .unwrap_or(ErrorClass::OutcomeUnknown),
             Self::RetryExhausted { last_error, .. } => last_error.class(),
         }
     }
@@ -301,6 +338,9 @@ impl fmt::Display for ClientError {
         match self {
             Self::InvalidOptions(message) => write!(formatter, "invalid client options: {message}"),
             Self::InvalidRoute(message) => write!(formatter, "invalid root route: {message}"),
+            Self::ControlRefusal { message, .. } => {
+                write!(formatter, "control plane refused this client: {message}")
+            }
             Self::Transport(error) => write!(formatter, "RPC transport failed: {error}"),
             Self::Protocol(error) => write!(formatter, "RPC protocol failed: {error}"),
             Self::Rpc(error) => write!(formatter, "workspace request failed: {}", error.message),
@@ -355,11 +395,20 @@ impl fmt::Display for ClientError {
                 expected_token,
                 source,
                 ..
-            } => write!(
-                formatter,
-                "append cleanup for {operation_id:?} is unresolved: {source}; retry with the same expected state digest {:?}",
-                expected_token.state_digest
-            ),
+            } => {
+                if self.class() == ErrorClass::OutcomeUnknown {
+                    write!(
+                        formatter,
+                        "append cleanup for {operation_id:?} is unresolved: {source}; retry with the same expected state digest {:?}",
+                        expected_token.state_digest
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "append cleanup for {operation_id:?} was refused: {source}"
+                    )
+                }
+            }
         }
     }
 }
@@ -391,6 +440,7 @@ impl std::error::Error for ClientError {
             Self::RetryExhausted { last_error, .. } => Some(last_error.as_ref()),
             Self::InvalidOptions(_)
             | Self::InvalidRoute(_)
+            | Self::ControlRefusal { .. }
             | Self::Rpc(_)
             | Self::ResponseMismatch(_)
             | Self::MissingCapabilities(_)
@@ -413,6 +463,101 @@ mod tests {
             current_generation: None,
             route_hint: None,
         }
+    }
+
+    #[test]
+    fn a_refused_append_is_the_refusal_not_an_unknown_outcome() {
+        // The owner refuses an append before applying anything when the
+        // principal lacks the role or the credential is no longer current;
+        // the caller must stop, not query an outcome that cannot exist.
+        for (code, class) in [
+            (ErrorCode::PermissionDenied, ErrorClass::PermissionDenied),
+            (ErrorCode::Unauthenticated, ErrorClass::Unauthenticated),
+        ] {
+            let error = ClientError::AppendUnresolved {
+                operation_id: OperationIdentity([1; 16]),
+                state: None,
+                source: Box::new(ClientError::Rpc(refusal(code, false))),
+            };
+            assert_eq!(error.class(), class, "{code:?}");
+        }
+        let handshake = ClientError::AppendUnresolved {
+            operation_id: OperationIdentity([1; 16]),
+            state: None,
+            source: Box::new(ClientError::Transport(TransportError::unauthenticated(
+                "no credential",
+            ))),
+        };
+        assert_eq!(handshake.class(), ErrorClass::Unauthenticated);
+        // A stale policy copy asks for a retry; the append was not applied.
+        let stale = ClientError::AppendUnresolved {
+            operation_id: OperationIdentity([1; 16]),
+            state: None,
+            source: Box::new(ClientError::Rpc(refusal(ErrorCode::Unauthenticated, true))),
+        };
+        assert_eq!(stale.class(), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn a_refused_cleanup_retry_is_the_refusal_not_an_unknown_outcome() {
+        // The owner refuses a cleanup retry of another principal's append
+        // before it applies anything; only the initiator or an operator can
+        // act, and nothing is pending behind the retry.
+        let unresolved = |source| ClientError::AppendCleanupUnresolved {
+            operation_id: OperationIdentity([1; 16]),
+            expected_token: OperationToken {
+                operation_id: OperationIdentity([1; 16]),
+                state_digest: nokv_protocol::Digest([2; 32]),
+            },
+            receipt: None,
+            source: Box::new(source),
+        };
+        let refused = unresolved(ClientError::Rpc(refusal(
+            ErrorCode::PermissionDenied,
+            false,
+        )));
+        assert_eq!(refused.class(), ErrorClass::PermissionDenied);
+        assert!(!refused.to_string().contains("retry"), "{refused}");
+        assert_eq!(
+            unresolved(ClientError::Rpc(refusal(ErrorCode::Unauthenticated, false))).class(),
+            ErrorClass::Unauthenticated
+        );
+        // A retry whose answer was lost may have been accepted.
+        let lost = unresolved(ClientError::Rpc(refusal(ErrorCode::NotOwner, false)));
+        assert_eq!(lost.class(), ErrorClass::OutcomeUnknown);
+        assert!(lost
+            .to_string()
+            .contains("retry with the same expected state digest"));
+    }
+
+    #[test]
+    fn a_refused_publish_is_the_refusal_even_when_its_abort_is_refused() {
+        // A principal whose role is revoked between two stages of a publish
+        // is refused at the next stage and again at the abort; the request
+        // was not applied, and only an operator can act.
+        let refused = ClientError::ArtifactPublishFailed {
+            stage: ArtifactPublishStage::Complete,
+            source: Box::new(ClientError::Rpc(refusal(
+                ErrorCode::PermissionDenied,
+                false,
+            ))),
+            abort_failure: Some(Box::new(ClientError::Rpc(refusal(
+                ErrorCode::PermissionDenied,
+                false,
+            )))),
+        };
+        assert_eq!(refused.class(), ErrorClass::PermissionDenied);
+        // A request whose answer was lost stays unknown even when the abort
+        // is then refused: the owner may have applied it.
+        let lost = ClientError::ArtifactPublishFailed {
+            stage: ArtifactPublishStage::Complete,
+            source: Box::new(ClientError::Rpc(refusal(ErrorCode::NotOwner, false))),
+            abort_failure: Some(Box::new(ClientError::Rpc(refusal(
+                ErrorCode::PermissionDenied,
+                false,
+            )))),
+        };
+        assert_eq!(lost.class(), ErrorClass::OutcomeUnknown);
     }
 
     #[test]

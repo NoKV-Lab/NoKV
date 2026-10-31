@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+from cli_contract import contract_failure, contract_tables, published_contract
 from object_namespace_recovery_gate import (
     INLINE_ARTIFACT_BODY_MAX_BYTES,
     PINNED_RUSTFS_IMAGE,
@@ -22,12 +24,17 @@ from object_namespace_recovery_gate import (
     control_args,
     execute,
     fixed_id,
+    graded,
+    logical_request_digest,
     parse_args,
     phymat_documents,
     run,
+    run_workbench_tool,
     rustfs_container_command,
     server_command,
+    start_owner,
     validate_gate_evidence,
+    wait_owner_serves,
     wait_rustfs,
     TYPED_SCENARIOS,
     TYPED_SUPPORTED_SCENARIOS,
@@ -36,6 +43,47 @@ import pre423_contract_ledger
 
 
 REPO = Path(__file__).resolve().parents[2]
+
+
+def failure_line(code: str, klass: str, message: str, *, retryable: bool) -> str:
+    """One CLI failure envelope as the binary prints it on stderr."""
+    return (
+        json.dumps(
+            {
+                "status": "error",
+                "code": code,
+                "message": message,
+                "retryable": retryable,
+                "details": {},
+                "class": klass,
+                "next_action": "resubmit_same",
+            }
+        )
+        + "\n"
+    )
+
+
+def refused_probe(exits: dict[str, int]) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        ["nokv"],
+        exits["transient"],
+        "",
+        failure_line(
+            "ClientFailure",
+            "transient",
+            "RPC transport failed: Connection refused (os error 111)",
+            retryable=True,
+        ),
+    )
+
+
+def not_found_probe(exits: dict[str, int]) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        ["nokv"],
+        exits["not_found"],
+        "",
+        failure_line("NotFound", "not_found", "operation not found", retryable=False),
+    )
 
 
 def valid_evidence() -> dict[str, object]:
@@ -62,11 +110,14 @@ def valid_evidence() -> dict[str, object]:
         "outage": {
             "error": {
                 "status": "error",
-                "code": "ObjectUnavailable",
-                "retryable": True,
-                "details": {"attempts": 3, "source": "nokv-client"},
-                "message": "workspace request exhausted 3 attempts: artifact object backend is unavailable",
+                "code": "ObjectProviderFailed",
+                "retryable": False,
+                "details": {},
+                "message": "artifact object backend is unavailable",
+                "class": "transient",
+                "next_action": "resubmit_same",
             },
+            "exit_code": 5,
             "failed_request_digest": "22" * 32,
             "recovered_request_digest": "22" * 32,
             "recovered": relaxation,
@@ -192,8 +243,8 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
                 ),
                 mock.patch(
                     "object_namespace_recovery_gate.free_port",
-                    side_effect=range(19000, 19006),
-                ),
+                    side_effect=range(19000, 19004),
+                ) as free_port_mock,
                 mock.patch("object_namespace_recovery_gate.wait_etcd"),
                 mock.patch("object_namespace_recovery_gate.wait_rustfs"),
                 mock.patch("object_namespace_recovery_gate.stop_process"),
@@ -202,6 +253,9 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
             ):
                 execute(args)
 
+        # etcd, its peer, RustFS and its console: the owner ports are drawn
+        # only when each owner starts.
+        self.assertEqual(free_port_mock.call_count, 4)
         provision = next(command for command, label in recorded if label == "provision")
         expected_agent_id = fixed_id(seed, "agent")
         self.assertRegex(expected_agent_id, r"^[0-9a-f]{32}$")
@@ -209,6 +263,144 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
         self.assertEqual(
             provision[provision.index("--agent-id") + 1], expected_agent_id
         )
+
+    def test_owner_port_is_drawn_when_the_owner_starts(self) -> None:
+        common = control_args(
+            Path("/tmp/nokv"),
+            "11" * 16,
+            "http://127.0.0.1:2379",
+            "/nokv/object-namespace-gate/test",
+        )
+        probe = ["nokv", "--max-attempts", "1"]
+        contract = ({"not_found": 3}, {"resubmit_same"})
+        process, evidence, log = mock.Mock(), mock.Mock(), mock.Mock()
+        with (
+            mock.patch(
+                "object_namespace_recovery_gate.free_port", return_value=19777
+            ) as free_port_mock,
+            mock.patch(
+                "object_namespace_recovery_gate.start_process", return_value=process
+            ) as start_mock,
+            mock.patch("object_namespace_recovery_gate.wait_owner_serves") as wait_mock,
+        ):
+            started = start_owner(
+                common,
+                ["--object-root", "gate/root"],
+                "object-gate-e2",
+                "--metadata-reopen",
+                Path("/tmp/metadata"),
+                log,
+                probe=probe,
+                contract=contract,
+                repo=REPO,
+                timeout=30.0,
+                evidence=evidence,
+                label="owner-e2-ready",
+            )
+        self.assertIs(started, process)
+        self.assertEqual(free_port_mock.call_count, 1)
+        command = start_mock.call_args.args[0]
+        self.assertEqual(command[command.index("--bind") + 1], "127.0.0.1:19777")
+        self.assertEqual(
+            command[command.index("--advertise-endpoint") + 1], "127.0.0.1:19777"
+        )
+        self.assertEqual(command[command.index("--node-id") + 1], "object-gate-e2")
+        self.assertEqual(command[-3:], ["--lifecycle-interval-millis", "100", "serve"])
+        self.assertIn("--metadata-reopen", command)
+        wait_mock.assert_called_once_with(
+            probe, process, contract, REPO, 30.0, evidence, "owner-e2-ready"
+        )
+
+    def test_owner_readiness_waits_for_a_metadata_read_through_the_route(self) -> None:
+        exits, actions = published_contract(REPO)
+        process = mock.Mock()
+        process.poll.return_value = None
+        evidence = mock.Mock()
+        with (
+            mock.patch(
+                "object_namespace_recovery_gate.run",
+                side_effect=[
+                    refused_probe(exits),
+                    refused_probe(exits),
+                    not_found_probe(exits),
+                ],
+            ) as run_mock,
+            mock.patch("object_namespace_recovery_gate.time") as clock,
+        ):
+            clock.monotonic.return_value = 0.0
+            wait_owner_serves(
+                ["nokv", "--max-attempts", "1"],
+                process,
+                (exits, actions),
+                REPO,
+                30.0,
+                evidence,
+                "owner-e2-ready",
+            )
+        self.assertEqual(run_mock.call_count, 3)
+        for call in run_mock.call_args_list:
+            self.assertEqual(
+                call.args[0],
+                ["nokv", "--max-attempts", "1", "operation", "status", "00" * 16],
+            )
+            self.assertEqual(call.kwargs["label"], "owner-e2-ready")
+            self.assertIs(call.kwargs["evidence"], evidence)
+            self.assertFalse(call.kwargs["check"])
+            self.assertLessEqual(call.kwargs["timeout"], 10.0)
+        self.assertEqual(clock.sleep.call_count, 2)
+
+    def test_owner_readiness_fails_fast_when_the_owner_exits(self) -> None:
+        exits, actions = published_contract(REPO)
+        process = mock.Mock()
+        process.poll.return_value = 1
+        process.returncode = 1
+        with (
+            mock.patch("object_namespace_recovery_gate.run") as run_mock,
+            self.assertRaisesRegex(
+                WorkflowFailure, "owner exited before serving \\(1\\)"
+            ),
+        ):
+            wait_owner_serves(
+                ["nokv"],
+                process,
+                (exits, actions),
+                REPO,
+                30.0,
+                mock.Mock(),
+                "owner-e2-ready",
+            )
+        run_mock.assert_not_called()
+
+    def test_owner_readiness_is_bounded_by_the_gate_timeout(self) -> None:
+        exits, actions = published_contract(REPO)
+        process = mock.Mock()
+        process.poll.return_value = None
+        elapsed = [0.0]
+
+        def sleep(seconds: float) -> None:
+            elapsed[0] += seconds
+
+        with (
+            mock.patch(
+                "object_namespace_recovery_gate.run", return_value=refused_probe(exits)
+            ) as run_mock,
+            mock.patch("object_namespace_recovery_gate.time") as clock,
+            self.assertRaisesRegex(
+                WorkflowFailure, "did not serve metadata reads within 1 seconds"
+            ),
+        ):
+            clock.monotonic.side_effect = lambda: elapsed[0]
+            clock.sleep.side_effect = sleep
+            wait_owner_serves(
+                ["nokv"],
+                process,
+                (exits, actions),
+                REPO,
+                1.0,
+                mock.Mock(),
+                "owner-e1-ready",
+            )
+        self.assertEqual(run_mock.call_count, 4)
 
     def test_rustfs_image_is_digest_pinned(self) -> None:
         self.assertIn("@sha256:", PINNED_RUSTFS_IMAGE)
@@ -287,11 +479,76 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
     def test_valid_evidence_covers_namespace_restart_outage_and_phymat(self) -> None:
         validate_gate_evidence(valid_evidence())
 
-    def test_retryable_false_is_a_release_failure(self) -> None:
+    def test_outage_read_must_fail_under_the_cli_contract(self) -> None:
+        for field, value, claim in (
+            ("code", "ObjectUnavailable", "ObjectProviderFailed"),
+            ("class", "outcome_unknown", "transient"),
+            ("next_action", "query_same", "resubmit_same"),
+        ):
+            evidence = valid_evidence()
+            evidence["outage"]["error"][field] = value  # type: ignore[index]
+            with self.subTest(field=field), self.assertRaisesRegex(
+                WorkflowFailure, claim
+            ):
+                validate_gate_evidence(evidence)
         evidence = valid_evidence()
-        evidence["outage"]["error"]["retryable"] = False  # type: ignore[index]
-        with self.assertRaisesRegex(WorkflowFailure, "retryable"):
+        evidence["outage"]["exit_code"] = 0  # type: ignore[index]
+        with self.assertRaisesRegex(WorkflowFailure, "failure code"):
             validate_gate_evidence(evidence)
+
+    def test_outage_read_is_graded_from_the_cli_failure_line(self) -> None:
+        exits, actions = contract_tables((REPO / "docs" / "cli-contract.md").read_text())
+        envelope = valid_evidence()["outage"]["error"]  # type: ignore[index]
+        arguments = {"id": "phymat-campaign", "section": "outputs", "path": "r.json"}
+
+        def completed(returncode: int) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(
+                ["nokv"], returncode, "", json.dumps(envelope) + "\n"
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = Evidence(Path(temporary) / "evidence")
+            evidence.prepare()
+            with mock.patch(
+                "object_namespace_recovery_gate.run",
+                side_effect=[completed(exits["transient"]), completed(1)],
+            ):
+                call = run_workbench_tool(
+                    ["nokv"], "workbench_read", arguments, REPO, 5, evidence, "outage"
+                )
+                graded_envelope = graded(
+                    contract_failure, call, exits, actions, "transient", "resubmit_same"
+                )
+                wrong_exit = run_workbench_tool(
+                    ["nokv"], "workbench_read", arguments, REPO, 5, evidence, "outage"
+                )
+                with self.assertRaisesRegex(WorkflowFailure, "exits with the code"):
+                    graded(
+                        contract_failure,
+                        wrong_exit,
+                        exits,
+                        actions,
+                        "transient",
+                        "resubmit_same",
+                    )
+            transcript = [
+                json.loads(line)
+                for line in (evidence.root / "cli-transcript.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+        self.assertEqual(graded_envelope, envelope)
+        self.assertEqual([entry["exit"] for entry in transcript], [exits["transient"], 1])
+        self.assertEqual(
+            {entry["request_digest"] for entry in transcript},
+            {logical_request_digest("workbench_read", arguments)},
+        )
+
+    def test_gate_drives_the_product_through_the_native_cli_only(self) -> None:
+        source = (REPO / "scripts/workbench/object_namespace_recovery_gate.py").read_text()
+        for sidecar in ('"mcp"', "nokv mcp", "jsonrpc", "tools/call"):
+            with self.subTest(sidecar=sidecar):
+                self.assertNotIn(sidecar, source)
 
     def test_provider_identity_must_not_leak_in_public_error(self) -> None:
         evidence = valid_evidence()

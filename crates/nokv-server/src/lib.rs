@@ -10,6 +10,7 @@
 //! in `nokv-meta`.
 
 mod access;
+mod audit;
 mod bootstrap;
 mod error;
 mod executor;
@@ -26,6 +27,7 @@ mod service;
 mod test_support;
 
 pub use access::{AccessDenial, TenantAccess, DEFAULT_MAX_POLICY_AGE, POLICY_REFRESH_INTERVAL};
+pub use audit::AuditLog;
 pub use bootstrap::{bootstrap_shard, LeaseMode, OpenMode, RootAttach, ShardBoot, ShardOwner};
 pub use error::ServerError;
 pub use executor::{MetadataWorkspaceRequestExecutor, MAX_APPEND_ACTIVITY_LEASE_MS};

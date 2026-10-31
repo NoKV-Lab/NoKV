@@ -25,16 +25,27 @@ NoKV's metadata service and control-plane endpoints currently assume a trusted
 deployment environment. The current `main` branch can require TLS 1.3 clients
 whose certificate is a current credential of the owner's tenant, and then
 authorizes every request by the roles of that principal on the request's root.
-It does not authenticate control-plane access, and does not enforce a live
-workspace-freeze policy at the service boundary. Without TLS it authenticates
-and authorizes no caller, and it refuses to serve a root that a tenant owns.
+It does not enforce a live workspace-freeze policy at the service boundary.
+Without TLS it authenticates and authorizes no caller, and it refuses to serve
+a root that a tenant owns.
+
+The control plane is etcd, and NoKV connects to it over mutual TLS when a
+deployment runs etcd with client-certificate authentication: each owner and
+Agent process presents its own certificate, etcd authenticates its Common
+Name as an etcd user, and that user's roles bound it to the keys its role
+needs, so an Agent can read only its root's routing records and an owner can
+write only its shard ([control plane credentials](docs/control-plane-credentials.md)).
+NoKV does not create those users or roles; a plaintext etcd, or a role wider
+than the documented one, authenticates and bounds nobody.
 
 Every object write is the owner's: a client never holds object write
 credentials, and sends each block to the owner, which verifies it against the
 staged plan before writing it. Give Agent processes prefix-scoped read-only
 object credentials (GET and HEAD under the root's prefix); the owner's
-credentials write. The object store itself still authenticates only what the
-deployment's IAM gives each credential.
+credentials write ([object store credentials](docs/object-credentials.md)
+lists the keys each role touches and example policies). The object store
+itself still authenticates only what the deployment's IAM gives each
+credential.
 
 - Workbench-root jailing only contains paths.
 - Without TLS, the native CLI's `RootId`-to-`AgentId` check only catches
@@ -49,7 +60,7 @@ directly to untrusted networks.
 
 Server-enforced role-based access control covers workspace RPC over TLS, and
 every durable operation records the principal that started it. Access control
-for the control plane is planned
+for the control plane is etcd's own, configured per the document above
 ([code contract](docs/development/code_contract.md#tenant-identity-and-access-control)).
 Until a release note states otherwise, the boundary above applies to every
 release.

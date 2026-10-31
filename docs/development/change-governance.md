@@ -55,7 +55,9 @@ proposed diff and can otherwise weaken the check that evaluates itself.
 [`pr-description.yml`](../../.github/workflows/pr-description.yml) applies the
 same protected-base boundary to PR metadata. It reads the live title and body
 through `gh`, treats them only as data, and fetches the validator from the exact
-base SHA. It reruns on `edited` as well as creation, reopening, pushes, and
+base SHA. It also passes the author's login from the same API response; only
+`dependabot[bot]` is exempt from the body sections, never from the title rule.
+It reruns on `edited` as well as creation, reopening, pushes, and
 ready-for-review events. A manual dispatch can recheck a PR with the current
 protected policy. Candidate policy regression tests run separately in
 [`pr-description-tests.yml`](../../.github/workflows/pr-description-tests.yml),

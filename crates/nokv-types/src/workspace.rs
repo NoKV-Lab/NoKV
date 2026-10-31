@@ -612,6 +612,20 @@ durable_enum! {
     }
 }
 
+impl Role {
+    pub const ALL: [Self; 3] = [Self::Reader, Self::Writer, Self::Operator];
+
+    /// The role's name on the command line, in identity results, and in an
+    /// owner's audit log.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Reader => "reader",
+            Self::Writer => "writer",
+            Self::Operator => "operator",
+        }
+    }
+}
+
 /// The roots one role binding covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RoleScope {
@@ -843,7 +857,6 @@ durable_enum! {
     /// Provider-observed state for one staged immutable object.
     pub enum StagedProviderState {
         Planned = 1,
-        Uploading = 2,
         Uploaded = 3,
         AbortPending = 4,
         Aborted = 5,
@@ -1477,7 +1490,6 @@ mod tests {
         ]);
         assert_durable_registry(&[
             (StagedProviderState::Planned, 1),
-            (StagedProviderState::Uploading, 2),
             (StagedProviderState::Uploaded, 3),
             (StagedProviderState::AbortPending, 4),
             (StagedProviderState::Aborted, 5),

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Black-box scientific Workbench evidence over the flat ``nokv`` binary."""
+"""Black-box scientific Workbench evidence over the flat ``nokv`` binary.
+
+Every Workbench tool call runs as its own ``nokv workbench <tool>`` process and
+is graded against the native CLI contract in docs/cli-contract.md; the 18 tool
+definitions come from ``nokv schema``.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +16,6 @@ import json
 import os
 import platform
 import re
-import selectors
 import shutil
 import signal
 import socket
@@ -20,8 +24,18 @@ import sys
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any, Iterable, TextIO
+from typing import Any, Iterable
 
+from cli_contract import (
+    Call,
+    Contract,
+    ContractFailure,
+    NotQualified as ContractTablesMissing,
+    contract_failure,
+    contract_success,
+    owner_serves,
+    published_contract,
+)
 from source_bound_producer import ProducerError, ScenarioContract
 from typed_live_qualification import (
     gap_record,
@@ -36,7 +50,6 @@ from workbench_contract import (
 
 
 SCHEMA = "nokv.workbench.live_evidence.v1"
-PROTOCOL_VERSION = "2025-11-25"
 RESTORE_MANIFEST_SCHEMA = "nokv.workbench.restore_manifest.v2"
 HEX_ID = re.compile(r"^[0-9a-f]{32}$")
 WORKBENCH_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -66,7 +79,7 @@ OPTIONAL_SCOPE_RESULT_PAIRS = (
     ("aggregate", "aggregate-empty-path"),
     ("catalog", "catalog-empty-path"),
 )
-TYPED_EVIDENCE_ROLES = ("producer-result", "qualification", "mcp-transcript")
+TYPED_EVIDENCE_ROLES = ("producer-result", "qualification", "cli-transcript")
 TYPED_SCENARIOS = {
     "t01.create-schema": ScenarioContract("T01", "schema-surface"),
     "t01.create-live": ScenarioContract("T01", "native-workbench-e2e"),
@@ -196,7 +209,11 @@ class ToolStep:
     label: str
     name: str
     arguments: dict[str, Any]
+    # An expected failure names its Agent error code and, from
+    # docs/cli-contract.md, the class and next action the CLI reports for it.
     error_code: str | None = None
+    error_class: str | None = None
+    error_next_action: str | None = None
 
 
 def canonical_json(value: Any) -> str:
@@ -314,6 +331,8 @@ def tool_plan(config: Config) -> list[ToolStep]:
                 "replace": False,
             },
             "AlreadyExists",
+            "precondition_failed",
+            "reread_then_retry",
         ),
         ToolStep(
             "implicit-put-second",
@@ -338,6 +357,8 @@ def tool_plan(config: Config) -> list[ToolStep]:
                 "replace": False,
             },
             "AlreadyExists",
+            "precondition_failed",
+            "reread_then_retry",
         ),
         ToolStep(
             "replace-input",
@@ -721,8 +742,12 @@ def server_command(config: Config) -> list[str]:
     ]
 
 
-def mcp_command(config: Config) -> list[str]:
-    return [*client_args(config), "mcp"]
+def workbench_tool_command(config: Config, tool: str, arguments_json: str) -> list[str]:
+    return [*client_args(config), "workbench", tool, arguments_json]
+
+
+def schema_command(config: Config) -> list[str]:
+    return [str(config.binary), "schema"]
 
 
 def materialize_command(config: Config, destination: Path) -> list[str]:
@@ -780,12 +805,13 @@ class Evidence:
             output.write(canonical_json(value) + "\n")
 
 
-def completed_process(
+def run_process(
     evidence: Evidence,
     label: str,
     command: list[str],
     config: Config,
 ) -> subprocess.CompletedProcess[str]:
+    """Run one command to completion and record it, whatever its exit code."""
     started = now()
     try:
         result = subprocess.run(
@@ -824,173 +850,82 @@ def completed_process(
             "stderr": result.stderr,
         },
     )
+    return result
+
+
+def completed_process(
+    evidence: Evidence,
+    label: str,
+    command: list[str],
+    config: Config,
+) -> subprocess.CompletedProcess[str]:
+    result = run_process(evidence, label, command, config)
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip() or "no output"
         raise WorkflowFailure(f"{label} failed ({result.returncode}): {detail}")
     return result
 
 
-def expected_failure_process(
-    evidence: Evidence,
-    label: str,
-    command: list[str],
-    config: Config,
-    stdin: str,
-) -> subprocess.CompletedProcess[str]:
-    started = now()
+def load_contract(config: Config) -> Contract:
     try:
-        result = subprocess.run(
-            command,
-            cwd=config.repo,
-            input=stdin,
-            text=True,
-            capture_output=True,
-            timeout=config.timeout,
-            check=False,
+        return published_contract(config.repo)
+    except (OSError, ContractTablesMissing) as error:
+        raise NotQualified(f"CLI contract tables are unavailable: {error}") from error
+
+
+def grade_tool_call(step: ToolStep, call: Call, contract: Contract) -> dict[str, Any]:
+    """Grade one finished `nokv workbench` call against the CLI contract and the
+    step's expectation. A success is one JSON result without internal keys; an
+    expected failure is one stderr envelope line of the step's code, class, and
+    next action, with the exit code of that class."""
+    exits, actions = contract
+    try:
+        if step.error_code is None:
+            result = contract_success(call)
+            reject_internal_keys(result, step.label)
+            return result
+        if step.error_class is None or step.error_next_action is None:
+            raise WorkflowFailure(
+                f"{step.label} expects {step.error_code} without a contract class"
+            )
+        envelope = contract_failure(
+            call, exits, actions, step.error_class, step.error_next_action
         )
-    except subprocess.TimeoutExpired as error:
-        evidence.line(
-            "processes.jsonl",
-            {
-                "schema": SCHEMA,
-                "label": label,
-                "argv": redact_argv(command),
-                "started_at": started,
-                "finished_at": now(),
-                "timed_out": True,
-                "stdout": error.stdout or "",
-                "stderr": error.stderr or "",
-            },
+    except ContractFailure as error:
+        raise WorkflowFailure(str(error)) from None
+    if envelope.get("code") != step.error_code:
+        raise WorkflowFailure(
+            f"{step.label} did not return {step.error_code}: {envelope.get('code')!r}"
         )
-        raise WorkflowFailure(f"{label} timed out instead of failing closed") from error
+    return envelope
+
+
+def call_tool(
+    config: Config, evidence: Evidence, step: ToolStep, contract: Contract
+) -> dict[str, Any]:
+    """Run one Workbench tool as its own `nokv workbench` process, record the
+    call in the CLI transcript, and grade it."""
+    result = run_process(
+        evidence,
+        step.label,
+        workbench_tool_command(config, step.name, canonical_json(step.arguments)),
+        config,
+    )
     evidence.line(
-        "processes.jsonl",
+        "cli-transcript.jsonl",
         {
             "schema": SCHEMA,
-            "label": label,
-            "argv": redact_argv(command),
-            "started_at": started,
-            "finished_at": now(),
-            "returncode": result.returncode,
+            "label": step.label,
+            "tool": step.name,
+            "arguments": step.arguments,
+            "exit": result.returncode,
             "stdout": result.stdout,
             "stderr": result.stderr,
+            "recorded_at": now(),
         },
     )
-    if result.returncode == 0:
-        raise WorkflowFailure(f"{label} unexpectedly succeeded")
-    return result
-
-
-class Mcp:
-    def __init__(
-        self,
-        process: subprocess.Popen[str],
-        evidence: Evidence,
-        attempt: int,
-        timeout: float,
-    ) -> None:
-        self.process, self.evidence = process, evidence
-        self.attempt, self.timeout, self.next_id = attempt, timeout, 1
-
-    def request(
-        self,
-        method: str,
-        params: dict[str, Any] | None = None,
-        normalized: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        request_id, self.next_id = self.next_id, self.next_id + 1
-        request: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
-        if params is not None:
-            request["params"] = params
-        sent = canonical_json(request)
-        if self.process.stdin is None or self.process.stdout is None:
-            raise WorkflowFailure("MCP pipes are unavailable")
-        self.process.stdin.write(sent + "\n")
-        self.process.stdin.flush()
-        selector = selectors.DefaultSelector()
-        selector.register(self.process.stdout, selectors.EVENT_READ)
-        try:
-            if not selector.select(self.timeout):
-                raise WorkflowFailure("MCP response timed out")
-            received = self.process.stdout.readline().rstrip("\n")
-        finally:
-            selector.close()
-        if not received:
-            raise WorkflowFailure(
-                f"MCP exited before responding ({self.process.poll()})"
-            )
-        try:
-            response = json.loads(received)
-        except json.JSONDecodeError as error:
-            raise WorkflowFailure(f"MCP returned invalid JSON: {received!r}") from error
-        self.evidence.line(
-            "mcp-transcript.jsonl",
-            {
-                "schema": SCHEMA,
-                "attempt": self.attempt,
-                "sequence": request_id,
-                "request_raw": sent,
-                "request": request,
-                "normalized_input": normalized,
-                "response_raw": received,
-                "response": response,
-            },
-        )
-        if response.get("jsonrpc") != "2.0" or response.get("id") != request_id:
-            raise WorkflowFailure("MCP response envelope mismatch")
-        return response
-
-    def notify(self, method: str) -> None:
-        request = {"jsonrpc": "2.0", "method": method}
-        sent = canonical_json(request)
-        assert self.process.stdin is not None
-        self.process.stdin.write(sent + "\n")
-        self.process.stdin.flush()
-        self.evidence.line(
-            "mcp-transcript.jsonl",
-            {
-                "schema": SCHEMA,
-                "attempt": self.attempt,
-                "sequence": None,
-                "request_raw": sent,
-                "request": request,
-                "normalized_input": None,
-                "response_raw": None,
-                "response": None,
-            },
-        )
-
-    def call(self, step: ToolStep) -> dict[str, Any]:
-        response = self.request(
-            "tools/call",
-            {"name": step.name, "arguments": step.arguments},
-            {
-                "name": step.name,
-                "arguments": json.loads(canonical_json(step.arguments)),
-            },
-        )
-        result = response.get("result")
-        structured = (
-            result.get("structuredContent") if isinstance(result, dict) else None
-        )
-        if not isinstance(structured, dict):
-            raise WorkflowFailure(f"{step.label} lacks structuredContent")
-        content = result.get("content")
-        try:
-            text_result = json.loads(content[0]["text"])
-        except (IndexError, KeyError, TypeError, json.JSONDecodeError) as error:
-            raise WorkflowFailure(f"{step.label} lacks JSON text content") from error
-        if text_result != structured:
-            raise WorkflowFailure(f"{step.label} text and structured results differ")
-        is_error = result.get("isError") is True
-        if step.error_code is not None:
-            if not is_error or structured.get("code") != step.error_code:
-                raise WorkflowFailure(f"{step.label} did not return {step.error_code}")
-        elif is_error or structured.get("status") != "success":
-            raise WorkflowFailure(f"{step.label} failed: {structured}")
-        else:
-            reject_internal_keys(structured, step.label)
-        return structured
+    call = Call(step.label, result.returncode, result.stdout, result.stderr)
+    return grade_tool_call(step, call, contract)
 
 
 def reject_internal_keys(value: Any, label: str) -> None:
@@ -1185,7 +1120,7 @@ def assert_phase_one_results(
 
 def assert_authority_results(
     results: dict[str, dict[str, Any]],
-    mismatch: subprocess.CompletedProcess[str],
+    mismatch: dict[str, Any],
     config: Config,
     peer: Config,
 ) -> dict[str, Any]:
@@ -1219,17 +1154,14 @@ def assert_authority_results(
             "RootId isolation allowed a peer write into the primary Workbench"
         )
 
-    combined_error = f"{mismatch.stdout}\n{mismatch.stderr}"
-    if (
-        mismatch.returncode == 0
-        or mismatch.stdout.strip()
-        or "already bound to another Agent" not in combined_error
-        or "jsonrpc" in combined_error.lower()
-    ):
+    # The graded envelope already proved AgentBindingMismatch, invalid_input,
+    # fix_input, nothing on stdout, and the exit code of invalid_input.
+    rendered_error = canonical_json(mismatch)
+    if "already bound to another Agent" not in str(mismatch.get("message")):
         raise WorkflowFailure(
-            "wrong AgentId was not rejected before MCP initialization"
+            "wrong AgentId was not refused as an Agent binding mismatch"
         )
-    if config.agent_id in combined_error or peer.agent_id in combined_error:
+    if config.agent_id in rendered_error or peer.agent_id in rendered_error:
         raise WorkflowFailure(
             "Agent binding mismatch disclosed a stable Agent identity"
         )
@@ -1241,7 +1173,7 @@ def assert_authority_results(
         "distinct_root_count": 2,
         "same_logical_shard": True,
         "peer_reconnect": "PASS",
-        "wrong_agent_admission": "rejected-before-initialize",
+        "wrong_agent_admission": "refused-at-root-admission",
     }
 
 
@@ -1427,105 +1359,6 @@ def require_running(label: str, process: subprocess.Popen[str]) -> None:
         )
 
 
-def start_mcp(
-    config: Config,
-    evidence: Evidence,
-    server: subprocess.Popen[str],
-    label: str = "mcp",
-    attempt_offset: int = 0,
-) -> tuple[Mcp, TextIO]:
-    deadline, last_error, attempt = (
-        time.monotonic() + config.timeout,
-        "",
-        attempt_offset,
-    )
-    while time.monotonic() < deadline:
-        attempt += 1
-        if server.poll() is not None:
-            raise WorkflowFailure(f"serve exited during startup ({server.returncode})")
-        stderr = (evidence.root / f"{label}.stderr.attempt-{attempt}.log").open("w")
-        process = subprocess.Popen(
-            mcp_command(config),
-            cwd=config.repo,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=stderr,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-        )
-        session = Mcp(process, evidence, attempt, min(config.timeout, 5))
-        try:
-            initialized = session.request(
-                "initialize",
-                {
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {"name": "nokv-workbench-harness", "version": "1"},
-                },
-            )
-            result = initialized.get("result", {})
-            if result.get("serverInfo", {}).get("name") != "nokv-mcp" or result.get(
-                "capabilities"
-            ) != {"tools": {}}:
-                raise WorkflowFailure("unexpected MCP initialize result")
-            session.notify("notifications/initialized")
-            # The short bound above only guards the startup probe against a
-            # not-yet-serving owner. Every tool call afterwards is bounded by
-            # the configured command timeout, exactly like the CLI steps.
-            session.timeout = config.timeout
-            evidence.line(
-                "processes.jsonl",
-                {
-                    "schema": SCHEMA,
-                    "label": label,
-                    "argv": redact_argv(mcp_command(config)),
-                    "pid": process.pid,
-                    "attempt": attempt,
-                    "started_at": now(),
-                },
-            )
-            return session, stderr
-        except WorkflowFailure as error:
-            last_error = str(error)
-            stop(process)
-            stderr.close()
-            time.sleep(0.25)
-    raise WorkflowFailure(f"MCP startup failed: {last_error}")
-
-
-def close_mcp(
-    session: Mcp | None, stderr: TextIO | None, evidence: Evidence, label: str
-) -> None:
-    try:
-        if session is not None:
-            if session.process.stdin is not None:
-                try:
-                    session.process.stdin.close()
-                except OSError as error:
-                    evidence.line(
-                        "processes.jsonl",
-                        {
-                            "schema": SCHEMA,
-                            "label": f"{label}-stdin-close",
-                            "finished_at": now(),
-                            "error": str(error),
-                        },
-                    )
-            evidence.line(
-                "processes.jsonl",
-                {
-                    "schema": SCHEMA,
-                    "label": f"{label}-exit",
-                    "returncode": stop(session.process),
-                    "finished_at": now(),
-                },
-            )
-    finally:
-        if stderr is not None:
-            stderr.close()
-
-
 def transfer(config: Config, evidence: Evidence) -> None:
     sandbox = evidence.root / "sandbox"
     sandbox.mkdir()
@@ -1558,109 +1391,104 @@ def grep_continuation_step(
     return ToolStep("grep-phase1-page-2", first_step.name, arguments)
 
 
-def run_authority_probe(
+def wait_owner_ready(
     config: Config,
     evidence: Evidence,
     server: subprocess.Popen[str],
-    primary: Mcp,
+    contract: Contract,
+) -> None:
+    """The owner serves once a metadata read reaches it: an unknown operation
+    is then not_found rather than a connection failure."""
+    exits, actions = contract
+    deadline = time.monotonic() + config.timeout
+    while time.monotonic() < deadline:
+        require_running("serve", server)
+        probe = run_process(
+            evidence,
+            "owner-ready",
+            [*client_args(config), "operation", "status", "00" * 16],
+            config,
+        )
+        call = Call("owner-ready", probe.returncode, probe.stdout, probe.stderr)
+        if owner_serves(call, exits, actions):
+            return
+        time.sleep(0.25)
+    raise WorkflowFailure("serve did not become ready for metadata reads")
+
+
+def tool_definitions(config: Config, evidence: Evidence) -> list[dict[str, Any]]:
+    """The 18 tool definitions the binary publishes through `nokv schema`."""
+    printed = completed_process(evidence, "schema", schema_command(config), config)
+    try:
+        published = json.loads(printed.stdout)
+    except json.JSONDecodeError as error:
+        raise WorkflowFailure("schema did not print JSON") from error
+    tools = published.get("tools") if isinstance(published, dict) else None
+    if not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools):
+        raise WorkflowFailure("schema did not print a tools array")
+    return tools
+
+
+def run_authority_probe(
+    config: Config,
+    evidence: Evidence,
+    contract: Contract,
 ) -> dict[str, Any]:
     peer, mismatch_config = authority_configs(config)
-    peer_stderr: TextIO | None = None
-    peer_session: Mcp | None = None
-    reconnect_stderr: TextIO | None = None
-    reconnect_session: Mcp | None = None
-    results: dict[str, dict[str, Any]] = {}
+    scan = {"id": config.workbench, "section": "input", "path": "scan.json"}
     peer_payload = canonical_json({"authority": "peer"}) + "\n"
-    try:
-        peer_session, peer_stderr = start_mcp(
-            peer, evidence, server, "mcp-authority-peer", 100
-        )
-        listed = peer_session.request("tools/list")
-        tools = listed.get("result", {}).get("tools")
-        if not isinstance(tools, list):
-            raise WorkflowFailure("peer tools/list did not return a tools array")
-        validate_tool_contract(tools)
-        results["peer-read-before-create"] = peer_session.call(
-            ToolStep(
-                "peer-read-before-create",
-                "workbench_read",
-                {"id": config.workbench, "section": "input", "path": "scan.json"},
-                "NotFound",
-            )
-        )
-        results["peer-put"] = peer_session.call(
-            ToolStep(
-                "peer-put",
-                "workbench_put_file",
-                {
-                    "id": config.workbench,
-                    "section": "input",
-                    "path": "scan.json",
-                    "text": peer_payload,
-                    "content_type": "application/json",
-                    "replace": False,
-                },
-            )
-        )
-        results["peer-read"] = peer_session.call(
-            ToolStep(
-                "peer-read",
-                "workbench_read",
-                {"id": config.workbench, "section": "input", "path": "scan.json"},
-            )
-        )
-    finally:
-        close_mcp(peer_session, peer_stderr, evidence, "mcp-authority-peer")
-
-    try:
-        reconnect_session, reconnect_stderr = start_mcp(
-            peer, evidence, server, "mcp-authority-reconnect", 200
-        )
-        results["peer-reconnect-read"] = reconnect_session.call(
-            ToolStep(
-                "peer-reconnect-read",
-                "workbench_read",
-                {"id": config.workbench, "section": "input", "path": "scan.json"},
-            )
-        )
-    finally:
-        close_mcp(
-            reconnect_session, reconnect_stderr, evidence, "mcp-authority-reconnect"
-        )
-
-    results["primary-read-after-peer-write"] = primary.call(
+    results: dict[str, dict[str, Any]] = {}
+    # Each call is its own process that admits the peer root from the control
+    # store again, so the reconnect read is a fresh admission of the same root.
+    for step in (
         ToolStep(
-            "primary-read-after-peer-write",
+            "peer-read-before-create",
             "workbench_read",
-            {"id": config.workbench, "section": "input", "path": "scan.json"},
-        )
-    )
-    initialize = (
-        canonical_json(
+            scan,
+            "NotFound",
+            "not_found",
+            "do_not_retry",
+        ),
+        ToolStep(
+            "peer-put",
+            "workbench_put_file",
             {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {"name": "nokv-authority-negative", "version": "1"},
-                },
-            }
-        )
-        + "\n"
-    )
-    mismatch = expected_failure_process(
+                **scan,
+                "text": peer_payload,
+                "content_type": "application/json",
+                "replace": False,
+            },
+        ),
+        ToolStep("peer-read", "workbench_read", scan),
+        ToolStep("peer-reconnect-read", "workbench_read", scan),
+    ):
+        results[step.label] = call_tool(peer, evidence, step, contract)
+    results["primary-read-after-peer-write"] = call_tool(
+        config,
         evidence,
-        "mcp-authority-mismatch",
-        mcp_command(mismatch_config),
+        ToolStep("primary-read-after-peer-write", "workbench_read", scan),
+        contract,
+    )
+    # The configured AgentId names another deployment of the primary root; the
+    # command is refused at root admission, before any Workbench request.
+    mismatch = call_tool(
         mismatch_config,
-        initialize,
+        evidence,
+        ToolStep(
+            "authority-mismatch",
+            "workbench_read",
+            scan,
+            "AgentBindingMismatch",
+            "invalid_input",
+            "fix_input",
+        ),
+        contract,
     )
     return assert_authority_results(results, mismatch, config, peer)
 
 
 def run_live(config: Config, evidence: Evidence, steps: list[ToolStep]) -> None:
+    contract = load_contract(config)
     provision = completed_process(
         evidence, "provision", provision_command(config), config
     )
@@ -1693,46 +1521,40 @@ def run_live(config: Config, evidence: Evidence, steps: list[ToolStep]) -> None:
             "started_at": now(),
         },
     )
-    session, mcp_err = None, None
     try:
-        session, mcp_err = start_mcp(config, evidence, server)
-        listed = session.request("tools/list")
-        tools = listed.get("result", {}).get("tools")
-        if not isinstance(tools, list):
-            raise WorkflowFailure("tools/list did not return a tools array")
-        validate_tool_contract(tools)
-        evidence.json("contract.json", contract_evidence(tools))
+        wait_owner_ready(config, evidence, server, contract)
+        tools = tool_definitions(config, evidence)
+        validate_tool_contract(tools, schema_key="input_schema")
+        evidence.json("contract.json", contract_evidence(tools, schema_key="input_schema"))
         results: dict[str, dict[str, Any]] = {}
         for step in steps:
-            results[step.label] = session.call(step)
+            results[step.label] = call_tool(config, evidence, step, contract)
             if step.label == "grep-phase1-page-1":
                 continuation = grep_continuation_step(step, results[step.label])
-                results[continuation.label] = session.call(continuation)
+                results[continuation.label] = call_tool(
+                    config, evidence, continuation, contract
+                )
             if step.label == "edit-input":
                 transfer(config, evidence)
         phase_one_evidence = assert_results(results, config)
-        authority_evidence = run_authority_probe(config, evidence, server, session)
-        require_running("mcp", session.process)
+        authority_evidence = run_authority_probe(config, evidence, contract)
         require_running("serve", server)
         evidence.json("phase1-contracts.json", phase_one_evidence)
         evidence.json("authority-contracts.json", authority_evidence)
     finally:
         try:
-            close_mcp(session, mcp_err, evidence, "mcp")
+            evidence.line(
+                "processes.jsonl",
+                {
+                    "schema": SCHEMA,
+                    "label": "serve-exit",
+                    "returncode": stop(server),
+                    "finished_at": now(),
+                },
+            )
         finally:
-            try:
-                evidence.line(
-                    "processes.jsonl",
-                    {
-                        "schema": SCHEMA,
-                        "label": "serve-exit",
-                        "returncode": stop(server),
-                        "finished_at": now(),
-                    },
-                )
-            finally:
-                serve_out.close()
-                serve_err.close()
+            serve_out.close()
+            serve_err.close()
 
 
 def shell_output(command: list[str], cwd: Path) -> str | None:
@@ -1799,9 +1621,16 @@ def plan(config: Config, steps: list[ToolStep]) -> dict[str, Any]:
             "provision": redact_argv(provision_command(config)),
             "provision_authority_peer": redact_argv(provision_command(peer)),
             "serve": redact_argv(server_command(config)),
-            "mcp": redact_argv(mcp_command(config)),
-            "mcp_authority_peer": redact_argv(mcp_command(peer)),
-            "mcp_authority_mismatch": redact_argv(mcp_command(mismatch)),
+            "schema": redact_argv(schema_command(config)),
+            "workbench_tool": redact_argv(
+                workbench_tool_command(config, "<tool>", "<json>")
+            ),
+            "workbench_tool_authority_peer": redact_argv(
+                workbench_tool_command(peer, "<tool>", "<json>")
+            ),
+            "workbench_tool_authority_mismatch": redact_argv(
+                workbench_tool_command(mismatch, "<tool>", "<json>")
+            ),
             "materialize": redact_argv(
                 materialize_command(config, sandbox / "scan.json")
             ),
@@ -1957,7 +1786,7 @@ def main(argv: list[str] | None = None) -> int:
         if typed_context is None or config.qualification_result is None:
             return code
         outcome = "PASS" if code == 0 else "NQ" if code == 3 else "FAIL"
-        transcript_path = evidence.root / "mcp-transcript.jsonl"
+        transcript_path = evidence.root / "cli-transcript.jsonl"
         transcript = transcript_path.read_bytes() if transcript_path.is_file() else None
         try:
             publish_live_result(
@@ -2029,7 +1858,7 @@ def main(argv: list[str] | None = None) -> int:
         validate(config, live=True)
         evidence.json("environment.json", environment(config))
         run_live(config, evidence, steps)
-        transcript = digest_file(evidence.root / "mcp-transcript.jsonl")
+        transcript = digest_file(evidence.root / "cli-transcript.jsonl")
         record = qualification(
             "NOT QUALIFIED",
             "Live Workbench workflow passed; full system acceptance "

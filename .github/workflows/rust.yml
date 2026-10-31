@@ -63,8 +63,12 @@ jobs:
             scripts/workbench/object_namespace_recovery_gate.py \
             scripts/workbench/restore_composition_gate.py \
             scripts/workbench/fork_restore_recovery_gate.py \
+            scripts/workbench/cli_contract.py \
             scripts/workbench/cli_contract_gate.py \
             scripts/workbench/rpc_tls_gate.py \
+            scripts/workbench/control_plane_gate.py \
+            scripts/workbench/control_plane_gate_test.py \
+            scripts/workbench/owner_upload_interference_probe.py \
             scripts/workbench/python_contract_gate.py \
             scripts/workbench/loopx_stage2a_stack.py
           python3 scripts/workbench/pre423_contract_ledger.py
@@ -77,6 +81,7 @@ jobs:
           python3 scripts/workbench/fork_restore_recovery_gate_test.py
           python3 scripts/workbench/cli_contract_gate_test.py
           python3 scripts/workbench/rpc_tls_gate_test.py
+          PYTHONPATH=scripts/workbench python3 -m unittest scripts/workbench/control_plane_gate_test.py
           python3 scripts/workbench/loopx_stage2a_stack_test.py
           bash -n scripts/workbench/start_rustfs.sh
 
@@ -203,7 +208,7 @@ jobs:
                   --dependency "etcd=sha256:e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9"
                   --dependency "object-store=oci:rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
                   --evidence "qualification=$evidence_root/qualification.json"
-                  --evidence "mcp-transcript=$evidence_root/mcp-transcript.jsonl"
+                  --evidence "cli-transcript=$evidence_root/cli-transcript.jsonl"
                 )
                 producer_args+=(
                   --nokv-bin "$product_binary"
@@ -627,6 +632,33 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Qualify the control plane over mutual TLS
+        id: control_plane
+        shell: bash
+        env:
+          CONTROL_PLANE_EVIDENCE_DIR: ${{ runner.temp }}/control-plane
+          AWS_ACCESS_KEY_ID: rustfsadmin
+          AWS_SECRET_ACCESS_KEY: rustfsadmin
+        run: |
+          set -euo pipefail
+          python3 scripts/workbench/control_plane_gate.py \
+            --nokv-bin target/debug/nokv \
+            --evidence-dir "$CONTROL_PLANE_EVIDENCE_DIR" \
+            --object-endpoint http://127.0.0.1:9000 \
+            --object-bucket nokv-local-wal-recovery-gate \
+            --object-root "control-plane-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --timeout 45
+          jq -e '.overall_status == "PASS"' "$CONTROL_PLANE_EVIDENCE_DIR/qualification.json"
+
+      - name: Upload control plane evidence
+        if: ${{ always() && steps.control_plane.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: control-plane-${{ github.sha }}
+          path: ${{ runner.temp }}/control-plane
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Build and install the Python SDK wheel
         shell: bash
         run: |
@@ -670,6 +702,35 @@ jobs:
         with:
           name: python-contract-${{ github.sha }}
           path: ${{ runner.temp }}/python-contract
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Qualify the direct Python SDK contract over TLS
+        id: python_contract_tls
+        shell: bash
+        env:
+          PYTHON_CONTRACT_TLS_EVIDENCE_DIR: ${{ runner.temp }}/python-contract-tls
+          AWS_ACCESS_KEY_ID: rustfsadmin
+          AWS_SECRET_ACCESS_KEY: rustfsadmin
+        run: |
+          set -euo pipefail
+          python3 scripts/workbench/python_contract_gate.py \
+            --tls \
+            --nokv-bin target/debug/nokv \
+            --python-executable "$RUNNER_TEMP/python-contract-venv/bin/python" \
+            --evidence-dir "$PYTHON_CONTRACT_TLS_EVIDENCE_DIR" \
+            --object-endpoint http://127.0.0.1:9000 \
+            --object-bucket nokv-local-wal-recovery-gate \
+            --object-root "python-contract-tls-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --timeout 45
+          jq -e '.overall_status == "PASS"' "$PYTHON_CONTRACT_TLS_EVIDENCE_DIR/qualification.json"
+
+      - name: Upload direct Python SDK TLS contract evidence
+        if: ${{ always() && steps.python_contract_tls.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: python-contract-tls-${{ github.sha }}
+          path: ${{ runner.temp }}/python-contract-tls
           if-no-files-found: error
           retention-days: 7
 

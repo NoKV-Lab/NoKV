@@ -61,9 +61,10 @@ pub use request::{
     RenewSnapshotRequest, RestoreManifestDescriptor, RestoreManifestIdentity, RestoreSource,
     RetireSnapshotRequest, SearchRequest, SortDirection, SortField, StageArtifactManifestRequest,
     StageArtifactObjectsRequest, UploadArtifactObjectRequest, WorkspaceContinuationFence,
-    WorkspacePreflightRequest, WorkspaceRequest, WorkspaceRpcRequest, MAX_GENERIC_INDEX_ABORT_ROWS,
-    MAX_GENERIC_INDEX_APPEND_ROWS, MAX_GENERIC_INDEX_FIELDS, MAX_GENERIC_INDEX_ROW_BYTES,
-    MAX_GENERIC_INDEX_ROW_FIELDS, MAX_GENERIC_INDEX_VALUES_PER_FIELD, MAX_QUERY_PAGE_LIMIT,
+    WorkspacePreflightRequest, WorkspaceRequest, WorkspaceRpcRequest, MAX_CHANGE_PAGE_LIMIT,
+    MAX_GENERIC_INDEX_ABORT_ROWS, MAX_GENERIC_INDEX_APPEND_ROWS, MAX_GENERIC_INDEX_FIELDS,
+    MAX_GENERIC_INDEX_ROW_BYTES, MAX_GENERIC_INDEX_ROW_FIELDS, MAX_GENERIC_INDEX_VALUES_PER_FIELD,
+    MAX_QUERY_PAGE_LIMIT,
 };
 pub use response::{
     AggregateGroup, AggregateResult, CatalogField, CatalogResult, ChangeEvent, ChangeKind,

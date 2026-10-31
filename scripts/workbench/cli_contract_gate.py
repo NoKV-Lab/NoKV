@@ -20,7 +20,6 @@ reproduces the contract gaps on a binary that predates them.
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import hashlib
 import json
 import os
@@ -35,6 +34,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from append_identity_recovery_gate import unpack
+from cli_contract import (
+    Call,
+    ContractFailure,
+    NotQualified,
+    contract_failure,
+    contract_success,
+    contract_tables,
+    require,
+)
 from fork_restore_recovery_gate import (
     ResponseDropProxy,
     _recv_exact,
@@ -60,43 +68,6 @@ NOT_QUALIFIED_SCENARIOS = {
 }
 
 
-class ContractFailure(Exception):
-    """The binary under test broke the published contract."""
-
-
-class NotQualified(Exception):
-    """The gate could not establish a scenario's precondition."""
-
-
-def require(condition: bool, claim: str, observed: Any = None) -> None:
-    if not condition:
-        detail = json.dumps(observed, sort_keys=True, default=str)[:900]
-        raise ContractFailure(f"{claim}: {detail}")
-
-
-def contract_tables(document: str) -> tuple[dict[str, int], set[str]]:
-    """The class-to-exit-code map and the next actions the contract publishes."""
-
-    def rows(name: str) -> list[list[str]]:
-        begin, end = f"<!-- {name}:begin -->", f"<!-- {name}:end -->"
-        start = document.index(begin) + len(begin)
-        table = document[start : document.index(end, start)]
-        cells = [
-            [cell.strip() for cell in line.strip().strip("|").split("|")]
-            for line in table.splitlines()
-            if line.startswith("| ") and not line.startswith("| ---")
-        ]
-        return cells[1:]
-
-    exits = {
-        row[1].strip("`"): int(row[0]) for row in rows("exit-codes") if row[1]
-    }
-    actions = {row[0].strip("`") for row in rows("next-actions")}
-    if not exits or not actions:
-        raise NotQualified("docs/cli-contract.md publishes no contract tables")
-    return exits, actions
-
-
 def free_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -110,16 +81,6 @@ def new_id() -> str:
 def hex_of(value: Any) -> str:
     """A decoded wire id: a MessagePack array of bytes or a binary value."""
     return value["binary_hex"] if isinstance(value, dict) else bytes(value).hex()
-
-
-@dataclasses.dataclass
-class Call:
-    label: str
-    exit: int
-    stdout: str
-    stderr: str
-    connections: int
-    requests: list[str]
 
 
 class TracingProxy(ResponseDropProxy):
@@ -275,9 +236,16 @@ class Stack:
         """The object-store options an invocation of `command` runs with."""
         return self.objects
 
-    def run(self, label: str, arguments: list[str]) -> Call:
-        prefix = [*self.route, "--agent-id", self.ids["agent"], *self.object_options(arguments[0])]
-        argv = [str(self.binary), *prefix, *arguments]
+    def run(self, label: str, arguments: list[str], client_options: list[str] = (), *,
+            root: str | None = None) -> Call:
+        """Run one command; `client_options` are connection options such as the
+        retry budget, which the CLI takes before the command. `root` runs it
+        against another root of the same control plane."""
+        route = list(self.route)
+        if root is not None:
+            route[route.index("--root-id") + 1] = root
+        prefix = [*route, "--agent-id", self.ids["agent"], *self.object_options(arguments[0])]
+        argv = [str(self.binary), *prefix, *client_options, *arguments]
         with self.proxy._lock:
             connections, requests = self.proxy.connections, len(self.proxy.requests)
         started = time.monotonic()
@@ -308,12 +276,14 @@ class Stack:
         )
         return call
 
-    def provision(self) -> None:
-        call = self.run("provision", ["provision", self.ids["shard"], "--workbench-root", WORKBENCH_ROOT])
+    def provision(self, root: str | None = None) -> None:
+        """Provision the stack's root, or another root on the same shard."""
+        label = "provision" if root is None else f"provision-{root[:8]}"
+        call = self.run(label, ["provision", self.ids["shard"], "--workbench-root", WORKBENCH_ROOT], root=root)
         if call.exit != 0:
             raise NotQualified(f"provision failed: {call.stderr[-600:]}")
 
-    def start_owner(self) -> None:
+    def start_owner(self, *serve_args: str) -> None:
         metadata = "--metadata-reopen" if self.owner_starts else "--metadata-create"
         self.owner_starts += 1
         argv = [
@@ -321,7 +291,7 @@ class Stack:
             "--bind", f"127.0.0.1:{self.owner_port}",
             "--advertise-endpoint", f"127.0.0.1:{self.proxy.port}",
             "--node-id", "cli-contract-owner",
-            metadata, str(self.metadata),
+            metadata, str(self.metadata), *serve_args,
             "serve",
         ]
         self.owner = subprocess.Popen(
@@ -362,45 +332,11 @@ class Stack:
     # Grading.
 
     def success(self, call: Call) -> dict[str, Any]:
-        require(call.exit == 0, f"{call.label} succeeds", [call.exit, call.stderr[-600:]])
-        try:
-            result = json.loads(call.stdout)
-        except json.JSONDecodeError:
-            raise ContractFailure(f"{call.label} prints one JSON result: {call.stdout[:300]}")
-        require(result.get("status") == "success", f"{call.label} reports success", result)
-        return result
+        return contract_success(call)
 
     def failure(self, call: Call, klass: str, next_action: str) -> dict[str, Any]:
         """The call failed with exactly the contract envelope of `klass`."""
-        observed = [call.exit, call.stdout[:200], call.stderr[-600:]]
-        require(call.exit != 0, f"{call.label} fails", observed)
-        require(call.stdout == "", f"{call.label} writes nothing to stdout", observed)
-        lines = call.stderr.splitlines()
-        require(len(lines) == 1, f"{call.label} writes exactly one stderr line", observed)
-        try:
-            envelope = json.loads(lines[0])
-        except json.JSONDecodeError:
-            raise ContractFailure(f"{call.label} writes a JSON failure line: {lines[0][:300]}")
-        require(
-            isinstance(envelope, dict)
-            and envelope.get("status") == "error"
-            and {"code", "message", "retryable", "details"} <= envelope.keys(),
-            f"{call.label} keeps the Agent error envelope",
-            envelope,
-        )
-        require(envelope.get("class") in self.exits, f"{call.label} names a published class", envelope)
-        require(envelope.get("next_action") in self.actions, f"{call.label} names a published next action", envelope)
-        require(
-            [envelope["class"], envelope["next_action"]] == [klass, next_action],
-            f"{call.label} is {klass} with {next_action}",
-            envelope,
-        )
-        require(
-            call.exit == self.exits[klass],
-            f"{call.label} exits with the code of {klass}",
-            [call.exit, self.exits[klass]],
-        )
-        return envelope
+        return contract_failure(call, self.exits, self.actions, klass, next_action)
 
     def faulted(self, label: str, arguments: list[str], operation: str) -> Call:
         """Run a command whose successful `operation` response is dropped and
@@ -611,6 +547,236 @@ def unknown_outcome_query_then_retry(stack: Stack) -> dict[str, Any]:
     return {"failure": envelope, "status": observed, "replay": retry, "effects": 1}
 
 
+def workbench_tool_operation_id_replays(stack: Stack) -> dict[str, Any]:
+    """S9: the Workbench mutation tools replay exactly under a caller operation id
+    across processes, and refuse the id for other inputs."""
+    workbench = "s9-workbench-identity"
+    stack.workbench(workbench)
+    target = {"id": workbench, "section": "outputs", "path": "notes.txt"}
+
+    def tool(label: str, name: str, arguments: dict[str, Any]) -> Call:
+        return stack.run(label, ["workbench", name, json.dumps(arguments)])
+
+    put_id, edit_id, append_id = new_id(), new_id(), new_id()
+    put = {**target, "text": "alpha beta", "operation_id": put_id}
+    first = stack.success(tool("s9-put", "workbench_put_file", put))
+    again = stack.success(tool("s9-put-again", "workbench_put_file", put))
+    require(first.get("idempotent_replay") is False and again.get("idempotent_replay") is True
+            and again.get("generation") == first.get("generation") == 1
+            and again.get("operation_id") == put_id,
+            "s9: the same put under the same id replays its receipt", [first, again])
+    other = stack.failure(tool("s9-put-other", "workbench_put_file", {**put, "text": "other"}),
+                          "identity_conflict", "do_not_retry")
+    edit = {**target, "old_string": "beta", "new_string": "gamma", "operation_id": edit_id}
+    edited = stack.success(tool("s9-edit", "workbench_edit", edit))
+    edited_again = stack.success(tool("s9-edit-again", "workbench_edit", edit))
+    require(edited.get("generation") == 2 and edited.get("replacements") == 1
+            and edited_again.get("idempotent_replay") is True and edited_again.get("generation") == 2
+            and edited_again.get("replacements") is None,
+            "s9: a repeated edit replays the recorded generation instead of NoMatch",
+            [edited, edited_again])
+    append = {**target, "text": " delta", "operation_id": append_id}
+    appended = stack.success(tool("s9-append", "workbench_append", append))
+    appended_again = stack.success(tool("s9-append-again", "workbench_append", append))
+    require(appended.get("idempotent_replay") is False and appended_again.get("idempotent_replay") is True
+            and appended_again.get("size_bytes") == appended.get("size_bytes")
+            and appended_again.get("generation") == appended.get("generation") == 3,
+            "s9: the same append under the same id is applied once", [appended, appended_again])
+    body = stack.body("s9-body", workbench, "notes.txt")
+    require(body == b"alpha gamma delta", "s9: the body holds one edit and one append", body)
+    return {"put": [first, again, other], "edit": [edited, edited_again],
+            "append": [appended, appended_again]}
+
+
+def session_backoff_bridges_owner_restart(stack: Stack) -> dict[str, Any]:
+    """S10: a `workbench-session` started with bounded retry backoff completes a
+    write sent while the owner is down, once the owner is back."""
+    workbench = "s10-session-backoff"
+    stack.workbench(workbench)
+    argv = [str(stack.binary), *stack.route, "--agent-id", stack.ids["agent"], *stack.objects,
+            "--max-attempts", "16", "--retry-backoff-ms", "250", "--max-retry-backoff-ms", "2000",
+            "workbench-session"]
+    session = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, env=stack.env)
+    transcript: list[dict[str, Any]] = []
+
+    def send(index: int) -> None:
+        request = {"id": str(index), "tool": "workbench_put_file", "arguments": {
+            "id": workbench, "section": "outputs", "path": f"session-{index}.txt",
+            "text": f"session {index}", "replace": False}}
+        session.stdin.write(json.dumps(request) + "\n")
+        session.stdin.flush()
+        transcript.append({"label": f"s10-send-{index}", "request": request, "at": time.time()})
+
+    def receive(index: int) -> dict[str, Any]:
+        line = session.stdout.readline()
+        reply = json.loads(line) if line else {"error": "the session closed its output"}
+        transcript.append({"label": f"s10-reply-{index}", "reply": reply, "at": time.time()})
+        return reply
+
+    def connections() -> int:
+        with stack.proxy._lock:
+            return stack.proxy.connections
+
+    try:
+        send(1)
+        before = receive(1)
+        require("result" in before, "s10: the session writes while the owner is up", before)
+        stack.kill_owner()
+        down = connections()
+        send(2)
+        # 250 ms, then 500 ms: at least two spaced attempts fall in this window,
+        # while 16 immediate attempts would all have failed within it.
+        time.sleep(1.0)
+        attempts_while_down = connections() - down
+        stack.start_owner()
+        after = receive(2)
+    finally:
+        session.stdin.close()
+        session.wait(timeout=stack.timeout)
+        stderr = session.stderr.read()
+    for entry in transcript:
+        stack.write("cli-transcript.jsonl", {"session": "s10", **entry})
+    require(session.returncode == 0 and not stderr,
+            "s10: the session exits 0 at end of input without complaints", [session.returncode, stderr])
+    require("result" in after and after["result"].get("generation") == 1,
+            "s10: the write sent during the outage lands once the owner is back", after)
+    require(2 <= attempts_while_down < 16,
+            "s10: the session spaced its attempts over the outage within its budget", attempts_while_down)
+    stat = stack.stat("s10-landed", workbench, "session-2.txt")
+    require(stat.get("exists") is True and stat.get("generation") == 1,
+            "s10: the live path is the session's write", [stat, after])
+    require(stack.body("s10-body", workbench, "session-2.txt") == b"session 2",
+            "s10: the live body is the session's text")
+    return {"before": before, "after": after, "attempts_while_down": attempts_while_down}
+
+
+def in_flight_identified_write_survives_owner_restart(stack: Stack) -> dict[str, Any]:
+    """S11: a caller-identified put whose owner died after admitting its attempt is
+    finished by the same command against the restarted owner: the client waits
+    out the orphaned attempt the owner aborts, then publishes the next attempt."""
+    workbench, operation_id = "s11-in-flight", new_id()
+    body = hashlib.sha256(b"s11").hexdigest().encode() * (MAX_INLINE_BODY_BYTES // 64 + 1)
+    stack.workbench(workbench)
+    arguments = stack.put_arguments("s11", workbench, "s11.bin", operation_id, body)
+    first = stack.failure(stack.faulted("s11-first", arguments, "prepare_artifact_publish"),
+                          "outcome_unknown", "query_same")
+    # A long lifecycle interval keeps the aborted attempt non-terminal for
+    # seconds after the restart, so the retry has to wait rather than find it
+    # already failed.
+    stack.start_owner("--lifecycle-interval-millis", "4000")
+    started = time.monotonic()
+    retry = stack.run("s11-retry", arguments, ["--max-attempts", "16", "--retry-backoff-ms", "250"])
+    waited = time.monotonic() - started
+    receipt = stack.success(retry)
+    require(receipt.get("replayed") is False and receipt.get("attempt") == 1
+            and receipt.get("generation") == 1 and receipt.get("operation_id") == operation_id,
+            "s11: the retry publishes its next attempt once the orphaned one is aborted", receipt)
+    require(waited >= 2.0, "s11: the retry waited out the aborting attempt", waited)
+    stack.assert_live("s11", workbench, "s11.bin", body, receipt)
+    status = stack.success(stack.run("s11-status", ["operation", "status", operation_id]))
+    require(status.get("state") == "failed", "s11: the orphaned first attempt ended failed", status)
+    stack.restart_owner()
+    return {"failure": first, "receipt": receipt, "waited_s": round(waited, 2),
+            "first_attempt": status, "effects": 1}
+
+
+def root_provisioned_after_owner_start_is_served(stack: Stack) -> dict[str, Any]:
+    """S12: a root provisioned on the owner's shard after the owner started is
+    served by that owner, without a restart, within its lifecycle interval."""
+    root = new_id()
+    starts = stack.owner_starts
+    stack.provision(root)
+    provisioned = time.monotonic()
+    deadline = provisioned + stack.timeout
+    probe = None
+    while time.monotonic() < deadline:
+        probe = stack.run("s12-probe", ["operation", "status", new_id()], root=root)
+        if '"NotFound"' in probe.stderr:
+            break
+        time.sleep(0.2)
+    else:
+        raise ContractFailure(f"s12: the new root was not served within {stack.timeout}s: {probe.stderr[-300:]}")
+    served_after = round(time.monotonic() - provisioned, 3)
+    require(stack.owner_starts == starts and stack.owner.poll() is None, "s12: the same owner serves it", starts)
+    stack.success(stack.run("s12-create", ["workbench", "workbench_create", json.dumps({"id": "s12"})], root=root))
+    put = stack.success(stack.run("s12-put", stack.put_arguments("s12-put", "s12", "mounted.txt", new_id(), b"mounted"),
+                                  root=root))
+    stat = stack.success(stack.run("s12-stat", ["workspace-path", "stat", "s12", "outputs", "mounted.txt"], root=root))
+    require(stat.get("exists") is True and stat.get("generation") == put.get("generation"),
+            "s12: the path published on the new root reads back", [put, stat])
+    return {"root": root, "served_after_seconds": served_after, "put": put}
+
+
+def owner_exits_when_its_control_directory_becomes_unsafe(stack: Stack) -> dict[str, Any]:
+    """S13: an owner whose control directory becomes group-writable stops
+    serving and exits within its session check, reporting the control store's
+    refusal: operator_required, since someone else may have changed the
+    records, with the directory and the fix. It does not resume by itself;
+    once the mode is fixed, a restart with --metadata-reopen serves what was
+    written before."""
+    workbench, body = "s13-unsafe-control", b"written before the refusal"
+    stack.workbench(workbench)
+    before = stack.success(stack.put("s13-before", workbench, "before.txt", new_id(), body))
+    owner, log = stack.owner, stack.evidence / f"owner-{stack.owner_starts}.log"
+    private = stack.control.stat().st_mode & 0o7777
+    stack.control.chmod(private | 0o020)
+    started = time.monotonic()
+    try:
+        owner.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        raise ContractFailure("s13: the owner still serves 10 s after its control directory became group-writable")
+    finally:
+        stack.control.chmod(private)
+    exited_after = round(time.monotonic() - started, 2)
+    # Serve logs to stderr; its failure is the last line.
+    lines = log.read_text(errors="replace").splitlines()
+    exit_call = Call("s13-owner-exit", owner.returncode, "", (lines[-1] if lines else "") + "\n")
+    envelope = stack.failure(exit_call, "operator_required", "operator")
+    require(str(stack.control) in envelope["message"] and "chmod go-w" in envelope["message"],
+            "s13: the owner's exit names its control directory and the fix", envelope)
+    stack.start_owner()
+    after = stack.stat("s13-after", workbench, "before.txt")
+    require(after.get("exists") is True and after.get("generation") == before.get("generation"),
+            "s13: the restarted owner serves the path written before the refusal", [before, after])
+    return {"exited_after_seconds": exited_after, "exit": envelope, "after_restart": after}
+
+
+def owner_stop_reports_an_unwritable_control_directory(stack: Stack) -> dict[str, Any]:
+    """S14: an owner whose control directory it can no longer write, though
+    still private, serves on until its next control-store write. Stopping it
+    releases its session there: the store refuses, and the owner exits with
+    that refusal, operator_required, naming the directory and why. Once the
+    mode is fixed, a restart serves what was written meanwhile."""
+    workbench, body = "s14-unwritable-control", b"written while the control directory was read-only"
+    stack.workbench(workbench)
+    owner, log = stack.owner, stack.evidence / f"owner-{stack.owner_starts}.log"
+    private = stack.control.stat().st_mode & 0o7777
+    stack.control.chmod(0o500)
+    try:
+        if os.access(stack.control, os.W_OK):
+            raise NotQualified("s14: this user may still write a 0500 control directory (root?)")
+        put = stack.success(stack.put("s14-put", workbench, "during.txt", new_id(), body))
+        owner.terminate()
+        try:
+            owner.wait(timeout=stack.timeout)
+        except subprocess.TimeoutExpired:
+            raise ContractFailure(f"s14: the owner still runs {stack.timeout} s after SIGTERM")
+    finally:
+        stack.control.chmod(private)
+    # Serve logs to stderr; its failure is the last line.
+    lines = log.read_text(errors="replace").splitlines()
+    exit_call = Call("s14-owner-exit", owner.returncode, "", (lines[-1] if lines else "") + "\n")
+    envelope = stack.failure(exit_call, "operator_required", "operator")
+    require(str(stack.control) in envelope["message"] and "cannot create files in it" in envelope["message"],
+            "s14: the owner's exit names its control directory and why it is refused", envelope)
+    stack.start_owner()
+    after = stack.stat("s14-after", workbench, "during.txt")
+    require(after.get("exists") is True and after.get("generation") == put.get("generation"),
+            "s14: the restarted owner serves the path written while the directory was read-only", [put, after])
+    return {"put": put, "exit": envelope, "after_restart": after}
+
+
 def usage_error_sends_no_request(stack: Stack) -> dict[str, Any]:
     """S7: an invalid command fails typed before it reaches the owner."""
     cases = {
@@ -640,6 +806,14 @@ SCENARIOS = {
     "s4_same_id_other_payload": same_id_other_payload,
     "s5_unknown_outcome_query_then_retry": unknown_outcome_query_then_retry,
     "s7_usage_error_sends_no_request": usage_error_sends_no_request,
+    "s9_workbench_tool_operation_id_replays": workbench_tool_operation_id_replays,
+    "s10_session_backoff_bridges_owner_restart": session_backoff_bridges_owner_restart,
+    "s11_in_flight_identified_write_survives_owner_restart": in_flight_identified_write_survives_owner_restart,
+    "s12_root_provisioned_after_owner_start_is_served": root_provisioned_after_owner_start_is_served,
+    "s13_owner_exits_when_its_control_directory_becomes_unsafe":
+        owner_exits_when_its_control_directory_becomes_unsafe,
+    "s14_owner_stop_reports_an_unwritable_control_directory":
+        owner_stop_reports_an_unwritable_control_directory,
 }
 
 

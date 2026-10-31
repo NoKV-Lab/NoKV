@@ -1,6 +1,7 @@
 """Installed Python surface checks for the Workbench-scoped SDK."""
 
 import inspect
+import types
 from pathlib import Path
 
 import nokv
@@ -29,14 +30,36 @@ def test_versioned_workbench_surface():
         "Client",
         "ObjectStoreConfig",
         "RoutingConfig",
+        "Session",
+        "TlsConfig",
         "WorkbenchFileSystem",
         "WorkspaceIncarnationMismatch",
         "checkpoint",
     ]
+    session = inspect.signature(nokv.Session).parameters
+    assert list(session)[:3] == ["routing", "object_store", "tls"]
+    assert "retry_backoff_ms" in session and "max_attempts" in session
+    client_of = inspect.signature(nokv.Session.client).parameters
+    assert list(client_of) == ["self", "root_id", "workbench_root"]
+    assert hasattr(nokv.Session, "workbench_root")
+    assert "tls" in inspect.signature(nokv.Client).parameters
+    assert list(inspect.signature(nokv.TlsConfig).parameters) == ["ca_pem", "cert_pem", "key_pem", "server_name"]
+    # A native getter is a descriptor, read like a property.
+    assert isinstance(nokv.Client.workbench_root, types.GetSetDescriptorType)
     assert issubclass(nokv.WorkspaceIncarnationMismatch, RuntimeError)
     assert nokv.WorkspaceIncarnationMismatch("m", "a" * 32).expected == "a" * 32
     assert hasattr(nokv.RoutingConfig, "static")
     assert hasattr(nokv.RoutingConfig, "etcd")
+    etcd = inspect.signature(nokv.RoutingConfig.etcd).parameters
+    assert list(etcd) == [
+        "endpoints",
+        "key_prefix",
+        "lease_ttl_seconds",
+        "tls_ca_pem",
+        "tls_cert_pem",
+        "tls_key_pem",
+    ]
+    assert all(etcd[name].default is None for name in ("tls_ca_pem", "tls_cert_pem", "tls_key_pem"))
     assert hasattr(nokv.Client, "create_workspace")
     assert hasattr(nokv.Client, "stat")
     assert hasattr(nokv.Client, "list")
@@ -228,3 +251,20 @@ def test_failure_attributes_use_the_published_contract_names():
     for error in (invalid, mismatch, defaults):
         assert error.error_class in classes
         assert error.next_action in actions
+
+
+def test_etcd_routing_refuses_endpoint_credentials_without_repeating_them():
+    for endpoint in (
+        "user:s3cr3t@127.0.0.1:2379",
+        "HTTP://user:s3cr3t@127.0.0.1:2379",
+        "ftp://user:s3cr3t@127.0.0.1:2379",
+        "http://user:s3cr3t@127.0.0.1:2379",
+    ):
+        try:
+            nokv.RoutingConfig.etcd([endpoint])
+        except ValueError as error:
+            text = str(error)
+            assert "s3cr3t" not in text, "the ValueError repeats credentials"
+            assert "carries credentials" in text, text
+        else:
+            raise AssertionError("an etcd endpoint with credentials was accepted")

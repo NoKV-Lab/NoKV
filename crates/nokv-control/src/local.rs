@@ -19,11 +19,24 @@
 //! The directory must be on a local filesystem of the one host that runs the
 //! owner: network filesystems do not give `flock` these semantics. Owners or
 //! clients that span hosts use the etcd store.
+//!
+//! File permissions are the directory's only access control, and its records
+//! include the tenants' authorization policy. So the store creates the
+//! directory and its files readable and writable by their owner alone, and
+//! refuses a directory, `sessions` directory, or record file that group or
+//! other users can write, or that belongs to a user other than this process's
+//! user or root. A mutation also refuses a directory this process cannot
+//! create or create files in, and checks each directory before it creates
+//! anything inside it. Each refusal is `ControlPathRefused`, for an operator:
+//! someone else may have changed the records. Processes of different users
+//! share a control plane through etcd.
 
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write as _};
-use std::os::unix::fs::MetadataExt as _;
+use std::io::{self, Read as _, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -50,6 +63,13 @@ const STORE_LOCK_FILE: &str = "control.lock";
 const SESSION_DIRECTORY: &str = "sessions";
 /// How often a locker reopens a lock file that was replaced while it waited.
 const MAX_LOCK_FILE_REOPENS: usize = 8;
+/// Mode of a directory the store creates.
+const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+/// Mode of a record or lock file the store creates.
+const PRIVATE_FILE_MODE: u32 = 0o600;
+/// Permission bits that let group or other users change a file or the entries
+/// of a directory.
+const SHARED_WRITE_BITS: u32 = 0o022;
 
 /// Control store for owners and clients on one host.
 pub struct LocalControlStore {
@@ -249,33 +269,53 @@ impl LocalControlStore {
         self.sessions.write().map_err(|_| poisoned_session_table())
     }
 
+    /// Take the store lock once the control directory and its `sessions`
+    /// directory pass `check_control_directory`. A missing one is created
+    /// private, inside a parent that passed the check.
     fn lock_store(&self) -> Result<FileLock, ControlError> {
-        let sessions = self.directory.join(SESSION_DIRECTORY);
-        if !sessions.is_dir() {
-            fs::create_dir_all(&sessions).map_err(io_error("create control directory"))?;
-            sync_directory(&self.directory).map_err(io_error("sync control directory"))?;
-            if let Some(parent) = self
-                .directory
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-            {
-                sync_directory(parent).map_err(io_error("sync control directory parent"))?;
-            }
-        }
+        let parent = self
+            .directory
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        ensure_control_directory(&self.directory, parent)?;
+        ensure_control_directory(
+            &self.directory.join(SESSION_DIRECTORY),
+            Some(&self.directory),
+        )?;
         FileLock::exclusive(&self.directory.join(STORE_LOCK_FILE))
             .map_err(io_error("lock control store"))
     }
 
+    /// The bytes of the record file `name`, or `None` before its first write.
+    fn read_record_file(
+        &self,
+        name: &str,
+        context: &'static str,
+    ) -> Result<Option<Vec<u8>>, ControlError> {
+        match fs::metadata(&self.directory) {
+            Ok(metadata) => check_control_path(&self.directory, &metadata)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_error("inspect control directory")(error)),
+        }
+        let path = self.directory.join(name);
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_error(context)(error)),
+        };
+        check_control_path(&path, &file.metadata().map_err(io_error(context))?)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(io_error(context))?;
+        Ok(Some(bytes))
+    }
+
     fn read_state(&self) -> Result<(Vec<u8>, InMemoryState), ControlError> {
-        match fs::read(self.directory.join(STATE_FILE)) {
-            Ok(bytes) => {
+        match self.read_record_file(STATE_FILE, "read control state")? {
+            Some(bytes) => {
                 let state = decode_local_control_state(&bytes)?;
                 Ok((bytes, state))
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                Ok((Vec::new(), InMemoryState::default()))
-            }
-            Err(error) => Err(io_error("read control state")(error)),
+            None => Ok((Vec::new(), InMemoryState::default())),
         }
     }
 
@@ -298,7 +338,18 @@ impl LocalControlStore {
         (write, replace): (&'static str, &'static str),
     ) -> Result<(), ControlError> {
         let temporary = self.directory.join(temporary);
-        let mut file = File::create(&temporary).map_err(io_error(write))?;
+        // A temporary left by a crash keeps its mode if reopened; start anew.
+        match fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(write)(error)),
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(PRIVATE_FILE_MODE)
+            .open(&temporary)
+            .map_err(io_error(write))?;
         file.write_all(encoded)
             .and_then(|()| file.sync_all())
             .map_err(io_error(write))?;
@@ -308,15 +359,12 @@ impl LocalControlStore {
     }
 
     fn read_identity(&self) -> Result<(Vec<u8>, IdentityState), ControlError> {
-        match fs::read(self.directory.join(IDENTITY_FILE)) {
-            Ok(bytes) => {
+        match self.read_record_file(IDENTITY_FILE, "read identity state")? {
+            Some(bytes) => {
                 let state = decode_local_identity_state(&bytes)?;
                 Ok((bytes, state))
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                Ok((Vec::new(), IdentityState::default()))
-            }
-            Err(error) => Err(io_error("read identity state")(error)),
+            None => Ok((Vec::new(), IdentityState::default())),
         }
     }
 
@@ -443,6 +491,7 @@ impl FileLock {
                 .write(true)
                 .create(true)
                 .truncate(false)
+                .mode(PRIVATE_FILE_MODE)
                 .open(path)?;
             loop {
                 // SAFETY: `file` owns the descriptor for the whole call.
@@ -490,6 +539,125 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 
 fn io_error(context: &'static str) -> impl Fn(io::Error) -> ControlError {
     move |error| ControlError::Backend(format!("local control store cannot {context}: {error}"))
+}
+
+/// Check the control directory `path`, first creating it private if it is
+/// missing.
+fn ensure_control_directory(path: &Path, parent: Option<&Path>) -> Result<(), ControlError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            create_private_directory(path, parent)?;
+            fs::metadata(path).map_err(io_error("inspect control directory"))?
+        }
+        Err(error) => return Err(io_error("inspect control directory")(error)),
+    };
+    check_control_directory(path, &metadata)
+}
+
+/// Create `path` readable and writable by this process's user alone, with
+/// any missing ancestors of `parent`, and sync `parent` so the new entry
+/// survives a crash.
+fn create_private_directory(path: &Path, parent: Option<&Path>) -> Result<(), ControlError> {
+    let failure = |error: io::Error| {
+        refusal_without_permission(path, "create it", &error)
+            .unwrap_or_else(|| io_error("create control directory")(error))
+    };
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent).map_err(failure)?;
+    }
+    match fs::DirBuilder::new()
+        .mode(PRIVATE_DIRECTORY_MODE)
+        .create(path)
+    {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(failure(error)),
+    }
+    match parent {
+        Some(parent) => sync_directory(parent).map_err(io_error("sync control directory parent")),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a control directory that `check_control_path` refuses, or in which
+/// this process cannot create files.
+fn check_control_directory(path: &Path, metadata: &fs::Metadata) -> Result<(), ControlError> {
+    check_control_path(path, metadata)?;
+    may_create_entries(path).map_err(|error| {
+        refusal_without_permission(path, "create files in it", &error)
+            .unwrap_or_else(|| io_error("check control directory access")(error))
+    })
+}
+
+/// Whether the kernel lets this process create entries in the directory
+/// `path`. `access` decides for the real user and group, which are this
+/// process's own unless it runs setuid or setgid.
+fn may_create_entries(path: &Path) -> io::Result<()> {
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: `path` is NUL-terminated and outlives the call.
+    if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// The refusal of a control directory that this process's user lacks the
+/// permission to `action`. That lasts until an operator changes the
+/// filesystem, so it is not a transient failure.
+fn refusal_without_permission(
+    path: &Path,
+    action: &str,
+    error: &io::Error,
+) -> Option<ControlError> {
+    matches!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+    )
+    .then(|| ControlError::ControlPathRefused {
+        path: path.to_path_buf(),
+        reason: format!(
+            "this process's user (uid {}) cannot {action} ({error}); make it a directory that \
+             user owns and can write, or choose another one",
+            effective_user()
+        ),
+    })
+}
+
+fn effective_user() -> u32 {
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Refuse a control path that anyone but this process's user or root could
+/// change.
+fn check_control_path(path: &Path, metadata: &fs::Metadata) -> Result<(), ControlError> {
+    match control_path_problem(metadata.mode(), metadata.uid(), effective_user()) {
+        None => Ok(()),
+        Some(reason) => Err(ControlError::ControlPathRefused {
+            path: path.to_path_buf(),
+            reason,
+        }),
+    }
+}
+
+/// Why a path with `mode` that belongs to `owner` cannot hold the control
+/// records of a process running as `user`.
+fn control_path_problem(mode: u32, owner: u32, user: u32) -> Option<String> {
+    if mode & SHARED_WRITE_BITS != 0 {
+        return Some(format!(
+            "group or other users can write it (mode {:o}); run `chmod go-w` on it",
+            mode & 0o7777
+        ));
+    }
+    if owner != user && owner != 0 {
+        return Some(format!(
+            "it belongs to uid {owner}, not to this process's user (uid {user}) or root; \
+             run every process that uses the control directory as its owner, or use etcd"
+        ));
+    }
+    None
 }
 
 fn poisoned_session_table() -> ControlError {
@@ -572,6 +740,22 @@ impl ControlStore for LocalControlStore {
     /// Sessions end with their process, not with a lease, so nothing renews.
     fn owner_lease_renew_interval(&self) -> Option<std::time::Duration> {
         None
+    }
+
+    /// Check the directory and its `sessions` directory as a mutation does,
+    /// creating neither: the first mutation creates a missing one.
+    fn check_owner_access(&self) -> Result<(), ControlError> {
+        for directory in [
+            self.directory.clone(),
+            self.directory.join(SESSION_DIRECTORY),
+        ] {
+            match fs::metadata(&directory) {
+                Ok(metadata) => check_control_directory(&directory, &metadata)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error("inspect control directory")(error)),
+            }
+        }
+        Ok(())
     }
 
     fn create_root_agent_binding(
@@ -1050,5 +1234,283 @@ mod tests {
             decode_local_control_state(repeated.as_bytes()),
             Err(ControlError::Codec(_))
         ));
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().mode() & 0o7777
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// `result` is the store's refusal of `path` because of `why`: a matter
+    /// for an operator, since someone else may have changed the records.
+    fn refused_because(result: Result<impl std::fmt::Debug, ControlError>, path: &Path, why: &str) {
+        let error = result.expect_err("the store must refuse");
+        assert_eq!(
+            error.class(),
+            nokv_types::ErrorClass::OperatorRequired,
+            "{error}"
+        );
+        match error {
+            ControlError::ControlPathRefused {
+                path: refused,
+                reason,
+            } => {
+                assert_eq!(refused, path, "{reason}");
+                assert!(reason.contains(why), "{reason}");
+            }
+            other => panic!("expected a refusal of {}, got {other:?}", path.display()),
+        }
+    }
+
+    #[test]
+    fn a_new_control_directory_and_its_files_are_private() {
+        let parent = tempfile::tempdir().unwrap();
+        let control = parent.path().join("deployment").join("control");
+        let store = LocalControlStore::open(&control).unwrap();
+        let shard = placed_shard(&store, 6);
+        store
+            .acquire_owner(&shard, node("node-a"), "127.0.0.1:7001".to_owned())
+            .unwrap();
+        store
+            .create_tenant(TenantRecord {
+                tenant_id: TenantId::from_bytes([6; 16]),
+            })
+            .unwrap();
+
+        assert_eq!(mode(&control), 0o700);
+        assert_eq!(mode(&control.join(SESSION_DIRECTORY)), 0o700);
+        for file in [
+            control.join(STATE_FILE),
+            control.join(IDENTITY_FILE),
+            control.join(STORE_LOCK_FILE),
+            store.session_lock_path(&shard),
+        ] {
+            assert_eq!(mode(&file) & 0o077, 0, "{}", file.display());
+        }
+    }
+
+    #[test]
+    fn a_control_directory_other_users_can_write_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let control = directory.path().join("control");
+        let store = LocalControlStore::open(&control).unwrap();
+        let shard = placed_shard(&store, 7);
+        let tenant = TenantId::from_bytes([7; 16]);
+        store
+            .create_tenant(TenantRecord { tenant_id: tenant })
+            .unwrap();
+
+        for writable in [0o770, 0o730, 0o707, 0o703, 0o1777] {
+            set_mode(&control, writable);
+            let why = "group or other users can write it";
+            refused_because(store.get_logical_shard(&shard), &control, why);
+            refused_because(store.tenant_policy_revision(&tenant), &control, why);
+            refused_because(
+                store.create_logical_shard(LogicalShardId::from_bytes([8; 16])),
+                &control,
+                why,
+            );
+            refused_because(
+                LocalControlStore::open(&control)
+                    .unwrap()
+                    .get_logical_shard(&shard),
+                &control,
+                why,
+            );
+        }
+
+        // Readable by others is the operator's choice; only writes are refused.
+        set_mode(&control, 0o755);
+        assert!(store.get_logical_shard(&shard).unwrap().is_some());
+        store
+            .create_logical_shard(LogicalShardId::from_bytes([8; 16]))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_sessions_directory_or_record_file_other_users_can_write_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let control = directory.path().join("control");
+        let store = LocalControlStore::open(&control).unwrap();
+        let shard = placed_shard(&store, 9);
+        let tenant = TenantId::from_bytes([9; 16]);
+        store
+            .create_tenant(TenantRecord { tenant_id: tenant })
+            .unwrap();
+        let why = "group or other users can write it";
+
+        let sessions = control.join(SESSION_DIRECTORY);
+        set_mode(&sessions, 0o770);
+        refused_because(
+            store.acquire_owner(&shard, node("node-a"), "127.0.0.1:7001".to_owned()),
+            &sessions,
+            why,
+        );
+        set_mode(&sessions, 0o700);
+
+        let state = control.join(STATE_FILE);
+        set_mode(&state, 0o660);
+        refused_because(store.get_logical_shard(&shard), &state, why);
+        refused_because(
+            store.acquire_owner(&shard, node("node-a"), "127.0.0.1:7001".to_owned()),
+            &state,
+            why,
+        );
+        set_mode(&state, 0o644);
+
+        let identity = control.join(IDENTITY_FILE);
+        set_mode(&identity, 0o606);
+        refused_because(store.tenant_policy_revision(&tenant), &identity, why);
+        set_mode(&identity, 0o600);
+
+        store
+            .acquire_owner(&shard, node("node-a"), "127.0.0.1:7001".to_owned())
+            .unwrap();
+        assert!(store.tenant_policy_revision(&tenant).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_control_path_owned_by_another_user_is_refused() {
+        let user = 501;
+        assert_eq!(control_path_problem(0o40700, user, user), None);
+        assert_eq!(control_path_problem(0o100600, user, user), None);
+        assert_eq!(control_path_problem(0o40755, user, user), None);
+        // Root can change anything this process could, so trusting it adds
+        // no one.
+        assert_eq!(control_path_problem(0o40755, 0, user), None);
+
+        let foreign = control_path_problem(0o40700, 502, user).unwrap();
+        assert!(foreign.contains("belongs to uid 502"), "{foreign}");
+        assert!(foreign.contains("uid 501"), "{foreign}");
+        let shared = control_path_problem(0o40775, user, user).unwrap();
+        assert!(
+            shared.contains("group or other users can write it"),
+            "{shared}"
+        );
+        assert!(shared.contains("775"), "{shared}");
+    }
+
+    /// Root may create entries in any directory, so a directory this process
+    /// cannot write is tested only as another user.
+    fn may_write_any_directory() -> bool {
+        effective_user() == 0
+    }
+
+    fn entries(directory: &Path) -> Vec<String> {
+        let mut names = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_directory_is_checked_before_anything_is_created_in_it() {
+        let parent = tempfile::tempdir().unwrap();
+        let control = parent.path().join("control");
+        fs::create_dir(&control).unwrap();
+        let tenant = TenantRecord {
+            tenant_id: TenantId::from_bytes([10; 16]),
+        };
+        let mut refusals = vec![
+            (0o770, "group or other users can write it"),
+            (0o702, "group or other users can write it"),
+        ];
+        if !may_write_any_directory() {
+            refusals.push((0o500, "cannot create files in it"));
+        }
+        for (unusable, why) in refusals {
+            set_mode(&control, unusable);
+            let result = LocalControlStore::open(&control)
+                .unwrap()
+                .create_tenant(tenant);
+            set_mode(&control, 0o700);
+            refused_because(result, &control, why);
+            assert_eq!(entries(&control), Vec::<String>::new(), "{unusable:o}");
+        }
+
+        // Once private, the same directory takes its first record.
+        LocalControlStore::open(&control)
+            .unwrap()
+            .create_tenant(tenant)
+            .unwrap();
+        assert_eq!(mode(&control.join(SESSION_DIRECTORY)), 0o700);
+    }
+
+    #[test]
+    fn a_control_directory_this_process_cannot_create_or_write_is_refused() {
+        if may_write_any_directory() {
+            return;
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let control = parent.path().join("control");
+        let tenant = TenantRecord {
+            tenant_id: TenantId::from_bytes([11; 16]),
+        };
+
+        set_mode(parent.path(), 0o500);
+        let result = LocalControlStore::open(&control)
+            .unwrap()
+            .create_tenant(tenant);
+        set_mode(parent.path(), 0o700);
+        refused_because(result, &control, "cannot create it");
+        assert!(!control.exists());
+
+        // Made read-only after its first records: reads go on, and a write
+        // is refused before it changes anything.
+        let store = LocalControlStore::open(&control).unwrap();
+        let shard = placed_shard(&store, 11);
+        let sessions = control.join(SESSION_DIRECTORY);
+        for directory in [&control, &sessions] {
+            set_mode(directory, 0o500);
+            let read = store.get_logical_shard(&shard);
+            let write = store.acquire_owner(&shard, node("node-a"), "127.0.0.1:7001".to_owned());
+            set_mode(directory, 0o700);
+            assert!(read.unwrap().is_some());
+            refused_because(write, directory, "cannot create files in it");
+        }
+        assert_eq!(entries(&sessions), Vec::<String>::new());
+        store
+            .acquire_owner(&shard, node("node-a"), "127.0.0.1:7001".to_owned())
+            .unwrap();
+    }
+
+    #[test]
+    fn the_owner_check_refuses_what_an_owner_could_not_use_and_creates_nothing() {
+        let parent = tempfile::tempdir().unwrap();
+        let control = parent.path().join("control");
+        let store = LocalControlStore::open(&control).unwrap();
+        // The first mutation creates a missing directory private.
+        store.check_owner_access().unwrap();
+        assert!(!control.exists());
+        fs::create_dir(&control).unwrap();
+        set_mode(&control, 0o700);
+        store.check_owner_access().unwrap();
+        assert_eq!(entries(&control), Vec::<String>::new());
+
+        let shard = placed_shard(&store, 12);
+        let sessions = control.join(SESSION_DIRECTORY);
+        let shared = "group or other users can write it";
+        let mut refusals = vec![(&control, 0o770, shared), (&sessions, 0o730, shared)];
+        if !may_write_any_directory() {
+            refusals.push((&control, 0o500, "cannot create files in it"));
+            refusals.push((&sessions, 0o500, "cannot create files in it"));
+        }
+        for (directory, unusable, why) in refusals {
+            set_mode(directory, unusable);
+            let result = store.check_owner_access();
+            set_mode(directory, 0o700);
+            refused_because(result, directory, why);
+        }
+
+        store.check_owner_access().unwrap();
+        store
+            .acquire_owner(&shard, node("node-a"), "127.0.0.1:7001".to_owned())
+            .unwrap();
     }
 }

@@ -24,7 +24,9 @@ def canonical_sha256(value: object) -> str:
 
 
 class TypedLiveQualificationTests(unittest.TestCase):
-    def context_environment(self, binary: Path) -> dict[str, str]:
+    def context_environment(
+        self, binary: Path, transcript_role: str = "mcp-transcript"
+    ) -> dict[str, str]:
         subjects = {
             "dependencies": [
                 {"name": "etcd", "identity": "sha256:" + "11" * 32},
@@ -57,7 +59,7 @@ class TypedLiveQualificationTests(unittest.TestCase):
                 sort_keys=True,
             ),
             "NOKV_QUALIFICATION_REQUIRED_EVIDENCE_ROLES": json.dumps(
-                ["producer-result", "qualification", "mcp-transcript"],
+                ["producer-result", "qualification", transcript_role],
                 separators=(",", ":"),
             ),
         }
@@ -172,7 +174,7 @@ class TypedLiveQualificationTests(unittest.TestCase):
             )
             evidence = root / "evidence"
             evidence.mkdir()
-            with self.assertRaisesRegex(ProducerError, "real MCP transcript"):
+            with self.assertRaisesRegex(ProducerError, "real mcp-transcript"):
                 publish_live_result(
                     result_path=evidence / "producer-result.json",
                     context=context,
@@ -185,6 +187,52 @@ class TypedLiveQualificationTests(unittest.TestCase):
                     ),
                 )
             self.assertEqual(list(evidence.iterdir()), [])
+
+    def test_native_cli_producer_publishes_its_cli_transcript(self) -> None:
+        roles = ("producer-result", "qualification", "cli-transcript")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "nokv"
+            binary.write_bytes(b"release identity")
+            context = load_live_context(
+                producer_id="live-workbench",
+                scenarios={
+                    "t01.create-live": ScenarioContract("T01", "native-workbench-e2e")
+                },
+                dependency_names=("etcd", "object-store"),
+                product_binary=binary,
+                evidence_roles=roles,
+                environ=self.context_environment(binary, "cli-transcript"),
+            )
+            evidence = root / "evidence"
+            evidence.mkdir()
+            with self.assertRaisesRegex(ProducerError, "real cli-transcript"):
+                publish_live_result(
+                    result_path=evidence / "producer-result.json",
+                    context=context,
+                    outcome="PASS",
+                    qualification={"status": "PASS"},
+                    evidence_roles=roles,
+                )
+            transcript = b'{"label":"create","exit":0}\n'
+            publish_live_result(
+                result_path=evidence / "producer-result.json",
+                context=context,
+                outcome="PASS",
+                qualification={"status": "PASS"},
+                evidence_roles=roles,
+                transcript=transcript,
+            )
+            self.assertEqual((evidence / "cli-transcript.jsonl").read_bytes(), transcript)
+            self.assertFalse((evidence / "mcp-transcript.jsonl").exists())
+            with self.assertRaisesRegex(ProducerError, "one transcript role"):
+                publish_live_result(
+                    result_path=root / "other" / "producer-result.json",
+                    context=context,
+                    outcome="NQ",
+                    qualification={"status": "NOT QUALIFIED", "reason": "test"},
+                    evidence_roles=(*roles, "mcp-transcript"),
+                )
 
 
 if __name__ == "__main__":

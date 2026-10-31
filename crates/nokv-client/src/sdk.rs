@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nokv_protocol::{
     decode_response, encode_request, AbortArtifactPublishRequest, AggregateRequest,
@@ -28,25 +28,54 @@ use sha2::{Digest as _, Sha256};
 use crate::body_digest::BodyDigestCache;
 use crate::{ClientError, ResolvedRoute, RouteRefreshMode, RouteResolver, RpcTransport};
 
+/// How a client repeats a request whose failure left nothing applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClientOptions {
+    /// Attempts per request, 1 to 16, counting the first.
     pub max_attempts: u32,
+    /// The pause before the second attempt; it doubles per further attempt.
+    /// Zero repeats at once.
+    pub retry_backoff: Duration,
+    /// The longest pause between two attempts.
+    pub max_retry_backoff: Duration,
 }
 
 impl Default for ClientOptions {
     fn default() -> Self {
-        Self { max_attempts: 3 }
+        Self {
+            max_attempts: 3,
+            retry_backoff: Duration::ZERO,
+            max_retry_backoff: Duration::from_millis(2_000),
+        }
     }
 }
 
 impl ClientOptions {
-    fn validate(self) -> Result<(), ClientError> {
+    /// The bounds every client enforces: 1 to 16 attempts, and a backoff
+    /// within its bound.
+    pub fn validate(self) -> Result<(), ClientError> {
         if !(1..=16).contains(&self.max_attempts) {
             return Err(ClientError::InvalidOptions(
                 "max_attempts must be between 1 and 16".to_owned(),
             ));
         }
+        if self.retry_backoff > self.max_retry_backoff {
+            return Err(ClientError::InvalidOptions(
+                "retry_backoff must not exceed max_retry_backoff".to_owned(),
+            ));
+        }
         Ok(())
+    }
+
+    /// The pause after `attempt` failed: the backoff doubled per earlier
+    /// failed attempt, bounded by `max_retry_backoff`.
+    pub fn retry_delay(self, attempt: u32) -> Duration {
+        let doublings = attempt.saturating_sub(1).min(31);
+        self.retry_backoff
+            .checked_mul(1 << doublings)
+            .map_or(self.max_retry_backoff, |delay| {
+                delay.min(self.max_retry_backoff)
+            })
     }
 }
 
@@ -146,8 +175,34 @@ where
         self.root_id
     }
 
+    /// The transport this client sends through; a session's clients share one.
+    pub const fn transport(&self) -> &Transport {
+        &self.transport
+    }
+
+    /// The resolver this client routes through; a session's clients share one.
+    pub const fn routes(&self) -> &Resolver {
+        &self.routes
+    }
+
     pub(crate) const fn max_attempts(&self) -> u32 {
         self.options.max_attempts
+    }
+
+    /// Whether a repeat waits before it runs. Without a backoff, repeating
+    /// an observation at once cannot change what it sees, so the workflows
+    /// that wait out another owner's attempt report it at once instead.
+    pub(crate) fn waits_between_retries(&self) -> bool {
+        !self.options.retry_backoff.is_zero()
+    }
+
+    /// Waits out the bounded backoff after `attempt` failed without taking
+    /// effect, so the repeat does not hit an owner that is still coming back.
+    pub(crate) fn pause_before_retry(&self, attempt: u32) {
+        let delay = self.options.retry_delay(attempt);
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
     }
 
     /// Allocates a process-local unique request id suitable for exact replay.
@@ -212,6 +267,7 @@ where
                 Err(error) => {
                     let retryable = error.retryable();
                     if retryable && attempt < self.options.max_attempts {
+                        self.pause_before_retry(attempt);
                         continue;
                     }
                     return exhausted_or_last(
@@ -287,6 +343,8 @@ where
                                 ));
                             }
                             resolved = refreshed;
+                        } else {
+                            self.pause_before_retry(attempt);
                         }
                         continue;
                     }
@@ -584,6 +642,10 @@ where
             .map(expect_workspaces)
     }
 
+    /// Reads one page of the root's change feed. A page holds at most
+    /// `nokv_protocol::MAX_CHANGE_PAGE_LIMIT` events, fewer than the other
+    /// paged reads, so a reader tailing the feed while writers run bounds the
+    /// work the owner does under one read.
     pub fn read_changes(
         &self,
         request: ChangePageRequest,
@@ -748,6 +810,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use nokv_protocol::{
         decode_request, encode_response, ArtifactDescriptor, ArtifactRevisionIdentity,
@@ -767,14 +830,22 @@ mod tests {
         responses: Mutex<VecDeque<WorkspaceRpcResponse>>,
         requests: Mutex<Vec<WorkspaceRpcRequest>>,
         endpoints: Mutex<Vec<SocketAddr>>,
+        /// Round trips refused with a retryable transport failure before the
+        /// scripted responses are served.
+        refusals: Mutex<u32>,
     }
 
     impl ScriptedTransport {
         fn new(responses: Vec<WorkspaceRpcResponse>) -> Self {
+            Self::failing_first(0, responses)
+        }
+
+        fn failing_first(refusals: u32, responses: Vec<WorkspaceRpcResponse>) -> Self {
             Self {
                 responses: Mutex::new(responses.into()),
                 requests: Mutex::new(Vec::new()),
                 endpoints: Mutex::new(Vec::new()),
+                refusals: Mutex::new(refusals),
             }
         }
     }
@@ -789,6 +860,13 @@ mod tests {
                 .map_err(|error| crate::TransportError::new(error.to_string(), false))?;
             self.endpoints.lock().unwrap().push(endpoint);
             self.requests.lock().unwrap().push(request);
+            {
+                let mut refusals = self.refusals.lock().unwrap();
+                if *refusals > 0 {
+                    *refusals -= 1;
+                    return Err(crate::TransportError::new("connection refused", true));
+                }
+            }
             let response = self
                 .responses
                 .lock()
@@ -1648,5 +1726,166 @@ mod tests {
                 WorkspaceCapability::RestoreV1
             ]))
         );
+    }
+
+    fn success(
+        request_id: RequestIdentity,
+        owner_epoch: u64,
+        commit_version: u64,
+    ) -> WorkspaceRpcResponse {
+        WorkspaceRpcResponse {
+            route: route(owner_epoch),
+            request_id,
+            commit_version: Some(commit_version),
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Success(Box::new(workspace_result())),
+        }
+    }
+
+    fn backoff(max_attempts: u32, backoff_ms: u64, bound_ms: u64) -> ClientOptions {
+        ClientOptions {
+            max_attempts,
+            retry_backoff: Duration::from_millis(backoff_ms),
+            max_retry_backoff: Duration::from_millis(bound_ms),
+        }
+    }
+
+    #[test]
+    fn retry_delay_doubles_from_the_backoff_up_to_its_bound() {
+        let options = backoff(16, 250, 2_000);
+        let delays = (1..=5)
+            .map(|attempt| options.retry_delay(attempt).as_millis())
+            .collect::<Vec<_>>();
+        assert_eq!(delays, vec![250, 500, 1_000, 2_000, 2_000]);
+        assert_eq!(options.retry_delay(15), Duration::from_millis(2_000));
+        assert_eq!(ClientOptions::default().retry_delay(15), Duration::ZERO);
+        let saturating = ClientOptions {
+            retry_backoff: Duration::MAX / 2,
+            max_retry_backoff: Duration::MAX,
+            ..options
+        };
+        assert_eq!(saturating.retry_delay(3), Duration::MAX);
+    }
+
+    #[test]
+    fn a_backoff_above_its_bound_is_rejected() {
+        let resolver = StaticRouteResolver::new(route(7), resolved(7, 4107).endpoint).unwrap();
+        let error = WorkspaceClient::new(
+            route(7).root_id,
+            ScriptedTransport::new(Vec::new()),
+            resolver,
+            backoff(3, 3_000, 2_000),
+        )
+        .err()
+        .expect("a backoff above its bound is invalid");
+        assert!(matches!(error, ClientError::InvalidOptions(_)), "{error}");
+    }
+
+    #[test]
+    fn retried_transport_failures_wait_the_bounded_backoff() {
+        let request_id = RequestIdentity([11; 16]);
+        let transport = ScriptedTransport::failing_first(3, vec![success(request_id, 7, 11)]);
+        let resolver = StaticRouteResolver::new(route(7), resolved(7, 4107).endpoint).unwrap();
+        let client =
+            WorkspaceClient::new(route(7).root_id, transport, resolver, backoff(4, 20, 30))
+                .unwrap();
+
+        let started = Instant::now();
+        let result = client
+            .create_workspace(request_id, create_request())
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        // 20 ms after the first failure, then 30 ms after each of the next two.
+        assert!(
+            elapsed >= Duration::from_millis(80),
+            "waited only {elapsed:?}"
+        );
+        assert_eq!(result.commit_version, Some(11));
+        assert_eq!(client.transport.requests.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_retryable_owner_answer_waits_before_the_next_attempt() {
+        let request_id = RequestIdentity([12; 16]);
+        let busy = WorkspaceRpcResponse {
+            route: route(7),
+            request_id,
+            commit_version: None,
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Failure(RpcFailure {
+                code: ErrorCode::ResourceExhausted,
+                message: "owner is busy".to_owned(),
+                retryable: true,
+                conflict: None,
+                current_generation: None,
+                route_hint: None,
+            }),
+        };
+        let transport = ScriptedTransport::new(vec![busy, success(request_id, 7, 13)]);
+        let resolver = StaticRouteResolver::new(route(7), resolved(7, 4107).endpoint).unwrap();
+        let client =
+            WorkspaceClient::new(route(7).root_id, transport, resolver, backoff(2, 40, 40))
+                .unwrap();
+
+        let started = Instant::now();
+        let result = client
+            .create_workspace(request_id, create_request())
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "waited only {elapsed:?}"
+        );
+        assert_eq!(result.commit_version, Some(13));
+        assert_eq!(client.transport.requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_not_owner_refresh_retries_without_waiting() {
+        let request_id = RequestIdentity([13; 16]);
+        let moved = WorkspaceRpcResponse {
+            route: route(7),
+            request_id,
+            commit_version: None,
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Failure(RpcFailure {
+                code: ErrorCode::NotOwner,
+                message: "owner changed".to_owned(),
+                retryable: true,
+                conflict: Some(ConflictKind::RootPlacement),
+                current_generation: None,
+                route_hint: Some(route(8)),
+            }),
+        };
+        let transport = ScriptedTransport::new(vec![moved, success(request_id, 8, 14)]);
+        let refreshes = Arc::new(Mutex::new(Vec::new()));
+        let resolver = ScriptedResolver {
+            initial: resolved(7, 4107),
+            refreshed: resolved(8, 4108),
+            refreshes: Arc::clone(&refreshes),
+        };
+        let client = WorkspaceClient::new(
+            route(7).root_id,
+            transport,
+            resolver,
+            backoff(3, 2_000, 2_000),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let result = client
+            .create_workspace(request_id, create_request())
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        // The re-routed attempt makes progress; only a repeated attempt waits.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a re-routed attempt waited {elapsed:?}"
+        );
+        assert_eq!(result.commit_version, Some(14));
+        assert_eq!(*refreshes.lock().unwrap(), vec![false, true]);
     }
 }

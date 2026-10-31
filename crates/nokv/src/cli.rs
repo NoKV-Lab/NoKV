@@ -23,6 +23,7 @@ pub const DEFAULT_ETCD_LEASE_TTL_SECONDS: i64 = 10;
 pub const DEFAULT_LIFECYCLE_INTERVAL_MILLIS: u64 = 1_000;
 pub const DEFAULT_APPEND_ACTIVITY_LEASE_MS: u64 = 1_800_000;
 pub const DEFAULT_HANDSHAKE_TIMEOUT_MILLIS: u64 = 5_000;
+pub const DEFAULT_MAX_RETRY_BACKOFF_MILLIS: u64 = 2_000;
 pub const DEFAULT_MAX_INFLIGHT_CONNECTIONS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +31,8 @@ pub struct ClientConfig {
     pub root_id: Option<String>,
     pub routing: RoutingConfig,
     pub max_attempts: u32,
+    pub retry_backoff_ms: u64,
+    pub max_retry_backoff_ms: u64,
     pub max_artifact_bytes: usize,
     pub object: ObjectConfig,
     pub tls: Option<ClientTlsConfig>,
@@ -74,6 +77,19 @@ pub struct EtcdRoutingConfig {
     pub endpoints: Vec<String>,
     pub key_prefix: String,
     pub lease_ttl_seconds: i64,
+    /// This process's identity towards etcd; required with `https://`
+    /// endpoints.
+    pub tls: Option<EtcdTlsFiles>,
+}
+
+/// The PEM files behind `--etcd-tls-ca`, `--etcd-tls-cert` and
+/// `--etcd-tls-key`: the roots that sign etcd's certificate, and this
+/// process's certificate chain and private key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EtcdTlsFiles {
+    pub trusted_ca: PathBuf,
+    pub certificate: PathBuf,
+    pub key: PathBuf,
 }
 
 /// Single-host control directory shared by the owner and its clients.
@@ -109,6 +125,8 @@ pub struct ServerConfig {
     pub append_activity_lease_ms: u64,
     pub recovery_publication: RecoveryPublicationConfig,
     pub tls: Option<ServerTlsConfig>,
+    /// Where a TLS owner appends one JSON line per refusal.
+    pub audit_log: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,9 +167,6 @@ pub enum Command {
     },
     /// Sequential Workbench calls, one JSON line each, over one client.
     WorkbenchSession,
-    Mcp {
-        profile: McpProfile,
-    },
     Materialize {
         workbench: String,
         section: String,
@@ -244,27 +259,12 @@ pub enum CredentialSource {
     Fingerprint(CredentialFingerprint),
 }
 
-/// Role names on the command line and in identity results.
-const ROLE_NAMES: [(Role, &str); 3] = [
-    (Role::Reader, "reader"),
-    (Role::Writer, "writer"),
-    (Role::Operator, "operator"),
-];
-
-pub(crate) fn role_name(role: Role) -> &'static str {
-    ROLE_NAMES
-        .iter()
-        .find_map(|(candidate, name)| (*candidate == role).then_some(*name))
-        .expect("every role has a name")
-}
-
 impl Command {
     /// Whether this command sends workspace RPC to an owner.
     pub fn connects_to_owner(&self) -> bool {
         match self {
             Self::Workbench { .. }
             | Self::WorkbenchSession
-            | Self::Mcp { .. }
             | Self::Materialize { .. }
             | Self::Collect { .. }
             | Self::WorkspacePath(_)
@@ -280,13 +280,6 @@ impl Command {
             | Self::Help => false,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum McpProfile {
-    Agent,
-    #[default]
-    Workbench,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -432,6 +425,8 @@ impl Default for ClientConfig {
             root_id: None,
             routing: RoutingConfig::Static(StaticRoutingConfig::default()),
             max_attempts: 3,
+            retry_backoff_ms: 0,
+            max_retry_backoff_ms: DEFAULT_MAX_RETRY_BACKOFF_MILLIS,
             max_artifact_bytes: DEFAULT_MAX_ARTIFACT_BYTES,
             object: ObjectConfig::default(),
             tls: None,
@@ -459,6 +454,7 @@ impl Default for EtcdRoutingConfig {
             endpoints: Vec::new(),
             key_prefix: DEFAULT_ETCD_KEY_PREFIX.to_owned(),
             lease_ttl_seconds: DEFAULT_ETCD_LEASE_TTL_SECONDS,
+            tls: None,
         }
     }
 }
@@ -496,6 +492,7 @@ impl Default for ServerConfig {
             append_activity_lease_ms: DEFAULT_APPEND_ACTIVITY_LEASE_MS,
             recovery_publication: RecoveryPublicationConfig::LocalOnly,
             tls: None,
+            audit_log: None,
         }
     }
 }
@@ -508,6 +505,9 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     let mut append_activity_lease_explicit = false;
     let mut static_routing = StaticRoutingConfig::default();
     let mut etcd_routing = EtcdRoutingConfig::default();
+    let mut etcd_tls_ca = None;
+    let mut etcd_tls_cert = None;
+    let mut etcd_tls_key = None;
     let mut control_directory = None;
     let mut routing_kind = None;
     let mut agent_id = None;
@@ -559,6 +559,18 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
                 select_routing(&mut routing_kind, RoutingKind::Etcd)?;
                 etcd_routing.key_prefix = next_value(&mut arguments, &argument)?;
             }
+            "--etcd-tls-ca" | "--etcd-tls-cert" | "--etcd-tls-key" => {
+                select_routing(&mut routing_kind, RoutingKind::Etcd)?;
+                let slot = match argument.as_str() {
+                    "--etcd-tls-ca" => &mut etcd_tls_ca,
+                    "--etcd-tls-cert" => &mut etcd_tls_cert,
+                    _ => &mut etcd_tls_key,
+                };
+                if slot.is_some() {
+                    return Err(CliError::UnexpectedArgument(argument));
+                }
+                *slot = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
+            }
             "--control-dir" => {
                 select_routing(&mut routing_kind, RoutingKind::Local)?;
                 control_directory = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
@@ -573,6 +585,16 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             "--max-attempts" => {
                 client.max_attempts =
                     parse_number("--max-attempts", next_value(&mut arguments, &argument)?)?;
+            }
+            "--retry-backoff-ms" => {
+                client.retry_backoff_ms =
+                    parse_number("--retry-backoff-ms", next_value(&mut arguments, &argument)?)?;
+            }
+            "--max-retry-backoff-ms" => {
+                client.max_retry_backoff_ms = parse_number(
+                    "--max-retry-backoff-ms",
+                    next_value(&mut arguments, &argument)?,
+                )?;
             }
             "--max-artifact-bytes" => {
                 client.max_artifact_bytes = parse_number(
@@ -637,7 +659,12 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
                 )?;
             }
             "--advertise-endpoint" => {
-                server.advertise_endpoint = Some(next_value(&mut arguments, &argument)?);
+                // Clients connect to the published route as a socket address
+                // and do not resolve host names, so refuse anything else here
+                // rather than publish a route no client can use.
+                let endpoint = next_value(&mut arguments, &argument)?;
+                parse_address("--advertise-endpoint", endpoint.clone())?;
+                server.advertise_endpoint = Some(endpoint);
             }
             "--node-id" => server.node_id = Some(next_value(&mut arguments, &argument)?),
             "--metadata-create" => {
@@ -699,6 +726,9 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             "--rpc-tls-server-name" => {
                 rpc_tls.server_name = Some(next_value(&mut arguments, &argument)?);
             }
+            "--audit-log" => {
+                server.audit_log = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
+            }
             "--help" => break Command::Help,
             "--version" => break Command::Version { json: false },
             _ => return Err(CliError::UnknownOption(argument)),
@@ -721,7 +751,10 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     }
     client.routing = match routing_kind.unwrap_or(RoutingKind::Static) {
         RoutingKind::Static => RoutingConfig::Static(static_routing),
-        RoutingKind::Etcd => RoutingConfig::Etcd(etcd_routing),
+        RoutingKind::Etcd => {
+            etcd_routing.tls = etcd_tls_files(etcd_tls_ca, etcd_tls_cert, etcd_tls_key)?;
+            RoutingConfig::Etcd(etcd_routing)
+        }
         RoutingKind::Local => RoutingConfig::Local(LocalRoutingConfig {
             directory: control_directory.ok_or(CliError::MissingOption("--control-dir"))?,
         }),
@@ -739,11 +772,17 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             "--append-activity-lease-ms is only valid with serve".to_owned(),
         ));
     }
+    if server.audit_log.is_some() && server.tls.is_none() {
+        return Err(CliError::UnexpectedArgument(
+            "--audit-log records the refusals of a TLS owner: it is only valid with serve, \
+             --rpc-tls-cert and --rpc-tls-key"
+                .to_owned(),
+        ));
+    }
     if matches!(
         &command,
         Command::Workbench { .. }
             | Command::WorkbenchSession
-            | Command::Mcp { .. }
             | Command::Materialize { .. }
             | Command::Collect { .. }
             | Command::WorkspacePath(_)
@@ -758,6 +797,12 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     {
         return Err(CliError::MissingOption("--agent-id"));
     }
+    if client.retry_backoff_ms > client.max_retry_backoff_ms {
+        return Err(CliError::InvalidOption {
+            option: "--retry-backoff-ms",
+            value: client.retry_backoff_ms.to_string(),
+        });
+    }
     Ok(Invocation {
         client,
         server,
@@ -771,6 +816,22 @@ enum RoutingKind {
     Static,
     Etcd,
     Local,
+}
+
+/// The three etcd TLS files are given together or not at all.
+fn etcd_tls_files(
+    trusted_ca: Option<PathBuf>,
+    certificate: Option<PathBuf>,
+    key: Option<PathBuf>,
+) -> Result<Option<EtcdTlsFiles>, CliError> {
+    if trusted_ca.is_none() && certificate.is_none() && key.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(EtcdTlsFiles {
+        trusted_ca: trusted_ca.ok_or(CliError::MissingOption("--etcd-tls-ca"))?,
+        certificate: certificate.ok_or(CliError::MissingOption("--etcd-tls-cert"))?,
+        key: key.ok_or(CliError::MissingOption("--etcd-tls-key"))?,
+    }))
 }
 
 fn select_routing(
@@ -876,7 +937,6 @@ fn parse_command(
             arguments: arguments.next().unwrap_or_else(|| "{}".to_owned()),
         }),
         "workbench-session" => Ok(Command::WorkbenchSession),
-        "mcp" => parse_mcp(arguments),
         "materialize" => Ok(Command::Materialize {
             workbench: arguments
                 .next()
@@ -1010,32 +1070,6 @@ fn parse_operation_options(
             expected_state_digest,
         })
     }
-}
-
-fn parse_mcp(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
-    let mut profile = None;
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--profile" if profile.is_none() => {
-                let value = next_value(arguments, &argument)?;
-                profile = Some(match value.as_str() {
-                    "agent" => McpProfile::Agent,
-                    "workbench" => McpProfile::Workbench,
-                    _ => {
-                        return Err(CliError::InvalidOption {
-                            option: "--profile",
-                            value,
-                        });
-                    }
-                });
-            }
-            "--profile" => return Err(CliError::UnexpectedArgument(argument)),
-            _ => return Err(CliError::UnexpectedArgument(argument)),
-        }
-    }
-    Ok(Command::Mcp {
-        profile: profile.unwrap_or_default(),
-    })
 }
 
 fn parse_workspace_path(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
@@ -1440,9 +1474,9 @@ fn parse_role_binding(
             "--role" if role.is_none() => {
                 let value = next_value(arguments, &argument)?;
                 role = Some(
-                    ROLE_NAMES
-                        .iter()
-                        .find_map(|(role, name)| (*name == value).then_some(*role))
+                    Role::ALL
+                        .into_iter()
+                        .find(|role| role.name() == value)
                         .ok_or(CliError::InvalidOption {
                             option: "--role",
                             value,
@@ -2243,7 +2277,7 @@ mod tests {
             "http://127.0.0.1:22379",
             "--etcd-key-prefix",
             "/nokv/production",
-            "mcp",
+            "workbench-session",
         ]))
         .unwrap();
         let RoutingConfig::Etcd(route) = parsed.client.routing else {
@@ -2255,54 +2289,7 @@ mod tests {
         );
         assert_eq!(route.key_prefix, "/nokv/production");
         assert_eq!(route.lease_ttl_seconds, 10);
-        assert_eq!(
-            parsed.command,
-            Command::Mcp {
-                profile: McpProfile::Workbench
-            }
-        );
-    }
-
-    #[test]
-    fn mcp_profile_is_explicit_and_defaults_to_workbench() {
-        let prefix = ["--agent-id", "44444444444444444444444444444444"];
-        for (suffix, expected) in [
-            (&["mcp"][..], McpProfile::Workbench),
-            (
-                &["mcp", "--profile", "workbench"][..],
-                McpProfile::Workbench,
-            ),
-            (&["mcp", "--profile", "agent"][..], McpProfile::Agent),
-        ] {
-            let parsed = parse(args(&prefix).into_iter().chain(args(suffix))).unwrap();
-            assert_eq!(parsed.command, Command::Mcp { profile: expected });
-        }
-
-        let invalid = parse(
-            args(&prefix)
-                .into_iter()
-                .chain(args(&["mcp", "--profile", "legacy"])),
-        )
-        .unwrap_err();
-        assert_eq!(
-            invalid,
-            CliError::InvalidOption {
-                option: "--profile",
-                value: "legacy".to_owned(),
-            }
-        );
-        let duplicate = parse(args(&prefix).into_iter().chain(args(&[
-            "mcp",
-            "--profile",
-            "agent",
-            "--profile",
-            "workbench",
-        ])))
-        .unwrap_err();
-        assert_eq!(
-            duplicate,
-            CliError::UnexpectedArgument("--profile".to_owned())
-        );
+        assert_eq!(parsed.command, Command::WorkbenchSession);
     }
 
     #[test]
@@ -2400,6 +2387,44 @@ mod tests {
             parse(args(&status)),
             Err(CliError::MissingOption("--agent-id"))
         );
+    }
+
+    #[test]
+    fn an_audit_log_belongs_to_a_tls_owner() {
+        let owner = [
+            "--rpc-tls-cert",
+            "owner.pem",
+            "--rpc-tls-key",
+            "owner.key",
+            "--audit-log",
+            "audit.jsonl",
+            "serve",
+        ];
+        assert_eq!(
+            parse(args(&owner)).unwrap().server.audit_log,
+            Some(PathBuf::from("audit.jsonl"))
+        );
+        assert_eq!(
+            parse(args(&owner[2..])).map(|parsed| parsed.server.audit_log),
+            Err(CliError::MissingOption("--rpc-tls-cert"))
+        );
+        for line in [
+            &["--audit-log", "audit.jsonl", "serve"][..],
+            &[
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "--audit-log",
+                "audit.jsonl",
+                "operation",
+                "status",
+                "11111111111111111111111111111111",
+            ][..],
+        ] {
+            assert!(matches!(
+                parse(args(line)),
+                Err(CliError::UnexpectedArgument(message)) if message.starts_with("--audit-log")
+            ));
+        }
     }
 
     #[test]
@@ -2686,6 +2711,83 @@ mod tests {
     }
 
     #[test]
+    fn etcd_tls_options_are_complete_and_select_etcd_routing() {
+        let parsed = parse(args(&[
+            "--etcd-endpoint",
+            "https://127.0.0.1:2379",
+            "--etcd-tls-ca",
+            "ca.pem",
+            "--etcd-tls-cert",
+            "client.pem",
+            "--etcd-tls-key",
+            "client.key",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "workbench-session",
+        ]))
+        .unwrap();
+        let RoutingConfig::Etcd(route) = parsed.client.routing else {
+            panic!("etcd route expected");
+        };
+        assert_eq!(
+            route.tls,
+            Some(EtcdTlsFiles {
+                trusted_ca: PathBuf::from("ca.pem"),
+                certificate: PathBuf::from("client.pem"),
+                key: PathBuf::from("client.key"),
+            })
+        );
+
+        let plaintext = parse(args(&[
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "workbench-session",
+        ]))
+        .unwrap();
+        let RoutingConfig::Etcd(route) = plaintext.client.routing else {
+            panic!("etcd route expected");
+        };
+        assert_eq!(route.tls, None);
+
+        assert_eq!(
+            parse(args(&[
+                "--etcd-endpoint",
+                "https://127.0.0.1:2379",
+                "--etcd-tls-ca",
+                "ca.pem",
+                "--etcd-tls-cert",
+                "client.pem",
+                "workbench-session",
+            ])),
+            Err(CliError::MissingOption("--etcd-tls-key"))
+        );
+        assert_eq!(
+            parse(args(&[
+                "--control-dir",
+                "/tmp/nokv-control",
+                "--etcd-tls-ca",
+                "ca.pem",
+                "workbench-session",
+            ])),
+            Err(CliError::MixedRoutingOptions)
+        );
+        assert_eq!(
+            parse(args(&[
+                "--etcd-endpoint",
+                "https://127.0.0.1:2379",
+                "--etcd-tls-ca",
+                "a.pem",
+                "--etcd-tls-ca",
+                "b.pem",
+                "workbench-session",
+            ])),
+            Err(CliError::UnexpectedArgument("--etcd-tls-ca".to_owned()))
+        );
+    }
+
+    #[test]
     fn mixed_static_and_control_routing_fails_closed() {
         assert_eq!(
             parse(args(&[
@@ -2693,7 +2795,7 @@ mod tests {
                 "127.0.0.1:7750",
                 "--etcd-endpoint",
                 "http://127.0.0.1:2379",
-                "mcp",
+                "workbench-session",
             ])),
             Err(CliError::MixedRoutingOptions)
         );
@@ -2836,6 +2938,24 @@ mod tests {
     }
 
     #[test]
+    fn an_advertised_endpoint_must_be_a_socket_address() {
+        for endpoint in ["nokv-owner:7750", "metadata-a.internal:7750", "10.0.0.5"] {
+            assert_eq!(
+                parse(args(&["--advertise-endpoint", endpoint, "serve"])),
+                Err(CliError::InvalidAddress {
+                    option: "--advertise-endpoint",
+                    value: endpoint.to_owned(),
+                }),
+                "{endpoint}"
+            );
+        }
+        for endpoint in ["10.0.0.5:7750", "[fd00::5]:7750"] {
+            let parsed = parse(args(&["--advertise-endpoint", endpoint, "serve"])).unwrap();
+            assert_eq!(parsed.server.advertise_endpoint.as_deref(), Some(endpoint));
+        }
+    }
+
+    #[test]
     fn server_metadata_open_mode_is_explicit_and_unique() {
         let parsed = parse(args(&[
             "--metadata-reopen",
@@ -2843,7 +2963,7 @@ mod tests {
             "--node-id",
             "owner-a",
             "--advertise-endpoint",
-            "metadata-a.internal:7750",
+            "10.0.0.5:7750",
             "serve",
         ]))
         .unwrap();
@@ -2856,7 +2976,7 @@ mod tests {
         assert_eq!(parsed.server.node_id.as_deref(), Some("owner-a"));
         assert_eq!(
             parsed.server.advertise_endpoint.as_deref(),
-            Some("metadata-a.internal:7750")
+            Some("10.0.0.5:7750")
         );
 
         assert_eq!(
@@ -2911,7 +3031,7 @@ mod tests {
     #[test]
     fn unknown_options_fail_closed() {
         assert!(matches!(
-            parse(args(&["--mount", "3", "mcp"])),
+            parse(args(&["--mount", "3", "workbench-session"])),
             Err(CliError::UnknownOption(option)) if option == "--mount"
         ));
     }
@@ -2939,7 +3059,7 @@ mod tests {
                 "44444444444444444444444444444444",
                 "--workbench-root",
                 "/agents/test/wb",
-                "mcp",
+                "workbench-session",
             ]),
             args(&[
                 "--workbench-root",
@@ -2958,9 +3078,28 @@ mod tests {
     }
 
     #[test]
-    fn agent_commands_and_provision_require_an_explicit_agent_id() {
+    fn mcp_is_not_a_command() {
         for arguments in [
             args(&["mcp"]),
+            args(&[
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "mcp",
+                "--profile",
+                "agent",
+            ]),
+        ] {
+            assert_eq!(
+                parse(arguments),
+                Err(CliError::UnknownCommand("mcp".to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn agent_commands_and_provision_require_an_explicit_agent_id() {
+        for arguments in [
+            args(&["workbench-session"]),
             args(&["workbench", "workbench_create", r#"{"id":"run-1"}"#]),
             args(&[
                 "materialize",
@@ -3047,11 +3186,75 @@ mod tests {
             parse(args(&[
                 "--agent-id",
                 "44444444444444444444444444444444",
-                "mcp",
+                "workbench-session",
                 "--adopt-legacy-agent-binding",
             ])),
             Err(CliError::UnexpectedArgument(argument))
                 if argument == "--adopt-legacy-agent-binding"
         ));
+    }
+
+    const SESSION_ROUTE: [&str; 6] = [
+        "--root-id",
+        "01",
+        "--agent-id",
+        "44444444444444444444444444444444",
+        "--control-dir",
+        "/control",
+    ];
+
+    #[test]
+    fn parses_client_retry_backoff_options() {
+        let parsed = parse(args(
+            &[
+                &SESSION_ROUTE[..],
+                &[
+                    "--max-attempts",
+                    "16",
+                    "--retry-backoff-ms",
+                    "250",
+                    "--max-retry-backoff-ms",
+                    "2000",
+                    "workbench-session",
+                ],
+            ]
+            .concat(),
+        ))
+        .unwrap();
+        assert_eq!(parsed.client.max_attempts, 16);
+        assert_eq!(parsed.client.retry_backoff_ms, 250);
+        assert_eq!(parsed.client.max_retry_backoff_ms, 2_000);
+        assert_eq!(parsed.command, Command::WorkbenchSession);
+
+        let defaults = parse(args(&[&SESSION_ROUTE[..], &["workbench-session"]].concat())).unwrap();
+        assert_eq!(defaults.client.max_attempts, 3);
+        assert_eq!(defaults.client.retry_backoff_ms, 0);
+        assert_eq!(defaults.client.max_retry_backoff_ms, 2_000);
+    }
+
+    #[test]
+    fn rejects_a_retry_backoff_above_its_bound() {
+        let Err(error) = parse(args(
+            &[
+                &SESSION_ROUTE[..],
+                &[
+                    "--retry-backoff-ms",
+                    "3000",
+                    "--max-retry-backoff-ms",
+                    "2000",
+                    "workbench-session",
+                ],
+            ]
+            .concat(),
+        )) else {
+            panic!("a backoff above its bound must be rejected");
+        };
+        assert_eq!(
+            error,
+            CliError::InvalidOption {
+                option: "--retry-backoff-ms",
+                value: "3000".to_owned(),
+            }
+        );
     }
 }

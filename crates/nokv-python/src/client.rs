@@ -6,13 +6,13 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use nokv_client::{
     ArtifactPublishOptions, ArtifactPublishOutcome, ArtifactRangeBatchRequest, ClientError,
-    ClientOptions, CommitWorkflowIdentities, FramedTcpOptions, FramedTcpTransport,
-    IdempotentAppendOptions, IdempotentPublishOptions, RouteResolver, SnapshotMintOptions,
-    SnapshotRenewOptions, SnapshotRetireOptions, WorkbenchCommitRequest, WorkbenchLifecycleError,
+    CommitWorkflowIdentities, FramedTcpTransport, IdempotentAppendOptions,
+    IdempotentPublishOptions, RouteResolver, SnapshotMintOptions, SnapshotRenewOptions,
+    SnapshotRetireOptions, WorkbenchCommitRequest, WorkbenchLifecycleError,
     WorkbenchLifecycleFacade, WorkbenchLifecycleOptions, WorkbenchRestoreOrigin,
     WorkbenchRestoreRequest, WorkbenchRestoreSource, WorkbenchSnapshotSelector, WorkspaceClient,
 };
@@ -38,7 +38,7 @@ use crate::local_adapter::{
 };
 use crate::object_store::{ConfiguredObjectStore, PythonObjectStoreConfig};
 use crate::python_error::{
-    append_failure, append_local_failure, client_failure, collect_failure, configuration_failure,
+    append_failure, append_local_failure, client_failure, collect_failure,
     identified_publish_failure, internal, invalid_input, lifecycle_failure, local_file_failure,
     publish_failure, runtime_client_failure, MaterializeFailure, ObjectBindFailure, OperationCall,
 };
@@ -52,6 +52,8 @@ use crate::python_value::{
     PythonAggregateSpec, PythonFieldSpec, PythonPredicateSpec, PythonSortSpec,
 };
 use crate::routing::PythonRoutingConfig;
+use crate::session::{PythonSession, SessionSettings};
+use crate::tls::PythonTlsConfig;
 
 type RustWorkspaceClient = WorkspaceClient<FramedTcpTransport, Arc<dyn RouteResolver>>;
 type BoundPythonObjectStore = Arc<nokv_object::BoundArtifactStore<ConfiguredObjectStore>>;
@@ -100,7 +102,10 @@ impl PythonWorkspaceClient {
         read_timeout_ms = 30_000,
         write_timeout_ms = 30_000,
         handshake_timeout_ms = 5_000,
-        workbench_root = None
+        workbench_root = None,
+        retry_backoff_ms = 0,
+        max_retry_backoff_ms = 2_000,
+        tls = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -114,30 +119,36 @@ impl PythonWorkspaceClient {
         write_timeout_ms: u64,
         handshake_timeout_ms: u64,
         workbench_root: Option<String>,
+        retry_backoff_ms: u64,
+        max_retry_backoff_ms: u64,
+        tls: Option<PyRef<'_, PythonTlsConfig>>,
     ) -> PyResult<Self> {
         let root_id = RootIdentity(parse_fixed_hex("root_id", root_id)?);
-        let transport = FramedTcpTransport::new(FramedTcpOptions {
-            connect_timeout: Duration::from_millis(connect_timeout_ms),
-            handshake_timeout: Duration::from_millis(handshake_timeout_ms),
-            read_timeout: Duration::from_millis(read_timeout_ms),
-            write_timeout: Duration::from_millis(write_timeout_ms),
-        })
-        .map_err(invalid_input)?;
-        let routing = (*routing).clone();
-        let resolver = py
-            .detach(move || routing.build(root_id))
-            .map_err(|error| configuration_failure(py, error))?;
-        let client =
-            WorkspaceClient::new(root_id, transport, resolver, ClientOptions { max_attempts })
-                .map_err(|error| configuration_failure(py, error))?;
-        py.detach(|| client.preflight(std::iter::empty()))
-            .map_err(|error| runtime_client_failure(py, error, IdempotencyScope::ReadOnly))?;
-        Ok(Self {
-            client: Arc::new(client),
-            objects: Mutex::new(None),
-            object_store: object_store.map(|config| (*config).clone()),
-            workbench_root,
-        })
+        // A client of one root is a session of one root: the same transport,
+        // resolver and retry policy, used once.
+        let session = PythonSession::open(
+            py,
+            (*routing).clone(),
+            object_store.map(|config| (*config).clone()),
+            tls.map(|tls| tls.rpc_tls()),
+            SessionSettings {
+                max_attempts,
+                connect_timeout_ms,
+                read_timeout_ms,
+                write_timeout_ms,
+                handshake_timeout_ms,
+                retry_backoff_ms,
+                max_retry_backoff_ms,
+            },
+        )?;
+        session.open_client(py, root_id, workbench_root)
+    }
+
+    /// The Workbench root this client presents the root under: the control
+    /// plane's binding, or the value given to a statically routed client.
+    #[getter]
+    fn workbench_root(&self) -> Option<&str> {
+        self.workbench_root.as_deref()
     }
 
     /// Publish or replay one canonical Workbench commit.
@@ -739,7 +750,6 @@ impl PythonWorkspaceClient {
             row.set_item("object_identity", entry.object_identity.as_str())?;
             row.set_item("expected_length", entry.expected_length)?;
             row.set_item("expected_digest", entry.expected_digest.as_str())?;
-            row.set_item("multipart_token", entry.multipart_token.clone())?;
             entries.append(row)?;
         }
         dict.set_item("entries", entries)?;
@@ -1424,6 +1434,19 @@ impl PythonWorkspaceClient {
 }
 
 impl PythonWorkspaceClient {
+    pub(crate) fn from_parts(
+        client: RustWorkspaceClient,
+        object_store: Option<PythonObjectStoreConfig>,
+        workbench_root: Option<String>,
+    ) -> Self {
+        Self {
+            client: Arc::new(client),
+            objects: Mutex::new(None),
+            object_store,
+            workbench_root,
+        }
+    }
+
     fn bound_objects(&self, py: Python<'_>) -> PyResult<BoundPythonObjectStore> {
         self.bind_objects(py)
             .map_err(|failure| failure.into_py_err(py))

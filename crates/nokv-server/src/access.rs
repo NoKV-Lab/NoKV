@@ -143,6 +143,11 @@ impl TenantAccess {
         self.max_age
     }
 
+    /// The tenant whose principals this access authenticates.
+    pub fn tenant_id(&self) -> TenantId {
+        self.tenant_id
+    }
+
     /// Reload the policy when its revision moved. A failure keeps the last
     /// copy, which stops authorizing once it is older than `max_age`.
     pub fn refresh(&self) -> Result<(), ControlError> {
@@ -418,6 +423,72 @@ mod tests {
                 },
             ),
         )
+    }
+
+    /// A timing probe, not a test: `cargo test -p nokv-server --lib
+    /// authorization_decision_cost -- --ignored --nocapture` prints the cost
+    /// of one authorization decision against a policy of 64 principals that
+    /// each hold a tenant-wide role and eight root-scoped roles.
+    #[test]
+    #[ignore = "timing probe; run with --ignored to measure the decision cost"]
+    fn authorization_decision_cost() {
+        let store = store();
+        for root in 3..=8_u8 {
+            store
+                .bind_root_tenant(RootTenantBinding {
+                    root_id: RootId::from_bytes([root; 16]),
+                    tenant_id: TENANT,
+                })
+                .unwrap();
+        }
+        for index in 100..164_u8 {
+            // Past the fixture's own principal ([6; 16]).
+            let principal_id = PrincipalId::from_bytes([index; 16]);
+            store
+                .create_principal(PrincipalRecord {
+                    tenant_id: TENANT,
+                    principal_id,
+                })
+                .unwrap();
+            store
+                .grant_role(RoleBinding {
+                    tenant_id: TENANT,
+                    principal_id,
+                    role: Role::Reader,
+                    scope: RoleScope::Tenant,
+                })
+                .unwrap();
+            for root in 1..=8_u8 {
+                store
+                    .grant_role(RoleBinding {
+                        tenant_id: TENANT,
+                        principal_id,
+                        role: Role::Writer,
+                        scope: RoleScope::Root(RootId::from_bytes([root; 16])),
+                    })
+                    .unwrap();
+            }
+        }
+        grant(&store, Role::Writer, RoleScope::Tenant);
+        let access = TenantAccess::load(store, TENANT, DEFAULT_MAX_POLICY_AGE).unwrap();
+        let requests = [read(1), write(1), write(2), operate(1)];
+        let rounds = 100_000;
+        let started = std::time::Instant::now();
+        let mut permitted = 0_usize;
+        for round in 0..rounds {
+            let request = &requests[round % requests.len()];
+            if access.authorize(&agent(), request, NOW).is_ok() {
+                permitted += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+        let decisions = rounds as u32;
+        println!(
+            "authorization decision: {:?} per call over {decisions} calls ({permitted} permitted, \
+             64 principals x (1 tenant role + 8 root roles))",
+            elapsed / decisions
+        );
+        assert_eq!(permitted, rounds / 4 * 3);
     }
 
     #[test]

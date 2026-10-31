@@ -133,8 +133,9 @@ fail-closed and unchanged.
 
 Durable codecs are independently versioned:
 the publish operation record uses value version `9` and rejects version `8`;
-staged-object and manifest-row records use value version
-`7` and reject version `6`; an append publication binds both the full 256-bit
+manifest-row records use value version `7` and reject version `6`; the
+staged-object record uses value version `8`, which dropped the multipart
+upload id, and rejects version `7`; an append publication binds both the full 256-bit
 intent and logical parent/attempt, with a cleanup retry counter that prevents
 repeated quarantine from recreating an earlier state token. `AppendOperationRecord` uses value version
 `2` and retains the current attempt, optional compact receipt, and initiator. An
@@ -242,7 +243,7 @@ RestorePhase:    Preparing=1, Copying=2, SourceSealed=3, Ready=4,
                  DestinationSealing=11
 CommitRetirePhase: Claiming=1, Releasing=2, Complete=3, Quarantined=4
 GcPhase:         Queued=1, Claimed=2, Deleting=3, Deleted=4, Quarantined=5
-StagedProviderState: Planned=1, Uploading=2, Uploaded=3, AbortPending=4,
+StagedProviderState: Planned=1, Uploaded=3, AbortPending=4,
                      Aborted=5, Ambiguous=6
 StagedCleanupState: Owned=1, DeletePending=2, Deleted=3, Quarantined=4
 GcClaimState:    Candidate=1, Claimed=2, Complete=3, Quarantined=4
@@ -485,8 +486,8 @@ RestoreMember
 
 StagedObject
   key: root_id | publish_operation_id | object_sequence
-  val: artifact revision, object key, multipart/upload id,
-       expected length/digest, provider state, cleanup state
+  val: artifact revision, object key, expected length/digest,
+       provider state, cleanup state
 
 CommandDedupe
   key: root_id | request_id
@@ -540,7 +541,11 @@ Workbench id, so root- and workspace-scoped feeds point-read that exact marker
 and verify its incarnation instead of scanning every marker at each event
 version. Repeated events for one Workbench in one commit share the marker
 result. An `after_commit_version` newer than the fenced root version fails
-closed.
+closed. A page holds at most 64 events (`MAX_CHANGE_PAGE_LIMIT`), below the
+256 of the other paged reads: the feed is polled while writers run, and one
+reader tailing full 256-event pages at full speed cost eight concurrent
+writers 74% of their throughput on the reference stack, while 64-event pages
+cost them 8% to 17%.
 
 Both scopes currently seek the root-wide `ChangeEvent` keyspace. A
 workspace-scoped feed filters on the embedded stable Workbench id after that
@@ -759,7 +764,7 @@ the old candidate stale.
 
 Publication is object-first and metadata-last. Before upload, a
 `PublishOperation` and exact `StagedObject` ledger own all object keys,
-multipart ids, lengths, and digests.
+lengths, and digests.
 
 The mutually exclusive operation transitions are:
 
@@ -797,7 +802,7 @@ retained staged rows, bound to the exact current logical/child state. Generic pu
 revision GC retain their existing deletion semantics.
 
 A late upload completion must observe the operation state; after abort it joins
-cleanup instead of publishing. Ambiguous multipart completion, late PUT, or
+cleanup instead of publishing. An ambiguous create, late PUT, or
 DELETE remains ledger-owned and `Quarantined` until reconciled. Object listing
 is never used to discover staged ownership.
 

@@ -9,14 +9,18 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
 #[cfg(feature = "control")]
-use nokv_control::{ControlStore, LogicalShardState, RootPlacementLifecycle};
+use nokv_control::{ControlStore, IdentityStore, LogicalShardState, RootPlacementLifecycle};
 #[cfg(feature = "etcd")]
-use nokv_control::{EtcdControlStore, EtcdControlStoreOptions};
+use nokv_control::{EtcdControlStore, EtcdControlStoreOptions, EtcdTlsConfig};
 #[cfg(feature = "control")]
 use nokv_protocol::{LogicalShardIdentity, ObjectNamespaceIdentity};
 use nokv_protocol::{RootIdentity, RootRoute};
 #[cfg(feature = "control")]
+use nokv_types::ErrorClass;
+#[cfg(feature = "control")]
 use nokv_types::RootId;
+#[cfg(feature = "control")]
+use nokv_types::WorkbenchRoot;
 
 use crate::ClientError;
 
@@ -55,6 +59,17 @@ pub trait RouteResolver: Send + Sync {
     }
 
     fn resolve(&self, root_id: RootIdentity, refresh: bool) -> Result<ResolvedRoute, ClientError>;
+
+    /// The Workbench root the control plane binds `root_id` to, which every
+    /// caller must present the root under. `None` when the control plane
+    /// has bound none, or when this resolver reads no control plane at all.
+    fn workbench_root(
+        &self,
+        root_id: RootIdentity,
+    ) -> Result<Option<nokv_types::WorkbenchRoot>, ClientError> {
+        let _ = root_id;
+        Ok(None)
+    }
 }
 
 impl<T> RouteResolver for Arc<T>
@@ -67,6 +82,13 @@ where
 
     fn resolve(&self, root_id: RootIdentity, refresh: bool) -> Result<ResolvedRoute, ClientError> {
         (**self).resolve(root_id, refresh)
+    }
+
+    fn workbench_root(
+        &self,
+        root_id: RootIdentity,
+    ) -> Result<Option<nokv_types::WorkbenchRoot>, ClientError> {
+        (**self).workbench_root(root_id)
     }
 }
 
@@ -132,6 +154,10 @@ impl RouteResolver for StaticRouteResolver {
 #[derive(Clone)]
 pub struct ControlRouteResolver {
     store: Arc<dyn ControlStore>,
+    /// The same control plane's identity records, when the caller opened a
+    /// store that holds them; a resolver over routing records alone cannot
+    /// answer for the Workbench root.
+    identity: Option<Arc<dyn IdentityStore>>,
     cached: Arc<RwLock<BTreeMap<RootIdentity, ResolvedRoute>>>,
 }
 
@@ -140,7 +166,17 @@ impl ControlRouteResolver {
     pub fn new(store: Arc<dyn ControlStore>) -> Self {
         Self {
             store,
+            identity: None,
             cached: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+
+    /// A resolver that also answers for the Workbench root each root is
+    /// bound to, from the identity records of the same control plane.
+    pub fn with_identity(store: Arc<dyn ControlStore>, identity: Arc<dyn IdentityStore>) -> Self {
+        Self {
+            identity: Some(identity),
+            ..Self::new(store)
         }
     }
 
@@ -148,17 +184,28 @@ impl ControlRouteResolver {
     /// sole route source.
     #[cfg(unix)]
     pub fn open_local(directory: impl Into<std::path::PathBuf>) -> Result<Self, ClientError> {
-        let store = nokv_control::LocalControlStore::open(directory).map_err(control_error)?;
-        Ok(Self::new(Arc::new(store)))
+        let store =
+            Arc::new(nokv_control::LocalControlStore::open(directory).map_err(control_error)?);
+        Ok(Self::with_identity(store.clone(), store))
     }
 
     /// Connect an etcd-backed control store and use it as the sole route source.
     #[cfg(feature = "etcd")]
     pub fn connect_etcd(options: EtcdRouteOptions) -> Result<Self, ClientError> {
         options.validate()?;
-        let store =
-            EtcdControlStore::connect(options.into_control_options()).map_err(control_error)?;
-        Ok(Self::new(Arc::new(store)))
+        let store = Arc::new(
+            EtcdControlStore::connect(options.into_control_options()).map_err(control_error)?,
+        );
+        Ok(Self::with_identity(store.clone(), store))
+    }
+
+    /// The route cached for `root_id`, if one was resolved and not refreshed
+    /// away since.
+    pub fn cached_route(&self, root_id: RootIdentity) -> Option<ResolvedRoute> {
+        self.cached
+            .read()
+            .ok()
+            .and_then(|cached| cached.get(&root_id).copied())
     }
 
     fn load(&self, root_identity: RootIdentity) -> Result<ResolvedRoute, ClientError> {
@@ -187,7 +234,7 @@ impl ControlRouteResolver {
 
         let shard = self
             .store
-            .get_logical_shard(&placement.logical_shard_id)
+            .get_logical_shard_route(&placement.logical_shard_id)
             .map_err(control_error)?
             .ok_or_else(|| invalid_route("logical shard record does not exist"))?;
         if shard.logical_shard_id != placement.logical_shard_id {
@@ -232,6 +279,19 @@ impl ControlRouteResolver {
 impl RouteResolver for ControlRouteResolver {
     fn refresh_mode(&self) -> RouteRefreshMode {
         RouteRefreshMode::Authoritative
+    }
+
+    fn workbench_root(&self, root_id: RootIdentity) -> Result<Option<WorkbenchRoot>, ClientError> {
+        let identity = self.identity.as_ref().ok_or_else(|| {
+            invalid_route(
+                "this resolver reads routing records only; open the control plane with its \
+                 identity records to learn a root's Workbench root",
+            )
+        })?;
+        Ok(identity
+            .get_root_presentation(&RootId::from(root_id))
+            .map_err(control_error)?
+            .map(|binding| binding.workbench_root))
     }
 
     fn resolve(&self, root_id: RootIdentity, refresh: bool) -> Result<ResolvedRoute, ClientError> {
@@ -284,6 +344,17 @@ impl EtcdRouteOptions {
         self
     }
 
+    /// Authenticate to etcd over mutual TLS; every endpoint must then be an
+    /// `https://` URL.
+    pub fn with_tls(mut self, tls: EtcdTlsConfig) -> Self {
+        self.control = self.control.with_tls(tls);
+        self
+    }
+
+    pub fn tls(&self) -> Option<&EtcdTlsConfig> {
+        self.control.tls()
+    }
+
     pub fn endpoints(&self) -> &[String] {
         self.control.endpoints()
     }
@@ -307,9 +378,33 @@ impl EtcdRouteOptions {
     }
 }
 
+/// A control-plane refusal of this client, or the local control store's
+/// refusal of its own directory, keeps its class, so that a caller stops;
+/// any other control failure is an unresolvable route.
 #[cfg(feature = "control")]
-fn control_error(error: impl std::fmt::Display) -> ClientError {
-    invalid_route(format!("control-plane lookup failed: {error}"))
+fn control_error(error: nokv_control::ControlError) -> ClientError {
+    use nokv_control::ControlError;
+    match error {
+        ControlError::Unauthenticated(message) => ClientError::ControlRefusal {
+            class: ErrorClass::Unauthenticated,
+            message,
+        },
+        ControlError::PermissionDenied(message) => ClientError::ControlRefusal {
+            class: ErrorClass::PermissionDenied,
+            message,
+        },
+        // Someone else may have changed the records: an operator decides.
+        refused @ ControlError::ControlPathRefused { .. } => ClientError::ControlRefusal {
+            class: refused.class(),
+            message: refused.to_string(),
+        },
+        // The control options cannot work as given (for example, the CA
+        // does not sign etcd's certificate): a usage error, not a route.
+        ControlError::InvalidOptions(message) => {
+            ClientError::InvalidOptions(format!("control plane: {message}"))
+        }
+        error => invalid_route(format!("control-plane lookup failed: {error}")),
+    }
 }
 
 #[cfg(feature = "control")]
@@ -320,6 +415,59 @@ fn invalid_route(message: impl Into<String>) -> ClientError {
 #[cfg(all(test, feature = "control"))]
 mod control_tests {
     use super::*;
+    use nokv_control::ControlError;
+    use nokv_types::ErrorClass;
+
+    #[test]
+    fn control_refusals_keep_their_class() {
+        for (error, class) in [
+            (
+                ControlError::PermissionDenied("etcd: permission denied".to_owned()),
+                ErrorClass::PermissionDenied,
+            ),
+            (
+                ControlError::Unauthenticated("etcd: user name not found".to_owned()),
+                ErrorClass::Unauthenticated,
+            ),
+        ] {
+            let mapped = control_error(error);
+            assert!(
+                matches!(&mapped, ClientError::ControlRefusal { .. }),
+                "{mapped}"
+            );
+            assert_eq!(mapped.class(), class);
+            assert_eq!(mapped.class().for_read(), class);
+            assert!(!mapped.retryable());
+        }
+        let refused = control_error(ControlError::ControlPathRefused {
+            path: "/srv/ctl".into(),
+            reason: "group or other users can write it (mode 770); run `chmod go-w` on it"
+                .to_owned(),
+        });
+        assert!(
+            matches!(&refused, ClientError::ControlRefusal { .. }),
+            "{refused}"
+        );
+        assert_eq!(refused.class(), ErrorClass::OperatorRequired);
+        assert_eq!(refused.class().for_read(), ErrorClass::OperatorRequired);
+        assert!(!refused.retryable());
+        assert!(refused
+            .to_string()
+            .contains("refuses /srv/ctl: group or other users"));
+        assert!(matches!(
+            control_error(ControlError::Backend("etcd: leader changed".to_owned())),
+            ClientError::InvalidRoute(_)
+        ));
+        let misconfigured = control_error(ControlError::InvalidOptions(
+            "etcd's certificate is not signed by the configured etcd TLS CA".to_owned(),
+        ));
+        assert!(
+            matches!(&misconfigured, ClientError::InvalidOptions(_)),
+            "{misconfigured}"
+        );
+        assert_eq!(misconfigured.class(), ErrorClass::InvalidInput);
+        assert!(misconfigured.to_string().contains("etcd TLS CA"));
+    }
     use nokv_control::{
         InMemoryControlStore, LogicalShardId, NodeId, PlacementGeneration, RecoveryPublication,
         RootObjectNamespaceBinding, RootPlacement,
@@ -406,6 +554,49 @@ mod control_tests {
             resolved.endpoint,
             "127.0.0.1:7751".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn control_resolvers_read_the_bound_workbench_root_and_static_ones_know_none() {
+        let (store, root_id, _) = serving_store("127.0.0.1:7750");
+        store
+            .bind_root_presentation(nokv_control::RootPresentationBinding {
+                root_id: RootId::from_bytes(id(1)),
+                workbench_root: nokv_types::WorkbenchRoot::new("/agents/one/wb").unwrap(),
+            })
+            .unwrap();
+        let identity: Arc<dyn nokv_control::IdentityStore> = store.clone();
+        let control: Arc<dyn ControlStore> = store.clone();
+        let resolver = ControlRouteResolver::with_identity(control.clone(), identity);
+        assert_eq!(
+            resolver
+                .workbench_root(root_id)
+                .unwrap()
+                .as_ref()
+                .map(nokv_types::WorkbenchRoot::as_str),
+            Some("/agents/one/wb")
+        );
+        assert_eq!(resolver.workbench_root(RootIdentity(id(9))).unwrap(), None);
+
+        // A resolver over routing records alone cannot answer, and says so
+        // rather than guessing; a static route has no control plane at all.
+        let routing_only = ControlRouteResolver::new(control);
+        assert!(matches!(
+            routing_only.workbench_root(root_id),
+            Err(ClientError::InvalidRoute(_))
+        ));
+        let pinned = StaticRouteResolver::new(
+            RootRoute {
+                root_id,
+                logical_shard_id: LogicalShardIdentity(id(2)),
+                object_namespace_id: nokv_protocol::ObjectNamespaceIdentity(id(8)),
+                placement_generation: 2,
+                owner_epoch: 1,
+            },
+            "127.0.0.1:7750".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pinned.workbench_root(root_id).unwrap(), None);
     }
 
     #[test]
