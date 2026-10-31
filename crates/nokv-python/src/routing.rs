@@ -339,6 +339,34 @@ mod tests {
         assert!(error.to_string().contains("invalid port"), "{error}");
     }
 
+    /// The ValueError for an endpoint with credentials never repeats them.
+    #[test]
+    fn an_etcd_endpoint_with_credentials_is_refused_without_repeating_them() {
+        Python::initialize();
+        for endpoint in [
+            "user:s3cr3t@127.0.0.1:2379",
+            "HTTP://user:s3cr3t@127.0.0.1:2379",
+            "ftp://user:s3cr3t@127.0.0.1:2379",
+            "http://user:s3cr3t@127.0.0.1:2379",
+        ] {
+            let error = PythonRoutingConfig::etcd(
+                vec![endpoint.to_owned()],
+                "/nokv/control",
+                10,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                !error.contains("s3cr3t"),
+                "the ValueError repeats credentials"
+            );
+            assert!(error.contains("carries credentials"), "{error}");
+        }
+    }
+
     #[test]
     fn etcd_tls_identity_is_complete_and_binds_https_endpoints() {
         Python::initialize();

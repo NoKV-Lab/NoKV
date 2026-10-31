@@ -1798,6 +1798,16 @@ pub(crate) mod tests {
         );
         assert_eq!(refused.class(), ErrorClass::InvalidInput);
         assert!(refused.to_string().contains("invalid uri"), "{refused}");
+        // The refusal never repeats the endpoint, so credentials in it stay
+        // out of every message.
+        let unparsable = "http://user:s3cr3t@exa mple:2379"
+            .parse::<tonic::codegen::http::Uri>()
+            .unwrap_err();
+        let refused = etcd_backend(etcd_client::Error::InvalidUri(unparsable));
+        assert!(
+            !refused.to_string().contains("s3cr3t"),
+            "the refusal repeats credentials"
+        );
     }
 
     use etcd_client::DeleteOptions;

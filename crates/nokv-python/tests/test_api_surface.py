@@ -251,3 +251,20 @@ def test_failure_attributes_use_the_published_contract_names():
     for error in (invalid, mismatch, defaults):
         assert error.error_class in classes
         assert error.next_action in actions
+
+
+def test_etcd_routing_refuses_endpoint_credentials_without_repeating_them():
+    for endpoint in (
+        "user:s3cr3t@127.0.0.1:2379",
+        "HTTP://user:s3cr3t@127.0.0.1:2379",
+        "ftp://user:s3cr3t@127.0.0.1:2379",
+        "http://user:s3cr3t@127.0.0.1:2379",
+    ):
+        try:
+            nokv.RoutingConfig.etcd([endpoint])
+        except ValueError as error:
+            text = str(error)
+            assert "s3cr3t" not in text, "the ValueError repeats credentials"
+            assert "carries credentials" in text, text
+        else:
+            raise AssertionError("an etcd endpoint with credentials was accepted")

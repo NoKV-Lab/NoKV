@@ -1,5 +1,6 @@
 #[cfg(any(feature = "etcd", test))]
 use crate::codec::encode_fixed_id;
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 
@@ -71,22 +72,24 @@ impl fmt::Debug for EtcdTlsConfig {
 /// server: it is an `http://` or `https://` URL whose authority is a host
 /// name, an IPv4 address or a bracketed IPv6 address, with an optional port
 /// in 1..=65535. What follows the authority is left to the client library.
+/// One that carries credentials is refused first, whatever else is wrong
+/// with it, and no refusal repeats them.
 fn validate_endpoint(endpoint: &str) -> Result<(), ControlError> {
+    let shown = redacted_endpoint(endpoint);
     let invalid =
-        |why: &str| ControlError::InvalidOptions(format!("etcd endpoint {endpoint:?} {why}"));
+        |why: &str| ControlError::InvalidOptions(format!("etcd endpoint {shown:?} {why}"));
+    if shown != endpoint {
+        return Err(invalid(
+            "carries credentials, which etcd never receives and the command line would keep; \
+             use the etcd TLS options to authenticate",
+        ));
+    }
+    // The client library matches these schemes case-sensitively.
     let rest = endpoint
         .strip_prefix("http://")
         .or_else(|| endpoint.strip_prefix("https://"))
-        .ok_or_else(|| invalid("is not an http:// or https:// URL"))?;
+        .ok_or_else(|| invalid("must start with http:// or https://, in lowercase"))?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.contains('@') {
-        // Never repeat the credentials in an error.
-        return Err(ControlError::InvalidOptions(
-            "an etcd endpoint must not carry credentials: etcd never receives them, and they \
-             would stay in the command line; use the etcd TLS options to authenticate"
-                .to_owned(),
-        ));
-    }
     let port = match authority.strip_prefix('[') {
         Some(bracketed) => {
             let invalid_address = || invalid("has an invalid IPv6 address");
@@ -131,12 +134,54 @@ fn validate_endpoint(endpoint: &str) -> Result<(), ControlError> {
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `endpoint` as a message may show it. Anything after its scheme up to the
+/// last `@` could be credentials, so it is replaced; a scheme cannot carry
+/// them.
+fn redacted_endpoint(endpoint: &str) -> Cow<'_, str> {
+    let start = endpoint
+        .find("://")
+        .filter(|&end| {
+            let scheme = &endpoint[..end];
+            scheme.starts_with(|character: char| character.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "+-.".contains(character))
+        })
+        .map_or(0, |end| end + "://".len());
+    match endpoint[start..].rfind('@') {
+        Some(at) => Cow::Owned(format!(
+            "{}<redacted>{}",
+            &endpoint[..start],
+            &endpoint[start + at..]
+        )),
+        None => Cow::Borrowed(endpoint),
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct EtcdControlStoreOptions {
     endpoints: Vec<String>,
     key_prefix: String,
     lease_ttl_seconds: i64,
     tls: Option<EtcdTlsConfig>,
+}
+
+/// Endpoints appear with any credentials redacted.
+impl fmt::Debug for EtcdControlStoreOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let endpoints = self
+            .endpoints
+            .iter()
+            .map(|endpoint| redacted_endpoint(endpoint))
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("EtcdControlStoreOptions")
+            .field("endpoints", &endpoints)
+            .field("key_prefix", &self.key_prefix)
+            .field("lease_ttl_seconds", &self.lease_ttl_seconds)
+            .field("tls", &self.tls)
+            .finish()
+    }
 }
 
 impl EtcdControlStoreOptions {
@@ -516,9 +561,12 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{endpoint}: {error}"));
         }
         for (endpoint, why) in [
-            ("127.0.0.1:2379", "http:// or https:// URL"),
-            ("ftp://127.0.0.1:2379", "http:// or https:// URL"),
-            ("HTTP://127.0.0.1:2379", "http:// or https:// URL"),
+            ("127.0.0.1:2379", "must start with http:// or https://"),
+            (
+                "ftp://127.0.0.1:2379",
+                "must start with http:// or https://",
+            ),
+            ("HTTP://127.0.0.1:2379", "in lowercase"),
             ("http://", "names no host"),
             ("http://:2379", "names no host"),
             ("http://exa mple:2379", "invalid host"),
@@ -541,15 +589,6 @@ mod tests {
                 other => panic!("{endpoint}: expected a refusal, got {other:?}"),
             }
         }
-        // Credentials in an endpoint would sit in argv and logs, and etcd
-        // never receives them: refused without repeating them.
-        match EtcdControlStoreOptions::new(["http://user:secret@127.0.0.1:2379"]).validate() {
-            Err(ControlError::InvalidOptions(message)) => {
-                assert!(message.contains("credentials"), "{message}");
-                assert!(!message.contains("secret"), "{message}");
-            }
-            other => panic!("expected a refusal, got {other:?}"),
-        }
         // Endpoints are checked before the TLS pairing, whose refusal would
         // otherwise hide the malformed one.
         match EtcdControlStoreOptions::new(["https://"])
@@ -560,6 +599,38 @@ mod tests {
                 assert!(message.contains("names no host"), "{message}");
             }
             other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// Credentials in an endpoint would stay in argv, and etcd never receives
+    /// them. The endpoint is refused for them first, whatever else is wrong
+    /// with it, and no message or debug output repeats them.
+    #[test]
+    fn an_endpoint_with_credentials_is_refused_without_repeating_them() {
+        for endpoint in [
+            "user:s3cr3t@127.0.0.1:2379",
+            "HTTP://user:s3cr3t@127.0.0.1:2379",
+            "ftp://user:s3cr3t@127.0.0.1:2379",
+            "http://user:s3cr3t@127.0.0.1:2379",
+            "http://user:pass/s3cr3t@127.0.0.1:2379",
+            "user:s3cr3t://@127.0.0.1:2379",
+        ] {
+            let options = EtcdControlStoreOptions::new([endpoint]);
+            let Err(ControlError::InvalidOptions(message)) = options.validate() else {
+                panic!("an endpoint with credentials was not refused as invalid options");
+            };
+            assert!(
+                !message.contains("s3cr3t"),
+                "the refusal repeats credentials"
+            );
+            assert!(!message.contains("user"), "the refusal repeats the user");
+            assert!(message.contains("carries credentials"), "{message}");
+            assert!(message.contains("<redacted>@127.0.0.1:2379"), "{message}");
+            let debug = format!("{options:?}");
+            assert!(
+                !debug.contains("s3cr3t"),
+                "debug output repeats credentials"
+            );
         }
     }
 
