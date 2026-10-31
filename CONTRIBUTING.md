@@ -206,6 +206,10 @@ order, and filled-in content. It ignores HTML comments and does not treat
 headings inside fenced code examples as sections. Bare placeholders such as
 `TODO` or `N/A` fail; explain why a section does not apply. The check reruns on
 PR creation, reopening, pushes, title/body edits, and ready-for-review events.
+Dependabot's version-update PRs are checked for the title only: their body is
+the generated release notes, and `.github/dependabot.yml` gives their titles a
+`deps:` or `ci:` type. Review them for the dependency change and its MSRV like
+any other PR.
 Plain English, brevity, factual claims, and relevance still require review.
 
 Run the same policy locally before opening or editing a PR:
