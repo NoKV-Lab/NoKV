@@ -111,6 +111,9 @@ pub(crate) enum RefusalReason {
     PolicyStale,
     /// The principal holds no role on the root that permits the request.
     PermissionDenied,
+    /// The request continues an operation or a snapshot that another
+    /// principal began; only that principal or an operator may.
+    NotTheInitiator,
 }
 
 impl From<AccessDenial> for RefusalReason {
@@ -171,15 +174,55 @@ impl<'a> Refusal<'a> {
         request: &WorkspaceRpcRequest,
     ) -> Self {
         Self {
-            event: RefusalEvent::RequestDenied,
-            principal_id: Some(lowercase_hex(principal.principal_id.as_bytes())),
-            root_id: Some(lowercase_hex(&request.route.root_id.0)),
-            request: Some(classify(&request.operation).name),
             required_role: match denial {
                 AccessDenial::PermissionDenied { required } => Some(required.name()),
                 AccessDenial::NotACurrentCredential | AccessDenial::PolicyStale => None,
             },
-            ..Self::connection(denial.into(), peer, tenant_id)
+            ..Self::denied(
+                denial.into(),
+                peer,
+                tenant_id,
+                principal,
+                classify(&request.operation).name,
+                &request.route.root_id.0,
+            )
+        }
+    }
+
+    /// A request the owner authorized and then refused, because what it
+    /// continues belongs to another principal. `detail` is the refusal.
+    pub(crate) fn not_the_initiator(
+        peer: Option<SocketAddr>,
+        tenant_id: TenantId,
+        principal: &ConnectionPrincipal,
+        (request, root_id): (&'static str, &[u8]),
+        detail: &'a str,
+    ) -> Self {
+        Self::denied(
+            RefusalReason::NotTheInitiator,
+            peer,
+            tenant_id,
+            principal,
+            request,
+            root_id,
+        )
+        .with_detail(detail)
+    }
+
+    fn denied(
+        reason: RefusalReason,
+        peer: Option<SocketAddr>,
+        tenant_id: TenantId,
+        principal: &ConnectionPrincipal,
+        request: &'static str,
+        root_id: &[u8],
+    ) -> Self {
+        Self {
+            event: RefusalEvent::RequestDenied,
+            principal_id: Some(lowercase_hex(principal.principal_id.as_bytes())),
+            root_id: Some(lowercase_hex(root_id)),
+            request: Some(request),
+            ..Self::connection(reason, peer, tenant_id)
         }
         .with_certificate(&principal.fingerprint)
     }

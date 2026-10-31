@@ -677,7 +677,23 @@ fn serve_connection(
             }
             None => RequestAuthority::TRUSTED,
         };
+        let named = (classify(&request.operation).name, request.route.root_id);
         let response = registry.dispatch_guarded(request, authority)?;
+        if let (Some(tls), Some(principal), WorkspaceRpcOutcome::Failure(failure)) =
+            (tls, &principal, &response.response().outcome)
+        {
+            // The executor answers PermissionDenied only to a principal that
+            // continues what another began.
+            if failure.code == ErrorCode::PermissionDenied {
+                tls.audit(&Refusal::not_the_initiator(
+                    peer,
+                    tls.access.tenant_id(),
+                    principal,
+                    (named.0, &named.1 .0),
+                    &failure.message,
+                ));
+            }
+        }
         let encoded = encode_response_or_internal_failure(response.response())?;
         write_frame(&mut stream, &encoded)?;
         drop(response);
@@ -1932,6 +1948,70 @@ mod tests {
         );
         assert_eq!(denied["request"], class.name);
         assert_eq!(denied["required_role"], class.role.name());
+    }
+
+    /// Refuses every request the way the executor refuses a principal that
+    /// continues an operation another began.
+    struct NotTheInitiatorExecutor;
+
+    const NOT_THE_INITIATOR: &str = "the principal did not begin this operation";
+
+    impl WorkspaceRequestExecutor for NotTheInitiatorExecutor {
+        fn execute(
+            &self,
+            _request: &WorkspaceRpcRequest,
+            _authority: RequestAuthority,
+        ) -> Result<ExecutedRequest, RpcFailure> {
+            Err(RpcFailure {
+                code: ErrorCode::PermissionDenied,
+                message: NOT_THE_INITIATOR.to_owned(),
+                retryable: false,
+                conflict: None,
+                current_generation: None,
+                route_hint: None,
+            })
+        }
+    }
+
+    #[test]
+    fn a_continuation_the_executor_refuses_is_audited() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let tls = Arc::new(
+            pki.server_tls()
+                .with_audit_log(crate::AuditLog::open(&path).unwrap()),
+        );
+        let registry = Arc::new(RootOwnerRegistry::new());
+        registry
+            .install(route(), Arc::new(NotTheInitiatorExecutor))
+            .unwrap();
+        let (client, server) = streams();
+        let serving_tls = Arc::clone(&tls);
+        let serving = thread::spawn(move || {
+            serve_connection(server, registry, tls_options(), Some(&serving_tls))
+        });
+
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.registered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        let response = tls_exchange(&mut stream, &request());
+        assert_eq!(failure_of(&response).code, ErrorCode::PermissionDenied);
+        stream.conn.send_close_notify();
+        stream.flush().unwrap();
+        serving.join().unwrap().unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line = serde_json::from_str::<serde_json::Value>(text.trim()).unwrap();
+        assert_eq!(line["event"], "request_denied");
+        assert_eq!(line["reason"], "not_the_initiator");
+        assert_eq!(line["principal_id"], "06".repeat(16).as_str());
+        assert_eq!(
+            line["root_id"],
+            lowercase_hex(&request().route.root_id.0).as_str()
+        );
+        assert_eq!(line["request"], classify(&request().operation).name);
+        assert_eq!(line["required_role"], serde_json::Value::Null);
+        assert_eq!(line["detail"], NOT_THE_INITIATOR);
     }
 
     #[test]

@@ -214,14 +214,14 @@ key that does not apply to the refusal is `null`:
 | --- | --- |
 | `time_unix_ms` | When the owner refused, in milliseconds since the Unix epoch. |
 | `event` | `connection_refused`, before any request, or `request_denied`. |
-| `reason` | `tls_required`, `tls_handshake_failed`, `incompatible_schema`, `not_a_current_credential`, `policy_stale`, or `permission_denied`. |
+| `reason` | `tls_required`, `tls_handshake_failed`, `incompatible_schema`, `not_a_current_credential`, `policy_stale`, `permission_denied` (no role permits the request), or `not_the_initiator` (the request continues an operation or snapshot another principal began). |
 | `peer` | The client's address and port. |
 | `tenant_id` | The tenant the owner serves. |
 | `certificate_fingerprint` | The SHA-256 of the client's certificate, once TLS has completed. |
 | `principal_id` | The authenticated principal of a denied request. |
 | `root_id`, `request` | The root and the RPC a denied request named. |
 | `required_role` | The least role that permits the request, for `permission_denied`. |
-| `detail` | The TLS error, for `tls_handshake_failed`. |
+| `detail` | The TLS error, for `tls_handshake_failed`; the owner's refusal, for `not_the_initiator`. |
 
 Every refusal is a line: a principal that repeats a denied request grows the
 file, and its lines name it. A write that fails, for example on a full disk,
