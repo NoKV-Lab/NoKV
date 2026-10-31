@@ -12,10 +12,8 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 env:
-  IMAGE_NAME: ghcr.io/feichai0017/nokv
   RUST_VERSION: "1.91"
   DEBIAN_VERSION: bookworm
 
@@ -27,20 +25,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Test image metadata
+        run: python3 scripts/ci/image_metadata_test.py
+
+      - name: Image metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          created="$(git log -1 --format=%cI)"
+          echo "created=$created" >> "$GITHUB_OUTPUT"
+          python3 scripts/ci/image_metadata.py emit \
+            --ref "$GITHUB_SHA" --version "dev-$GITHUB_SHA" \
+            --revision "$GITHUB_SHA" --created "$created" >> "$GITHUB_OUTPUT"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Log in to GitHub Container Registry
-        if: github.repository == 'feichai0017/NoKV' && github.ref == 'refs/heads/main'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
+      # Build both platforms into an OCI layout, so the step below can read
+      # the index exactly as a registry would serve it.
       - name: Build Docker image
         uses: docker/build-push-action@v7
         with:
@@ -52,7 +58,16 @@ jobs:
             DEBIAN_VERSION=${{ env.DEBIAN_VERSION }}
             NOKV_PACKAGE=nokv
             NOKV_BINARY=nokv
-          push: ${{ github.repository == 'feichai0017/NoKV' && github.ref == 'refs/heads/main' }}
-          tags: |
-            ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          annotations: ${{ steps.metadata.outputs.annotations }}
+          outputs: type=oci,dest=${{ runner.temp }}/nokv-image.tar
+
+      - name: Check image metadata
+        shell: bash
+        env:
+          CREATED: ${{ steps.metadata.outputs.created }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/image_metadata.py check "$RUNNER_TEMP/nokv-image.tar" \
+            --ref "$GITHUB_SHA" --version "dev-$GITHUB_SHA" \
+            --revision "$GITHUB_SHA" --created "$CREATED"

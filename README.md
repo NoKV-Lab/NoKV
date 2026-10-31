@@ -688,6 +688,7 @@ immutable revisions are visible and retained by a workspace.
 - [Path-native metadata comparison](docs/development/path-native-metadata-comparison.md)
 - [Workspace acceptance](docs/development/workspace-acceptance.md)
 - [Live deployment preflight](docs/workbench-preflight.md)
+- [Container image](docs/container-image.md) and its [Artifact Hub listing](docs/development/artifact-hub.md)
 - [Agent contributor handbook](docs/development/nokv-agent.md)
 - [Code contract](docs/development/code_contract.md)
 - [PR review checklist](docs/development/pr_review_checklist.md)
