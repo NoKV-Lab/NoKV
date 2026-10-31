@@ -11417,6 +11417,61 @@ mod tests {
     }
 
     #[test]
+    fn another_principal_cannot_rebind_a_commit_projection() {
+        let (_store, executor) = ready_executor();
+        executor
+            .execute(
+                &create_request(70, "commit-time-test", 0x42, 1),
+                RequestAuthority::TRUSTED,
+            )
+            .unwrap();
+        let first = executor
+            .execute(&commit_request(71), principal(0xa1))
+            .unwrap();
+        let protocol::WorkspaceResult::Operation(first_status) = first.result else {
+            panic!("commit prepare returned the wrong result variant");
+        };
+        let initiator = Some(protocol::PrincipalIdentity([0xa1; types::FIXED_ID_BYTES]));
+        assert_eq!(first_status.initiator, initiator);
+        let first_preparation = first_status.commit_preparation.unwrap();
+
+        // The projection digest is the committing principal's claim. Neither
+        // another writer nor an operator can present the operation with
+        // another one.
+        for (request_fill, authority) in [(72, principal(0xb2)), (73, operator(0xc3))] {
+            let mut forged = commit_request(request_fill);
+            let protocol::WorkspaceRequest::Commit(request) = &mut forged.operation else {
+                unreachable!("commit_request always creates a commit request");
+            };
+            request.projection_input_digest.0[0] ^= 0xff;
+            let failure = executor.execute(&forged, authority).unwrap_err();
+            assert_eq!(failure.code, protocol::ErrorCode::RequestReplayMismatch);
+            assert!(!failure.retryable);
+        }
+
+        let status = executor
+            .execute(
+                &protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([74; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::GetOperation(
+                        protocol::GetOperationRequest {
+                            operation_id: first_preparation.request.operation_id,
+                        },
+                    ),
+                },
+                principal(0xb2),
+            )
+            .unwrap();
+        let protocol::WorkspaceResult::Operation(status) = status.result else {
+            panic!("get operation returned the wrong result variant");
+        };
+        assert_eq!(status.state, protocol::OperationState::Running);
+        assert_eq!(status.initiator, initiator);
+        assert_eq!(status.commit_preparation, Some(first_preparation));
+    }
+
+    #[test]
     fn commit_prepare_rejects_a_changed_projection_input_digest() {
         let (_store, executor) = ready_executor();
         executor

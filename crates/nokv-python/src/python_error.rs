@@ -198,10 +198,14 @@ impl OperationCall {
 
     /// The action after a failure of `class`. An absent operation is a
     /// point-in-time observation: resubmitting the command that names it
-    /// admits it at most once. A cleanup request names its saved state
-    /// digest, so its retry repeats that digest.
+    /// admits it at most once. A cleanup request whose answer was lost names
+    /// its saved state digest, so its retry repeats that digest; a refused
+    /// one is the refusal's to act on.
     fn next_action(self, error: &ClientError, class: ErrorClass) -> NextAction {
-        if self != Self::Observe && matches!(error, ClientError::AppendCleanupUnresolved { .. }) {
+        if self != Self::Observe
+            && class == ErrorClass::OutcomeUnknown
+            && matches!(error, ClientError::AppendCleanupUnresolved { .. })
+        {
             NextAction::RetrySameCleanup
         } else if self != Self::Append && class == ErrorClass::NotFound {
             NextAction::ResubmitSame
@@ -708,6 +712,25 @@ pub(crate) mod tests {
                         OperationCall::Recover,
                     ),
                     ("AppendError", "outcome_unknown", "retry_same_cleanup"),
+                ),
+                // A cleanup retry of another principal's append is refused.
+                (
+                    append_failure(
+                        py,
+                        ClientError::AppendCleanupUnresolved {
+                            operation_id: OPERATION,
+                            expected_token: OperationToken {
+                                operation_id: OPERATION,
+                                state_digest: Digest([0xcc; 32]),
+                            },
+                            receipt: None,
+                            source: Box::new(rpc(ErrorCode::PermissionDenied, false)),
+                        },
+                        OPERATION,
+                        None,
+                        OperationCall::Recover,
+                    ),
+                    ("AppendError", "permission_denied", "operator"),
                 ),
                 // An absent operation is resubmitted; it is admitted at most once.
                 (
