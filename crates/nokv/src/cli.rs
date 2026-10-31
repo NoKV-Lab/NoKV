@@ -659,7 +659,12 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
                 )?;
             }
             "--advertise-endpoint" => {
-                server.advertise_endpoint = Some(next_value(&mut arguments, &argument)?);
+                // Clients connect to the published route as a socket address
+                // and do not resolve host names, so refuse anything else here
+                // rather than publish a route no client can use.
+                let endpoint = next_value(&mut arguments, &argument)?;
+                parse_address("--advertise-endpoint", endpoint.clone())?;
+                server.advertise_endpoint = Some(endpoint);
             }
             "--node-id" => server.node_id = Some(next_value(&mut arguments, &argument)?),
             "--metadata-create" => {
@@ -2933,6 +2938,24 @@ mod tests {
     }
 
     #[test]
+    fn an_advertised_endpoint_must_be_a_socket_address() {
+        for endpoint in ["nokv-owner:7750", "metadata-a.internal:7750", "10.0.0.5"] {
+            assert_eq!(
+                parse(args(&["--advertise-endpoint", endpoint, "serve"])),
+                Err(CliError::InvalidAddress {
+                    option: "--advertise-endpoint",
+                    value: endpoint.to_owned(),
+                }),
+                "{endpoint}"
+            );
+        }
+        for endpoint in ["10.0.0.5:7750", "[fd00::5]:7750"] {
+            let parsed = parse(args(&["--advertise-endpoint", endpoint, "serve"])).unwrap();
+            assert_eq!(parsed.server.advertise_endpoint.as_deref(), Some(endpoint));
+        }
+    }
+
+    #[test]
     fn server_metadata_open_mode_is_explicit_and_unique() {
         let parsed = parse(args(&[
             "--metadata-reopen",
@@ -2940,7 +2963,7 @@ mod tests {
             "--node-id",
             "owner-a",
             "--advertise-endpoint",
-            "metadata-a.internal:7750",
+            "10.0.0.5:7750",
             "serve",
         ]))
         .unwrap();
@@ -2953,7 +2976,7 @@ mod tests {
         assert_eq!(parsed.server.node_id.as_deref(), Some("owner-a"));
         assert_eq!(
             parsed.server.advertise_endpoint.as_deref(),
-            Some("metadata-a.internal:7750")
+            Some("10.0.0.5:7750")
         );
 
         assert_eq!(

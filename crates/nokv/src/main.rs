@@ -1652,7 +1652,7 @@ OWNER:
   a root bound to a tenant is served only over RPC TLS: a plaintext serve refuses to start
   --root-id HEX32 (--etcd-endpoint URL | --control-dir PATH) --node-id ID
   --append-activity-lease-ms N: serve only, range 1000..=86400000, default 1800000; clock-skew grace is additional
-  --advertise-endpoint HOST:PORT --bind HOST:PORT
+  --advertise-endpoint IP:PORT --bind IP:PORT (clients connect to the advertised IP:PORT; host names are not resolved)
   --etcd-lease-ttl-seconds N (default 10; owner keepalive runs every max(1, N/3) seconds)
   --handshake-timeout-millis N --max-inflight-connections N
   --metadata-create PATH starts the first standalone local-WAL owner
