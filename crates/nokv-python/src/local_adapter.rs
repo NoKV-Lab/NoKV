@@ -497,16 +497,13 @@ enum Publication {
     /// Link the staged file under its final name, which fails with `EEXIST`
     /// when the name exists, then drop the staging name.
     Link,
-    /// Create the final name with `O_CREAT | O_EXCL` under the pinned
-    /// directory and write the bytes again; create-only without staging.
-    CreateExclusive,
 }
 
 #[cfg(unix)]
 impl Publication {
     /// The next strategy to try when a file system refuses this one, such as
-    /// the Linux NFS client's `EINVAL` for every rename flag or a provider
-    /// without hard links.
+    /// the Linux NFS client's `EINVAL` for every rename flag. If linking also
+    /// fails, publishing must fail rather than expose a partially written file.
     fn fallback(self, error: &io::Error) -> Option<Self> {
         let code = error.raw_os_error();
         let refused = |candidates: &[Errno]| {
@@ -520,33 +517,19 @@ impl Publication {
             {
                 Some(Self::Link)
             }
-            Self::Link
-                if refused(&[
-                    Errno::INVAL,
-                    Errno::NOSYS,
-                    Errno::NOTSUP,
-                    Errno::OPNOTSUPP,
-                    Errno::PERM,
-                    Errno::XDEV,
-                    Errno::MLINK,
-                ]) =>
-            {
-                Some(Self::CreateExclusive)
-            }
             _ => None,
         }
     }
 }
 
 /// Publish the staged file `staging` under `name` in the pinned `directory`,
-/// never replacing an existing name; `bytes` are the staged contents, needed
-/// only by the last fallback. Returns the strategy that succeeded.
+/// never replacing an existing name or exposing incomplete bytes. Returns the
+/// strategy that succeeded.
 #[cfg(unix)]
 fn publish_staged(
     directory: &File,
     staging: &str,
     name: &OsStr,
-    bytes: &[u8],
     first: Publication,
 ) -> io::Result<Publication> {
     let mut strategy = first;
@@ -571,9 +554,6 @@ fn publish_staged(
             .map(|()| {
                 let _ = unlinkat(directory, staging, AtFlags::empty());
             }),
-            Publication::CreateExclusive => create_exclusive(directory, name, bytes).map(|()| {
-                let _ = unlinkat(directory, staging, AtFlags::empty());
-            }),
         };
         match attempt {
             Ok(()) => return Ok(strategy),
@@ -583,18 +563,6 @@ fn publish_staged(
             },
         }
     }
-}
-
-#[cfg(unix)]
-fn create_exclusive(directory: &File, name: &OsStr, bytes: &[u8]) -> io::Result<()> {
-    let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let descriptor = openat(directory, name, flags, Mode::from_bits_retain(0o666))?;
-    let mut file = File::from(descriptor);
-    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-        let _ = unlinkat(directory, name, AtFlags::empty());
-        return Err(error);
-    }
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -793,7 +761,6 @@ fn create_materialized_file_with_hook(
         &parent,
         staging_name.as_str(),
         OsStr::new(*file_name),
-        bytes,
         Publication::RenameNoReplace,
     );
     if let Err(error) = published {
@@ -803,26 +770,7 @@ fn create_materialized_file_with_hook(
             target.display()
         ));
     }
-    let identity = match published {
-        // The exclusive create wrote a new inode under the final name.
-        Ok(Publication::CreateExclusive) => {
-            let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-            match openat(&parent, *file_name, flags, Mode::empty())
-                .map_err(io::Error::from)
-                .and_then(|descriptor| File::from(descriptor).metadata())
-            {
-                Ok(metadata) => (metadata.dev(), metadata.ino()),
-                Err(error) => {
-                    let _ = unlinkat(&parent, *file_name, AtFlags::empty());
-                    return Err(format!(
-                        "cannot inspect published materialized file {}: {error}",
-                        target.display()
-                    ));
-                }
-            }
-        }
-        _ => (metadata.dev(), metadata.ino()),
-    };
+    let identity = (metadata.dev(), metadata.ino());
     let created = CreatedMaterializedFile {
         path: target,
         directories: directories.iter().map(OsString::from).collect(),
@@ -1036,52 +984,34 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn publication_fallbacks_stay_create_only() {
-        for strategy in [Publication::Link, Publication::CreateExclusive] {
-            let directory = tempfile::tempdir().unwrap();
-            let base = directory.path().canonicalize().unwrap();
-            let handle = File::open(&base).unwrap();
-            fs::write(base.join(".staging"), b"first").unwrap();
-            let used = publish_staged(
-                &handle,
-                ".staging",
-                OsStr::new("out.bin"),
-                b"first",
-                strategy,
-            )
-            .unwrap();
-            assert_eq!(used, strategy);
-            assert_eq!(fs::read(base.join("out.bin")).unwrap(), b"first");
-            assert!(
-                !base.join(".staging").exists(),
-                "{strategy:?} must drop the staging name"
-            );
+        let strategy = Publication::Link;
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        let handle = File::open(&base).unwrap();
+        fs::write(base.join(".staging"), b"first").unwrap();
+        let used = publish_staged(&handle, ".staging", OsStr::new("out.bin"), strategy).unwrap();
+        assert_eq!(used, strategy);
+        assert_eq!(fs::read(base.join("out.bin")).unwrap(), b"first");
+        assert!(
+            !base.join(".staging").exists(),
+            "{strategy:?} must drop the staging name"
+        );
 
-            fs::write(base.join(".staging"), b"second").unwrap();
-            let error = publish_staged(
-                &handle,
-                ".staging",
-                OsStr::new("out.bin"),
-                b"second",
-                strategy,
-            )
-            .unwrap_err();
-            assert_eq!(
-                error.kind(),
-                io::ErrorKind::AlreadyExists,
-                "{strategy:?}: {error}"
-            );
-            assert_eq!(fs::read(base.join("out.bin")).unwrap(), b"first");
-        }
+        fs::write(base.join(".staging"), b"second").unwrap();
+        let error =
+            publish_staged(&handle, ".staging", OsStr::new("out.bin"), strategy).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::AlreadyExists,
+            "{strategy:?}: {error}"
+        );
+        assert_eq!(fs::read(base.join("out.bin")).unwrap(), b"first");
         let refused = io::Error::from_raw_os_error(Errno::INVAL.raw_os_error());
         assert_eq!(
             Publication::RenameNoReplace.fallback(&refused),
             Some(Publication::Link)
         );
-        assert_eq!(
-            Publication::Link.fallback(&refused),
-            Some(Publication::CreateExclusive)
-        );
-        assert_eq!(Publication::CreateExclusive.fallback(&refused), None);
+        assert_eq!(Publication::Link.fallback(&refused), None);
         let exists = io::Error::from_raw_os_error(Errno::EXIST.raw_os_error());
         assert_eq!(Publication::RenameNoReplace.fallback(&exists), None);
     }
