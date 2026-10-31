@@ -1618,9 +1618,14 @@ fn lease_id_i64(lease_id: u64) -> Result<i64, ControlError> {
 }
 
 /// Classify an etcd failure. A refusal of this process's identity or of the
-/// key it touched is typed so that callers stop instead of retrying; every
+/// key it touched is typed so that callers stop instead of retrying, and an
+/// endpoint the client library cannot parse is the caller's mistake; every
 /// other failure stays a transient backend error.
 pub(crate) fn etcd_backend(error: etcd_client::Error) -> ControlError {
+    // The library parses each endpoint before it connects, and only there.
+    if let etcd_client::Error::InvalidUri(_) = &error {
+        return ControlError::InvalidOptions(format!("an etcd endpoint cannot be used: {error}"));
+    }
     if let etcd_client::Error::GRpcStatus(status) = &error {
         let message = status.message();
         let names_identity =
@@ -1776,6 +1781,33 @@ pub(crate) mod tests {
             assert!(matches!(other, ControlError::Backend(_)), "{other}");
             assert_eq!(other.class(), ErrorClass::Transient);
         }
+    }
+
+    /// The client library refuses an endpoint it cannot parse before it
+    /// connects. Whatever the options check lets through, that is still the
+    /// caller's mistake, not an unreachable etcd.
+    #[test]
+    fn an_endpoint_the_client_library_cannot_parse_is_invalid_options() {
+        let unparsable = "http://127.0.0.1:2379/a path"
+            .parse::<tonic::codegen::http::Uri>()
+            .unwrap_err();
+        let refused = etcd_backend(etcd_client::Error::InvalidUri(unparsable));
+        assert!(
+            matches!(refused, ControlError::InvalidOptions(_)),
+            "{refused}"
+        );
+        assert_eq!(refused.class(), ErrorClass::InvalidInput);
+        assert!(refused.to_string().contains("invalid uri"), "{refused}");
+        // The refusal never repeats the endpoint, so credentials in it stay
+        // out of every message.
+        let unparsable = "http://user:s3cr3t@exa mple:2379"
+            .parse::<tonic::codegen::http::Uri>()
+            .unwrap_err();
+        let refused = etcd_backend(etcd_client::Error::InvalidUri(unparsable));
+        assert!(
+            !refused.to_string().contains("s3cr3t"),
+            "the refusal repeats credentials"
+        );
     }
 
     use etcd_client::DeleteOptions;

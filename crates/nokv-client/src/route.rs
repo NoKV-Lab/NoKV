@@ -378,8 +378,9 @@ impl EtcdRouteOptions {
     }
 }
 
-/// A control-plane refusal of this client keeps its class, so that a caller
-/// stops; any other control failure is an unresolvable route.
+/// A control-plane refusal of this client, or the local control store's
+/// refusal of its own directory, keeps its class, so that a caller stops;
+/// any other control failure is an unresolvable route.
 #[cfg(feature = "control")]
 fn control_error(error: nokv_control::ControlError) -> ClientError {
     use nokv_control::ControlError;
@@ -391,6 +392,11 @@ fn control_error(error: nokv_control::ControlError) -> ClientError {
         ControlError::PermissionDenied(message) => ClientError::ControlRefusal {
             class: ErrorClass::PermissionDenied,
             message,
+        },
+        // Someone else may have changed the records: an operator decides.
+        refused @ ControlError::ControlPathRefused { .. } => ClientError::ControlRefusal {
+            class: refused.class(),
+            message: refused.to_string(),
         },
         // The control options cannot work as given (for example, the CA
         // does not sign etcd's certificate): a usage error, not a route.
@@ -433,6 +439,21 @@ mod control_tests {
             assert_eq!(mapped.class().for_read(), class);
             assert!(!mapped.retryable());
         }
+        let refused = control_error(ControlError::ControlPathRefused {
+            path: "/srv/ctl".into(),
+            reason: "group or other users can write it (mode 770); run `chmod go-w` on it"
+                .to_owned(),
+        });
+        assert!(
+            matches!(&refused, ClientError::ControlRefusal { .. }),
+            "{refused}"
+        );
+        assert_eq!(refused.class(), ErrorClass::OperatorRequired);
+        assert_eq!(refused.class().for_read(), ErrorClass::OperatorRequired);
+        assert!(!refused.retryable());
+        assert!(refused
+            .to_string()
+            .contains("refuses /srv/ctl: group or other users"));
         assert!(matches!(
             control_error(ControlError::Backend("etcd: leader changed".to_owned())),
             ClientError::InvalidRoute(_)
