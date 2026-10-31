@@ -911,10 +911,12 @@ fn request_client_failure(
 
 /// A failure of an append or operation command over its caller operation id.
 fn append_client_failure(error: nokv_client::ClientError) -> CliFailure {
+    // A cleanup retry whose answer was lost is repeated with its saved state
+    // digest; a refused one is the refusal's to act on.
     let cleanup_unresolved = matches!(
         error,
         nokv_client::ClientError::AppendCleanupUnresolved { .. }
-    );
+    ) && error.class() == ErrorClass::OutcomeUnknown;
     let failure = CliFailure::from_agent(
         &backend::map_append_client_error(error).into(),
         IdempotencyScope::CallerOperation,

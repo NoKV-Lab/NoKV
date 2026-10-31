@@ -2949,6 +2949,7 @@ fn map_idempotent_publish_error(error: nokv_client::IdempotentPublishError) -> a
 }
 
 fn map_client_error_shape(error: ClientError) -> agent::BackendError {
+    let outcome_unknown = error.class() == ErrorClass::OutcomeUnknown;
     if let ClientError::AppendCleanupUnresolved {
         operation_id,
         expected_token,
@@ -2962,7 +2963,9 @@ fn map_client_error_shape(error: ClientError) -> agent::BackendError {
         mapped.details["operation_id"] = json!(super::encode_lowercase_hex(&operation_id.0));
         mapped.details["expected_state_digest"] =
             json!(super::encode_lowercase_hex(&expected_token.state_digest.0));
-        mapped.details["next_action"] = json!("retry_same_cleanup");
+        if outcome_unknown {
+            mapped.details["next_action"] = json!("retry_same_cleanup");
+        }
         mapped.details["publication_operation_id"] = json!(receipt
             .as_ref()
             .map(|value| super::encode_lowercase_hex(&value.publication_operation_id.0)));
@@ -7676,6 +7679,34 @@ mod tests {
         assert_eq!(error.details["state"], "Running");
         assert_eq!(error.details["code"], "Conflict");
         assert!(!error.retryable);
+    }
+
+    #[test]
+    fn a_refused_cleanup_retry_is_reported_as_the_refusal() {
+        let operation_id = wire::OperationIdentity([0xaa; 16]);
+        let failure = super::super::append_client_failure(ClientError::AppendCleanupUnresolved {
+            operation_id,
+            expected_token: wire::OperationToken {
+                operation_id,
+                state_digest: wire::Digest([0xbb; 32]),
+            },
+            receipt: None,
+            source: Box::new(ClientError::Rpc(wire::RpcFailure {
+                code: wire::ErrorCode::PermissionDenied,
+                message: "principal b2 did not begin this operation".to_owned(),
+                retryable: false,
+                conflict: None,
+                current_generation: None,
+                route_hint: None,
+            })),
+        });
+        let failure = super::super::with_append_details(failure, operation_id);
+        let json: Value = serde_json::from_str(&failure.to_line()).unwrap();
+        assert_eq!(json["class"], "permission_denied");
+        assert_eq!(json["next_action"], "operator");
+        assert_eq!(json["details"]["next_action"], "operator");
+        assert_eq!(json["details"]["expected_state_digest"], "bb".repeat(32));
+        assert_eq!(json["retryable"], false);
     }
 
     #[test]

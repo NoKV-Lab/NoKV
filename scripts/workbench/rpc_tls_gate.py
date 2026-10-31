@@ -25,6 +25,14 @@ Every TLS owner keeps an audit log (`--audit-log`). Each of its lines must be
 one JSON object with the documented keys, and the refusals one scenario
 provokes must each appear with the peer, certificate, principal, root and
 request that apply.
+
+One scenario provisions a root of the same tenant on a second logical shard
+and serves it with a second owner that writes through the append gates' object
+fault proxy and has a one-second activity lease. It kills an appending caller
+while that owner's first block write is held, and makes the cleanup's seal of
+that block lose its answer while a HEAD of it fails, so the owner quarantines
+the append. Only the append's initiator or an operator may then retry its
+cleanup. The first owner keeps serving the other scenarios unchanged.
 """
 
 from __future__ import annotations
@@ -41,11 +49,13 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
+import append_product_acceptance_gate as append_gate
 from cli_contract_gate import (
     REPOSITORY,
     Call,
@@ -64,6 +74,12 @@ WORKBENCH = "tls"
 # Two object blocks at the default block size, so the body cannot publish
 # inline and the owner must write more than one object.
 MULTI_BLOCK_BODY_BYTES = 4 * 1024 * 1024 + 17
+# t23: the shortest activity lease the CLI accepts, so the owner fences the
+# dead caller's child publication within the scenario, and a block size that
+# makes an 8 KiB append two object blocks, which cannot publish inline.
+QUARANTINE_LEASE_MS = 1000
+APPEND_BLOCK_BYTES = 4096
+QUARANTINE_WORKBENCH_ROOT = "/agents/rpc-tls-quarantine/wb"
 # The keys of every audit log line (docs/cli-contract.md).
 AUDIT_KEYS = {
     "time_unix_ms", "event", "reason", "peer", "tenant_id", "certificate_fingerprint",
@@ -312,6 +328,17 @@ class TlsStack(Stack):
         # Evidence keeps the certificates, never the private keys.
         for key in self.pki.directory.glob("*.key"):
             key.unlink()
+
+    def spawn(self, label: str, arguments: list[str], *, tls: str = "agent", root: str) -> subprocess.Popen:
+        """Start one command against `root` as `run` would, without waiting."""
+        route = list(self.route)
+        route[route.index("--root-id") + 1] = root
+        argv = [
+            str(self.binary), *route, "--agent-id", self.ids["agent"],
+            *self.object_options(arguments[0]), *self.tls_options(tls, SERVER_NAME), *arguments,
+        ]
+        return subprocess.Popen(argv, stdout=(self.evidence / f"{label}.stdout").open("wb"),
+                                stderr=(self.evidence / f"{label}.stderr").open("wb"), env=self.env)
 
     def audit_lines(self) -> list[dict[str, Any]]:
         """Every line the owners appended to the audit log, each checked to be
@@ -1045,6 +1072,155 @@ def every_refusal_is_audited(stack: TlsStack) -> dict[str, Any]:
     }
 
 
+def await_operation(stack: TlsStack, operation_id: str, reached: Callable[[dict[str, Any]], bool],
+                    label: str, seconds: float, root: str) -> dict[str, Any]:
+    """Poll `operation status` on `root` until `reached` holds."""
+    deadline = time.monotonic() + seconds
+    observed: list[dict[str, Any]] = []
+    while True:
+        status = stack.success(stack.run(f"{label}-{len(observed):02d}", ["operation", "status", operation_id],
+                                         root=root))
+        observed.append(status)
+        if reached(status):
+            return status
+        if time.monotonic() >= deadline:
+            raise ContractFailure(f"{label}: the operation did not reach the expected state: {observed[-3:]}")
+        time.sleep(0.25)
+
+
+def only_the_initiator_or_an_operator_retries_a_quarantined_append(stack: TlsStack) -> dict[str, Any]:
+    """T23: the owner quarantines an append whose caller died mid-upload and
+    whose cleanup cannot confirm its seal. Another writer may read the
+    operation, but its `operation recover` is refused `permission_denied`,
+    changes nothing, and is audited; an operator's retry is accepted; the
+    initiator then completes the append exactly once. A second owner serves a
+    root of the same tenant on its own shard, so the first owner, which may not
+    restart once t15 has bound a root of its shard to another tenant, keeps
+    serving unchanged."""
+    root, shard, port = new_id(), new_id(), free_port()
+    stack.success(stack.run("t23-provision", ["provision", shard, "--workbench-root", QUARANTINE_WORKBENCH_ROOT],
+                            root=root))
+    stack.identity("t23-root", "root", "bind", root, stack.tenant)
+    endpoint = stack.owner_objects[stack.owner_objects.index("--object-endpoint") + 1]
+    proxy = append_gate.ObjectProxy(types.SimpleNamespace(timeout=stack.timeout, record=stack.write),
+                                    free_port(), urllib.parse.urlsplit(endpoint).port)
+    proxy.start()
+    route = list(stack.route)
+    route[route.index("--root-id") + 1] = root
+    argv = [
+        str(stack.binary), *route,
+        *with_object_endpoint(stack.owner_objects, f"http://127.0.0.1:{proxy.port}"),
+        "--rpc-tls-cert", str(stack.pki.directory / "owner.pem"),
+        "--rpc-tls-key", str(stack.pki.directory / "owner.key"),
+        "--audit-log", str(stack.audit_log),
+        "--bind", f"127.0.0.1:{port}", "--advertise-endpoint", f"127.0.0.1:{port}",
+        "--node-id", "rpc-tls-quarantine-owner",
+        "--append-activity-lease-ms", str(QUARANTINE_LEASE_MS),
+        "--metadata-create", str(stack.evidence / "t23-metadata"),
+        "serve",
+    ]
+    owner = subprocess.Popen(argv, stdout=(stack.evidence / "owner-t23.log").open("wb"),
+                             stderr=subprocess.STDOUT, env=stack.env)
+    try:
+        stack.wait_tcp(port, "the t23 owner")
+        deadline = time.monotonic() + stack.timeout
+        while '"NotFound"' not in stack.run("t23-owner-ready", ["operation", "status", new_id()], root=root).stderr:
+            if owner.poll() is not None or time.monotonic() >= deadline:
+                raise NotQualified("the t23 owner did not become ready")
+            time.sleep(0.2)
+        evidence = quarantined_append_continuations(stack, proxy, root)
+        require(not proxy.errors, "t23: the object proxy forwarded every request", proxy.errors)
+        return evidence
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+        owner.wait(timeout=stack.timeout)
+        proxy.close()
+
+
+def quarantined_append_continuations(stack: TlsStack, proxy: Any, root: str) -> dict[str, Any]:
+    stack.success(stack.run("t23-create", ["workbench", "workbench_create", json.dumps({"id": WORKBENCH})],
+                            root=root))
+    operation_id = new_id()
+    body = b"".join(index.to_bytes(4, "big") + bytes([index + 1]) * (APPEND_BLOCK_BYTES - 4) for index in range(2))
+    source = stack.files / "t23-append.body"
+    source.write_bytes(body)
+    append = [
+        "workspace-path", "append", WORKBENCH, "logs", "t23.log", "--operation-id", operation_id,
+        "--file", str(source), "--content-type", "application/octet-stream",
+        "--max-logical-size", str(4 * 1024 * 1024), "--block-size", str(APPEND_BLOCK_BYTES),
+    ]
+    # The cleanup's seal of the first block persists but loses its answer, and
+    # every HEAD of that block then fails, so the owner cannot confirm it.
+    with proxy.lock:
+        proxy.rule = {"method": "PUT", "action": "seal_ack_loss_head_failure",
+                      "path_suffix": "/blocks/0000000000000000"}
+    proxy.hold_next_put()
+    caller = stack.spawn("t23-caller", append, root=root)
+    try:
+        deadline = time.monotonic() + stack.timeout
+        while not proxy.held.wait(0.05):
+            if caller.poll() is not None or time.monotonic() >= deadline:
+                raise NotQualified(f"t23: the owner wrote no block while the caller ran (exit {caller.poll()})")
+        caller.kill()
+        caller.wait(timeout=stack.timeout)
+    finally:
+        proxy.release.set()
+    held = proxy.held_request
+    require(proxy.released_response.wait(stack.timeout) and held["path"].endswith("/blocks/0000000000000000")
+            and held["if_none_match"] == "*" and held["request_bytes"] == APPEND_BLOCK_BYTES,
+            "t23: the dead caller's first block reached the provider", held)
+
+    # "fourth" writes every root of the tenant; "operator" is a tenant operator.
+    agent, peer = stack.principals["agent"], stack.principals["fourth"]
+    quarantined = await_operation(stack, operation_id, lambda status: status.get("state") == "quarantined",
+                                  "t23-quarantine", QUARANTINE_LEASE_MS / 1000 + 2 * stack.timeout, root)
+    require(quarantined.get("initiator") == agent and quarantined.get("cleanup_retry_count") == 0,
+            "t23: the quarantined append names its initiator and has no retry yet", quarantined)
+    require([fault["fault"] for fault in proxy.fired] == ["seal_ack_loss_head_failure"],
+            "t23: the cleanup's seal lost its answer once", proxy.fired)
+
+    # Another writer of the root reads the operation, but cannot continue it.
+    seen = stack.success(stack.run("t23-peer-status", ["operation", "status", operation_id],
+                                   tls="fourth", root=root))
+    require(seen.get("state") == "quarantined" and seen.get("initiator") == agent,
+            "t23: another writer sees the quarantined append and its initiator", seen)
+    audited = len(stack.audit_lines())
+    refused = stack.failure(stack.run("t23-peer-recover", ["operation", "recover", operation_id],
+                                      tls="fourth", root=root), "permission_denied", "operator")
+    unchanged = stack.success(stack.run("t23-after-peer", ["operation", "status", operation_id], root=root))
+    require(unchanged.get("state") == "quarantined" and unchanged.get("cleanup_retry_count") == 0,
+            "t23: the refused retry changed nothing", unchanged)
+    denials = [line for line in stack.audit_lines()[audited:] if line["reason"] == "not_the_initiator"]
+    require(len(denials) == 1 and denials[0]["principal_id"] == peer and denials[0]["root_id"] == root
+            and denials[0]["request"] == "RetryAppendCleanup" and denials[0]["detail"],
+            "t23: the owner audited the refused retry with the peer, the root and the RPC", denials)
+
+    # The provider answers again; an operator retries the cleanup.
+    with proxy.lock:
+        proxy.reject_matching = None
+    accepted = stack.success(stack.run("t23-operator-recover", ["operation", "recover", operation_id],
+                                       tls="operator", root=root))
+    receipt = accepted.get("recovery_receipt") or {}
+    require(accepted.get("requested") is True and receipt.get("operation_id") == operation_id
+            and receipt.get("cleanup_retry_count") == 1,
+            "t23: an operator's retry of another principal's cleanup is accepted", accepted)
+    ready = await_operation(stack, operation_id,
+                            lambda status: status.get("state") == "ready_to_retry"
+                            and status.get("next_action") == "resubmit_same",
+                            "t23-ready", 2 * stack.timeout, root)
+    require(ready.get("initiator") == agent and ready.get("cleanup_retry_count") == 1,
+            "t23: the operator's retry kept the initiator", ready)
+
+    completed = stack.success(stack.run("t23-resubmit", append, root=root))
+    target = stack.files / "t23.read"
+    stack.success(stack.run("t23-read", ["materialize", WORKBENCH, "logs", "t23.log", str(target)], root=root))
+    require(target.read_bytes() == body, "t23: the initiator's resubmission appended the body exactly once",
+            {"read_bytes": target.stat().st_size, "expected": len(body)})
+    return {"held_block": held, "quarantined": quarantined, "peer_refusal": refused, "audited": denials[0],
+            "operator_retry": accepted, "ready": ready, "completed": completed}
+
+
 SCENARIOS: dict[str, Callable[[TlsStack], dict]] = {
     "t1_registered_client_round_trip": registered_client_round_trip,
     "t2_unregistered_certificate_refused": unregistered_certificate_refused,
@@ -1072,6 +1248,8 @@ SCENARIOS: dict[str, Callable[[TlsStack], dict]] = {
     "t21_a_principal_of_another_tenant_is_refused_without_a_route":
         a_principal_of_another_tenant_is_refused_without_a_route,
     "t22_every_refusal_is_audited": every_refusal_is_audited,
+    "t23_only_the_initiator_or_an_operator_retries_a_quarantined_append":
+        only_the_initiator_or_an_operator_retries_a_quarantined_append,
 }
 
 
