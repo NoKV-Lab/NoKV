@@ -332,6 +332,38 @@ fn object_failure(error: nokv_object::ObjectError) -> CliFailure {
     control_failure("ObjectProviderFailed", error.to_string(), error.class())
 }
 
+/// The object provider admission `provision` and `serve` run before any
+/// object write, repeated within the command's retry budget while it fails
+/// before it could take effect (an unreachable or inconclusive provider).
+/// A provider that lacks a required capability is `operator_required`.
+fn admit_object_provider(
+    objects: &CliObjectStore,
+    invocation: &Invocation,
+) -> Result<(), CliFailure> {
+    objects
+        .admit_within(
+            connection::client_options(&invocation.client),
+            std::thread::sleep,
+        )
+        .map_err(|(error, attempts)| {
+            let mut failure = control_failure(
+                "ProviderAdmissionFailed",
+                format!(
+                    "{error} after {attempts} attempt{}",
+                    if attempts == 1 { "" } else { "s" }
+                ),
+                error.class(),
+            );
+            failure.details_mut()["attempts"] = json!(attempts);
+            failure
+        })
+}
+
+#[cfg(feature = "control")]
+fn provision_failure(error: provision::ProvisionError) -> CliFailure {
+    control_failure(error.code(), error.to_string(), error.class())
+}
+
 /// An Agent-facing command's admitted connection to its root, and the
 /// Workbench root the control plane binds that root to.
 struct AdmittedRoot {
@@ -1597,6 +1629,8 @@ CLIENT RETRIES:
   --retry-backoff-ms N (default 0) --max-retry-backoff-ms N (default 2000): the pause before the second attempt,
     doubling per further attempt up to the bound; 0 repeats at once, and a backoff above its bound is invalid_input
   a workbench-session that must outlive an owner restart starts with --max-attempts 16 --retry-backoff-ms 250
+  provision and serve repeat the object provider's admission probe within the same budget while the provider
+    is unreachable; a provider that lacks a required capability fails at once as operator_required
   with a backoff set, an identified write the owner left running when it died is re-observed with the same budget
     until the restarted owner has aborted it and the next attempt publishes; in_progress is answered when the
     budget runs out, or at once without a backoff
@@ -1691,70 +1725,71 @@ fn run_provision(
     workbench_root: &str,
     adopt_legacy_object_namespace: bool,
     adopt_legacy_agent_binding: bool,
-) -> Result<(), String> {
+) -> Result<(), CliFailure> {
     use nokv_control::{LogicalShardId, RootId, RootPresentationBinding};
     use nokv_types::{RootPlacementLifecycle, WorkbenchRoot};
 
+    let control_error = |error: nokv_control::ControlError| {
+        control_failure("ControlFailure", error.to_string(), error.class())
+    };
     let root_id = RootId::from(
-        connection::configured_root_id(&invocation.client).map_err(|error| error.to_string())?,
+        connection::configured_root_id(&invocation.client).map_err(connection_failure)?,
     );
     let logical_shard_id = LogicalShardId::from(
-        connection::parse_logical_shard_id(logical_shard_id).map_err(|error| error.to_string())?,
+        connection::parse_logical_shard_id(logical_shard_id).map_err(connection_failure)?,
     );
     let agent_id = connection::parse_agent_id(
         invocation
             .agent_id
             .as_deref()
-            .ok_or_else(|| "provision requires --agent-id".to_owned())?,
+            .ok_or_else(|| CliFailure::invalid_input("provision requires --agent-id"))?,
     )
-    .map_err(|error| error.to_string())?;
-    let workbench_root =
-        WorkbenchRoot::new(workbench_root).map_err(|error| format!("--workbench-root: {error}"))?;
-    let connection::ControlPlane { control, identity } =
-        open_control_plane(invocation).map_err(|failure| failure.message())?;
+    .map_err(connection_failure)?;
+    let workbench_root = WorkbenchRoot::new(workbench_root)
+        .map_err(|error| CliFailure::invalid_input(format!("--workbench-root: {error}")))?;
+    let connection::ControlPlane { control, identity } = open_control_plane(invocation)?;
     let existing_placement =
         provision::preflight_provision(control.as_ref(), root_id, logical_shard_id)
-            .map_err(|error| error.to_string())?;
+            .map_err(provision_failure)?;
     let binding_preexisting = provision::ensure_root_agent_binding(
         control.as_ref(),
         root_id,
         agent_id,
         adopt_legacy_agent_binding,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(provision_failure)?;
     // Every Agent of the root presents it under this one Workbench root.
     let presentation_preexisting = identity
         .get_root_presentation(&root_id)
-        .map_err(|error| error.to_string())?
+        .map_err(control_error)?
         .is_some();
     let presentation = identity
         .bind_root_presentation(RootPresentationBinding {
             root_id,
             workbench_root,
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(control_error)?;
     // Provision proves the provider semantics the owner's writes will need.
     let objects = CliObjectStore::build(&invocation.client.object)?;
-    objects
-        .validate_append_capabilities()
-        .map_err(|error| error.to_string())?;
+    admit_object_provider(&objects, invocation)?;
     let namespace_id = match control
         .get_root_object_namespace_binding(&root_id)
-        .map_err(|error| error.to_string())?
+        .map_err(control_error)?
     {
         Some(binding) => {
             objects
                 .clone()
                 .bind(binding.object_namespace_id)
-                .map_err(|error| error.to_string())?;
+                .map_err(object_failure)?;
             binding.object_namespace_id
         }
         None => {
             if existing_placement.is_some() && !adopt_legacy_object_namespace {
-                return Err(
-                    "legacy root has no durable object namespace binding; verify the configured bucket/prefix, then rerun provision with --adopt-legacy-object-namespace"
-                        .to_owned(),
-                );
+                return Err(control_failure(
+                    "LegacyObjectNamespaceAdoptionRequired",
+                    "legacy root has no durable object namespace binding; verify the configured bucket/prefix, then rerun provision with --adopt-legacy-object-namespace",
+                    ErrorClass::OperatorRequired,
+                ));
             }
             match objects.load_namespace()? {
                 Some(existing) => existing,
@@ -1772,17 +1807,15 @@ fn run_provision(
         logical_shard_id,
         namespace_id,
     )
-    .map_err(|error| error.to_string())?;
-    objects
-        .bind(namespace_id)
-        .map_err(|error| error.to_string())?;
+    .map_err(provision_failure)?;
+    objects.bind(namespace_id).map_err(object_failure)?;
     let lifecycle = match outcome.placement.lifecycle {
         RootPlacementLifecycle::Provisioning => "provisioning",
         RootPlacementLifecycle::Active => "active",
         RootPlacementLifecycle::Draining => "draining",
         RootPlacementLifecycle::Retired => "retired",
     };
-    print_json(&json!({
+    Ok(print_json(&json!({
         "status": "success",
         "root_id": encode_lowercase_hex(root_id.as_bytes()),
         "agent_id": encode_lowercase_hex(agent_id.as_bytes()),
@@ -1797,7 +1830,7 @@ fn run_provision(
         "object_namespace_preexisting": outcome.object_namespace_preexisting,
         "placement_preexisting": outcome.placement_preexisting,
         "activation_required": outcome.activation_required,
-    }))
+    }))?)
 }
 
 #[cfg(not(feature = "control"))]
@@ -1807,8 +1840,10 @@ fn run_provision(
     _workbench_root: &str,
     _adopt_legacy_object_namespace: bool,
     _adopt_legacy_agent_binding: bool,
-) -> Result<(), String> {
-    Err("provision requires the nokv control feature".to_owned())
+) -> Result<(), CliFailure> {
+    Err("provision requires the nokv control feature"
+        .to_owned()
+        .into())
 }
 
 #[cfg(feature = "control")]
@@ -2101,7 +2136,7 @@ fn join_lifecycle_workers(
 }
 
 #[cfg(feature = "control")]
-fn run_server(invocation: &Invocation) -> Result<(), String> {
+fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
@@ -2184,17 +2219,23 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     if invocation.server.lifecycle_interval_millis == 0
         || invocation.server.lifecycle_interval_millis > 60_000
     {
-        return Err("--lifecycle-interval-millis must be within 1..=60000".to_owned());
+        return Err(CliFailure::invalid_input(
+            "--lifecycle-interval-millis must be within 1..=60000",
+        ));
     }
     if invocation.server.handshake_timeout_millis == 0
         || invocation.server.handshake_timeout_millis > 60_000
     {
-        return Err("--handshake-timeout-millis must be within 1..=60000".to_owned());
+        return Err(CliFailure::invalid_input(
+            "--handshake-timeout-millis must be within 1..=60000",
+        ));
     }
     if invocation.server.max_inflight_connections == 0
         || invocation.server.max_inflight_connections > 4_096
     {
-        return Err("--max-inflight-connections must be within 1..=4096".to_owned());
+        return Err(CliFailure::invalid_input(
+            "--max-inflight-connections must be within 1..=4096",
+        ));
     }
     let expected_namespace = object_namespace.object_namespace_id;
     let namespace_bindings = placements
@@ -2213,7 +2254,9 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         .any(|binding| binding.object_namespace_id != expected_namespace)
     {
         return Err(
-            "one shard owner cannot serve roots bound to different object namespaces".to_owned(),
+            "one shard owner cannot serve roots bound to different object namespaces"
+                .to_owned()
+                .into(),
         );
     }
     // Roots mounted after the start pass the same checks as these did.
@@ -2252,9 +2295,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
             .bind(expected_namespace)
             .map_err(|error| error.to_string())?,
     );
-    objects
-        .validate_append_capabilities()
-        .map_err(|error| error.to_string())?;
+    admit_object_provider(&objects, invocation)?;
     let registry = Arc::new(RootOwnerRegistry::new());
     let owner = bootstrap_shard(
         Arc::clone(&control),
@@ -2343,7 +2384,8 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
                 return Err(match release {
                     Ok(()) => primary,
                     Err(release) => format!("{primary}; owner release failed: {release}"),
-                });
+                }
+                .into());
             }
         }
     }
@@ -2369,7 +2411,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
                 if let Err(error) = server.release_ownership() {
                     failures.push(format!("owner release failed: {error}"));
                 }
-                return Err(failures.join("; "));
+                return Err(failures.join("; ").into());
             }
         }
     }
@@ -2463,13 +2505,13 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(failures.join("; "))
+        Err(failures.join("; ").into())
     }
 }
 
 #[cfg(not(feature = "control"))]
-fn run_server(_invocation: &Invocation) -> Result<(), String> {
-    Err("serve requires the nokv control feature".to_owned())
+fn run_server(_invocation: &Invocation) -> Result<(), CliFailure> {
+    Err("serve requires the nokv control feature".to_owned().into())
 }
 
 #[cfg(test)]

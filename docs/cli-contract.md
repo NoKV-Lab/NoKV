@@ -96,7 +96,11 @@ must outlive such a restart starts with `--max-attempts 16
 --retry-backoff-ms 250`: it waits about 26 seconds in all before giving up. A
 backoff above its bound is `invalid_input`. The Python SDK takes the same
 options as `Client(..., max_attempts=3, retry_backoff_ms=0,
-max_retry_backoff_ms=2000)`.
+max_retry_backoff_ms=2000)`. `provision` and `serve` probe the object
+provider's admission within the same budget: an unreachable or inconclusive
+provider is probed again and, once the budget is spent, fails as `transient`
+(`ProviderAdmissionFailed`, with `details.attempts`); a provider that lacks a
+required capability is `operator_required` at once.
 
 Exhausted attempts fail with class `transient` when no attempt can have
 taken effect and `outcome_unknown` when the last one may have reached the

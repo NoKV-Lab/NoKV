@@ -186,17 +186,18 @@ fn workspace_client(
         transport =
             transport.with_tls(crate::rpc_tls::client_tls(tls).map_err(ConnectionError::RpcTls)?);
     }
-    WorkspaceClient::new(
-        root_id,
-        transport,
-        routes,
-        ClientOptions {
-            max_attempts: config.max_attempts,
-            retry_backoff: Duration::from_millis(config.retry_backoff_ms),
-            max_retry_backoff: Duration::from_millis(config.max_retry_backoff_ms),
-        },
-    )
-    .map_err(ConnectionError::from)
+    WorkspaceClient::new(root_id, transport, routes, client_options(config))
+        .map_err(ConnectionError::from)
+}
+
+/// The retry budget the command line configured: attempts per request and
+/// the pause between them.
+pub fn client_options(config: &ClientConfig) -> ClientOptions {
+    ClientOptions {
+        max_attempts: config.max_attempts,
+        retry_backoff: Duration::from_millis(config.retry_backoff_ms),
+        max_retry_backoff: Duration::from_millis(config.max_retry_backoff_ms),
+    }
 }
 
 /// Decode the one canonical root identity shared by client and owner commands.

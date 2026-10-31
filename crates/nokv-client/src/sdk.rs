@@ -69,7 +69,7 @@ impl ClientOptions {
 
     /// The pause after `attempt` failed: the backoff doubled per earlier
     /// failed attempt, bounded by `max_retry_backoff`.
-    pub(crate) fn retry_delay(self, attempt: u32) -> Duration {
+    pub fn retry_delay(self, attempt: u32) -> Duration {
         let doublings = attempt.saturating_sub(1).min(31);
         self.retry_backoff
             .checked_mul(1 << doublings)
