@@ -449,7 +449,7 @@ tested `LocalSync` implementation, while S3-compatible storage still owns
 artifact bytes.
 
 This evidence snapshot covers the exact `holt = "=0.8.7"` dependency of NoKV
-0.12.1. `main` now pins `=0.8.8`, which is 0.8.7 plus a fail-closed fix: a
+0.12.1. NoKV 0.20.0 pins `=0.8.8`, which is 0.8.7 plus a fail-closed fix: a
 write that fails after changing cached frames stops the database instead of
 letting a later checkpoint persist part of it. Later upstream Holt `main`
 features are outside this section's claims; identify an installed build with

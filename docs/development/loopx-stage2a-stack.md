@@ -27,8 +27,8 @@ reconstructing the recipe by hand.
 
   ```bash
   python3 -m venv stage2a-venv
-  stage2a-venv/bin/pip install "nokv==0.12.1" \
-    --find-links https://github.com/NoKV-Lab/NoKV/releases/expanded_assets/v0.12.1
+  stage2a-venv/bin/pip install "nokv==0.20.0" \
+    --find-links https://github.com/NoKV-Lab/NoKV/releases/expanded_assets/v0.20.0
   ```
 
   The script refuses a wheel whose `__version__` differs from `nokv --version`,
