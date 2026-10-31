@@ -541,6 +541,14 @@ impl WorkspaceRequestExecutor for RecoveryPublishingExecutor {
 }
 
 impl RecoveryPublisherError {
+    /// The control plane's own failure behind this error, if there is one.
+    pub fn control_error(&self) -> Option<&ControlError> {
+        match self {
+            Self::Control(error) => Some(error),
+            _ => None,
+        }
+    }
+
     fn terminal(&self) -> bool {
         match self {
             Self::Control(ControlError::Backend(_))

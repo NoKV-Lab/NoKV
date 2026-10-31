@@ -17,9 +17,21 @@ it is for one trusted host only. NoKV creates the directory and its files
 readable and writable by their owner alone, and every command refuses a
 control directory, `sessions` directory or record file that group or other
 users can write, or that belongs to a user other than the one running the
-command or root (`invalid_input`, exit 2). Every process that uses a control
-directory therefore runs as its owner; processes of different users share a
-control plane through etcd.
+command or root. A command that writes the directory also refuses one it
+cannot create or write, and creates nothing inside a directory it refuses;
+`serve` makes all of these checks before it prepares its metadata store, and
+`provision` before it writes its first record. Someone else may have changed
+the records of such a directory, so each refusal is `operator_required` (exit
+9, `next_action` `operator`) and names the path and the fix: an operator checks
+the records, fixes the permissions, and then repeats the command. A running
+owner whose control directory becomes unsafe stops serving and exits with that
+refusal, and does not resume by itself. One that can no longer write the
+directory serves on until its next control-store write (a shared recovery
+publication, or the release of its session when it stops), and then exits with
+that refusal too. Once the permissions are fixed, a restart by its supervisor
+or the operator serves again. Every process that uses a control directory
+therefore runs as its owner; processes of different users share a control
+plane through etcd.
 
 ## What each role touches
 
@@ -137,7 +149,10 @@ the classes of the [CLI contract](cli-contract.md):
 | The same rejection, but the connection closed before the alert reached the client | `transient` | 5 |
 | The certificate is trusted, but its Common Name is no etcd user, or the user's roles do not grant the key the command needs | `permission_denied` | 11 |
 | etcd's own certificate is not signed by `--etcd-tls-ca` | `invalid_input` | 2 |
+| An `--etcd-endpoint` that is not an `http://` or `https://` URL (scheme in lowercase) naming a host, with an optional port in 1..=65535 (refused before any connection) | `invalid_input` | 2 |
+| An `--etcd-endpoint` that carries credentials (`user:password@`): etcd never receives them; the refusal shows the endpoint with them redacted | `invalid_input` | 2 |
 | etcd is unreachable, or an `http://` endpoint names a TLS listener | `transient` | 5 |
+| A `--control-dir` directory, its `sessions` directory or a record file that group or other users can write, that another user owns, or that this process cannot write | `operator_required` | 9 |
 
 etcd answers a trusted certificate with no user the same way as a user whose
 role lacks the key, "permission denied", so NoKV reports both as
