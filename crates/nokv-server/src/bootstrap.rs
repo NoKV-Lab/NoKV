@@ -2214,7 +2214,7 @@ mod tests {
     }
 
     fn add_active_root(
-        control: &InMemoryControlStore,
+        control: &dyn ControlStore,
         root_id: RootId,
         logical_shard_id: nokv_types::LogicalShardId,
     ) {
@@ -2721,6 +2721,48 @@ mod tests {
         assert_eq!(server.health().unwrap().installed_roots, 1);
         server.release_ownership().unwrap();
         assert_eq!(registry.installed_root_count().unwrap(), 0);
+    }
+
+    /// Release writes the local control store. When the store refuses a
+    /// control directory the owner can no longer write, the release fails
+    /// with that typed refusal, so the caller can say what to fix.
+    #[cfg(unix)]
+    #[test]
+    fn release_fails_with_the_control_store_refusal_itself() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root may write any directory");
+            return;
+        }
+        let temporary = TempDir::new().unwrap();
+        let directory = temporary.path().join("control");
+        let root_id = root(1);
+        let control = nokv_control::LocalControlStore::open(&directory).unwrap();
+        control.create_logical_shard(shard()).unwrap();
+        add_active_root(&control, root_id, shard());
+        let registry = Arc::new(RootOwnerRegistry::new());
+        let owner = bootstrap_shard(
+            Arc::new(control),
+            Arc::clone(&registry),
+            acquire_boot(temporary.path().join("metadata"), &[root_id]),
+        )
+        .unwrap();
+        let server = WorkspaceServer::new(options(), Arc::clone(&registry), vec![owner]).unwrap();
+
+        let private = std::fs::metadata(&directory).unwrap().permissions();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let released = server.release_ownership();
+        std::fs::set_permissions(&directory, private).unwrap();
+
+        match released {
+            Err(ServerError::Control(ControlError::ControlPathRefused { path, reason })) => {
+                assert_eq!(path, directory, "{reason}");
+                assert!(reason.contains("cannot create files in it"), "{reason}");
+            }
+            other => panic!("release lost the control store's typed refusal: {other:?}"),
+        }
     }
 
     #[test]

@@ -37,6 +37,14 @@ pub trait ControlStore: Send + Sync {
     /// owner sessions do not expire must explicitly return `None`.
     fn owner_lease_renew_interval(&self) -> Option<std::time::Duration>;
 
+    /// Refuse, changing nothing, a store in which this process could not hold
+    /// an owner session, so an owner can refuse before it prepares metadata.
+    /// The default accepts: a store without local files has nothing to check
+    /// before the acquisition itself.
+    fn check_owner_access(&self) -> Result<(), ControlError> {
+        Ok(())
+    }
+
     /// Create the immutable Agent authority for a root. An exact replay is
     /// idempotent; the root can never be rebound to another Agent.
     fn create_root_agent_binding(
