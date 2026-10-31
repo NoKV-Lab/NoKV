@@ -51,7 +51,7 @@ identities. Replace the identities with your own 32-hex-digit values and keep
 them stable: the root, the Agent and the logical shard are durable names.
 
 ```bash
-docker network create nokv
+docker network create --subnet 172.28.0.0/24 nokv
 IMAGE=ghcr.io/nokv-lab/nokv:latest
 ROOT=11111111111111111111111111111111
 AGENT=44444444444444444444444444444444
@@ -68,17 +68,20 @@ docker run --rm --network nokv -v nokv:/var/lib/nokv -e AWS_ACCESS_KEY_ID -e AWS
 ```
 
 Start the owner. Inside a container it must bind a non-loopback address and
-advertise the address clients reach it at:
+advertise an IP address and port that clients reach it at. Clients connect to
+the advertised address as given and do not resolve host names, so the owner
+takes a fixed address on the network:
 
 ```bash
-docker run -d --name nokv-owner --network nokv -p 7750:7750 -v nokv:/var/lib/nokv \
+docker run -d --name nokv-owner --network nokv --ip 172.28.0.10 -p 7750:7750 -v nokv:/var/lib/nokv \
   -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
-  "$IMAGE" $COMMON --node-id owner-1 --bind 0.0.0.0:7750 --advertise-endpoint nokv-owner:7750 \
+  "$IMAGE" $COMMON --node-id owner-1 --bind 0.0.0.0:7750 --advertise-endpoint 172.28.0.10:7750 \
   --metadata-create /var/lib/nokv/metadata serve
 ```
 
 `--metadata-create` starts a new owner. When the same owner restarts on the
-same volume, use `--metadata-reopen /var/lib/nokv/metadata` instead.
+same volume, use `--metadata-reopen /var/lib/nokv/metadata` instead, with the
+same `--ip`.
 
 Use it as an Agent from the same host and volume:
 
