@@ -271,13 +271,18 @@ fn control_failure(code: &str, message: impl Into<String>, class: ErrorClass) ->
     CliFailure::new(code, message, class, IdempotencyScope::ReadOnly)
 }
 
+/// A control store's own failure, in the class the store gives it.
+fn control_store_failure(error: nokv_control::ControlError) -> CliFailure {
+    control_failure("ControlFailure", error.to_string(), error.class())
+}
+
 fn load_root_agent_binding(
     control: &dyn nokv_control::ControlStore,
     root_id: nokv_control::RootId,
 ) -> Result<nokv_control::RootAgentBinding, CliFailure> {
     let binding = control
         .get_root_agent_binding(&root_id)
-        .map_err(|error| control_failure("ControlFailure", error.to_string(), error.class()))?
+        .map_err(control_store_failure)?
         .ok_or_else(|| {
             control_failure(
                 "RootNotProvisioned",
@@ -423,7 +428,7 @@ fn bound_workbench_root(
 ) -> Result<nokv_types::WorkbenchRoot, CliFailure> {
     identity
         .get_root_presentation(&root_id)
-        .map_err(|error| control_failure("ControlFailure", error.to_string(), error.class()))?
+        .map_err(control_store_failure)?
         .map(|binding| binding.workbench_root)
         .ok_or_else(|| {
             control_failure(
@@ -1647,7 +1652,7 @@ OWNER:
   a root bound to a tenant is served only over RPC TLS: a plaintext serve refuses to start
   --root-id HEX32 (--etcd-endpoint URL | --control-dir PATH) --node-id ID
   --append-activity-lease-ms N: serve only, range 1000..=86400000, default 1800000; clock-skew grace is additional
-  --advertise-endpoint HOST:PORT --bind HOST:PORT
+  --advertise-endpoint IP:PORT --bind IP:PORT (clients connect to the advertised IP:PORT; host names are not resolved)
   --etcd-lease-ttl-seconds N (default 10; owner keepalive runs every max(1, N/3) seconds)
   --handshake-timeout-millis N --max-inflight-connections N
   --metadata-create PATH starts the first standalone local-WAL owner
@@ -1734,9 +1739,6 @@ fn run_provision(
     use nokv_control::{LogicalShardId, RootId, RootPresentationBinding};
     use nokv_types::{RootPlacementLifecycle, WorkbenchRoot};
 
-    let control_error = |error: nokv_control::ControlError| {
-        control_failure("ControlFailure", error.to_string(), error.class())
-    };
     let root_id = RootId::from(
         connection::configured_root_id(&invocation.client).map_err(connection_failure)?,
     );
@@ -1753,9 +1755,15 @@ fn run_provision(
     let workbench_root = WorkbenchRoot::new(workbench_root)
         .map_err(|error| CliFailure::invalid_input(format!("--workbench-root: {error}")))?;
     let connection::ControlPlane { control, identity } = open_control_plane(invocation)?;
+    // Read every record provision writes before writing any, so a record
+    // the control store refuses leaves the control plane unchanged.
     let existing_placement =
         provision::preflight_provision(control.as_ref(), root_id, logical_shard_id)
             .map_err(provision_failure)?;
+    let presentation_preexisting = identity
+        .get_root_presentation(&root_id)
+        .map_err(control_store_failure)?
+        .is_some();
     let binding_preexisting = provision::ensure_root_agent_binding(
         control.as_ref(),
         root_id,
@@ -1764,22 +1772,18 @@ fn run_provision(
     )
     .map_err(provision_failure)?;
     // Every Agent of the root presents it under this one Workbench root.
-    let presentation_preexisting = identity
-        .get_root_presentation(&root_id)
-        .map_err(control_error)?
-        .is_some();
     let presentation = identity
         .bind_root_presentation(RootPresentationBinding {
             root_id,
             workbench_root,
         })
-        .map_err(control_error)?;
+        .map_err(control_store_failure)?;
     // Provision proves the provider semantics the owner's writes will need.
     let objects = CliObjectStore::build(&invocation.client.object)?;
     admit_object_provider(&objects, invocation)?;
     let namespace_id = match control
         .get_root_object_namespace_binding(&root_id)
-        .map_err(control_error)?
+        .map_err(control_store_failure)?
     {
         Some(binding) => {
             objects
@@ -1855,10 +1859,10 @@ fn run_provision(
 fn active_shard_placements(
     control: &dyn nokv_control::ControlStore,
     seed: &nokv_control::RootPlacement,
-) -> Result<Vec<nokv_control::RootPlacement>, String> {
+) -> Result<Vec<nokv_control::RootPlacement>, CliFailure> {
     let mut placements = control
         .list_root_placements()
-        .map_err(|error| error.to_string())?
+        .map_err(control_store_failure)?
         .into_iter()
         .filter(|placement| {
             placement.logical_shard_id == seed.logical_shard_id
@@ -1870,7 +1874,9 @@ fn active_shard_placements(
         .iter()
         .any(|placement| placement.root_id == seed.root_id)
     {
-        return Err("configured root placement must be Active before serve".to_owned());
+        return Err("configured root placement must be Active before serve"
+            .to_owned()
+            .into());
     }
     Ok(placements)
 }
@@ -1879,9 +1885,9 @@ fn active_shard_placements(
 fn validate_served_root_agent_bindings(
     control: &dyn nokv_control::ControlStore,
     placements: &[nokv_control::RootPlacement],
-) -> Result<(), String> {
+) -> Result<(), CliFailure> {
     for placement in placements {
-        load_root_agent_binding(control, placement.root_id).map_err(|failure| failure.message())?;
+        load_root_agent_binding(control, placement.root_id)?;
     }
     Ok(())
 }
@@ -1892,12 +1898,12 @@ fn validate_served_root_agent_bindings(
 fn served_tenant(
     identity: &dyn nokv_control::IdentityStore,
     placements: &[nokv_control::RootPlacement],
-) -> Result<nokv_types::TenantId, String> {
+) -> Result<nokv_types::TenantId, CliFailure> {
     let mut tenant = None;
     for placement in placements {
         let binding = identity
             .get_root_tenant(&placement.root_id)
-            .map_err(|error| error.to_string())?
+            .map_err(control_store_failure)?
             .ok_or_else(|| {
                 format!(
                     "root {} is not bound to a tenant; run `nokv identity root bind` before \
@@ -1911,13 +1917,18 @@ fn served_tenant(
                 return Err(
                     "one owner serves one tenant, but the roots of this shard are bound to \
                      different tenants"
-                        .to_owned(),
+                        .to_owned()
+                        .into(),
                 );
             }
             Some(_) => {}
         }
     }
-    tenant.ok_or_else(|| "serving over TLS requires at least one root".to_owned())
+    tenant.ok_or_else(|| {
+        "serving over TLS requires at least one root"
+            .to_owned()
+            .into()
+    })
 }
 
 /// A plaintext owner authenticates nobody, so it refuses every root a tenant
@@ -1926,18 +1937,19 @@ fn served_tenant(
 fn refuse_plaintext_for_tenant_roots(
     identity: &dyn nokv_control::IdentityStore,
     placements: &[nokv_control::RootPlacement],
-) -> Result<(), String> {
+) -> Result<(), CliFailure> {
     for placement in placements {
         if let Some(binding) = identity
             .get_root_tenant(&placement.root_id)
-            .map_err(|error| error.to_string())?
+            .map_err(control_store_failure)?
         {
             return Err(format!(
                 "root {} is bound to tenant {}; a tenant-bound root is served only over RPC TLS, \
                  so start serve with --rpc-tls-cert and --rpc-tls-key",
                 encode_lowercase_hex(placement.root_id.as_bytes()),
                 encode_lowercase_hex(binding.tenant_id.as_bytes())
-            ));
+            )
+            .into());
         }
     }
     Ok(())
@@ -2012,11 +2024,11 @@ impl RootMountChecks {
                 {
                     return Ok(Some(failure.message()));
                 }
-                if let Err(reason) = refuse_plaintext_for_tenant_roots(
+                if let Err(failure) = refuse_plaintext_for_tenant_roots(
                     self.identity.as_ref(),
                     std::slice::from_ref(placement),
                 ) {
-                    return Ok(Some(reason));
+                    return Ok(Some(failure.message()));
                 }
             }
             Some(served) => match self
@@ -2073,8 +2085,11 @@ fn mount_roots_until(
         }
         let candidates = match active_shard_placements(checks.control.as_ref(), seed) {
             Ok(placements) => placements,
-            Err(reason) => {
-                eprintln!("root mounter: cannot list placements: {reason}");
+            Err(failure) => {
+                eprintln!(
+                    "root mounter: cannot list placements: {}",
+                    failure.message()
+                );
                 continue;
             }
         };
@@ -2130,14 +2145,50 @@ fn mount_roots_until(
 fn join_lifecycle_workers(
     workers: Vec<std::thread::JoinHandle<Result<(), nokv_server::LifecycleError>>>,
     failures: &mut Vec<String>,
+    causes: &mut Vec<nokv_control::ControlError>,
 ) {
     for worker in workers {
         match worker.join() {
-            Ok(Err(error)) => failures.push(format!("lifecycle worker failed: {error}")),
+            Ok(Err(error)) => {
+                failures.push(format!("lifecycle worker failed: {error}"));
+                causes.extend(error.control_error().cloned());
+            }
             Ok(Ok(())) => {}
             Err(_) => failures.push("lifecycle worker panicked".to_owned()),
         }
     }
+}
+
+/// The failure `serve` exits with once it has begun to take ownership:
+/// `failures` in the order they were found, all kept in the message, and
+/// `causes`, the control store's own failures behind them. The store's
+/// refusal of its directory or a record anywhere among them needs an
+/// operator before a restart can serve, so it sets the class
+/// (`operator_required`); otherwise `session_end`, the store's failure that
+/// ended the owner session, keeps the store's class; anything else is
+/// internal.
+#[cfg(feature = "control")]
+fn serve_failure(
+    failures: Vec<String>,
+    session_end: Option<&nokv_control::ControlError>,
+    causes: &[nokv_control::ControlError],
+) -> CliFailure {
+    let message = failures.join("; ");
+    match causes
+        .iter()
+        .find(|cause| matches!(cause, nokv_control::ControlError::ControlPathRefused { .. }))
+        .or(session_end)
+    {
+        Some(cause) => control_failure("ControlFailure", message, cause.class()),
+        None => message.into(),
+    }
+}
+
+/// `serve`'s failure from one server error.
+#[cfg(feature = "control")]
+fn server_failure(error: nokv_server::ServerError) -> CliFailure {
+    let causes = error.control_error().cloned();
+    serve_failure(vec![error.to_string()], None, causes.as_slice())
 }
 
 #[cfg(feature = "control")]
@@ -2191,11 +2242,15 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
     let root_id = RootId::from(
         connection::configured_root_id(&invocation.client).map_err(|error| error.to_string())?,
     );
-    let connection::ControlPlane { control, identity } =
-        open_control_plane(invocation).map_err(|failure| failure.message())?;
+    let connection::ControlPlane { control, identity } = open_control_plane(invocation)?;
+    // The owner writes its session and records in the control store: refuse
+    // a store it could not use before reading a record or preparing metadata.
+    control
+        .check_owner_access()
+        .map_err(control_store_failure)?;
     let placement = control
         .get_root_placement(&root_id)
-        .map_err(|error| error.to_string())?
+        .map_err(control_store_failure)?
         .ok_or_else(|| "root placement does not exist; provision it before serve".to_owned())?;
     let placements = active_shard_placements(control.as_ref(), &placement)?;
     // Over TLS the owner authorizes principals by role; the plaintext
@@ -2207,14 +2262,14 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
     }
     let object_namespace = control
         .get_root_object_namespace_binding(&root_id)
-        .map_err(|error| error.to_string())?
+        .map_err(control_store_failure)?
         .ok_or_else(|| {
             "root object namespace is not bound; run provision after verifying the configured bucket/prefix"
                 .to_owned()
         })?;
     let shard = control
         .get_logical_shard(&placement.logical_shard_id)
-        .map_err(|error| error.to_string())?
+        .map_err(control_store_failure)?
         .ok_or_else(|| "logical shard does not exist; provision it before serve".to_owned())?;
     let recovery = RecoveryPublication {
         checkpoint: shard.checkpoint.clone(),
@@ -2248,9 +2303,12 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
         .map(|placement| {
             control
                 .get_root_object_namespace_binding(&placement.root_id)
-                .map_err(|error| error.to_string())?
+                .map_err(control_store_failure)?
                 .ok_or_else(|| {
-                    "every root on a served shard must have an object namespace binding".to_owned()
+                    CliFailure::from(
+                        "every root on a served shard must have an object namespace binding"
+                            .to_owned(),
+                    )
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2341,7 +2399,7 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
                 .collect(),
         },
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(server_failure)?;
 
     // An expiring owner lease is renewed on the store's cadence. A session
     // that ends only with its process is still checked on a fixed cadence, so
@@ -2366,7 +2424,7 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
         Arc::clone(&registry),
         vec![owner],
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(server_failure)?;
     let server = match rpc_tls {
         Some(tls) => server.with_rpc_tls(tls),
         None => server,
@@ -2390,13 +2448,13 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
         ) {
             Ok(lifecycle) => lifecycles.push(lifecycle),
             Err(error) => {
-                let primary = error.to_string();
-                let release = server.release_ownership();
-                return Err(match release {
-                    Ok(()) => primary,
-                    Err(release) => format!("{primary}; owner release failed: {release}"),
+                let mut failures = vec![error.to_string()];
+                let mut causes = Vec::from_iter(error.control_error().cloned());
+                if let Err(release) = server.release_ownership() {
+                    failures.push(format!("owner release failed: {release}"));
+                    causes.extend(release.control_error().cloned());
                 }
-                .into());
+                return Err(serve_failure(failures, None, &causes));
             }
         }
     }
@@ -2418,11 +2476,13 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
             Err(error) => {
                 owner_loss.fail_closed();
                 let mut failures = vec![format!("cannot start lifecycle worker: {error}")];
-                join_lifecycle_workers(lifecycle_workers, &mut failures);
+                let mut causes = Vec::new();
+                join_lifecycle_workers(lifecycle_workers, &mut failures, &mut causes);
                 if let Err(error) = server.release_ownership() {
                     failures.push(format!("owner release failed: {error}"));
+                    causes.extend(error.control_error().cloned());
                 }
-                return Err(failures.join("; ").into());
+                return Err(serve_failure(failures, None, &causes));
             }
         }
     }
@@ -2499,24 +2559,36 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
     }
 
     let mut failures = Vec::new();
-    join_lifecycle_workers(lifecycle_workers, &mut failures);
+    let mut causes = Vec::new();
+    join_lifecycle_workers(lifecycle_workers, &mut failures, &mut causes);
     join_lifecycle_workers(
         mounted_workers
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
         &mut failures,
+        &mut causes,
     );
     let release_result = server.release_ownership();
+    // The control store can end the session, for example once the control
+    // directory becomes unsafe, and can refuse the release, for example
+    // once the owner can no longer write the directory. Either way the exit
+    // reports the store's class, as every command does.
+    let mut session_end = None;
     if let Err(error) = server_result {
         failures.push(format!("RPC server stopped: {error}"));
+        causes.extend(error.control_error().cloned());
+        if let nokv_server::ServerError::Control(cause) = error {
+            session_end = Some(cause);
+        }
     }
     if let Err(error) = release_result {
         failures.push(format!("owner release failed: {error}"));
+        causes.extend(error.control_error().cloned());
     }
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(failures.join("; ").into())
+        Err(serve_failure(failures, session_end.as_ref(), &causes))
     }
 }
 
@@ -3165,8 +3237,9 @@ mod tests {
             .unwrap()
             .unwrap()
             .owner_epoch;
-        let error = validate_served_root_agent_bindings(&control, &placements).unwrap_err();
-        assert!(error.contains("no durable Agent binding"));
+        let failure = validate_served_root_agent_bindings(&control, &placements).unwrap_err();
+        assert_eq!(failure.class(), ErrorClass::OperatorRequired);
+        assert!(failure.message().contains("no durable Agent binding"));
         assert_eq!(
             control
                 .get_logical_shard(&shard(9))
@@ -3188,6 +3261,56 @@ mod tests {
 
         let provisioning = control.get_root_placement(&root(4)).unwrap().unwrap();
         assert!(active_shard_placements(&control, &provisioning).is_err());
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn a_control_store_refusal_anywhere_in_a_serve_failure_decides_its_class() {
+        use nokv_control::ControlError;
+
+        let refusal = ControlError::ControlPathRefused {
+            path: "/srv/ctl".into(),
+            reason: "this process's user (uid 501) cannot create files in it".to_owned(),
+        };
+        let lease_lost = ControlError::Backend("owner lease expired".to_owned());
+        let malformed = ControlError::InvalidOptions("bad etcd endpoint".to_owned());
+        let failures = vec![
+            "lifecycle worker failed: lifecycle owner fence lost".to_owned(),
+            "RPC server stopped: invalid logical-shard bootstrap: control-plane owner was lost"
+                .to_owned(),
+            format!("owner release failed: control plane failed: {refusal}"),
+        ];
+
+        // A refusal behind the release decides; the message keeps every
+        // failure, with the refused path and the fix.
+        let failure = serve_failure(failures.clone(), None, std::slice::from_ref(&refusal));
+        assert_eq!(failure.class(), ErrorClass::OperatorRequired);
+        assert_eq!(failure.exit_code(), 9);
+        assert_eq!(failure.next_action(), NextAction::Operator);
+        assert_eq!(failure.message(), failures.join("; "));
+        assert!(failure
+            .message()
+            .contains("refuses /srv/ctl: this process's user"));
+
+        // It also decides over the store failure that ended the session.
+        let failure = serve_failure(
+            failures.clone(),
+            Some(&lease_lost),
+            &[lease_lost.clone(), refusal],
+        );
+        assert_eq!(failure.class(), ErrorClass::OperatorRequired);
+
+        // Without a refusal, the session's end keeps the store's class.
+        let failure = serve_failure(
+            failures.clone(),
+            Some(&lease_lost),
+            std::slice::from_ref(&lease_lost),
+        );
+        assert_eq!(failure.class(), ErrorClass::Transient);
+
+        // Any other store failure behind a release leaves the stop internal.
+        let failure = serve_failure(failures, None, &[lease_lost, malformed]);
+        assert_eq!(failure.class(), ErrorClass::Internal);
     }
 
     #[test]
@@ -3215,7 +3338,9 @@ mod tests {
                 tenant_id,
             })
             .unwrap();
-        let error = refuse_plaintext_for_tenant_roots(&control, &placements).unwrap_err();
+        let error = refuse_plaintext_for_tenant_roots(&control, &placements)
+            .unwrap_err()
+            .message();
         assert!(
             error.contains(&encode_lowercase_hex(root(2).as_bytes())),
             "{error}"

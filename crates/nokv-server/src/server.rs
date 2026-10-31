@@ -607,19 +607,25 @@ fn release_rejected_ownership(ownership: Vec<ShardOwner>, primary: ServerError) 
     }
 }
 
+/// Release every owner once. One owner's failure is returned as it is, so a
+/// typed control-plane cause, such as the control store refusing its
+/// directory, reaches the caller.
 fn release_ownership(ownership: Vec<ShardOwner>) -> Result<(), ServerError> {
-    let failures = ownership
+    let mut failures = ownership
         .into_iter()
-        .filter_map(|owner| owner.release().err().map(|error| error.to_string()))
+        .filter_map(|owner| owner.release().err())
         .collect::<Vec<_>>();
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(ServerError::BootstrapRollback {
-            primary: "release logical-shard ownership".to_owned(),
-            rollback: failures.join("; "),
-        })
+    if failures.len() <= 1 {
+        return failures.pop().map_or(Ok(()), Err);
     }
+    Err(ServerError::BootstrapRollback {
+        primary: "release logical-shard ownership".to_owned(),
+        rollback: failures
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; "),
+    })
 }
 
 fn serve_connection(

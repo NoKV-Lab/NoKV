@@ -296,6 +296,16 @@ impl fmt::Display for LifecycleError {
     }
 }
 
+impl LifecycleError {
+    /// The control plane's own failure behind this error, if there is one.
+    pub fn control_error(&self) -> Option<&nokv_control::ControlError> {
+        match self {
+            Self::RecoveryPublication { source, .. } => source.control_error(),
+            _ => None,
+        }
+    }
+}
+
 impl std::error::Error for LifecycleError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
