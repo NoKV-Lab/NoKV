@@ -612,6 +612,20 @@ durable_enum! {
     }
 }
 
+impl Role {
+    pub const ALL: [Self; 3] = [Self::Reader, Self::Writer, Self::Operator];
+
+    /// The role's name on the command line, in identity results, and in an
+    /// owner's audit log.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Reader => "reader",
+            Self::Writer => "writer",
+            Self::Operator => "operator",
+        }
+    }
+}
+
 /// The roots one role binding covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RoleScope {

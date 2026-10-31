@@ -197,3 +197,34 @@ authenticates clients by certificate (`--etcd-tls-ca`, `--etcd-tls-cert`,
 read or write as `permission_denied`; both happen before any request reaches
 an owner. [Control plane credentials](control-plane-credentials.md) lists the
 keys each role needs.
+
+### Refusal audit log
+
+`nokv serve --audit-log PATH`, with `--rpc-tls-cert` and `--rpc-tls-key`,
+appends one JSON object per line to `PATH` for every connection the owner
+turns away and every request it denies. A served request is attributed in its
+operation record instead (`initiator`), so the two together say who did, and
+who tried, what. The file is created readable and writable by its owner
+only, is appended to across restarts, and is never truncated by NoKV; since
+the owner keeps it open, rotate it by copying and truncating in place (for
+example `logrotate`'s `copytruncate`). Every line has the same keys, and a
+key that does not apply to the refusal is `null`:
+
+| Key | Value |
+| --- | --- |
+| `time_unix_ms` | When the owner refused, in milliseconds since the Unix epoch. |
+| `event` | `connection_refused`, before any request, or `request_denied`. |
+| `reason` | `tls_required`, `tls_handshake_failed`, `incompatible_schema`, `not_a_current_credential`, `policy_stale`, `permission_denied` (no role permits the request), or `not_the_initiator` (the request continues an operation or snapshot another principal began). |
+| `peer` | The client's address and port. |
+| `tenant_id` | The tenant the owner serves. |
+| `certificate_fingerprint` | The SHA-256 of the client's certificate, once TLS has completed. |
+| `principal_id` | The authenticated principal of a denied request. |
+| `root_id`, `request` | The root and the RPC a denied request named. |
+| `required_role` | The least role that permits the request, for `permission_denied`. |
+| `detail` | The TLS error, for `tls_handshake_failed`; the owner's refusal, for `not_the_initiator`. |
+
+Every refusal is a line: a principal that repeats a denied request grows the
+file, and its lines name it. A write that fails, for example on a full disk,
+is reported once on the owner's standard error and does not stop the owner,
+which keeps its own refusal lines there as well. A plaintext owner
+authenticates nobody and refuses `--audit-log`.

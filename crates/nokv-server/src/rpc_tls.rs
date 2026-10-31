@@ -15,7 +15,8 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::{ServerError, TenantAccess};
+use crate::audit::Refusal;
+use crate::{AuditLog, ServerError, TenantAccess};
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
@@ -32,6 +33,7 @@ use rustls::{
 pub struct RpcServerTls {
     pub(crate) config: Arc<ServerConfig>,
     pub(crate) access: TenantAccess,
+    audit: Option<AuditLog>,
 }
 
 impl RpcServerTls {
@@ -58,7 +60,23 @@ impl RpcServerTls {
         Ok(Self {
             config: Arc::new(config),
             access,
+            audit: None,
         })
+    }
+
+    /// Append every refused connection and denied request to `audit`.
+    pub fn with_audit_log(self, audit: AuditLog) -> Self {
+        Self {
+            audit: Some(audit),
+            ..self
+        }
+    }
+
+    /// Record `refusal` when this listener keeps an audit log.
+    pub(crate) fn audit(&self, refusal: &Refusal<'_>) {
+        if let Some(audit) = &self.audit {
+            audit.record(refusal);
+        }
     }
 }
 

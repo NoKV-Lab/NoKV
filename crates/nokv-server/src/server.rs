@@ -17,9 +17,11 @@ use nokv_protocol::{
     WorkspaceHandshake, WorkspaceRpcOutcome, WorkspaceRpcRequest, WorkspaceRpcResponse,
     HANDSHAKE_FRAME_BYTES, HANDSHAKE_PAYLOAD_BYTES, MAX_FRAME_BYTES, WORKSPACE_PROTOCOL_SCHEMA,
 };
+use nokv_types::CredentialFingerprint;
 use sha2::{Digest as _, Sha256};
 
 use crate::access::{classify, AccessDenial, ConnectionPrincipal, POLICY_REFRESH_INTERVAL};
+use crate::audit::{Refusal, RefusalReason};
 use crate::legacy_rejection::{legacy_rejection_response, MAX_LEGACY_FIRST_FRAME_BYTES};
 use crate::rpc_tls::{
     accept_tls, drain_tls_record, opens_tls_record, DeadlineSocket, RpcServerTls, RpcStream,
@@ -655,6 +657,13 @@ fn serve_connection(
                     },
                     Err(denial) => {
                         log_denial(peer, principal, &request, denial, &mut denials_logged);
+                        tls.audit(&Refusal::request(
+                            denial,
+                            peer,
+                            tls.access.tenant_id(),
+                            principal,
+                            &request,
+                        ));
                         write_frame(
                             &mut stream,
                             &encode_response(&denied_response(&request, denial))?,
@@ -668,7 +677,23 @@ fn serve_connection(
             }
             None => RequestAuthority::TRUSTED,
         };
+        let named = (classify(&request.operation).name, request.route.root_id);
         let response = registry.dispatch_guarded(request, authority)?;
+        if let (Some(tls), Some(principal), WorkspaceRpcOutcome::Failure(failure)) =
+            (tls, &principal, &response.response().outcome)
+        {
+            // The executor answers PermissionDenied only to a principal that
+            // continues what another began.
+            if failure.code == ErrorCode::PermissionDenied {
+                tls.audit(&Refusal::not_the_initiator(
+                    peer,
+                    tls.access.tenant_id(),
+                    principal,
+                    (named.0, &named.1 .0),
+                    &failure.message,
+                ));
+            }
+        }
         let encoded = encode_response_or_internal_failure(response.response())?;
         write_frame(&mut stream, &encoded)?;
         drop(response);
@@ -811,15 +836,20 @@ fn admit(
             log_refusal(&socket.socket, "a TLS client; this owner serves plaintext");
             Ok(None)
         }
-        (tls, false) => Ok(admit_plaintext(&mut socket, tls.is_some())?
-            .then_some((RpcStream::Plain(socket), None))),
+        (tls, false) => {
+            Ok(admit_plaintext(&mut socket, tls)?.then_some((RpcStream::Plain(socket), None)))
+        }
     }
 }
 
 /// Answer a plaintext first frame. A hello for the current schema is accepted
 /// only when the owner does not require TLS; an older protocol gets its
 /// readable rejection.
-fn admit_plaintext(socket: &mut DeadlineSocket, tls_required: bool) -> Result<bool, ServerError> {
+fn admit_plaintext(
+    socket: &mut DeadlineSocket,
+    tls: Option<&RpcServerTls>,
+) -> Result<bool, ServerError> {
+    let tls_required = tls.is_some();
     let mut length = [0_u8; 4];
     socket
         .read_exact(&mut length)
@@ -860,15 +890,18 @@ fn admit_plaintext(socket: &mut DeadlineSocket, tls_required: bool) -> Result<bo
                         &socket.socket,
                         "a plaintext client; this owner requires TLS",
                     );
+                    audit_connection(tls, &socket.socket, RefusalReason::TlsRequired);
                 }
                 HandshakeKind::Incompatible => {
                     log_refusal(&socket.socket, "a client speaking another protocol schema");
+                    audit_connection(tls, &socket.socket, RefusalReason::IncompatibleSchema);
                 }
                 _ => {}
             }
             return Ok(verdict == HandshakeKind::Accepted);
         }
         write_legacy_rejection(socket, &payload)?;
+        audit_connection(tls, &socket.socket, RefusalReason::IncompatibleSchema);
         return Ok(false);
     }
 
@@ -877,7 +910,19 @@ fn admit_plaintext(socket: &mut DeadlineSocket, tls_required: bool) -> Result<bo
         .read_exact(&mut first_frame)
         .map_err(ServerError::Connection)?;
     write_legacy_rejection(socket, &first_frame)?;
+    audit_connection(tls, &socket.socket, RefusalReason::IncompatibleSchema);
     Ok(false)
+}
+
+/// Record a refused plaintext connection when a TLS owner keeps an audit log.
+fn audit_connection(tls: Option<&RpcServerTls>, socket: &TcpStream, reason: RefusalReason) {
+    if let Some(tls) = tls {
+        tls.audit(&Refusal::connection(
+            reason,
+            socket.peer_addr().ok(),
+            tls.access.tenant_id(),
+        ));
+    }
 }
 
 /// Complete TLS, then the protocol handshake inside it. A current schema from
@@ -888,7 +933,22 @@ fn admit_tls(
     socket: DeadlineSocket,
     tls: &RpcServerTls,
 ) -> Result<Option<(RpcStream, Option<ConnectionPrincipal>)>, ServerError> {
-    let (mut stream, certificate) = accept_tls(socket, tls)?;
+    let peer = socket.socket.peer_addr().ok();
+    let tenant_id = tls.access.tenant_id();
+    let (mut stream, certificate) = match accept_tls(socket, tls) {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            let detail = error.to_string();
+            tls.audit(
+                &Refusal::connection(RefusalReason::TlsHandshakeFailed, peer, tenant_id)
+                    .with_detail(&detail),
+            );
+            return Err(error);
+        }
+    };
+    let fingerprint = CredentialFingerprint::from_bytes(Sha256::digest(&certificate).into());
+    let refused =
+        |reason| Refusal::connection(reason, peer, tenant_id).with_certificate(&fingerprint);
     let mut hello = [0_u8; HANDSHAKE_FRAME_BYTES];
     stream
         .read_exact(&mut hello)
@@ -903,6 +963,7 @@ fn admit_tls(
             &stream.sock.socket,
             "a client speaking another protocol schema",
         );
+        tls.audit(&refused(RefusalReason::IncompatibleSchema));
         HandshakeKind::Incompatible
     } else {
         match tls.access.authenticate(&certificate, unix_now()) {
@@ -916,17 +977,19 @@ fn admit_tls(
                     &stream.sock.socket,
                     "a TLS client while the tenant policy copy is stale; left unanswered",
                 );
+                tls.audit(&refused(RefusalReason::PolicyStale));
                 return Ok(None);
             }
-            Err(_) => {
+            Err(denial) => {
                 // The fingerprint lets an operator register the certificate.
                 log_refusal(
                     &stream.sock.socket,
                     &format!(
                         "a TLS client whose certificate {} is not a current credential of the tenant",
-                        lowercase_hex(&Sha256::digest(&certificate))
+                        lowercase_hex(fingerprint.as_bytes())
                     ),
                 );
+                tls.audit(&refused(denial.into()));
                 HandshakeKind::Unauthenticated
             }
         }
@@ -949,7 +1012,7 @@ fn log_refusal(socket: &TcpStream, what: &str) {
     }
 }
 
-fn lowercase_hex(bytes: &[u8]) -> String {
+pub(crate) fn lowercase_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -1787,6 +1850,168 @@ mod tests {
         stream.flush().unwrap();
         serving.join().unwrap().unwrap();
         assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn every_refusal_of_a_tls_owner_is_appended_to_its_audit_log() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let tls = Arc::new(
+            pki.server_tls()
+                .with_audit_log(crate::AuditLog::open(&path).unwrap()),
+        );
+        let serve = |server| {
+            let tls = Arc::clone(&tls);
+            let (registry, _) = registry();
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)))
+        };
+
+        // A plaintext client.
+        let (mut client, server) = streams();
+        let serving = serve(server);
+        let hello =
+            WorkspaceHandshake::new(HandshakeKind::ClientHello, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
+        client
+            .write_all(&encode_handshake_frame(&hello).unwrap())
+            .unwrap();
+        let mut answer = [0_u8; HANDSHAKE_FRAME_BYTES];
+        client.read_exact(&mut answer).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        serving.join().unwrap().unwrap();
+
+        // A certificate that is no credential of the tenant.
+        let (client, server) = streams();
+        let serving = serve(server);
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.unregistered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Unauthenticated);
+        stream.read_to_end(&mut Vec::new()).unwrap();
+        serving.join().unwrap().unwrap();
+
+        // No certificate at all.
+        let (client, server) = streams();
+        let serving = serve(server);
+        assert!(tls_hello(client, pki.client_config(None)).1.is_err());
+        assert!(serving.join().unwrap().is_err());
+
+        // A reader's write.
+        let (client, server) = streams();
+        let serving = serve(server);
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.reader)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        let response = tls_exchange(&mut stream, &request());
+        assert_eq!(failure_of(&response).code, ErrorCode::PermissionDenied);
+        stream.conn.send_close_notify();
+        stream.flush().unwrap();
+        serving.join().unwrap().unwrap();
+
+        let lines = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let summary = lines
+            .iter()
+            .map(|line| (line["event"].as_str(), line["reason"].as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                (Some("connection_refused"), Some("tls_required")),
+                (Some("connection_refused"), Some("not_a_current_credential")),
+                (Some("connection_refused"), Some("tls_handshake_failed")),
+                (Some("request_denied"), Some("permission_denied")),
+            ]
+        );
+        let tenant = lowercase_hex(crate::rpc_tls::test_pki::TENANT.as_bytes());
+        for line in &lines {
+            assert_eq!(line["tenant_id"], tenant.as_str());
+            assert!(line["peer"].as_str().is_some(), "{line}");
+        }
+        assert_eq!(
+            lines[1]["certificate_fingerprint"],
+            lowercase_hex(pki.unregistered.fingerprint().as_bytes()).as_str()
+        );
+        assert!(lines[2]["detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.is_empty()));
+        let denied = &lines[3];
+        let class = classify(&request().operation);
+        assert_eq!(denied["principal_id"], "07".repeat(16).as_str());
+        assert_eq!(
+            denied["certificate_fingerprint"],
+            lowercase_hex(pki.reader.fingerprint().as_bytes()).as_str()
+        );
+        assert_eq!(
+            denied["root_id"],
+            lowercase_hex(&request().route.root_id.0).as_str()
+        );
+        assert_eq!(denied["request"], class.name);
+        assert_eq!(denied["required_role"], class.role.name());
+    }
+
+    /// Refuses every request the way the executor refuses a principal that
+    /// continues an operation another began.
+    struct NotTheInitiatorExecutor;
+
+    const NOT_THE_INITIATOR: &str = "the principal did not begin this operation";
+
+    impl WorkspaceRequestExecutor for NotTheInitiatorExecutor {
+        fn execute(
+            &self,
+            _request: &WorkspaceRpcRequest,
+            _authority: RequestAuthority,
+        ) -> Result<ExecutedRequest, RpcFailure> {
+            Err(RpcFailure {
+                code: ErrorCode::PermissionDenied,
+                message: NOT_THE_INITIATOR.to_owned(),
+                retryable: false,
+                conflict: None,
+                current_generation: None,
+                route_hint: None,
+            })
+        }
+    }
+
+    #[test]
+    fn a_continuation_the_executor_refuses_is_audited() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let tls = Arc::new(
+            pki.server_tls()
+                .with_audit_log(crate::AuditLog::open(&path).unwrap()),
+        );
+        let registry = Arc::new(RootOwnerRegistry::new());
+        registry
+            .install(route(), Arc::new(NotTheInitiatorExecutor))
+            .unwrap();
+        let (client, server) = streams();
+        let serving_tls = Arc::clone(&tls);
+        let serving = thread::spawn(move || {
+            serve_connection(server, registry, tls_options(), Some(&serving_tls))
+        });
+
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.registered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        let response = tls_exchange(&mut stream, &request());
+        assert_eq!(failure_of(&response).code, ErrorCode::PermissionDenied);
+        stream.conn.send_close_notify();
+        stream.flush().unwrap();
+        serving.join().unwrap().unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line = serde_json::from_str::<serde_json::Value>(text.trim()).unwrap();
+        assert_eq!(line["event"], "request_denied");
+        assert_eq!(line["reason"], "not_the_initiator");
+        assert_eq!(line["principal_id"], "06".repeat(16).as_str());
+        assert_eq!(
+            line["root_id"],
+            lowercase_hex(&request().route.root_id.0).as_str()
+        );
+        assert_eq!(line["request"], classify(&request().operation).name);
+        assert_eq!(line["required_role"], serde_json::Value::Null);
+        assert_eq!(line["detail"], NOT_THE_INITIATOR);
     }
 
     #[test]

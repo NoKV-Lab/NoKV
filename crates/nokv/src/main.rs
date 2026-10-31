@@ -1664,12 +1664,15 @@ RPC TLS:
   --rpc-tls-ca PEM --rpc-tls-cert PEM --rpc-tls-key PEM --rpc-tls-server-name NAME: with a command that
     connects to an owner, the roots that sign the owner's certificate, this client's certificate and key,
     and the name the owner's certificate must carry; there is no fallback to plaintext
-  a refused credential or a TLS mismatch fails with class operator_required before any request is sent
+  a certificate that is not a current credential fails as unauthenticated (exit 10), and a TLS mismatch as
+    operator_required, before any request is sent
   every request needs a role on its root: reader reads, writer also writes, and operator also reconciles
-    quarantined publications; a refusal is PermissionDenied, class operator_required
+    quarantined publications; a refusal is permission_denied (exit 11)
   the owner rereads its tenant's records every second: a revoked credential or role stops working within
     that interval plus the request in flight
   over RPC TLS, --agent-id is not needed and the AgentId binding is not checked
+  --audit-log PATH: with serve over RPC TLS, append one JSON line per refused connection and per denied request
+    (fields in docs/cli-contract.md); the file is created owner-only and is never truncated
 
 CONTROL PLANE TLS:
   --etcd-tls-ca PEM --etcd-tls-cert PEM --etcd-tls-key PEM: with https:// --etcd-endpoint URLs, the roots that
@@ -1694,7 +1697,7 @@ TENANT IDENTITY:
   records live in the control plane; running these commands requires write access to the control store
   a credential is the SHA-256 of a client certificate's DER bytes; --certificate reads the first PEM certificate
   a root belongs to one tenant, and a root-scoped role requires that binding first
-  the server does not enforce these records yet: until it does, every deployment remains trusted
+  an owner serving over RPC TLS authenticates and authorizes every client against these records
 
 OBJECT DATA:
   --object-bucket NAME [--object-endpoint URL] [--object-root PREFIX]
@@ -2142,7 +2145,7 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
 
     use nokv_control::{NodeId, RecoveryPublication, RootId};
     use nokv_server::{
-        bootstrap_shard, ArtifactLifecycleCleaner, LeaseMode, LifecycleObjectCleaner,
+        bootstrap_shard, ArtifactLifecycleCleaner, AuditLog, LeaseMode, LifecycleObjectCleaner,
         LifecycleRunner, LifecycleRunnerOptions, OpenMode, RecoveryPublicationMode, RootAttach,
         RootOwnerRegistry, RpcServerTls, ServerOptions, ShardBoot, TenantAccess, WorkspaceServer,
         DEFAULT_MAX_POLICY_AGE,
@@ -2287,7 +2290,13 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
             let access = TenantAccess::load(identity, tenant_id, max_policy_age)
                 .map_err(|error| error.to_string())?;
             let (chain, key) = rpc_tls::server_identity(tls)?;
-            Some(RpcServerTls::new(chain, key, access).map_err(|error| error.to_string())?)
+            let tls = RpcServerTls::new(chain, key, access).map_err(|error| error.to_string())?;
+            Some(match &invocation.server.audit_log {
+                Some(path) => tls.with_audit_log(
+                    AuditLog::open(path.as_path()).map_err(|error| error.to_string())?,
+                ),
+                None => tls,
+            })
         }
     };
     let objects = Arc::new(
