@@ -12,7 +12,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from cli_contract import contract_failure, contract_tables
+from cli_contract import contract_failure, contract_tables, published_contract
 from object_namespace_recovery_gate import (
     INLINE_ARTIFACT_BODY_MAX_BYTES,
     PINNED_RUSTFS_IMAGE,
@@ -32,7 +32,9 @@ from object_namespace_recovery_gate import (
     run_workbench_tool,
     rustfs_container_command,
     server_command,
+    start_owner,
     validate_gate_evidence,
+    wait_owner_serves,
     wait_rustfs,
     TYPED_SCENARIOS,
     TYPED_SUPPORTED_SCENARIOS,
@@ -41,6 +43,47 @@ import pre423_contract_ledger
 
 
 REPO = Path(__file__).resolve().parents[2]
+
+
+def failure_line(code: str, klass: str, message: str, *, retryable: bool) -> str:
+    """One CLI failure envelope as the binary prints it on stderr."""
+    return (
+        json.dumps(
+            {
+                "status": "error",
+                "code": code,
+                "message": message,
+                "retryable": retryable,
+                "details": {},
+                "class": klass,
+                "next_action": "resubmit_same",
+            }
+        )
+        + "\n"
+    )
+
+
+def refused_probe(exits: dict[str, int]) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        ["nokv"],
+        exits["transient"],
+        "",
+        failure_line(
+            "ClientFailure",
+            "transient",
+            "RPC transport failed: Connection refused (os error 111)",
+            retryable=True,
+        ),
+    )
+
+
+def not_found_probe(exits: dict[str, int]) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        ["nokv"],
+        exits["not_found"],
+        "",
+        failure_line("NotFound", "not_found", "operation not found", retryable=False),
+    )
 
 
 def valid_evidence() -> dict[str, object]:
@@ -200,8 +243,8 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
                 ),
                 mock.patch(
                     "object_namespace_recovery_gate.free_port",
-                    side_effect=range(19000, 19006),
-                ),
+                    side_effect=range(19000, 19004),
+                ) as free_port_mock,
                 mock.patch("object_namespace_recovery_gate.wait_etcd"),
                 mock.patch("object_namespace_recovery_gate.wait_rustfs"),
                 mock.patch("object_namespace_recovery_gate.stop_process"),
@@ -210,6 +253,9 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
             ):
                 execute(args)
 
+        # etcd, its peer, RustFS and its console: the owner ports are drawn
+        # only when each owner starts.
+        self.assertEqual(free_port_mock.call_count, 4)
         provision = next(command for command, label in recorded if label == "provision")
         expected_agent_id = fixed_id(seed, "agent")
         self.assertRegex(expected_agent_id, r"^[0-9a-f]{32}$")
@@ -217,6 +263,144 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
         self.assertEqual(
             provision[provision.index("--agent-id") + 1], expected_agent_id
         )
+
+    def test_owner_port_is_drawn_when_the_owner_starts(self) -> None:
+        common = control_args(
+            Path("/tmp/nokv"),
+            "11" * 16,
+            "http://127.0.0.1:2379",
+            "/nokv/object-namespace-gate/test",
+        )
+        probe = ["nokv", "--max-attempts", "1"]
+        contract = ({"not_found": 3}, {"resubmit_same"})
+        process, evidence, log = mock.Mock(), mock.Mock(), mock.Mock()
+        with (
+            mock.patch(
+                "object_namespace_recovery_gate.free_port", return_value=19777
+            ) as free_port_mock,
+            mock.patch(
+                "object_namespace_recovery_gate.start_process", return_value=process
+            ) as start_mock,
+            mock.patch("object_namespace_recovery_gate.wait_owner_serves") as wait_mock,
+        ):
+            started = start_owner(
+                common,
+                ["--object-root", "gate/root"],
+                "object-gate-e2",
+                "--metadata-reopen",
+                Path("/tmp/metadata"),
+                log,
+                probe=probe,
+                contract=contract,
+                repo=REPO,
+                timeout=30.0,
+                evidence=evidence,
+                label="owner-e2-ready",
+            )
+        self.assertIs(started, process)
+        self.assertEqual(free_port_mock.call_count, 1)
+        command = start_mock.call_args.args[0]
+        self.assertEqual(command[command.index("--bind") + 1], "127.0.0.1:19777")
+        self.assertEqual(
+            command[command.index("--advertise-endpoint") + 1], "127.0.0.1:19777"
+        )
+        self.assertEqual(command[command.index("--node-id") + 1], "object-gate-e2")
+        self.assertEqual(command[-3:], ["--lifecycle-interval-millis", "100", "serve"])
+        self.assertIn("--metadata-reopen", command)
+        wait_mock.assert_called_once_with(
+            probe, process, contract, REPO, 30.0, evidence, "owner-e2-ready"
+        )
+
+    def test_owner_readiness_waits_for_a_metadata_read_through_the_route(self) -> None:
+        exits, actions = published_contract(REPO)
+        process = mock.Mock()
+        process.poll.return_value = None
+        evidence = mock.Mock()
+        with (
+            mock.patch(
+                "object_namespace_recovery_gate.run",
+                side_effect=[
+                    refused_probe(exits),
+                    refused_probe(exits),
+                    not_found_probe(exits),
+                ],
+            ) as run_mock,
+            mock.patch("object_namespace_recovery_gate.time") as clock,
+        ):
+            clock.monotonic.return_value = 0.0
+            wait_owner_serves(
+                ["nokv", "--max-attempts", "1"],
+                process,
+                (exits, actions),
+                REPO,
+                30.0,
+                evidence,
+                "owner-e2-ready",
+            )
+        self.assertEqual(run_mock.call_count, 3)
+        for call in run_mock.call_args_list:
+            self.assertEqual(
+                call.args[0],
+                ["nokv", "--max-attempts", "1", "operation", "status", "00" * 16],
+            )
+            self.assertEqual(call.kwargs["label"], "owner-e2-ready")
+            self.assertIs(call.kwargs["evidence"], evidence)
+            self.assertFalse(call.kwargs["check"])
+            self.assertLessEqual(call.kwargs["timeout"], 10.0)
+        self.assertEqual(clock.sleep.call_count, 2)
+
+    def test_owner_readiness_fails_fast_when_the_owner_exits(self) -> None:
+        exits, actions = published_contract(REPO)
+        process = mock.Mock()
+        process.poll.return_value = 1
+        process.returncode = 1
+        with (
+            mock.patch("object_namespace_recovery_gate.run") as run_mock,
+            self.assertRaisesRegex(
+                WorkflowFailure, "owner exited before serving \\(1\\)"
+            ),
+        ):
+            wait_owner_serves(
+                ["nokv"],
+                process,
+                (exits, actions),
+                REPO,
+                30.0,
+                mock.Mock(),
+                "owner-e2-ready",
+            )
+        run_mock.assert_not_called()
+
+    def test_owner_readiness_is_bounded_by_the_gate_timeout(self) -> None:
+        exits, actions = published_contract(REPO)
+        process = mock.Mock()
+        process.poll.return_value = None
+        elapsed = [0.0]
+
+        def sleep(seconds: float) -> None:
+            elapsed[0] += seconds
+
+        with (
+            mock.patch(
+                "object_namespace_recovery_gate.run", return_value=refused_probe(exits)
+            ) as run_mock,
+            mock.patch("object_namespace_recovery_gate.time") as clock,
+            self.assertRaisesRegex(
+                WorkflowFailure, "did not serve metadata reads within 1 seconds"
+            ),
+        ):
+            clock.monotonic.side_effect = lambda: elapsed[0]
+            clock.sleep.side_effect = sleep
+            wait_owner_serves(
+                ["nokv"],
+                process,
+                (exits, actions),
+                REPO,
+                1.0,
+                mock.Mock(),
+                "owner-e1-ready",
+            )
+        self.assertEqual(run_mock.call_count, 4)
 
     def test_rustfs_image_is_digest_pinned(self) -> None:
         self.assertIn("@sha256:", PINNED_RUSTFS_IMAGE)
