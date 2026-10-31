@@ -17,9 +17,14 @@ it is for one trusted host only. NoKV creates the directory and its files
 readable and writable by their owner alone, and every command refuses a
 control directory, `sessions` directory or record file that group or other
 users can write, or that belongs to a user other than the one running the
-command or root (`invalid_input`, exit 2). Every process that uses a control
-directory therefore runs as its owner; processes of different users share a
-control plane through etcd.
+command or root (`invalid_input`, exit 2). A command that writes the directory
+also refuses one it cannot create or write, and creates nothing inside a
+directory it refuses; `serve` makes all of these checks before it prepares its
+metadata store. A running owner whose control directory becomes unsafe stops
+serving and exits with that refusal, and does not resume by itself; once the
+permissions are fixed, a restart by its supervisor or the operator serves
+again. Every process that uses a control directory therefore runs as its
+owner; processes of different users share a control plane through etcd.
 
 ## What each role touches
 

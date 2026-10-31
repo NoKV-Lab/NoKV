@@ -41,9 +41,11 @@ Boundaries:
    system user is the boundary: NoKV creates the directory and its files for
    their owner alone, and refuses a directory, `sessions` directory or record
    file that group or other users can write, or that belongs to a user other
-   than the process's own or root. With etcd, R6a binds the owner, the
-   operator and each Agent principal to an etcd user with a least-privilege
-   role (`c*`).
+   than the process's own or root. An owner whose control directory becomes
+   unsafe while it serves stops serving and exits with that refusal; once the
+   permissions are fixed, a restart by its supervisor or the operator serves
+   again. With etcd, R6a binds the owner, the operator and each Agent
+   principal to an etcd user with a least-privilege role (`c*`).
 3. **Owner → object store** with the owner's credentials; **Agent → object
    store** read-only.
 
@@ -64,7 +66,7 @@ Boundaries:
 | Tampering: another writer renews or retires a snapshot it did not mint | Only the minter or an operator may | `t11` |
 | Tampering: an Agent writes object bodies directly | Agent object credentials are read-only; the owner uploads every block (R5a) | `t14`, `c4` (etcd roles) |
 | Tampering: a forged commit projection in a raw RPC | The projection digest is the committing principal's claim, which the owner seals into the commit operation without recomputing it: a request that presents the operation with another digest, from any principal including an operator, is refused (`RequestReplayMismatch`) and changes nothing, and the commit records its initiator | `executor::another_principal_cannot_rebind_a_commit_projection`, `executor::commit_prepare_rejects_a_changed_projection_input_digest`, `t10` |
-| Tampering: a client of another root or tenant writes the control store | etcd roles: an Agent user cannot write `roots/`, `tenants/` or another tenant's keys. A control directory is created owner-only (0700, files 0600), and every command refuses one that group or other users can write or another user owns (`invalid_input`, exit 2), before it reads or writes a record | `c3`, `c4`, `nokv-control` `local::tests::a_control_directory_other_users_can_write_is_refused`, `nokv` `control_directory_permissions` |
+| Tampering: a client of another root or tenant writes the control store | etcd roles: an Agent user cannot write `roots/`, `tenants/` or another tenant's keys. A control directory is created owner-only (0700, files 0600), and every command refuses one that group or other users can write or another user owns (`invalid_input`, exit 2), before it reads or writes a record; a running owner exits with that refusal | `c3`, `c4`, `s13`, `nokv-control` `local::tests::a_control_directory_other_users_can_write_is_refused`, `nokv` `control_directory_permissions` |
 | Tampering: an old-format store opened by a new owner | format 15 refuses to open a 0.12.x store and writes nothing; there is no migration | `nokv-meta` codec and recovery tests |
 | **R**epudiation: who made a write | Every operation records the principal that began it; `operation status` reports it to any reader of the root; a put through the Workbench tools carries the caller's operation id | `t10`, `t13`, `t20`, Pi `m1`, `m3`, Hermes `hm1` |
 | Repudiation: a write replayed by another principal | A replay returns the original receipt and keeps the original initiator | `t9`, `t12` |

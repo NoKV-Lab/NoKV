@@ -708,6 +708,39 @@ def root_provisioned_after_owner_start_is_served(stack: Stack) -> dict[str, Any]
     return {"root": root, "served_after_seconds": served_after, "put": put}
 
 
+def owner_exits_when_its_control_directory_becomes_unsafe(stack: Stack) -> dict[str, Any]:
+    """S13: an owner whose control directory becomes group-writable stops
+    serving and exits within its session check, reporting the control store's
+    refusal: invalid_input, with the directory and the fix. It does not resume
+    by itself; once the mode is fixed, a restart with --metadata-reopen serves
+    what was written before."""
+    workbench, body = "s13-unsafe-control", b"written before the refusal"
+    stack.workbench(workbench)
+    before = stack.success(stack.put("s13-before", workbench, "before.txt", new_id(), body))
+    owner, log = stack.owner, stack.evidence / f"owner-{stack.owner_starts}.log"
+    private = stack.control.stat().st_mode & 0o7777
+    stack.control.chmod(private | 0o020)
+    started = time.monotonic()
+    try:
+        owner.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        raise ContractFailure("s13: the owner still serves 10 s after its control directory became group-writable")
+    finally:
+        stack.control.chmod(private)
+    exited_after = round(time.monotonic() - started, 2)
+    # Serve logs to stderr; its failure is the last line.
+    lines = log.read_text(errors="replace").splitlines()
+    exit_call = Call("s13-owner-exit", owner.returncode, "", (lines[-1] if lines else "") + "\n")
+    envelope = stack.failure(exit_call, "invalid_input", "fix_input")
+    require(str(stack.control) in envelope["message"] and "chmod go-w" in envelope["message"],
+            "s13: the owner's exit names its control directory and the fix", envelope)
+    stack.start_owner()
+    after = stack.stat("s13-after", workbench, "before.txt")
+    require(after.get("exists") is True and after.get("generation") == before.get("generation"),
+            "s13: the restarted owner serves the path written before the refusal", [before, after])
+    return {"exited_after_seconds": exited_after, "exit": envelope, "after_restart": after}
+
+
 def usage_error_sends_no_request(stack: Stack) -> dict[str, Any]:
     """S7: an invalid command fails typed before it reaches the owner."""
     cases = {
@@ -741,6 +774,8 @@ SCENARIOS = {
     "s10_session_backoff_bridges_owner_restart": session_backoff_bridges_owner_restart,
     "s11_in_flight_identified_write_survives_owner_restart": in_flight_identified_write_survives_owner_restart,
     "s12_root_provisioned_after_owner_start_is_served": root_provisioned_after_owner_start_is_served,
+    "s13_owner_exits_when_its_control_directory_becomes_unsafe":
+        owner_exits_when_its_control_directory_becomes_unsafe,
 }
 
 

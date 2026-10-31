@@ -271,13 +271,18 @@ fn control_failure(code: &str, message: impl Into<String>, class: ErrorClass) ->
     CliFailure::new(code, message, class, IdempotencyScope::ReadOnly)
 }
 
+/// A control store's own failure, in the class the store gives it.
+fn control_store_failure(error: nokv_control::ControlError) -> CliFailure {
+    control_failure("ControlFailure", error.to_string(), error.class())
+}
+
 fn load_root_agent_binding(
     control: &dyn nokv_control::ControlStore,
     root_id: nokv_control::RootId,
 ) -> Result<nokv_control::RootAgentBinding, CliFailure> {
     let binding = control
         .get_root_agent_binding(&root_id)
-        .map_err(|error| control_failure("ControlFailure", error.to_string(), error.class()))?
+        .map_err(control_store_failure)?
         .ok_or_else(|| {
             control_failure(
                 "RootNotProvisioned",
@@ -423,7 +428,7 @@ fn bound_workbench_root(
 ) -> Result<nokv_types::WorkbenchRoot, CliFailure> {
     identity
         .get_root_presentation(&root_id)
-        .map_err(|error| control_failure("ControlFailure", error.to_string(), error.class()))?
+        .map_err(control_store_failure)?
         .map(|binding| binding.workbench_root)
         .ok_or_else(|| {
             control_failure(
@@ -1734,9 +1739,6 @@ fn run_provision(
     use nokv_control::{LogicalShardId, RootId, RootPresentationBinding};
     use nokv_types::{RootPlacementLifecycle, WorkbenchRoot};
 
-    let control_error = |error: nokv_control::ControlError| {
-        control_failure("ControlFailure", error.to_string(), error.class())
-    };
     let root_id = RootId::from(
         connection::configured_root_id(&invocation.client).map_err(connection_failure)?,
     );
@@ -1766,20 +1768,20 @@ fn run_provision(
     // Every Agent of the root presents it under this one Workbench root.
     let presentation_preexisting = identity
         .get_root_presentation(&root_id)
-        .map_err(control_error)?
+        .map_err(control_store_failure)?
         .is_some();
     let presentation = identity
         .bind_root_presentation(RootPresentationBinding {
             root_id,
             workbench_root,
         })
-        .map_err(control_error)?;
+        .map_err(control_store_failure)?;
     // Provision proves the provider semantics the owner's writes will need.
     let objects = CliObjectStore::build(&invocation.client.object)?;
     admit_object_provider(&objects, invocation)?;
     let namespace_id = match control
         .get_root_object_namespace_binding(&root_id)
-        .map_err(control_error)?
+        .map_err(control_store_failure)?
     {
         Some(binding) => {
             objects
@@ -1855,10 +1857,10 @@ fn run_provision(
 fn active_shard_placements(
     control: &dyn nokv_control::ControlStore,
     seed: &nokv_control::RootPlacement,
-) -> Result<Vec<nokv_control::RootPlacement>, String> {
+) -> Result<Vec<nokv_control::RootPlacement>, CliFailure> {
     let mut placements = control
         .list_root_placements()
-        .map_err(|error| error.to_string())?
+        .map_err(control_store_failure)?
         .into_iter()
         .filter(|placement| {
             placement.logical_shard_id == seed.logical_shard_id
@@ -1870,7 +1872,9 @@ fn active_shard_placements(
         .iter()
         .any(|placement| placement.root_id == seed.root_id)
     {
-        return Err("configured root placement must be Active before serve".to_owned());
+        return Err("configured root placement must be Active before serve"
+            .to_owned()
+            .into());
     }
     Ok(placements)
 }
@@ -1879,9 +1883,9 @@ fn active_shard_placements(
 fn validate_served_root_agent_bindings(
     control: &dyn nokv_control::ControlStore,
     placements: &[nokv_control::RootPlacement],
-) -> Result<(), String> {
+) -> Result<(), CliFailure> {
     for placement in placements {
-        load_root_agent_binding(control, placement.root_id).map_err(|failure| failure.message())?;
+        load_root_agent_binding(control, placement.root_id)?;
     }
     Ok(())
 }
@@ -1892,12 +1896,12 @@ fn validate_served_root_agent_bindings(
 fn served_tenant(
     identity: &dyn nokv_control::IdentityStore,
     placements: &[nokv_control::RootPlacement],
-) -> Result<nokv_types::TenantId, String> {
+) -> Result<nokv_types::TenantId, CliFailure> {
     let mut tenant = None;
     for placement in placements {
         let binding = identity
             .get_root_tenant(&placement.root_id)
-            .map_err(|error| error.to_string())?
+            .map_err(control_store_failure)?
             .ok_or_else(|| {
                 format!(
                     "root {} is not bound to a tenant; run `nokv identity root bind` before \
@@ -1911,13 +1915,18 @@ fn served_tenant(
                 return Err(
                     "one owner serves one tenant, but the roots of this shard are bound to \
                      different tenants"
-                        .to_owned(),
+                        .to_owned()
+                        .into(),
                 );
             }
             Some(_) => {}
         }
     }
-    tenant.ok_or_else(|| "serving over TLS requires at least one root".to_owned())
+    tenant.ok_or_else(|| {
+        "serving over TLS requires at least one root"
+            .to_owned()
+            .into()
+    })
 }
 
 /// A plaintext owner authenticates nobody, so it refuses every root a tenant
@@ -1926,18 +1935,19 @@ fn served_tenant(
 fn refuse_plaintext_for_tenant_roots(
     identity: &dyn nokv_control::IdentityStore,
     placements: &[nokv_control::RootPlacement],
-) -> Result<(), String> {
+) -> Result<(), CliFailure> {
     for placement in placements {
         if let Some(binding) = identity
             .get_root_tenant(&placement.root_id)
-            .map_err(|error| error.to_string())?
+            .map_err(control_store_failure)?
         {
             return Err(format!(
                 "root {} is bound to tenant {}; a tenant-bound root is served only over RPC TLS, \
                  so start serve with --rpc-tls-cert and --rpc-tls-key",
                 encode_lowercase_hex(placement.root_id.as_bytes()),
                 encode_lowercase_hex(binding.tenant_id.as_bytes())
-            ));
+            )
+            .into());
         }
     }
     Ok(())
@@ -2012,11 +2022,11 @@ impl RootMountChecks {
                 {
                     return Ok(Some(failure.message()));
                 }
-                if let Err(reason) = refuse_plaintext_for_tenant_roots(
+                if let Err(failure) = refuse_plaintext_for_tenant_roots(
                     self.identity.as_ref(),
                     std::slice::from_ref(placement),
                 ) {
-                    return Ok(Some(reason));
+                    return Ok(Some(failure.message()));
                 }
             }
             Some(served) => match self
@@ -2073,8 +2083,11 @@ fn mount_roots_until(
         }
         let candidates = match active_shard_placements(checks.control.as_ref(), seed) {
             Ok(placements) => placements,
-            Err(reason) => {
-                eprintln!("root mounter: cannot list placements: {reason}");
+            Err(failure) => {
+                eprintln!(
+                    "root mounter: cannot list placements: {}",
+                    failure.message()
+                );
                 continue;
             }
         };
@@ -2191,11 +2204,15 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
     let root_id = RootId::from(
         connection::configured_root_id(&invocation.client).map_err(|error| error.to_string())?,
     );
-    let connection::ControlPlane { control, identity } =
-        open_control_plane(invocation).map_err(|failure| failure.message())?;
+    let connection::ControlPlane { control, identity } = open_control_plane(invocation)?;
+    // The owner writes its session and records in the control store: refuse
+    // a store it could not use before reading a record or preparing metadata.
+    control
+        .check_owner_access()
+        .map_err(control_store_failure)?;
     let placement = control
         .get_root_placement(&root_id)
-        .map_err(|error| error.to_string())?
+        .map_err(control_store_failure)?
         .ok_or_else(|| "root placement does not exist; provision it before serve".to_owned())?;
     let placements = active_shard_placements(control.as_ref(), &placement)?;
     // Over TLS the owner authorizes principals by role; the plaintext
@@ -2207,14 +2224,14 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
     }
     let object_namespace = control
         .get_root_object_namespace_binding(&root_id)
-        .map_err(|error| error.to_string())?
+        .map_err(control_store_failure)?
         .ok_or_else(|| {
             "root object namespace is not bound; run provision after verifying the configured bucket/prefix"
                 .to_owned()
         })?;
     let shard = control
         .get_logical_shard(&placement.logical_shard_id)
-        .map_err(|error| error.to_string())?
+        .map_err(control_store_failure)?
         .ok_or_else(|| "logical shard does not exist; provision it before serve".to_owned())?;
     let recovery = RecoveryPublication {
         checkpoint: shard.checkpoint.clone(),
@@ -2248,9 +2265,12 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
         .map(|placement| {
             control
                 .get_root_object_namespace_binding(&placement.root_id)
-                .map_err(|error| error.to_string())?
+                .map_err(control_store_failure)?
                 .ok_or_else(|| {
-                    "every root on a served shard must have an object namespace binding".to_owned()
+                    CliFailure::from(
+                        "every root on a served shard must have an object namespace binding"
+                            .to_owned(),
+                    )
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2507,16 +2527,30 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
         &mut failures,
     );
     let release_result = server.release_ownership();
-    if let Err(error) = server_result {
-        failures.push(format!("RPC server stopped: {error}"));
-    }
+    // When the control store ended the session, for example because the
+    // control directory became unsafe, the exit reports the store's failure
+    // in the class the store gives it, as every command does, and logs the
+    // failures it caused before it.
+    let control_cause = match server_result {
+        Err(nokv_server::ServerError::Control(cause)) => Some(cause),
+        Err(error) => {
+            failures.push(format!("RPC server stopped: {error}"));
+            None
+        }
+        Ok(()) => None,
+    };
     if let Err(error) = release_result {
         failures.push(format!("owner release failed: {error}"));
     }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(failures.join("; ").into())
+    match control_cause {
+        Some(cause) => {
+            for failure in &failures {
+                eprintln!("{failure}");
+            }
+            Err(control_store_failure(cause))
+        }
+        None if failures.is_empty() => Ok(()),
+        None => Err(failures.join("; ").into()),
     }
 }
 
@@ -3165,8 +3199,9 @@ mod tests {
             .unwrap()
             .unwrap()
             .owner_epoch;
-        let error = validate_served_root_agent_bindings(&control, &placements).unwrap_err();
-        assert!(error.contains("no durable Agent binding"));
+        let failure = validate_served_root_agent_bindings(&control, &placements).unwrap_err();
+        assert_eq!(failure.class(), ErrorClass::OperatorRequired);
+        assert!(failure.message().contains("no durable Agent binding"));
         assert_eq!(
             control
                 .get_logical_shard(&shard(9))
@@ -3215,7 +3250,9 @@ mod tests {
                 tenant_id,
             })
             .unwrap();
-        let error = refuse_plaintext_for_tenant_roots(&control, &placements).unwrap_err();
+        let error = refuse_plaintext_for_tenant_roots(&control, &placements)
+            .unwrap_err()
+            .message();
         assert!(
             error.contains(&encode_lowercase_hex(root(2).as_bytes())),
             "{error}"
