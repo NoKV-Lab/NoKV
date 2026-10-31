@@ -27,7 +27,7 @@ homepage = "https://nokv.io"
 
 [workspace.dependencies]
 base64 = "0.23.0"
-getrandom = "0.3"
+getrandom = "0.4"
 libc = "0.2.189"
 nokv-types = { path = "crates/nokv-types", version = "0.1.0" }
 nokv-protocol = { path = "crates/nokv-protocol", version = "0.1.0" }

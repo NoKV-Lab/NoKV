@@ -1229,7 +1229,7 @@ name = "nokv"
 version = "0.12.1"
 dependencies = [
  "base64 0.23.1",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "nokv-agent",
  "nokv-client",
  "nokv-control",
@@ -1357,7 +1357,7 @@ dependencies = [
 name = "nokv-python"
 version = "0.12.1"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "nokv-agent",
  "nokv-client",
  "nokv-object",
