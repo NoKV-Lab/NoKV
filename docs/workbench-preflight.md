@@ -63,9 +63,11 @@ owner session is still live.
 On one host, `--control-dir PATH` keeps the control records in a local
 directory, and the owner session is an exclusive file lock that the kernel
 releases when the owner process exits, so no etcd process runs and the proof
-is an in-process check. The directory must be on a local filesystem. Use
-`--etcd-endpoint` when owners or clients span hosts; the proof is then one
-linearizable etcd read per acknowledgement.
+is an in-process check. The directory must be on a local filesystem, and
+every process that uses it runs as its owner: NoKV creates it private and
+refuses one that group or other users can write or another user owns. Use
+`--etcd-endpoint` when owners or clients span hosts or users; the proof is
+then one linearizable etcd read per acknowledgement.
 
 Publishing the recovery log to Control (`--recovery-publication shared`) is
 an option, and an immature one: without checkpoint compaction the shared log
