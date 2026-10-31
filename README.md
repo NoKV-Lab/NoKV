@@ -448,9 +448,12 @@ over the storage-neutral `TxnStore` contract; Holt is the currently wired and
 tested `LocalSync` implementation, while S3-compatible storage still owns
 artifact bytes.
 
-This evidence snapshot covers NoKV's exact `holt = "=0.8.7"` dependency.
-Later upstream Holt `main` features are outside this section's claims; identify
-an installed build with `nokv version --json`.
+This evidence snapshot covers the exact `holt = "=0.8.7"` dependency of NoKV
+0.12.1. `main` now pins `=0.8.8`, which is 0.8.7 plus a fail-closed fix: a
+write that fails after changing cached frames stops the database instead of
+letting a later checkpoint persist part of it. Later upstream Holt `main`
+features are outside this section's claims; identify an installed build with
+`nokv version --json`.
 
 Holt maps NoKV metadata families to named persistent adaptive radix trees:
 

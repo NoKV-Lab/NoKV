@@ -30,10 +30,12 @@ from typing import Any, Callable, Sequence, TextIO
 
 from cli_contract import (
     Call,
+    Contract,
     ContractFailure,
     contract_failure,
     contract_success,
     contract_tables,
+    owner_serves,
 )
 from source_bound_producer import ProducerError, ScenarioContract
 from typed_live_qualification import (
@@ -433,6 +435,43 @@ def wait_tcp(process: subprocess.Popen[str], port: int, timeout: float) -> None:
     raise WorkflowFailure(f"process did not listen on 127.0.0.1:{port}")
 
 
+def wait_owner_serves(
+    probe: list[str],
+    process: subprocess.Popen[str],
+    contract: Contract,
+    repo: Path,
+    timeout: float,
+    evidence: Evidence,
+    label: str,
+) -> None:
+    """Return once `process` answers a metadata read through the route it
+    published: `operation status` of an unknown id is then not_found rather
+    than a transport failure. A TCP connect proves less: the owner publishes
+    its route before it binds, and any other listener on the port accepts."""
+    exits, actions = contract
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise WorkflowFailure(
+                f"{label}: owner exited before serving ({process.returncode})"
+            )
+        result = run(
+            [*probe, "operation", "status", "00" * 16],
+            cwd=repo,
+            timeout=min(max(deadline - time.monotonic(), 1.0), 10.0),
+            check=False,
+            evidence=evidence,
+            label=label,
+        )
+        call = Call(label, result.returncode, result.stdout, result.stderr)
+        if owner_serves(call, exits, actions):
+            return
+        time.sleep(0.25)
+    raise WorkflowFailure(
+        f"{label}: owner did not serve metadata reads within {timeout:g} seconds"
+    )
+
+
 def wait_etcd(
     etcdctl: Path,
     endpoint: str,
@@ -677,6 +716,35 @@ def server_command(
     ]
 
 
+def start_owner(
+    common: list[str],
+    objects: list[str],
+    node: str,
+    metadata_option: str,
+    metadata: Path,
+    log: TextIO,
+    *,
+    probe: list[str],
+    contract: Contract,
+    repo: Path,
+    timeout: float,
+    evidence: Evidence,
+    label: str,
+) -> subprocess.Popen[str]:
+    """Start one shard owner and return once it serves. The port is drawn
+    here, not reserved earlier: nothing holds a reserved port, and another
+    process that takes it meanwhile makes the owner's bind fail while a TCP
+    probe of the port still succeeds."""
+    port = free_port()
+    process = start_process(
+        server_command(common, objects, port, node, metadata_option, metadata),
+        repo,
+        log,
+    )
+    wait_owner_serves(probe, process, contract, repo, timeout, evidence, label)
+    return process
+
+
 def logical_request_digest(tool: str, arguments: dict[str, Any]) -> str:
     """The identity of one Workbench request independent of its transport:
     the tool and its canonical arguments."""
@@ -836,7 +904,6 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
     access_key, secret_key = "rustfsadmin", "rustfsadmin"
     etcd_port, peer_port = free_port(), free_port()
     s3_port, console_port = free_port(), free_port()
-    owner_port, retry_port = free_port(), free_port()
     etcd_endpoint = f"http://127.0.0.1:{etcd_port}"
     s3_endpoint = f"http://127.0.0.1:{s3_port}"
     aws_env = aws_environment(access_key, secret_key)
@@ -946,11 +1013,21 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         if not isinstance(namespace_id, str):
             raise WorkflowFailure("provision did not report object_namespace_id")
 
-        first_command = server_command(
-            common, objects, owner_port, "object-gate-e1", "--metadata-create", metadata
+        probe_client = [*agent_common, "--max-attempts", "1", *objects]
+        owner = start_owner(
+            common,
+            objects,
+            "object-gate-e1",
+            "--metadata-create",
+            metadata,
+            owner_log,
+            probe=probe_client,
+            contract=(exits, actions),
+            repo=repo,
+            timeout=args.timeout,
+            evidence=evidence,
+            label="owner-e1-ready",
         )
-        owner = start_process(first_command, repo, owner_log)
-        wait_tcp(owner, owner_port, args.timeout)
         owner_key = f"{prefix}/logical-shards/{shard_id}"
         session_key = f"{prefix}/sessions/{shard_id}"
         first_control_raw = etcd_value(
@@ -1055,16 +1132,20 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         )
         owner = None
 
-        retry_command = server_command(
+        retry_owner = start_owner(
             common,
             objects,
-            retry_port,
             "object-gate-e2",
             "--metadata-reopen",
             metadata,
+            retry_log,
+            probe=probe_client,
+            contract=(exits, actions),
+            repo=repo,
+            timeout=args.timeout,
+            evidence=evidence,
+            label="owner-e2-ready",
         )
-        retry_owner = start_process(retry_command, repo, retry_log)
-        wait_tcp(retry_owner, retry_port, args.timeout)
         second_control_raw = etcd_value(
             Path(args.etcdctl_bin), etcd_endpoint, owner_key, repo, args.timeout
         )

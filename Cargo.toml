@@ -27,7 +27,7 @@ homepage = "https://nokv.io"
 
 [workspace.dependencies]
 base64 = "0.23.0"
-getrandom = "0.3"
+getrandom = "0.4"
 libc = "0.2.189"
 nokv-types = { path = "crates/nokv-types", version = "0.1.0" }
 nokv-protocol = { path = "crates/nokv-protocol", version = "0.1.0" }
@@ -43,7 +43,7 @@ nokv-server = { path = "crates/nokv-server", version = "0.1.0" }
 nokv = { path = "crates/nokv", version = "0.12.1" }
 nokv-python = { path = "crates/nokv-python", version = "0.12.1" }
 nokv-bench = { path = "bench", version = "0.1.0" }
-holt = { version = "=0.8.7", default-features = false }
+holt = { version = "=0.8.8", default-features = false }
 etcd-client = { version = "0.21.0", default-features = false }
 tonic = { version = "0.14.6", default-features = false }
 opendal = { version = "0.59.5", default-features = false, features = ["blocking", "executors-tokio", "reqwest-rustls-tls", "services-s3"] }
