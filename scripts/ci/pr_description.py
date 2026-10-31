@@ -18,13 +18,19 @@ SECTIONS = (
 )
 TITLE = re.compile(r"[a-z][a-z0-9-]*: \S.*")
 PLACEHOLDERS = {"todo", "tbd", "na", "none", "placeholder"}
+# Dependabot writes its version-update PR bodies itself (release notes and
+# commits) and cannot be asked for the eight sections. The login comes from
+# the pull request API, which a PR author cannot set.
+DEPENDABOT = "dependabot[bot]"
 
 
-def validate_description(title: object, body: object) -> list[str]:
+def validate_description(title: object, body: object, author: object = None) -> list[str]:
     """Return actionable errors without echoing untrusted PR content."""
     errors = []
     if not isinstance(title, str) or not TITLE.fullmatch(title.strip()):
         errors.append("Title must use <type>: <outcome>, for example chore: enforce PR descriptions.")
+    if author == DEPENDABOT:
+        return errors
     if not isinstance(body, str) or not body.strip():
         return errors + ["PR body must contain all required sections with content."]
 
@@ -68,7 +74,8 @@ def validate_description(title: object, body: object) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pull-request-json", required=True, type=Path,
-                        help="JSON object containing title and body, obtained with gh pr view or gh api")
+                        help="JSON object containing title, body and optionally the author's login, "
+                             "obtained with gh pr view or gh api")
     args = parser.parse_args()
     try:
         payload = json.loads(args.pull_request_json.read_text(encoding="utf-8"))
@@ -77,7 +84,7 @@ def main() -> int:
     except (OSError, ValueError) as error:
         print(f"PR description input could not be read: {error}", file=sys.stderr)
         return 1
-    errors = validate_description(payload.get("title"), payload.get("body"))
+    errors = validate_description(payload.get("title"), payload.get("body"), payload.get("author"))
     for error in errors:
         print(error, file=sys.stderr)
     if errors:
