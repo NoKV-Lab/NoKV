@@ -1,6 +1,6 @@
 [package]
 name = "nokv"
-version = "0.12.1"
+version = "0.20.0"
 description = "Custom CLI and shard-owner process for NoKV Agent workspaces."
 edition.workspace = true
 rust-version.workspace = true
