@@ -259,6 +259,37 @@ mod tests {
         assert!(error.to_string().contains("root placement does not exist"));
     }
 
+    /// The SDK classifies a control directory that group or other users can
+    /// write as the CLI does: for an operator, who checks its records.
+    #[test]
+    fn an_unsafe_local_control_directory_is_for_an_operator() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        Python::initialize();
+        let directory = tempfile::tempdir().unwrap();
+        let control = directory.path().join("control");
+        std::fs::create_dir(&control).unwrap();
+        std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let root_id = RootIdentity([0x11; 16]);
+        let error = PythonRoutingConfig::local(control)
+            .unwrap()
+            .build(root_id)
+            .unwrap()
+            .resolve(root_id, true)
+            .unwrap_err();
+        assert_eq!(
+            error.class(),
+            nokv_types::ErrorClass::OperatorRequired,
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("group or other users can write it"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn control_backed_configurations_share_one_resolver_and_static_ones_pin_one_root() {
         Python::initialize();

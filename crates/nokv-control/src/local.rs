@@ -27,8 +27,9 @@
 //! other users can write, or that belongs to a user other than this process's
 //! user or root. A mutation also refuses a directory this process cannot
 //! create or create files in, and checks each directory before it creates
-//! anything inside it. Processes of different users share a control plane
-//! through etcd.
+//! anything inside it. Each refusal is `ControlPathRefused`, for an operator:
+//! someone else may have changed the records. Processes of different users
+//! share a control plane through etcd.
 
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -604,7 +605,7 @@ fn may_create_entries(path: &Path) -> io::Result<()> {
 
 /// The refusal of a control directory that this process's user lacks the
 /// permission to `action`. That lasts until an operator changes the
-/// filesystem, so it is invalid input, not a transient failure.
+/// filesystem, so it is not a transient failure.
 fn refusal_without_permission(
     path: &Path,
     action: &str,
@@ -614,13 +615,13 @@ fn refusal_without_permission(
         error.kind(),
         io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
     )
-    .then(|| {
-        ControlError::InvalidOptions(format!(
-            "local control store refuses {}: this process's user (uid {}) cannot {action} \
-             ({error}); make it a directory that user owns and can write, or choose another one",
-            path.display(),
+    .then(|| ControlError::ControlPathRefused {
+        path: path.to_path_buf(),
+        reason: format!(
+            "this process's user (uid {}) cannot {action} ({error}); make it a directory that \
+             user owns and can write, or choose another one",
             effective_user()
-        ))
+        ),
     })
 }
 
@@ -634,10 +635,10 @@ fn effective_user() -> u32 {
 fn check_control_path(path: &Path, metadata: &fs::Metadata) -> Result<(), ControlError> {
     match control_path_problem(metadata.mode(), metadata.uid(), effective_user()) {
         None => Ok(()),
-        Some(problem) => Err(ControlError::InvalidOptions(format!(
-            "local control store refuses {}: {problem}",
-            path.display()
-        ))),
+        Some(reason) => Err(ControlError::ControlPathRefused {
+            path: path.to_path_buf(),
+            reason,
+        }),
     }
 }
 
@@ -1244,11 +1245,22 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    /// `result` is the store's refusal of `path` because of `why`: a matter
+    /// for an operator, since someone else may have changed the records.
     fn refused_because(result: Result<impl std::fmt::Debug, ControlError>, path: &Path, why: &str) {
-        match result {
-            Err(ControlError::InvalidOptions(message)) => {
-                assert!(message.contains(&path.display().to_string()), "{message}");
-                assert!(message.contains(why), "{message}");
+        let error = result.expect_err("the store must refuse");
+        assert_eq!(
+            error.class(),
+            nokv_types::ErrorClass::OperatorRequired,
+            "{error}"
+        );
+        match error {
+            ControlError::ControlPathRefused {
+                path: refused,
+                reason,
+            } => {
+                assert_eq!(refused, path, "{reason}");
+                assert!(reason.contains(why), "{reason}");
             }
             other => panic!("expected a refusal of {}, got {other:?}", path.display()),
         }

@@ -1755,9 +1755,15 @@ fn run_provision(
     let workbench_root = WorkbenchRoot::new(workbench_root)
         .map_err(|error| CliFailure::invalid_input(format!("--workbench-root: {error}")))?;
     let connection::ControlPlane { control, identity } = open_control_plane(invocation)?;
+    // Read every record provision writes before writing any, so a record
+    // the control store refuses leaves the control plane unchanged.
     let existing_placement =
         provision::preflight_provision(control.as_ref(), root_id, logical_shard_id)
             .map_err(provision_failure)?;
+    let presentation_preexisting = identity
+        .get_root_presentation(&root_id)
+        .map_err(control_store_failure)?
+        .is_some();
     let binding_preexisting = provision::ensure_root_agent_binding(
         control.as_ref(),
         root_id,
@@ -1766,10 +1772,6 @@ fn run_provision(
     )
     .map_err(provision_failure)?;
     // Every Agent of the root presents it under this one Workbench root.
-    let presentation_preexisting = identity
-        .get_root_presentation(&root_id)
-        .map_err(control_store_failure)?
-        .is_some();
     let presentation = identity
         .bind_root_presentation(RootPresentationBinding {
             root_id,
@@ -2143,14 +2145,50 @@ fn mount_roots_until(
 fn join_lifecycle_workers(
     workers: Vec<std::thread::JoinHandle<Result<(), nokv_server::LifecycleError>>>,
     failures: &mut Vec<String>,
+    causes: &mut Vec<nokv_control::ControlError>,
 ) {
     for worker in workers {
         match worker.join() {
-            Ok(Err(error)) => failures.push(format!("lifecycle worker failed: {error}")),
+            Ok(Err(error)) => {
+                failures.push(format!("lifecycle worker failed: {error}"));
+                causes.extend(error.control_error().cloned());
+            }
             Ok(Ok(())) => {}
             Err(_) => failures.push("lifecycle worker panicked".to_owned()),
         }
     }
+}
+
+/// The failure `serve` exits with once it has begun to take ownership:
+/// `failures` in the order they were found, all kept in the message, and
+/// `causes`, the control store's own failures behind them. The store's
+/// refusal of its directory or a record anywhere among them needs an
+/// operator before a restart can serve, so it sets the class
+/// (`operator_required`); otherwise `session_end`, the store's failure that
+/// ended the owner session, keeps the store's class; anything else is
+/// internal.
+#[cfg(feature = "control")]
+fn serve_failure(
+    failures: Vec<String>,
+    session_end: Option<&nokv_control::ControlError>,
+    causes: &[nokv_control::ControlError],
+) -> CliFailure {
+    let message = failures.join("; ");
+    match causes
+        .iter()
+        .find(|cause| matches!(cause, nokv_control::ControlError::ControlPathRefused { .. }))
+        .or(session_end)
+    {
+        Some(cause) => control_failure("ControlFailure", message, cause.class()),
+        None => message.into(),
+    }
+}
+
+/// `serve`'s failure from one server error.
+#[cfg(feature = "control")]
+fn server_failure(error: nokv_server::ServerError) -> CliFailure {
+    let causes = error.control_error().cloned();
+    serve_failure(vec![error.to_string()], None, causes.as_slice())
 }
 
 #[cfg(feature = "control")]
@@ -2361,7 +2399,7 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
                 .collect(),
         },
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(server_failure)?;
 
     // An expiring owner lease is renewed on the store's cadence. A session
     // that ends only with its process is still checked on a fixed cadence, so
@@ -2386,7 +2424,7 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
         Arc::clone(&registry),
         vec![owner],
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(server_failure)?;
     let server = match rpc_tls {
         Some(tls) => server.with_rpc_tls(tls),
         None => server,
@@ -2410,13 +2448,13 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
         ) {
             Ok(lifecycle) => lifecycles.push(lifecycle),
             Err(error) => {
-                let primary = error.to_string();
-                let release = server.release_ownership();
-                return Err(match release {
-                    Ok(()) => primary,
-                    Err(release) => format!("{primary}; owner release failed: {release}"),
+                let mut failures = vec![error.to_string()];
+                let mut causes = Vec::from_iter(error.control_error().cloned());
+                if let Err(release) = server.release_ownership() {
+                    failures.push(format!("owner release failed: {release}"));
+                    causes.extend(release.control_error().cloned());
                 }
-                .into());
+                return Err(serve_failure(failures, None, &causes));
             }
         }
     }
@@ -2438,11 +2476,13 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
             Err(error) => {
                 owner_loss.fail_closed();
                 let mut failures = vec![format!("cannot start lifecycle worker: {error}")];
-                join_lifecycle_workers(lifecycle_workers, &mut failures);
+                let mut causes = Vec::new();
+                join_lifecycle_workers(lifecycle_workers, &mut failures, &mut causes);
                 if let Err(error) = server.release_ownership() {
                     failures.push(format!("owner release failed: {error}"));
+                    causes.extend(error.control_error().cloned());
                 }
-                return Err(failures.join("; ").into());
+                return Err(serve_failure(failures, None, &causes));
             }
         }
     }
@@ -2519,38 +2559,36 @@ fn run_server(invocation: &Invocation) -> Result<(), CliFailure> {
     }
 
     let mut failures = Vec::new();
-    join_lifecycle_workers(lifecycle_workers, &mut failures);
+    let mut causes = Vec::new();
+    join_lifecycle_workers(lifecycle_workers, &mut failures, &mut causes);
     join_lifecycle_workers(
         mounted_workers
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
         &mut failures,
+        &mut causes,
     );
     let release_result = server.release_ownership();
-    // When the control store ended the session, for example because the
-    // control directory became unsafe, the exit reports the store's failure
-    // in the class the store gives it, as every command does, and logs the
-    // failures it caused before it.
-    let control_cause = match server_result {
-        Err(nokv_server::ServerError::Control(cause)) => Some(cause),
-        Err(error) => {
-            failures.push(format!("RPC server stopped: {error}"));
-            None
+    // The control store can end the session, for example once the control
+    // directory becomes unsafe, and can refuse the release, for example
+    // once the owner can no longer write the directory. Either way the exit
+    // reports the store's class, as every command does.
+    let mut session_end = None;
+    if let Err(error) = server_result {
+        failures.push(format!("RPC server stopped: {error}"));
+        causes.extend(error.control_error().cloned());
+        if let nokv_server::ServerError::Control(cause) = error {
+            session_end = Some(cause);
         }
-        Ok(()) => None,
-    };
+    }
     if let Err(error) = release_result {
         failures.push(format!("owner release failed: {error}"));
+        causes.extend(error.control_error().cloned());
     }
-    match control_cause {
-        Some(cause) => {
-            for failure in &failures {
-                eprintln!("{failure}");
-            }
-            Err(control_store_failure(cause))
-        }
-        None if failures.is_empty() => Ok(()),
-        None => Err(failures.join("; ").into()),
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(serve_failure(failures, session_end.as_ref(), &causes))
     }
 }
 
@@ -3223,6 +3261,56 @@ mod tests {
 
         let provisioning = control.get_root_placement(&root(4)).unwrap().unwrap();
         assert!(active_shard_placements(&control, &provisioning).is_err());
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn a_control_store_refusal_anywhere_in_a_serve_failure_decides_its_class() {
+        use nokv_control::ControlError;
+
+        let refusal = ControlError::ControlPathRefused {
+            path: "/srv/ctl".into(),
+            reason: "this process's user (uid 501) cannot create files in it".to_owned(),
+        };
+        let lease_lost = ControlError::Backend("owner lease expired".to_owned());
+        let malformed = ControlError::InvalidOptions("bad etcd endpoint".to_owned());
+        let failures = vec![
+            "lifecycle worker failed: lifecycle owner fence lost".to_owned(),
+            "RPC server stopped: invalid logical-shard bootstrap: control-plane owner was lost"
+                .to_owned(),
+            format!("owner release failed: control plane failed: {refusal}"),
+        ];
+
+        // A refusal behind the release decides; the message keeps every
+        // failure, with the refused path and the fix.
+        let failure = serve_failure(failures.clone(), None, std::slice::from_ref(&refusal));
+        assert_eq!(failure.class(), ErrorClass::OperatorRequired);
+        assert_eq!(failure.exit_code(), 9);
+        assert_eq!(failure.next_action(), NextAction::Operator);
+        assert_eq!(failure.message(), failures.join("; "));
+        assert!(failure
+            .message()
+            .contains("refuses /srv/ctl: this process's user"));
+
+        // It also decides over the store failure that ended the session.
+        let failure = serve_failure(
+            failures.clone(),
+            Some(&lease_lost),
+            &[lease_lost.clone(), refusal],
+        );
+        assert_eq!(failure.class(), ErrorClass::OperatorRequired);
+
+        // Without a refusal, the session's end keeps the store's class.
+        let failure = serve_failure(
+            failures.clone(),
+            Some(&lease_lost),
+            std::slice::from_ref(&lease_lost),
+        );
+        assert_eq!(failure.class(), ErrorClass::Transient);
+
+        // Any other store failure behind a release leaves the stop internal.
+        let failure = serve_failure(failures, None, &[lease_lost, malformed]);
+        assert_eq!(failure.class(), ErrorClass::Internal);
     }
 
     #[test]

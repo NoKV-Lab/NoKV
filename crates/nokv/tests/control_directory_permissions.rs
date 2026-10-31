@@ -6,11 +6,13 @@
 //! A control directory's records include the tenants' authorization policy,
 //! and its file permissions are its only access control. Every command
 //! refuses one that group or other users can write, before it reads or
-//! writes a record, as a usage error that names the directory and the fix.
-//! A command that writes it also refuses one it cannot create or write, and
-//! creates nothing in a directory it refuses.
+//! writes a record. Someone else may have changed its records, so the
+//! refusal is `operator_required` (exit 9, `operator`) and names the
+//! directory and the fix. A command that writes it also refuses one it
+//! cannot create or write, and changes nothing when it refuses.
 #![cfg(unix)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -58,7 +60,7 @@ fn mode(path: &Path) -> u32 {
 }
 
 #[test]
-fn a_control_directory_other_users_can_write_is_refused_as_invalid_input() {
+fn a_control_directory_other_users_can_write_is_refused_for_an_operator() {
     let parent = tempfile::tempdir().unwrap();
     let control = parent.path().join("control");
     let (exit, envelope) = nokv(
@@ -87,9 +89,9 @@ fn a_control_directory_other_users_can_write_is_refused_as_invalid_input() {
         &["operation", "status", OPERATION][..],
     ] {
         let (exit, envelope) = nokv(&control, arguments);
-        assert_eq!(exit, 2, "{envelope}");
-        assert_eq!(envelope["class"], "invalid_input", "{envelope}");
-        assert_eq!(envelope["next_action"], "fix_input", "{envelope}");
+        assert_eq!(exit, 9, "{envelope}");
+        assert_eq!(envelope["class"], "operator_required", "{envelope}");
+        assert_eq!(envelope["next_action"], "operator", "{envelope}");
         let message = envelope["message"].as_str().unwrap_or_default();
         assert!(
             message.contains(&control.display().to_string())
@@ -125,9 +127,9 @@ fn user_of(created: &Path) -> u32 {
 }
 
 fn assert_refused(exit: i32, envelope: &Value, path: &Path, why: &str) {
-    assert_eq!(exit, 2, "{}: {envelope}", path.display());
-    assert_eq!(envelope["class"], "invalid_input", "{envelope}");
-    assert_eq!(envelope["next_action"], "fix_input", "{envelope}");
+    assert_eq!(exit, 9, "{}: {envelope}", path.display());
+    assert_eq!(envelope["class"], "operator_required", "{envelope}");
+    assert_eq!(envelope["next_action"], "operator", "{envelope}");
     let message = envelope["message"].as_str().unwrap_or_default();
     assert!(
         message.contains(&format!("refuses {}:", path.display())) && message.contains(why),
@@ -242,6 +244,99 @@ fn serve_refuses_an_unsafe_control_directory_before_it_prepares_metadata() {
         assert_refused(exit, &envelope, &path, why);
         assert!(!metadata.exists(), "{}: {envelope}", path.display());
     }
+}
+
+/// Every entry under `directory`: its mode and, for a file, its contents.
+/// The records are JSON, so they compare and print as text.
+fn tree(directory: &Path) -> BTreeMap<PathBuf, (u32, Option<String>)> {
+    let mut entries = BTreeMap::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let contents = if metadata.is_dir() {
+                pending.push(path.clone());
+                None
+            } else {
+                Some(String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned())
+            };
+            entries.insert(
+                path.strip_prefix(directory).unwrap().to_path_buf(),
+                (metadata.mode() & 0o7777, contents),
+            );
+        }
+    }
+    entries
+}
+
+/// `nokv provision` of `ROOT` on a new logical shard. The object provider
+/// refuses connections, so a provision that passes its control checks writes
+/// the Agent binding and the presentation and then fails at the provider.
+fn provision(control: &Path) -> (i32, Value) {
+    nokv(
+        control,
+        &[
+            "--object-bucket",
+            "permissions-test",
+            "--object-endpoint",
+            "http://127.0.0.1:1",
+            "--object-skip-signature",
+            "--max-attempts",
+            "1",
+            "provision",
+            "22222222222222222222222222222222",
+            "--workbench-root",
+            "/agents/permissions/wb",
+        ],
+    )
+}
+
+#[test]
+fn provision_refuses_an_unsafe_control_record_before_it_writes_anything() {
+    let parent = tempfile::tempdir().unwrap();
+    let control = parent.path().join("control");
+    // Another shard and a tenant: both record files exist, and provisioning
+    // `ROOT` writes to each of them.
+    let store = LocalControlStore::open(&control).unwrap();
+    store
+        .create_logical_shard(LogicalShardId::from_bytes([0x23; 16]))
+        .unwrap();
+    store
+        .create_tenant(TenantRecord {
+            tenant_id: TenantId::from_bytes([0x66; 16]),
+        })
+        .unwrap();
+    let before = tree(&control);
+
+    let shared = "group or other users can write it";
+    let mut cases = vec![
+        (control.join("identity-state.json"), 0o606, shared),
+        (control.join("control-state.json"), 0o660, shared),
+        (control.join("sessions"), 0o770, shared),
+    ];
+    if user_of(parent.path()) != 0 {
+        // Root may write any directory.
+        cases.push((control.clone(), 0o500, "cannot create files in it"));
+    }
+    for (path, unusable, why) in cases {
+        let private = mode(&path);
+        fs::set_permissions(&path, fs::Permissions::from_mode(unusable)).unwrap();
+        let (exit, envelope) = provision(&control);
+        fs::set_permissions(&path, fs::Permissions::from_mode(private)).unwrap();
+        assert_refused(exit, &envelope, &path, why);
+        assert_eq!(tree(&control), before, "{}: {envelope}", path.display());
+    }
+
+    // As it was, the directory passes every control check: provision writes
+    // the Agent binding, then fails at the provider.
+    let (exit, envelope) = provision(&control);
+    assert_eq!(exit, 5, "{envelope}");
+    assert_eq!(envelope["code"], "ProviderAdmissionFailed", "{envelope}");
+    assert!(store
+        .get_root_agent_binding(&RootId::from_bytes([0x11; 16]))
+        .unwrap()
+        .is_some());
 }
 
 #[test]

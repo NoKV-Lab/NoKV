@@ -111,7 +111,8 @@ pub enum ClientError {
     InvalidOptions(String),
     InvalidRoute(String),
     /// The control plane refused this client's identity, or the key its
-    /// route needs. Nothing reached an owner.
+    /// route needs; or the local control store refused its own directory.
+    /// Nothing reached an owner.
     ControlRefusal {
         class: ErrorClass,
         message: String,

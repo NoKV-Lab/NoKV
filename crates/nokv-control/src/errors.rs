@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 
 use nokv_types::ErrorClass;
 
@@ -102,6 +103,15 @@ pub enum ControlError {
     },
     InvalidRecord(String),
     InvalidOptions(String),
+    /// The local control store refuses its directory, its `sessions`
+    /// directory or a record file at `path`: group or other users can write
+    /// it, another user owns it, or this process cannot create what it needs
+    /// in it. Someone else may have changed the records, so an operator
+    /// checks them and fixes the permissions. Nothing ran.
+    ControlPathRefused {
+        path: PathBuf,
+        reason: String,
+    },
     /// A durable control record declares a codec version this reader does not
     /// implement. The record itself is intact; the reader is too old.
     UnsupportedRecordVersion {
@@ -159,6 +169,7 @@ impl ControlError {
             | Self::LeaseIdExhausted(_)
             | Self::TenantPolicyLimitExceeded { .. }
             | Self::InvalidRecord(_)
+            | Self::ControlPathRefused { .. }
             | Self::Codec(_) => ErrorClass::OperatorRequired,
         }
     }
@@ -320,6 +331,11 @@ impl fmt::Display for ControlError {
             Self::InvalidOptions(reason) => {
                 write!(formatter, "invalid control store options: {reason}")
             }
+            Self::ControlPathRefused { path, reason } => write!(
+                formatter,
+                "local control store refuses {}: {reason}",
+                path.display()
+            ),
             Self::UnsupportedRecordVersion {
                 record,
                 version,
