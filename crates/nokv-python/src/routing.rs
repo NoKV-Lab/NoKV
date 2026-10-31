@@ -326,6 +326,17 @@ mod tests {
         let error = PythonRoutingConfig::etcd(Vec::new(), "/nokv/control", 10, None, None, None)
             .unwrap_err();
         assert!(error.to_string().contains("at least one etcd endpoint"));
+        // A malformed endpoint is refused as a ValueError, not tried.
+        let error = PythonRoutingConfig::etcd(
+            vec!["http://127.0.0.1:99999".to_owned()],
+            "/nokv/control",
+            10,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid port"), "{error}");
     }
 
     #[test]

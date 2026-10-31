@@ -67,6 +67,70 @@ impl fmt::Debug for EtcdTlsConfig {
     }
 }
 
+/// Refuse, before any connection, an etcd endpoint that cannot name an etcd
+/// server: it is an `http://` or `https://` URL whose authority is a host
+/// name, an IPv4 address or a bracketed IPv6 address, with an optional port
+/// in 1..=65535. What follows the authority is left to the client library.
+fn validate_endpoint(endpoint: &str) -> Result<(), ControlError> {
+    let invalid =
+        |why: &str| ControlError::InvalidOptions(format!("etcd endpoint {endpoint:?} {why}"));
+    let rest = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .ok_or_else(|| invalid("is not an http:// or https:// URL"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        // Never repeat the credentials in an error.
+        return Err(ControlError::InvalidOptions(
+            "an etcd endpoint must not carry credentials: etcd never receives them, and they \
+             would stay in the command line; use the etcd TLS options to authenticate"
+                .to_owned(),
+        ));
+    }
+    let port = match authority.strip_prefix('[') {
+        Some(bracketed) => {
+            let invalid_address = || invalid("has an invalid IPv6 address");
+            let (address, tail) = bracketed.split_once(']').ok_or_else(invalid_address)?;
+            address
+                .parse::<std::net::Ipv6Addr>()
+                .map_err(|_| invalid_address())?;
+            match tail {
+                "" => None,
+                tail => Some(tail.strip_prefix(':').ok_or_else(invalid_address)?),
+            }
+        }
+        None => {
+            let (host, port) = match authority.rsplit_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (authority, None),
+            };
+            if host.is_empty() {
+                return Err(invalid("names no host"));
+            }
+            // A host name or an IPv4 address; an IPv6 address needs brackets.
+            if !host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b".-_~".contains(&byte))
+            {
+                return Err(invalid("has an invalid host"));
+            }
+            port
+        }
+    };
+    if let Some(port) = port {
+        let number = port
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| port.parse::<u16>().ok())
+            .flatten()
+            .filter(|number| *number != 0);
+        if number.is_none() {
+            return Err(invalid("has an invalid port; use one in 1..=65535"));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EtcdControlStoreOptions {
     endpoints: Vec<String>,
@@ -158,6 +222,9 @@ impl EtcdControlStoreOptions {
             return Err(ControlError::InvalidOptions(
                 "etcd endpoints must not be empty".to_owned(),
             ));
+        }
+        for endpoint in &self.endpoints {
+            validate_endpoint(endpoint)?;
         }
         let secured = self
             .endpoints
@@ -429,6 +496,70 @@ mod tests {
                 matches!(options.validate(), Err(ControlError::InvalidOptions(_))),
                 "{endpoints:?}"
             );
+        }
+    }
+
+    /// An endpoint that cannot name an etcd server is the caller's mistake,
+    /// refused before any connection; a well-formed one that nothing answers
+    /// fails later, as unreachable.
+    #[test]
+    fn etcd_endpoints_must_be_http_urls_naming_a_host_and_a_valid_port() {
+        for endpoint in [
+            "http://127.0.0.1:2379",
+            "http://localhost",
+            "http://[::1]:2379",
+            "http://etcd-0.etcd.nokv.svc:2379",
+            "http://127.0.0.1:2379/",
+        ] {
+            EtcdControlStoreOptions::new([endpoint])
+                .validate()
+                .unwrap_or_else(|error| panic!("{endpoint}: {error}"));
+        }
+        for (endpoint, why) in [
+            ("127.0.0.1:2379", "http:// or https:// URL"),
+            ("ftp://127.0.0.1:2379", "http:// or https:// URL"),
+            ("HTTP://127.0.0.1:2379", "http:// or https:// URL"),
+            ("http://", "names no host"),
+            ("http://:2379", "names no host"),
+            ("http://exa mple:2379", "invalid host"),
+            ("http://[::1", "invalid IPv6 address"),
+            ("http://[::1]x:2379", "invalid IPv6 address"),
+            ("http://[zz]:2379", "invalid IPv6 address"),
+            ("http://::1:2379", "invalid host"),
+            ("http://127.0.0.1:", "invalid port"),
+            ("http://127.0.0.1:0", "invalid port"),
+            ("http://127.0.0.1:99999", "invalid port"),
+            ("http://127.0.0.1:23x9", "invalid port"),
+        ] {
+            match EtcdControlStoreOptions::new([endpoint]).validate() {
+                Err(ControlError::InvalidOptions(message)) => {
+                    assert!(
+                        message.contains(&format!("{endpoint:?}")) && message.contains(why),
+                        "{endpoint}: {message}"
+                    );
+                }
+                other => panic!("{endpoint}: expected a refusal, got {other:?}"),
+            }
+        }
+        // Credentials in an endpoint would sit in argv and logs, and etcd
+        // never receives them: refused without repeating them.
+        match EtcdControlStoreOptions::new(["http://user:secret@127.0.0.1:2379"]).validate() {
+            Err(ControlError::InvalidOptions(message)) => {
+                assert!(message.contains("credentials"), "{message}");
+                assert!(!message.contains("secret"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        // Endpoints are checked before the TLS pairing, whose refusal would
+        // otherwise hide the malformed one.
+        match EtcdControlStoreOptions::new(["https://"])
+            .with_tls(tls())
+            .validate()
+        {
+            Err(ControlError::InvalidOptions(message)) => {
+                assert!(message.contains("names no host"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 

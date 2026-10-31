@@ -149,6 +149,7 @@ the classes of the [CLI contract](cli-contract.md):
 | The same rejection, but the connection closed before the alert reached the client | `transient` | 5 |
 | The certificate is trusted, but its Common Name is no etcd user, or the user's roles do not grant the key the command needs | `permission_denied` | 11 |
 | etcd's own certificate is not signed by `--etcd-tls-ca` | `invalid_input` | 2 |
+| An `--etcd-endpoint` that is not an `http://` or `https://` URL naming a host, with an optional port in 1..=65535 (refused before any connection) | `invalid_input` | 2 |
 | etcd is unreachable, or an `http://` endpoint names a TLS listener | `transient` | 5 |
 | A `--control-dir` directory, its `sessions` directory or a record file that group or other users can write, that another user owns, or that this process cannot write | `operator_required` | 9 |
 
