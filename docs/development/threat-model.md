@@ -60,6 +60,7 @@ Boundaries:
 | Spoofing: a plaintext owner for a tenant-bound root | `nokv serve` without `--rpc-tls-cert` refuses to serve a root a tenant owns | `t0b` |
 | **T**ampering: a reader principal writes | Every RPC variant is classified (`access::classify`, an exhaustive match) and checked against the principal's highest role on the root; the Workbench mutation tools, snapshot and restore tools, and `workspace-path put/append/rename/remove` are all refused `permission_denied` (exit 11) with no effect | `t6`, `t16`, Pi `m2`, Hermes `hm2`, `access::each_role_permits_its_own_requests_and_those_of_lesser_roles` |
 | Tampering: one principal continues, completes or aborts another's operation | An operation keeps its initiator; another principal presenting the id with other inputs gets `identity_conflict`, with the same inputs is answered from the existing operation without a write | `t9`, `t20` |
+| Tampering: another principal retries the cleanup of a quarantined append | A cleanup retry belongs to the append's initiator or an operator: another writer's `operation recover` is refused `permission_denied`, changes nothing, and is audited as `not_the_initiator`; an operator's is accepted and keeps the initiator, who then completes the append once | `t23`, `nokv-meta` `only_the_initiator_or_an_operator_retries_an_append_cleanup` |
 | Tampering: another writer renews or retires a snapshot it did not mint | Only the minter or an operator may | `t11` |
 | Tampering: an Agent writes object bodies directly | Agent object credentials are read-only; the owner uploads every block (R5a) | `t14`, `c4` (etcd roles) |
 | Tampering: a forged commit projection in a raw RPC | The owner recomputes the projection digest from the staged state and refuses a commit whose projection disagrees | `executor` unit tests (forged inline publication) |
@@ -96,10 +97,3 @@ Boundaries:
   write when that matters.
 - **Forged projections** are covered by unit tests only; the live gates drive
   the CLI, which cannot send a crafted RPC.
-- **Continuing another principal's pending append** (`operation recover`)
-  is checked by the executor's unit tests only. The live gates cannot leave
-  an append pending under TLS: an owner killed during the upload leaves no
-  operation record, so a later `recover` by anyone is `not_found`, and the
-  frame-level fault proxy cannot read TLS records. A committed append's
-  `recover` by another principal reports the committed state, as
-  `operation status` does for any reader.

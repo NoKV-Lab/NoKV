@@ -3612,6 +3612,25 @@ impl PublicationService<'_> {
     ) -> Result<AppendCleanupRetryOutcome, PublicationError> {
         context.request_id =
             append_cleanup_retry_request_id(context.root_id, operation_id, expected_state_digest);
+        // The parent record is never deleted, so it names the append's
+        // initiator for a first retry and for the replay of an accepted one.
+        let parent_payload = self
+            .read_payload(
+                context,
+                MetadataFamily::Operation,
+                &operation_key(context.root_id, OperationKind::Append, operation_id),
+            )?
+            .ok_or(PublicationError::OperationInputMismatch)?;
+        let parent = AppendOperationRecord::decode(&parent_payload)?;
+        if parent.operation_id != operation_id {
+            return Err(PublicationError::OperationInputMismatch);
+        }
+        // A cleanup retry continues the append: only its initiator or an
+        // operator asks for one.
+        context
+            .authority
+            .continuation(parent.initiator)
+            .map_err(PublicationError::NotTheInitiator)?;
         if let Some(replay) = self.store.lookup_request_result(
             context.root_id,
             context.placement_generation,
@@ -3629,17 +3648,6 @@ impl PublicationService<'_> {
                 commit_version: replay.commit_version,
                 replayed: true,
             });
-        }
-        let parent_payload = self
-            .read_payload(
-                context,
-                MetadataFamily::Operation,
-                &operation_key(context.root_id, OperationKind::Append, operation_id),
-            )?
-            .ok_or(PublicationError::OperationInputMismatch)?;
-        let parent = AppendOperationRecord::decode(&parent_payload)?;
-        if parent.operation_id != operation_id {
-            return Err(PublicationError::OperationInputMismatch);
         }
         let child_key = operation_key(
             context.root_id,
@@ -6612,6 +6620,17 @@ mod tests {
         count: usize,
         cleaned: usize,
     ) -> (PublishOperationRecord, Vec<StagedObjectRecord>) {
+        quarantined_append_fixture_begun_by(store, counter, count, cleaned, None)
+    }
+
+    /// A quarantined append whose child publication `initiator` began.
+    fn quarantined_append_fixture_begun_by(
+        store: &MetaShard,
+        counter: &mut u128,
+        count: usize,
+        cleaned: usize,
+        initiator: Option<nokv_types::PrincipalId>,
+    ) -> (PublishOperationRecord, Vec<StagedObjectRecord>) {
         let service = PublicationService::new(store);
         let template = logical_append_child(0);
         let staged = staged_rows(template.artifact_revision_id, count);
@@ -6625,8 +6644,17 @@ mod tests {
         );
         initial.append_attempt = template.append_attempt;
         initial.append_intent_digest = template.append_intent_digest;
+        initial.initiator = initiator;
         seal_publish_operation(&mut initial);
-        let child = begin_operation(&service, store, counter, initial);
+        let mut begin = publication_context(store, counter);
+        begin.authority.initiator = initiator;
+        let child = service
+            .begin_publish(BeginPublishRequest {
+                context: begin,
+                operation: initial,
+            })
+            .unwrap()
+            .operation;
         let mut child = service
             .stage_objects_batch(StageObjectsBatchRequest {
                 context: publication_context(store, counter),
@@ -6708,6 +6736,77 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn only_the_initiator_or_an_operator_retries_an_append_cleanup() {
+        use crate::workspace::namespace::{NotTheInitiator, WriteAuthority};
+        use nokv_types::PrincipalId;
+
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let alice = PrincipalId::from_bytes([0xa1; FIXED_ID_BYTES]);
+        let bob = PrincipalId::from_bytes([0xb2; FIXED_ID_BYTES]);
+        let as_principal = |counter: &mut u128, principal: PrincipalId, operator: bool| {
+            let mut context = publication_context(&store, counter);
+            context.authority = WriteAuthority {
+                initiator: Some(principal),
+                operator,
+            };
+            context
+        };
+        let (child, _) =
+            quarantined_append_fixture_begun_by(&store, &mut counter, 2, 1, Some(alice));
+        let parent = read_append_parent(&service, &store, &mut counter);
+        assert_eq!(parent.initiator, Some(alice));
+        let token = append_operation_state_digest(&parent, &child).unwrap();
+
+        // Bob did not begin the append: refused, and nothing is written.
+        let version = store.current_read_version().unwrap();
+        let refused = service
+            .retry_append_cleanup(
+                as_principal(&mut counter, bob, false),
+                parent.operation_id,
+                token,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            refused,
+            PublicationError::NotTheInitiator(NotTheInitiator { initiator, principal })
+                if initiator == alice && principal == bob
+        ));
+        assert_eq!(store.current_read_version().unwrap(), version);
+
+        // An operator retries another principal's cleanup.
+        let accepted = service
+            .retry_append_cleanup(
+                as_principal(&mut counter, bob, true),
+                parent.operation_id,
+                token,
+            )
+            .unwrap();
+        assert!(!accepted.replayed);
+        assert_eq!(accepted.receipt.cleanup_retry_count, 1);
+
+        // The accepted retry replays for its initiator, never for Bob.
+        let replayed = service
+            .retry_append_cleanup(
+                as_principal(&mut counter, alice, false),
+                parent.operation_id,
+                token,
+            )
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.receipt, accepted.receipt);
+        assert!(matches!(
+            service.retry_append_cleanup(
+                as_principal(&mut counter, bob, false),
+                parent.operation_id,
+                token
+            ),
+            Err(PublicationError::NotTheInitiator(_))
+        ));
     }
 
     #[test]

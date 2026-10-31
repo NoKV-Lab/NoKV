@@ -261,7 +261,11 @@ impl ClientError {
                     }
                 }
             }
-            Self::AppendCleanupUnresolved { .. } => ErrorClass::OutcomeUnknown,
+            // A refused retry applied nothing; any other may have been
+            // accepted before its answer was lost.
+            Self::AppendCleanupUnresolved { source, .. } => source
+                .refused_before_dispatch()
+                .unwrap_or(ErrorClass::OutcomeUnknown),
             Self::RetryExhausted { last_error, .. } => last_error.class(),
         }
     }
@@ -390,11 +394,20 @@ impl fmt::Display for ClientError {
                 expected_token,
                 source,
                 ..
-            } => write!(
-                formatter,
-                "append cleanup for {operation_id:?} is unresolved: {source}; retry with the same expected state digest {:?}",
-                expected_token.state_digest
-            ),
+            } => {
+                if self.class() == ErrorClass::OutcomeUnknown {
+                    write!(
+                        formatter,
+                        "append cleanup for {operation_id:?} is unresolved: {source}; retry with the same expected state digest {:?}",
+                        expected_token.state_digest
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "append cleanup for {operation_id:?} was refused: {source}"
+                    )
+                }
+            }
         }
     }
 }
@@ -482,6 +495,38 @@ mod tests {
             source: Box::new(ClientError::Rpc(refusal(ErrorCode::Unauthenticated, true))),
         };
         assert_eq!(stale.class(), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn a_refused_cleanup_retry_is_the_refusal_not_an_unknown_outcome() {
+        // The owner refuses a cleanup retry of another principal's append
+        // before it applies anything; only the initiator or an operator can
+        // act, and nothing is pending behind the retry.
+        let unresolved = |source| ClientError::AppendCleanupUnresolved {
+            operation_id: OperationIdentity([1; 16]),
+            expected_token: OperationToken {
+                operation_id: OperationIdentity([1; 16]),
+                state_digest: nokv_protocol::Digest([2; 32]),
+            },
+            receipt: None,
+            source: Box::new(source),
+        };
+        let refused = unresolved(ClientError::Rpc(refusal(
+            ErrorCode::PermissionDenied,
+            false,
+        )));
+        assert_eq!(refused.class(), ErrorClass::PermissionDenied);
+        assert!(!refused.to_string().contains("retry"), "{refused}");
+        assert_eq!(
+            unresolved(ClientError::Rpc(refusal(ErrorCode::Unauthenticated, false))).class(),
+            ErrorClass::Unauthenticated
+        );
+        // A retry whose answer was lost may have been accepted.
+        let lost = unresolved(ClientError::Rpc(refusal(ErrorCode::NotOwner, false)));
+        assert_eq!(lost.class(), ErrorClass::OutcomeUnknown);
+        assert!(lost
+            .to_string()
+            .contains("retry with the same expected state digest"));
     }
 
     #[test]
