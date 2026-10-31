@@ -69,13 +69,51 @@ not for installing the SDK.
   `expected`) with nothing written. Callers that omit the argument keep the
   0.11.0 behaviour; a server older than 0.11.1 rejects a fenced request as an
   invalid argument instead of ignoring the fence.
+- `Session(routing, object_store=None, tls=None, ...)` is what one process
+  shares across the roots it uses: the transport with its TLS identity and
+  connection pool, the control-plane connection and route cache, the retry
+  policy and timeouts, and the object-store configuration.
+  `session.client(root_id)` derives a `Client` of one root from it, so a
+  process working on several roots holds one control-plane connection and
+  one pool. `Client(root_id, routing, ...)` is unchanged and is a session of
+  one root. Over static routing a session serves only the root it pins.
+- `TlsConfig(ca_pem, cert_pem, key_pem, server_name)` is the client's
+  identity towards an owner that serves workspace RPC over TLS: the PEM
+  roots that sign the owner's certificate, this client's certificate chain
+  (whose fingerprint `nokv identity credential add` registered) and private
+  key, and the name the owner's certificate carries. Pass it as `tls=` to
+  `Session` or `Client`; the owner then authorizes every call by the
+  principal's roles, and an unregistered certificate or a missing role raises
+  with `error_class` `unauthenticated` or `permission_denied`, as the CLI
+  reports them. The key material is parsed once and never printed.
+- The Workbench root a client presents its root under comes from the control
+  plane: `nokv provision --workbench-root` binds it, and a `Client` or
+  `session.client(root_id)` over etcd or a control directory reads it
+  (`client.workbench_root`; `session.workbench_root(root_id)`). A
+  `workbench_root` argument must then equal the binding, and raises
+  `ValueError` otherwise; it is required only over static routing, which has
+  no control plane to ask.
+- `RoutingConfig.etcd(endpoints, key_prefix="/nokv/control",
+  lease_ttl_seconds=10, tls_ca_pem=None, tls_cert_pem=None, tls_key_pem=None)`
+  discovers the owner through etcd. With the three PEM `bytes` arguments,
+  given together, the client authenticates to etcd over mutual TLS as the
+  certificate's Common Name, which etcd maps to a user when it runs with
+  `--client-cert-auth`; every endpoint must then be an `https://` URL, and
+  `https://` endpoints require them, or `ValueError` is raised before any
+  connection. The PEM bytes stay in memory and are never printed. An etcd
+  that rejects the certificate raises with `error_class="unauthenticated"`;
+  one whose roles do not grant a key the route needs raises with
+  `error_class="permission_denied"`; `docs/control-plane-credentials.md`
+  lists the keys an Agent's role needs.
 - `Client(root_id, routing, ..., max_attempts=3, retry_backoff_ms=0,
   max_retry_backoff_ms=2000)` repeats a request whose failure left nothing
   applied up to `max_attempts` times (1 to 16), pausing `retry_backoff_ms`
   before the second attempt and doubling per further attempt up to
   `max_retry_backoff_ms`. The default repeats at once, so a client that must
   outlive an owner restart passes `max_attempts=16, retry_backoff_ms=250`; a
-  backoff above its bound raises `ValueError`.
+  backoff above its bound raises `ValueError`. With a backoff set, the same
+  budget waits out an attempt a dead owner left running under the caller's
+  `operation_id`.
 - `Client.put_bytes(workbench, path, data, operation_id, ...)` is native
   `workspace-path put`: one whole-body publication under a caller-chosen
   operation identity (32 lowercase hex, for example a UUIDv7 without hyphens).

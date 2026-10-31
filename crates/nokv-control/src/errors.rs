@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 
 use nokv_types::ErrorClass;
 
@@ -102,6 +103,15 @@ pub enum ControlError {
     },
     InvalidRecord(String),
     InvalidOptions(String),
+    /// The local control store refuses its directory, its `sessions`
+    /// directory or a record file at `path`: group or other users can write
+    /// it, another user owns it, or this process cannot create what it needs
+    /// in it. Someone else may have changed the records, so an operator
+    /// checks them and fixes the permissions. Nothing ran.
+    ControlPathRefused {
+        path: PathBuf,
+        reason: String,
+    },
     /// A durable control record declares a codec version this reader does not
     /// implement. The record itself is intact; the reader is too old.
     UnsupportedRecordVersion {
@@ -109,6 +119,12 @@ pub enum ControlError {
         version: u8,
         supported: u8,
     },
+    /// The control plane does not accept this process's identity: its
+    /// certificate names no user, or authentication failed. Nothing ran.
+    Unauthenticated(String),
+    /// The control plane's roles do not grant the key this operation needs.
+    /// Nothing ran.
+    PermissionDenied(String),
     Codec(String),
     Backend(String),
 }
@@ -144,6 +160,8 @@ impl ControlError {
             | Self::RecoveryUploadConflict { .. }
             | Self::Backend(_) => ErrorClass::Transient,
             Self::UnsupportedRecordVersion { .. } => ErrorClass::Incompatible,
+            Self::Unauthenticated(_) => ErrorClass::Unauthenticated,
+            Self::PermissionDenied(_) => ErrorClass::PermissionDenied,
             Self::RootPlacementNotFound(_)
             | Self::LogicalShardNotFound(_)
             | Self::RootPlacementRequired(_)
@@ -151,6 +169,7 @@ impl ControlError {
             | Self::LeaseIdExhausted(_)
             | Self::TenantPolicyLimitExceeded { .. }
             | Self::InvalidRecord(_)
+            | Self::ControlPathRefused { .. }
             | Self::Codec(_) => ErrorClass::OperatorRequired,
         }
     }
@@ -312,6 +331,11 @@ impl fmt::Display for ControlError {
             Self::InvalidOptions(reason) => {
                 write!(formatter, "invalid control store options: {reason}")
             }
+            Self::ControlPathRefused { path, reason } => write!(
+                formatter,
+                "local control store refuses {}: {reason}",
+                path.display()
+            ),
             Self::UnsupportedRecordVersion {
                 record,
                 version,
@@ -322,6 +346,12 @@ impl fmt::Display for ControlError {
                  versions up to {supported}, so this client or owner must be upgraded before it \
                  can use this control plane"
             ),
+            Self::Unauthenticated(reason) => {
+                write!(formatter, "control plane does not accept this identity: {reason}")
+            }
+            Self::PermissionDenied(reason) => {
+                write!(formatter, "control plane denies this operation: {reason}")
+            }
             Self::Codec(reason) => write!(formatter, "control store codec error: {reason}"),
             Self::Backend(reason) => write!(formatter, "control store backend error: {reason}"),
         }

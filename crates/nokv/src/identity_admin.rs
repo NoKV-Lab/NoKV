@@ -23,7 +23,7 @@ use nokv_types::{CredentialFingerprint, IdempotencyScope, RoleScope};
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 
-use crate::cli::{role_name, CredentialSource, IdentityCommand};
+use crate::cli::{CredentialSource, IdentityCommand};
 use crate::encode_lowercase_hex;
 use crate::failure_envelope::CliFailure;
 
@@ -187,7 +187,7 @@ fn credential_json(binding: &CredentialBinding) -> Value {
 fn role_json(binding: &RoleBinding) -> Value {
     json!({
         "principal_id": encode_lowercase_hex(binding.principal_id.as_bytes()),
-        "role": role_name(binding.role),
+        "role": binding.role.name(),
         "scope": match binding.scope {
             RoleScope::Tenant => json!("tenant"),
             RoleScope::Root(root_id) => json!({"root_id": encode_lowercase_hex(root_id.as_bytes())}),

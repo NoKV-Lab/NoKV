@@ -68,9 +68,9 @@ become canonical metadata or introduce fields outside that contract.
 
 Delivery priority and semantic ownership are separate. The CLI is the default
 integration surface, the Python SDK is second for in-process callers, and the
-Rust SDK is third for native integrations. The `nokv mcp` sidecar is deprecated
-and is not a supported surface. None of these transports may fork the stable
-Workbench semantics or duplicate the client state machines.
+Rust SDK is third for native integrations. There is no MCP transport. None of
+these surfaces may fork the stable Workbench semantics or duplicate the client
+state machines.
 
 The Agent adapter owns canonical Workbench projections. It must recompute any
 projection commitment from typed facade inputs for every fresh request and

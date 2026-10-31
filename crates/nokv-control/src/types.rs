@@ -190,6 +190,18 @@ pub struct TenantPolicy {
     pub role_bindings: Vec<RoleBinding>,
 }
 
+/// What a client needs to reach a logical shard's owner: the fields of
+/// [`LogicalShardRecord`] that are stored in its routing value. The recovery
+/// frontier and the owner session are not part of it, so a client's control
+/// credentials need read access to the routing record alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalShardRoute {
+    pub logical_shard_id: LogicalShardId,
+    pub owner_epoch: Option<OwnerEpoch>,
+    pub state: LogicalShardState,
+    pub endpoint: Option<String>,
+}
+
 /// Durable ownership and recovery state for one logical metadata shard.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogicalShardRecord {
@@ -340,6 +352,16 @@ impl LogicalShardRecord {
             log: None,
             durable_lsn: 0,
             pending_recovery_upload: None,
+        }
+    }
+
+    /// The routing projection of this record.
+    pub fn route(&self) -> LogicalShardRoute {
+        LogicalShardRoute {
+            logical_shard_id: self.logical_shard_id,
+            owner_epoch: self.owner_epoch,
+            state: self.state,
+            endpoint: self.endpoint.clone(),
         }
     }
 

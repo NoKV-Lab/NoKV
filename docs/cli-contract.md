@@ -49,9 +49,11 @@ model carries a class itself, and no new caller should read it.
 | 7 | `identity_conflict` | The identity was already used for other inputs; nothing was applied. |
 | 8 | `incompatible` | The client and owner do not share a protocol version or capability. |
 | 9 | `operator_required` | Durable or control state needs operator action, or the client's TLS settings do not fit the owner. |
-| 10 | `unauthenticated` | The owner does not accept this client's identity: the connection has no TLS where the owner requires it, or its certificate is not a current credential of the owner's tenant. Nothing was applied. |
-| 11 | `permission_denied` | The authenticated principal holds no role that allows the request, or it tried to continue an operation another principal began. Nothing was applied. |
+| 10 | `unauthenticated` | The owner does not accept this client's identity: the connection has no TLS where the owner requires it, or its certificate is not a current credential of the owner's tenant; or the control plane rejected the client's certificate. Nothing was applied. |
+| 11 | `permission_denied` | The authenticated principal holds no role that allows the request, or it tried to continue an operation another principal began; or the control plane's roles do not grant a key the command needs. Nothing was applied. |
 <!-- exit-codes:end -->
+
+A refusal of the principal keeps its class when it ends an append or a multi-stage publish: the owner refuses before it applies anything, so an append refused as `permission_denied` or `unauthenticated` is not an unknown outcome, and a publish whose next stage and whose abort are both refused after a role change is `permission_denied`, not `outcome_unknown`. `next_action` is `operator` in both cases.
 
 A Rust panic exits `101`, outside this table. A `nokv workbench-session`
 answers each failed line with `{"id","error","class","next_action"}` and keeps
@@ -94,7 +96,11 @@ must outlive such a restart starts with `--max-attempts 16
 --retry-backoff-ms 250`: it waits about 26 seconds in all before giving up. A
 backoff above its bound is `invalid_input`. The Python SDK takes the same
 options as `Client(..., max_attempts=3, retry_backoff_ms=0,
-max_retry_backoff_ms=2000)`.
+max_retry_backoff_ms=2000)`. `provision` and `serve` probe the object
+provider's admission within the same budget: an unreachable or inconclusive
+provider is probed again and, once the budget is spent, fails as `transient`
+(`ProviderAdmissionFailed`, with `details.attempts`); a provider that lacks a
+required capability is `operator_required` at once.
 
 Exhausted attempts fail with class `transient` when no attempt can have
 taken effect and `outcome_unknown` when the last one may have reached the
@@ -103,9 +109,11 @@ create-only `workbench_put_file` after an unknown outcome gives it an
 `operation_id` so an applied first attempt replays its receipt; without one,
 `precondition_failed` (`AlreadyExists`) on the repeat may be its own earlier
 write, and the caller reads the path back before deciding. An identified
-write that was in flight when the owner died may answer `in_progress` after
-the restart while the owner still holds its earlier attempt; the client does
-not wait that out, so the caller follows `poll` and resubmits the same call.
+write that was in flight when the owner died is re-observed with the same
+budget when a backoff is set: the restarted owner aborts the attempt it did
+not admit, and the command then publishes the next attempt under the same
+id. `in_progress` is answered when the budget runs out, or at once without a
+backoff, and the caller then follows `poll`.
 
 ## Identity
 
@@ -162,7 +170,8 @@ most once.
 
 The direct Python SDK reports this contract on its exceptions: every
 exception a `Client` call raises carries `error_class` and `next_action` with
-the names above. `Client.put_bytes` is `workspace-path put` and
+the names above, including `unauthenticated` and `permission_denied` from an
+owner that authenticates the client's `TlsConfig` certificate. `Client.put_bytes` is `workspace-path put` and
 `Client.operation_status`, whose `commit_identity` is `--commit-identity`, is
 `operation status`; both return the fields this CLI prints, and a put or an
 append made through one surface replays through the other. See
@@ -180,3 +189,42 @@ continues any operation. The owner that cannot refresh its tenant policy
 answers `transient` with `resubmit_same`. Without RPC TLS the owner
 authenticates nobody: every client of a root shares its identity namespace,
 and the `unauthenticated` and `permission_denied` classes do not occur.
+
+The control plane has the same two classes of its own. An etcd that
+authenticates clients by certificate (`--etcd-tls-ca`, `--etcd-tls-cert`,
+`--etcd-tls-key`) rejects a certificate it does not trust as
+`unauthenticated`, and denies a key that the certificate's etcd user may not
+read or write as `permission_denied`; both happen before any request reaches
+an owner. [Control plane credentials](control-plane-credentials.md) lists the
+keys each role needs.
+
+### Refusal audit log
+
+`nokv serve --audit-log PATH`, with `--rpc-tls-cert` and `--rpc-tls-key`,
+appends one JSON object per line to `PATH` for every connection the owner
+turns away and every request it denies. A served request is attributed in its
+operation record instead (`initiator`), so the two together say who did, and
+who tried, what. The file is created readable and writable by its owner
+only, is appended to across restarts, and is never truncated by NoKV; since
+the owner keeps it open, rotate it by copying and truncating in place (for
+example `logrotate`'s `copytruncate`). Every line has the same keys, and a
+key that does not apply to the refusal is `null`:
+
+| Key | Value |
+| --- | --- |
+| `time_unix_ms` | When the owner refused, in milliseconds since the Unix epoch. |
+| `event` | `connection_refused`, before any request, or `request_denied`. |
+| `reason` | `tls_required`, `tls_handshake_failed`, `incompatible_schema`, `not_a_current_credential`, `policy_stale`, `permission_denied` (no role permits the request), or `not_the_initiator` (the request continues an operation or snapshot another principal began). |
+| `peer` | The client's address and port. |
+| `tenant_id` | The tenant the owner serves. |
+| `certificate_fingerprint` | The SHA-256 of the client's certificate, once TLS has completed. |
+| `principal_id` | The authenticated principal of a denied request. |
+| `root_id`, `request` | The root and the RPC a denied request named. |
+| `required_role` | The least role that permits the request, for `permission_denied`. |
+| `detail` | The TLS error, for `tls_handshake_failed`; the owner's refusal, for `not_the_initiator`. |
+
+Every refusal is a line: a principal that repeats a denied request grows the
+file, and its lines name it. A write that fails, for example on a full disk,
+is reported once on the owner's standard error and does not stop the owner,
+which keeps its own refusal lines there as well. A plaintext owner
+authenticates nobody and refuses `--audit-log`.

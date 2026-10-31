@@ -6,7 +6,7 @@
 //! SDK. `nokv-client` defines [`WorkbenchProjection`] and deliberately does
 //! not depend on the tool layer, so it cannot see the formats. Something has
 //! to join them, and every caller that drives a Workbench commit or restore
-//! needs the same join: the CLI, the MCP server, and the Python SDK all
+//! needs the same join: the CLI, the Python SDK, and Rust SDK callers all
 //! publish manifests that must be byte-identical, because a commit written
 //! by one is restored by another.
 //!

@@ -12,10 +12,10 @@ native full CLI, the secondary direct Python SDK, metadata semantics, object
 publication, root routing, recovery, and garbage collection must run against
 the same workspace format.
 
-The `nokv mcp` sidecar is a deprecated transport, not a qualified surface. No
-runner in this document drives the product through it; every live runner runs
-its Workbench tool calls as `nokv workbench <tool>` processes. Evidence
-produced over the sidecar qualifies neither the CLI nor the Python SDK path.
+NoKV ships no MCP transport. Every live runner in this document runs its
+Workbench tool calls as `nokv workbench <tool>` processes; historical evidence
+produced over the removed sidecar qualifies neither the CLI nor the Python SDK
+path.
 Passing a codec or Holt microbenchmark alone does not qualify the product.
 
 Every applicable gate reports exactly one status:
@@ -309,9 +309,6 @@ Required evidence:
   explicit materialize/collect adapters;
 - `nokv-agent` remains transport-free and shapes the stable 18 tools over SDK
   traits;
-- the deprecated `nokv mcp` sidecar remains a thin consumer of the same Agent
-  facade, is presented in no document as a supported integration surface, and
-  gains no new behavior;
 - protocol DTOs are versioned and storage-neutral;
 - provider-specific behavior stays inside the object package;
 - no second implementation of namespace, publication, restore, references, or

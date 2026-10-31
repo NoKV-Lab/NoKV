@@ -293,6 +293,7 @@ where
         let intent = append_intent_digest(self.root_id(), &options, delta)?;
         let mut observed = self.observe_append(&options)?;
         let mut submissions = 0;
+        let mut rounds = 1;
 
         loop {
             let attempt = match observed.as_ref() {
@@ -322,6 +323,18 @@ where
                                     ),
                                 )
                             })?,
+                        // The attempt is running or aborting under an owner
+                        // that may have died; the restarted owner stops it on
+                        // its own. Wait that out with the retry budget before
+                        // handing the pending state to the caller.
+                        AppendRecoveryState::Pending
+                            if rounds < self.max_attempts() && self.waits_between_retries() =>
+                        {
+                            rounds += 1;
+                            self.pause_before_retry(rounds - 1);
+                            observed = self.observe_append(&options)?;
+                            continue;
+                        }
                         _ => return Err(pending_append(&options, &status.value)),
                     }
                 }
@@ -649,10 +662,12 @@ mod tests {
         WorkspaceRpcResponse, WorkspaceSummary,
     };
     use nokv_types::ErrorClass;
+    use std::collections::VecDeque;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
+    use std::time::{Duration, Instant};
 
     fn options() -> IdempotentAppendOptions {
         IdempotentAppendOptions::new(
@@ -745,6 +760,143 @@ mod tests {
             })
             .map_err(|error| TransportError::new(error.to_string(), false))
         }
+    }
+
+    /// Answers each operation read with the next scripted status and
+    /// repeats the last one.
+    struct SequencedStatusTransport {
+        statuses: Mutex<VecDeque<OperationStatus>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RpcTransport for SequencedStatusTransport {
+        fn round_trip(
+            &self,
+            _endpoint: std::net::SocketAddr,
+            bytes: &[u8],
+        ) -> Result<Vec<u8>, TransportError> {
+            let request = decode_request(bytes).unwrap();
+            assert!(matches!(
+                request.operation,
+                WorkspaceRequest::GetOperation(_)
+            ));
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut statuses = self.statuses.lock().unwrap();
+            let status = if statuses.len() > 1 {
+                statuses.pop_front().unwrap()
+            } else {
+                statuses.front().cloned().expect("at least one status")
+            };
+            encode_response(&WorkspaceRpcResponse {
+                route: request.route,
+                request_id: request.request_id,
+                commit_version: None,
+                replayed: false,
+                outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::Operation(status))),
+            })
+            .map_err(|error| TransportError::new(error.to_string(), false))
+        }
+    }
+
+    fn sequenced_client(
+        statuses: Vec<OperationStatus>,
+        options: ClientOptions,
+    ) -> (
+        WorkspaceClient<SequencedStatusTransport, StaticRouteResolver>,
+        Arc<AtomicUsize>,
+    ) {
+        let root_id = RootIdentity([3; 16]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route = RootRoute {
+            root_id,
+            logical_shard_id: LogicalShardIdentity([4; 16]),
+            object_namespace_id: ObjectNamespaceIdentity([5; 16]),
+            placement_generation: 1,
+            owner_epoch: 1,
+        };
+        (
+            WorkspaceClient::new(
+                root_id,
+                SequencedStatusTransport {
+                    statuses: Mutex::new(statuses.into()),
+                    calls: calls.clone(),
+                },
+                StaticRouteResolver::new(route, ([127, 0, 0, 1], 4100).into()).unwrap(),
+                options,
+            )
+            .unwrap(),
+            calls,
+        )
+    }
+
+    fn pending_status(options: &IdempotentAppendOptions) -> OperationStatus {
+        let mut status = committed_status(options);
+        status.state = OperationState::Running;
+        status.result = None;
+        status.append_preparation.as_mut().unwrap().attempt_phase = AppendAttemptPhase::Uploading;
+        status
+    }
+
+    fn waiting(max_attempts: u32, backoff_ms: u64) -> ClientOptions {
+        ClientOptions {
+            max_attempts,
+            retry_backoff: Duration::from_millis(backoff_ms),
+            max_retry_backoff: Duration::from_millis(backoff_ms),
+        }
+    }
+
+    #[test]
+    fn a_pending_append_attempt_is_waited_out_within_the_retry_budget() {
+        let options = options();
+        let (client, calls) = sequenced_client(
+            vec![
+                pending_status(&options),
+                pending_status(&options),
+                committed_status(&options),
+            ],
+            waiting(4, 20),
+        );
+
+        let started = Instant::now();
+        let receipt = client
+            .append_artifact_idempotent(&MemoryArtifactStore::new(), options.clone(), b"event\n")
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "waited only {elapsed:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(receipt.value.operation_id, options.operation_id);
+        assert!(receipt.replayed);
+    }
+
+    #[test]
+    fn a_pending_append_attempt_is_reported_once_the_budget_is_spent() {
+        let options = options();
+        let (client, calls) = sequenced_client(vec![pending_status(&options)], waiting(2, 5));
+
+        let started = Instant::now();
+        let error = client
+            .append_artifact_idempotent(&MemoryArtifactStore::new(), options.clone(), b"event\n")
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(
+                error,
+                ClientError::AppendUnresolved { operation_id, state: Some(OperationState::Running), .. }
+                    if operation_id == options.operation_id
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.class(), ErrorClass::InProgress);
+        assert!(
+            elapsed >= Duration::from_millis(5),
+            "waited only {elapsed:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     fn client(

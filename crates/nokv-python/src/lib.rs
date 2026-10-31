@@ -15,18 +15,24 @@ mod object_store;
 mod python_error;
 mod python_value;
 mod routing;
+mod session;
+mod tls;
 
 use pyo3::prelude::*;
 
 use crate::client::PythonWorkspaceClient;
 use crate::object_store::PythonObjectStoreConfig;
 use crate::routing::PythonRoutingConfig;
+use crate::session::PythonSession;
+use crate::tls::PythonTlsConfig;
 
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PythonWorkspaceClient>()?;
     module.add_class::<PythonRoutingConfig>()?;
     module.add_class::<PythonObjectStoreConfig>()?;
+    module.add_class::<PythonSession>()?;
+    module.add_class::<PythonTlsConfig>()?;
     Ok(())
 }
 
@@ -46,6 +52,10 @@ mod tests {
             assert!(routing.getattr("etcd").is_ok());
             assert!(module.getattr("Client").is_ok());
             assert!(module.getattr("ObjectStoreConfig").is_ok());
+            assert!(module.getattr("Session").is_ok());
+            assert!(module.getattr("TlsConfig").is_ok());
+            let session = module.getattr("Session").unwrap();
+            assert!(session.getattr("client").is_ok());
 
             let client = module.getattr("Client").unwrap();
             for method in [

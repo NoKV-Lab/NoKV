@@ -19,6 +19,7 @@ mod idempotent_publish;
 mod operation_status;
 mod route;
 mod sdk;
+mod session;
 mod snapshot_workflow;
 mod transport;
 mod workbench_lifecycle;
@@ -47,6 +48,8 @@ pub use idempotent_publish::{
     publish_attempt_identity, IdempotentPublishError, IdempotentPublishOptions,
     IdempotentPublishReceipt, PublishAttemptIdentity, MAX_IDEMPOTENT_PUBLISH_ATTEMPTS,
 };
+#[cfg(feature = "etcd")]
+pub use nokv_control::EtcdTlsConfig;
 pub use operation_status::{operation_observation, OperationObservation, OperationObservedState};
 #[cfg(feature = "control")]
 pub use route::ControlRouteResolver;
@@ -54,6 +57,7 @@ pub use route::ControlRouteResolver;
 pub use route::EtcdRouteOptions;
 pub use route::{ResolvedRoute, RouteRefreshMode, RouteResolver, StaticRouteResolver};
 pub use sdk::{ClientCall, ClientOptions, WorkspaceClient};
+pub use session::Session;
 pub use snapshot_workflow::{
     SnapshotMintOptions, SnapshotRenewOptions, SnapshotRetireOptions, SnapshotRetireOutcome,
 };

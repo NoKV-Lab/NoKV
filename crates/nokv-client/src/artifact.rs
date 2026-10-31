@@ -3153,6 +3153,7 @@ fn is_append_retry_error(error: &ClientError) -> bool {
         }
         | ClientError::InvalidOptions(_)
         | ClientError::InvalidRoute(_)
+        | ClientError::ControlRefusal { .. }
         | ClientError::Transport(_)
         | ClientError::Protocol(_)
         | ClientError::ResponseMismatch(_)
@@ -3487,6 +3488,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use nokv_object::{
         ArtifactStoreCapabilities, ImmutableCreateOutcome, MemoryArtifactStore,
@@ -3506,6 +3508,25 @@ mod tests {
     struct ScriptedArtifactTransport {
         state: Arc<Mutex<ScriptedArtifactState>>,
         events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    /// An attempt an earlier owner left running. The restarted owner refuses
+    /// every mutation under its epoch-bound identity, resumes and aborts
+    /// alike; operation reads answer it as running until
+    /// `refusals_until_failed` publications were refused, and as failed by the
+    /// owner's own takeover after that.
+    struct OrphanedAttempt {
+        status: OperationStatus,
+        until_failed: UntilFailed,
+        refusals: u32,
+    }
+
+    /// When the owner's takeover turns the orphaned attempt into a failed one.
+    enum UntilFailed {
+        /// After this many refused publications under its identity.
+        Refusals(u32),
+        /// After this many operation reads.
+        Reads(u32),
     }
 
     struct ScriptedArtifactState {
@@ -3545,6 +3566,7 @@ mod tests {
         advance_finish_before_response_once: bool,
         finish_requests: Vec<FinishArtifactPublishRequest>,
         lose_inline_responses: bool,
+        orphan: Option<OrphanedAttempt>,
         /// Inline retries of the stored intent to refuse as the engine does
         /// once the owner epoch bound into a visible identity has moved.
         inline_replay_rejections: usize,
@@ -3586,6 +3608,7 @@ mod tests {
                     advance_finish_before_response_once: false,
                     finish_requests: Vec::new(),
                     lose_inline_responses: false,
+                    orphan: None,
                     inline_replay_rejections: 0,
                 })),
                 events,
@@ -3634,6 +3657,84 @@ mod tests {
 
         fn lose_inline_responses(&self) {
             self.state.lock().unwrap().lose_inline_responses = true;
+        }
+
+        fn orphan_running(
+            &self,
+            attempt: &crate::idempotent_publish::PublishAttemptIdentity,
+            options: &crate::IdempotentPublishOptions,
+            refusals_until_failed: u32,
+        ) {
+            self.orphan(
+                attempt,
+                options,
+                OperationState::Running,
+                UntilFailed::Refusals(refusals_until_failed),
+            );
+        }
+
+        /// An attempt the restarted owner is aborting; its row stays aborting
+        /// for `reads` operation reads, then is failed.
+        fn orphan_aborting(
+            &self,
+            attempt: &crate::idempotent_publish::PublishAttemptIdentity,
+            options: &crate::IdempotentPublishOptions,
+            reads: u32,
+        ) {
+            self.orphan(
+                attempt,
+                options,
+                OperationState::Aborting,
+                UntilFailed::Reads(reads),
+            );
+        }
+
+        fn orphan(
+            &self,
+            attempt: &crate::idempotent_publish::PublishAttemptIdentity,
+            options: &crate::IdempotentPublishOptions,
+            state: OperationState,
+            until_failed: UntilFailed,
+        ) {
+            let mut scripted = self.state.lock().unwrap();
+            let token = scripted.next_token(attempt.operation_id);
+            scripted.orphan = Some(OrphanedAttempt {
+                status: OperationStatus {
+                    initiator: None,
+                    token,
+                    kind: OperationKind::ArtifactPublish,
+                    append_preparation: None,
+                    publish_preparation: Some(Box::new(nokv_protocol::PublishPreparation {
+                        append_intent_digest: None,
+                        append_attempt: None,
+                        target: options.target.clone(),
+                        workspace_incarnation_id: WorkspaceIdentity([9; 16]),
+                        artifact_revision_id: attempt.artifact_revision_id,
+                    })),
+                    commit_preparation: None,
+                    restore_preparation: None,
+                    state,
+                    progress: OperationProgress {
+                        completed_rows: 0,
+                        total_rows: None,
+                        completed_bytes: 0,
+                        total_bytes: None,
+                    },
+                    result: None,
+                    failure: None,
+                },
+                until_failed,
+                refusals: 0,
+            });
+        }
+
+        fn orphan_refusals(&self) -> u32 {
+            self.state
+                .lock()
+                .unwrap()
+                .orphan
+                .as_ref()
+                .map_or(0, |orphan| orphan.refusals)
         }
 
         fn reject_inline_replays(&self, count: usize) {
@@ -3845,6 +3946,82 @@ mod tests {
             let label = operation_label(&request.operation);
             let mut state = self.state.lock().unwrap();
             state.attempts.push((label, request.request_id));
+            if let Some(orphan) = state.orphan.as_mut() {
+                let orphan_id = orphan.status.token.operation_id;
+                let mutation_identity = match &request.operation {
+                    WorkspaceRequest::BeginArtifactPublish(begin) => Some(begin.operation_id),
+                    WorkspaceRequest::PublishInlineArtifact(publish) => {
+                        Some(publish.begin.operation_id)
+                    }
+                    WorkspaceRequest::PrepareArtifactPublish(prepare) => {
+                        Some(prepare.begin.operation_id)
+                    }
+                    _ => None,
+                };
+                let refusal = |message: &str| RpcFailure {
+                    code: ErrorCode::RequestReplayMismatch,
+                    message: message.to_owned(),
+                    retryable: false,
+                    conflict: Some(ConflictKind::OperationState),
+                    current_generation: None,
+                    route_hint: None,
+                };
+                let outcome = match &request.operation {
+                    WorkspaceRequest::GetOperation(get) if get.operation_id == orphan_id => {
+                        let pending = match &mut orphan.until_failed {
+                            UntilFailed::Refusals(count) => orphan.refusals < *count,
+                            UntilFailed::Reads(remaining) => {
+                                let pending = *remaining > 0;
+                                *remaining = remaining.saturating_sub(1);
+                                pending
+                            }
+                        };
+                        let status = if pending {
+                            orphan.status.clone()
+                        } else {
+                            let mut failed = orphan.status.clone();
+                            failed.state = OperationState::Failed;
+                            failed.failure = Some(RpcFailure {
+                                code: ErrorCode::OperationFailed,
+                                message: "publish owner epoch 1 was superseded by epoch 2"
+                                    .to_owned(),
+                                retryable: false,
+                                conflict: Some(ConflictKind::OperationState),
+                                current_generation: None,
+                                route_hint: None,
+                            });
+                            failed
+                        };
+                        Some(WorkspaceRpcOutcome::Success(Box::new(
+                            WorkspaceResult::Operation(status),
+                        )))
+                    }
+                    WorkspaceRequest::AbortArtifactPublish(abort)
+                        if abort.token.operation_id == orphan_id =>
+                    {
+                        Some(WorkspaceRpcOutcome::Failure(refusal(
+                            "operation token was issued by an earlier owner epoch",
+                        )))
+                    }
+                    _ if mutation_identity == Some(orphan_id) => {
+                        orphan.refusals += 1;
+                        Some(WorkspaceRpcOutcome::Failure(refusal(
+                            "publication identity was admitted by an earlier owner epoch",
+                        )))
+                    }
+                    _ => None,
+                };
+                if let Some(outcome) = outcome {
+                    return encode_response(&WorkspaceRpcResponse {
+                        route: request.route,
+                        request_id: request.request_id,
+                        commit_version: None,
+                        replayed: false,
+                        outcome,
+                    })
+                    .map_err(|error| TransportError::new(error.to_string(), false));
+                }
+            }
             if let Some(mut replayed) = state.replay.get(&request.request_id).cloned() {
                 if matches!(label, "complete" | "finish") && state.lose_complete_responses {
                     return Err(TransportError::new(
@@ -5452,6 +5629,155 @@ mod tests {
         assert_eq!(refused.class(), nokv_types::ErrorClass::PreconditionFailed);
         assert_eq!(refused.attempt(), Some(0));
         assert_eq!(inspector.state().abort_applies, 0);
+    }
+
+    fn client_with(
+        transport: ScriptedArtifactTransport,
+        options: ClientOptions,
+    ) -> WorkspaceClient<ScriptedArtifactTransport, StaticRouteResolver> {
+        WorkspaceClient::new(
+            route().root_id,
+            transport,
+            StaticRouteResolver::new(route(), ([127, 0, 0, 1], 4100).into()).unwrap(),
+            options,
+        )
+        .unwrap()
+    }
+
+    fn waiting(max_attempts: u32, backoff_ms: u64) -> ClientOptions {
+        ClientOptions {
+            max_attempts,
+            retry_backoff: Duration::from_millis(backoff_ms),
+            max_retry_backoff: Duration::from_millis(backoff_ms),
+        }
+    }
+
+    #[test]
+    fn a_caller_identified_publication_waits_out_the_attempt_a_dead_owner_left_running() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client_with(transport, waiting(4, 20));
+        let store = RecordingStore::new(events, inspector.objects());
+        let options = caller_identified(0x45);
+        let orphan = crate::idempotent_publish::publish_attempt_identity(
+            client.root_id(),
+            options.operation_id,
+            0,
+            options.intent_digest(b"exact"),
+        );
+        // Refused twice, then failed by the restarted owner's own takeover.
+        inspector.orphan_running(&orphan, &options, 2);
+
+        let started = Instant::now();
+        let receipt = client
+            .publish_idempotent(&store, &options, b"exact")
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "waited only {elapsed:?}"
+        );
+        assert_eq!(receipt.attempt, 1);
+        assert!(!receipt.replayed);
+        assert_eq!(receipt.publication.generation, 1);
+        assert_eq!(inspector.orphan_refusals(), 2);
+    }
+
+    #[test]
+    fn a_caller_identified_publication_reports_in_progress_once_its_budget_is_spent() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client_with(transport, waiting(2, 5));
+        let store = RecordingStore::new(events, inspector.objects());
+        let options = caller_identified(0x46);
+        let orphan = crate::idempotent_publish::publish_attempt_identity(
+            client.root_id(),
+            options.operation_id,
+            0,
+            options.intent_digest(b"exact"),
+        );
+        inspector.orphan_running(&orphan, &options, u32::MAX);
+
+        let started = Instant::now();
+        let error = client
+            .publish_idempotent(&store, &options, b"exact")
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(
+                error,
+                crate::IdempotentPublishError::InProgress {
+                    attempt: 0,
+                    state: OperationState::Running,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(5),
+            "waited only {elapsed:?}"
+        );
+        assert_eq!(inspector.orphan_refusals(), 2);
+    }
+
+    #[test]
+    fn a_replay_lookup_finds_no_receipt_while_the_owner_aborts_an_attempt() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let options = caller_identified(0x47);
+        let orphan = crate::idempotent_publish::publish_attempt_identity(
+            client.root_id(),
+            options.operation_id,
+            0,
+            options.intent_digest(b"exact"),
+        );
+        inspector.orphan_aborting(&orphan, &options, u32::MAX);
+
+        assert_eq!(
+            client
+                .replay_idempotent_publish(&options, b"exact")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_caller_identified_publication_waits_out_an_attempt_the_owner_is_aborting() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client_with(transport, waiting(4, 20));
+        let store = RecordingStore::new(events, inspector.objects());
+        let options = caller_identified(0x48);
+        let orphan = crate::idempotent_publish::publish_attempt_identity(
+            client.root_id(),
+            options.operation_id,
+            0,
+            options.intent_digest(b"exact"),
+        );
+        // Aborting for two reads, then failed by the owner's cleanup.
+        inspector.orphan_aborting(&orphan, &options, 2);
+
+        let started = Instant::now();
+        let receipt = client
+            .publish_idempotent(&store, &options, b"exact")
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "waited only {elapsed:?}"
+        );
+        assert_eq!(receipt.attempt, 1);
+        assert!(!receipt.replayed);
+        assert_eq!(inspector.orphan_refusals(), 0);
     }
 
     #[test]

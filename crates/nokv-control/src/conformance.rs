@@ -371,7 +371,33 @@ pub(crate) fn transition_table_is_provider_neutral(harness: &dyn ConformanceHarn
     store.release_owner(&rebound).unwrap();
 }
 
+/// The routing read every client makes is a projection of the shard record
+/// that only the owner reads in full, before and after recovery state exists.
+pub(crate) fn route_read_projects_the_routing_record(harness: &dyn ConformanceHarness) {
+    let store = harness.store();
+    let (_, unknown) = harness.fresh_shard(5);
+    assert_eq!(store.get_logical_shard_route(&unknown).unwrap(), None);
+
+    let (shard, lease) = place_and_acquire(harness, 4);
+    let recovering = store.get_logical_shard_route(&shard).unwrap().unwrap();
+    assert_eq!(
+        recovering,
+        store.get_logical_shard(&shard).unwrap().unwrap().route()
+    );
+    assert_eq!(recovering.logical_shard_id, shard);
+    assert_eq!(recovering.owner_epoch, Some(lease.owner_epoch));
+    assert_eq!(recovering.state, LogicalShardState::Recovering);
+    assert_eq!(recovering.endpoint.as_deref(), Some("node-a:7000"));
+
+    let served = store.mark_serving(&lease, empty_publication()).unwrap();
+    let serving = store.get_logical_shard_route(&shard).unwrap().unwrap();
+    assert_eq!(serving, served.route());
+    assert_eq!(serving.state, LogicalShardState::Serving);
+    assert_eq!(serving.owner_epoch, Some(lease.owner_epoch));
+}
+
 pub(crate) fn run_all(harness: &dyn ConformanceHarness) {
+    route_read_projects_the_routing_record(harness);
     recovering_crash_rebinds_same_epoch_and_fences_old_lease(harness);
     serving_crash_admits_exactly_one_successor_and_old_authority_never_returns(harness);
     transition_table_is_provider_neutral(harness);

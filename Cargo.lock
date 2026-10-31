@@ -727,9 +727,9 @@ dependencies = [
 
 [[package]]
 name = "holt"
-version = "0.8.7"
+version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0429a061efcfb85c11a21a62eaf20a2410e014ca6cc5a987b5a8c59e3984463"
+checksum = "2ebadadf8981b49ae2ffcac930f26d10c5a76a0db127c9b7eabacea8282976d1"
 dependencies = [
  "crc32fast",
  "crossbeam-channel",
@@ -1303,6 +1303,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -1384,6 +1385,7 @@ dependencies = [
  "rmp-serde",
  "rustls",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
 ]
@@ -2163,6 +2165,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -2696,6 +2699,7 @@ dependencies = [
  "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",

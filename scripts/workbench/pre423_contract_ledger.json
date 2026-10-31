@@ -829,9 +829,9 @@
       "scope": "legacy",
       "class": "C",
       "current_disposition": "restore",
-      "owner": "nokv-agent + nokv CLI",
-      "boundary": "generic seven-tool Agent MCP profile",
-      "requirement": "Restore an explicitly selectable generic Agent MCP profile with exactly ls, stat, catalog, read, aggregate, find, and grep, while retaining the explicit 18-tool Workbench profile; both profiles must route through current RootId and WorkspaceClient authority.",
+      "owner": "nokv-agent",
+      "boundary": "generic seven-tool Agent profile",
+      "requirement": "Keep an explicitly selectable generic Agent profile in nokv-agent with exactly ls, stat, catalog, read, aggregate, find, and grep, alongside the explicit 18-tool Workbench profile; both profiles must route through current RootId and WorkspaceClient authority.",
       "source_evidence": ["pre:crates/nokv/src/bin/nokv.rs:190-194,230-236,2103-2135", "pre:docs/lingtai-workbench-preflight.md:13-28"],
       "required_gates": ["api-decision", "schema-surface", "native-workbench-e2e"],
       "gate_expectations": {

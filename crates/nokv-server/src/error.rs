@@ -41,6 +41,19 @@ pub enum ServerError {
     Executor(String),
 }
 
+impl ServerError {
+    /// The control plane's own failure behind this error, if there is one.
+    pub fn control_error(&self) -> Option<&nokv_control::ControlError> {
+        match self {
+            Self::Control(error) | Self::PreparedOwnerAdmission { source: error, .. } => {
+                Some(error)
+            }
+            Self::RecoveryPublication(error) => error.control_error(),
+            _ => None,
+        }
+    }
+}
+
 impl From<nokv_protocol::ProtocolError> for ServerError {
     fn from(error: nokv_protocol::ProtocolError) -> Self {
         Self::Protocol(error)
@@ -146,5 +159,48 @@ impl From<crate::RecoveryPublisherError> for ServerError {
 impl From<nokv_protocol::HandshakeError> for ServerError {
     fn from(error: nokv_protocol::HandshakeError) -> Self {
         Self::Handshake(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nokv_control::ControlError;
+
+    use super::*;
+    use crate::{LifecycleError, RecoveryPublisherError};
+
+    #[test]
+    fn a_control_failure_is_found_behind_the_errors_that_carry_it() {
+        let refusal = ControlError::ControlPathRefused {
+            path: "/ctl".into(),
+            reason: "this process's user (uid 501) cannot create files in it".to_owned(),
+        };
+        let publication = || RecoveryPublisherError::Control(refusal.clone());
+
+        assert_eq!(
+            ServerError::Control(refusal.clone()).control_error(),
+            Some(&refusal)
+        );
+        assert_eq!(
+            ServerError::RecoveryPublication(publication()).control_error(),
+            Some(&refusal)
+        );
+        assert_eq!(
+            LifecycleError::RecoveryPublication {
+                primary: None,
+                source: publication(),
+            }
+            .control_error(),
+            Some(&refusal)
+        );
+        assert_eq!(
+            ServerError::InvalidBootstrap("control-plane owner was lost".to_owned())
+                .control_error(),
+            None
+        );
+        assert_eq!(
+            LifecycleError::OwnerLost("owner-loss signal is set".to_owned()).control_error(),
+            None
+        );
     }
 }
