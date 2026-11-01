@@ -6,20 +6,22 @@ SPDX-License-Identifier: Apache-2.0
 <div align="center">
   <img src="./docs/public/img/logo.png" width="320" alt="NoKV" />
 
-  <h3>Durable, versioned workspaces for disposable agents.</h3>
+  <h3>The state layer for agent workspaces and AI-for-science campaigns.</h3>
 
   <p>
-    NoKV keeps declared inputs, code, outputs, logs, and lineage alive when an
-    agent sandbox disappears. It publishes immutable S3-compatible artifact
-    bytes through a path-native, transactional metadata control plane; it does
-    not pretend to restore process memory, a model session, or a VM.
+    Agents and experiment pipelines publish versioned artifacts that are never
+    silently overwritten, retry any write exactly, seal checkpoints, and fork a
+    checkpoint into a new branch of the work. Artifact bytes stay in any
+    S3-compatible store; NoKV decides which revisions are visible, records who
+    wrote them, and keeps alive what history still references.
   </p>
 
   <p>
-    <strong>18-operation native CLI</strong> ·
-    <strong>direct Python and Rust SDKs</strong> ·
-    <strong>commit, snapshot, and restore</strong> ·
-    <strong>conditional publication and exact replay</strong>
+    <strong>native CLI, Python and Rust SDKs</strong> ·
+    <strong>exact replay</strong> ·
+    <strong>commit, snapshot, and fork</strong> ·
+    <strong>tenants, roles, and audit</strong> ·
+    <strong>pluggable storage</strong>
   </p>
 
   <p>
@@ -38,90 +40,80 @@ SPDX-License-Identifier: Apache-2.0
   </p>
 
   <p>
-    <a href="#what-nokv-adds"><strong>What it adds</strong></a> ·
-    <a href="#use-cases"><strong>Use cases</strong></a> ·
-    <a href="#feature-map"><strong>Feature map</strong></a> ·
-    <a href="#choose-an-interface"><strong>Integrate</strong></a> ·
-    <a href="#evidence-and-qualification"><strong>Evidence</strong></a> ·
+    <a href="#a-agent-workspace"><strong>Agent workspace</strong></a> ·
+    <a href="#b-ai-for-science"><strong>AI for Science</strong></a> ·
+    <a href="#core-primitives"><strong>Primitives</strong></a> ·
     <a href="#quick-start"><strong>Quick start</strong></a> ·
+    <a href="#evidence-and-qualification"><strong>Evidence</strong></a> ·
     <a href="./docs/index.md"><strong>Docs</strong></a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> This README describes the current `main` contract. An installed release may
-> pin different component revisions; run `nokv version --json` to identify the
+> This README describes the current `main` contract, released as NoKV 0.20.0.
+> An installed build may differ; run `nokv version --json` to identify the
 > exact NoKV commit, Workbench schema, and
 > [Holt](https://github.com/NoKV-Lab/holt) build. Implemented and
-> deterministic-test-passing do not mean live or production-qualified. The
-> current qualification boundary is explicit below.
+> deterministic-test-passing do not mean live or production-qualified; the
+> qualification boundary is explicit [below](#evidence-and-qualification).
 
-## What NoKV Adds
+## What's new in 0.20
 
-Most agent systems already have an object store and a database. Their hard
-problem is the failure window between them: bytes may exist without a visible
-workspace entry, a retry may publish twice, a stale worker may overwrite a
-newer result, or cleanup may delete an object that history still references.
+NoKV 0.20.0 lets many agents share one deployment safely
+([release notes](https://github.com/NoKV-Lab/NoKV/releases/tag/v0.20.0)):
 
-NoKV closes that window as one artifact lifecycle:
+- **Tenants, principals, and roles.** Over TLS 1.3, an owner admits only a
+  current credential of the tenant that owns its roots and authorizes every
+  request as `reader`, `writer`, or `operator`. Revoking a credential or a role
+  takes effect within about a second, on open connections too.
+- **Attribution and audit.** Every durable operation records the principal
+  that began it, and only that principal or an operator may continue it.
+  `nokv serve --audit-log` writes one JSON line for every refusal.
+- **Read-only agents on the object store.** The owner writes every object
+  block, so agents need only read access under their root's prefix.
+- **A hardened control plane.** etcd with mutual TLS and least-privilege
+  roles; a single-host control directory that refuses unsafe permissions
+  before anything changes.
+- **One session, many roots.** Rust and Python `Session`s share one transport
+  and one set of credentials across roots, and an owner serves a root that is
+  provisioned after it started.
+- **CLI contract v2.** Exit codes 10 (`unauthenticated`) and 11
+  (`permission_denied`), Workbench writes that replay under a caller operation
+  id, and bounded retry backoff.
+- **Holt 0.8.8.** A metadata batch that fails part-way can no longer reach
+  disk.
+- **Removed:** the deprecated `nokv mcp` sidecar.
 
-```text
-produce bytes
-    |
-    v
-hand each immutable block to the shard owner, which verifies and writes it
-    |
-    v
-one final bounded metadata command makes the revision visible
-  - compare the current path generation and owner epoch
-  - publish the immutable revision and advance the path head
-  - update indexes, references, change history, and operation receipt
-    |
-    v
-visible workspace result, or a typed conflict / recoverable exact replay
-```
+Upgrading from 0.12.x is breaking: the wire protocol (v15), the metadata format
+(15, with no migration), and the CLI contract (v2) change together.
 
-The current hard-to-substitute increment is this combined closure, not one
-data structure or a claim that alternatives cannot exist. A replacement must
-preserve all of the following under response loss and restart, then pass the
-same conformance and fault evidence:
+## Core primitives
 
-- **Atomic visibility:** artifact bytes are staged first and become reachable
-  only when their revision, path head, indexes, references, and receipt commit.
-- **No silent overwrite:** create, replace, edit, append, rename, and remove
-  are explicit and generation-fenced. A stale writer gets a conflict.
-- **Exact retry:** request identity and operation records distinguish
-  definitely-not-applied, applied-with-lost-response, and unknown outcomes.
-- **Durable decision points:** commits retain an immutable revision closure;
-  restore builds a hidden same-root incarnation and publishes it atomically.
-- **History-aware collection:** object listing is never namespace truth. GC is
-  fenced by path references, commits, snapshots, restore operations, and
-  quarantine state.
-- **Fenced ownership:** persisted root placement and owner epochs prevent an
-  obsolete shard owner from continuing to publish metadata.
+Both use cases below are built from the same small set of primitives.
 
-### Find a capability by job
-
-| I need to... | Use | What the caller gets |
+| Primitive | What it guarantees | Surface |
 | --- | --- | --- |
-| Persist one run | `workbench_create`, `workbench_put_file`, `workspace-path append`, `workbench_edit`, `workbench_commit` | Five-section workspace, explicit write modes, immutable revisions, and a sealed run manifest |
-| Reopen work from another process | `workbench_list`, `workbench_stat`, `workbench_read`, `workbench_find` | Path-shaped discovery and verified reads without retaining the original sandbox |
-| Prevent stale or duplicate writes | generations, explicit request identity, exact replay | Typed conflict for stale state; the same outcome for an exact retry after response loss |
-| Search many artifacts or runs | `workbench_grep`, `workbench_search`, `workbench_aggregate`, `workbench_catalog`, `workbench_find` | Literal body search plus typed indexed metadata query and aggregation |
-| Freeze a short-lived view | `workbench_snapshot`, `workbench_snapshot_renew`, `workbench_snapshot_list` | Leased point-in-time reads with explicit lifecycle state |
-| Create a durable replay point | `workbench_commit` then `workbench_restore` | Retained revision closure and atomic restore into a new destination |
-| Run a local executable | `nokv materialize` then `nokv collect` | Verified input files in disposable scratch and explicit output publication |
-| Embed NoKV in Python | direct `Client`, Workbench fsspec, checkpoint, optional torch DCP | In-process path/artifact/range/query/lifecycle APIs bounded to an explicit Workbench |
-| Build a native provider or control plane | Rust `WorkspaceClient`, change polling, custom-index registration, operation status | Typed lower-level integration and recovery primitives |
+| Workbench | One jailed workspace with `input`, `scripts`, `outputs`, `logs`, and `metadata` sections, addressed by path | `workbench_create`, `workbench_list`, `workbench_stat` |
+| Explicit writes | Create-only, replace-only, exact-text edit, or append, each fenced by the generation the writer observed: a stale writer gets a conflict instead of overwriting newer state | `workbench_put_file`, `workbench_edit`, `workbench_append`, `workspace-path put`/`append`/`rename`/`remove` |
+| Exact replay | A retry with the same operation id and inputs returns the original receipt after a lost response or a restart; other inputs are an `identity_conflict` | `--operation-id`, `nokv operation status` |
+| Commit | A durable decision point: one run manifest plus the exact immutable revisions present at that moment, retained until the commit is retired | `workbench_commit` |
+| Snapshot | A leased point-in-time view for reads and short-lived recovery (seven days by default, at most 90) | `workbench_snapshot` and its `_renew`, `_list`, `_retire` tools; reads with `at_snapshot` |
+| Fork | Restore a retained commit, or a snapshot whose lease is alive, into a new Workbench: a new branch of the work, without copying payload bytes; the source stays unchanged | `workbench_restore` |
+| Query | Literal body search, typed indexed-metadata predicates, aggregation, and field discovery | `workbench_grep`, `workbench_search`, `workbench_aggregate`, `workbench_catalog`, `workbench_find` |
+| Local execution | Copy verified inputs to disposable scratch, then publish outputs back explicitly | `nokv materialize`, `nokv collect` |
+| Identity | TLS client authentication, roles per root, initiator attribution, refusal audit | `nokv identity`, `nokv serve --rpc-tls-*`, `--audit-log` |
 
-## Use Cases
+NoKV stores declared durable state. It does not checkpoint process memory,
+sockets, credentials, a container or VM, or an in-flight model session.
 
-### State provider for disposable agent sandboxes
+## A. Agent workspace
 
-An agent sandbox should be disposable; its durable state should not be. Any
-agent, loop harness, or sandbox runner can keep transient execution local while
-using NoKV as the durable state provider for everything that must survive:
-task state, inputs, code, tool outputs, logs, checkpoints, and lineage.
+### A pluggable state layer for agent sandboxes
+
+An agent sandbox should be disposable; its state should not be. Any agent
+harness or sandbox runner keeps execution local and uses NoKV as the state
+provider for what must survive: task state, inputs, code, tool outputs, logs,
+checkpoints, and lineage.
 
 ```text
 run inside a sandbox
@@ -130,74 +122,91 @@ run inside a sandbox
 
 sandbox exits or disappears
   -> reopen the workspace from its durable identity
-  -> continue from the commit, or restore it into a fresh Workbench
+  -> continue from the commit, or fork it into a new branch
   -> retry the same request exactly; reject an obsolete writer
 ```
 
-**The value is not another state-blob write.** NoKV is not raw storage alone;
-it is an implemented, composable, sandbox-native functional storage layer. A
-harness can use its lifecycle primitives through the native CLI or SDK:
-
-- **Atomic checkpoint visibility:** artifact bytes are published first; a
-  Workbench commit then seals one canonical manifest and its exact immutable
-  revision closure as the durable decision point.
-- **Idempotent recovery:** for the same request identity and inputs, durable
-  operation receipts return the prior outcome after a lost response instead of
-  applying the same transition twice.
-- **Stale-writer rejection:** a caller submits the generation it observed;
-  generation compare-and-swap rejects its update if newer state won first.
-  Owner epochs separately fence an obsolete shard owner.
-- **Restore without payload copying:** a retained commit can populate a hidden
-  same-root incarnation whose destination becomes visible atomically. Leased
-  snapshots provide shorter-lived point-in-time recovery and inspection.
-- **One recoverable workspace:** verified materialize/collect, indexed search,
-  immutable lineage, and retention-aware GC share one workspace contract. The
-  Rust SDK additionally exposes change polling; quarantine and reconciliation
-  remain internal lifecycle mechanisms rather than CLI commands.
+- **Atomic checkpoint visibility.** Artifact bytes are staged first; a commit
+  then seals one canonical manifest and its exact immutable revision closure.
+- **Idempotent recovery.** Durable operation receipts return the prior outcome
+  after a lost response instead of applying the same transition twice.
+- **Stale-writer rejection.** Generation compare-and-swap rejects an update if
+  newer state won first; owner epochs separately fence an obsolete shard owner.
+- **One recoverable workspace.** Verified materialize and collect, indexed
+  search, immutable lineage, and retention-aware garbage collection share one
+  workspace contract.
 
 The harness still decides which state is authoritative and when execution may
 resume. Restoring state does not grant a replacement worker permission to act;
-the harness must reacquire its own leases and gates. NoKV recovers declared
-durable state, not RAM, sockets, credentials, container or VM state, or an
-in-flight model session. These lifecycle primitives are implemented and
-layer-tested at the evidence revision below; a complete harness adapter and
-authority handoff remain caller-owned and require separate live qualification.
+the harness reacquires its own leases and gates.
 
-### AI-for-science: durable evidence for adaptive HPC loops
+### Fork a checkpoint into a new branch for an agent
 
-An adaptive AI-for-science campaign can use a fast surrogate to screen a broad
-candidate space, spend expensive high-fidelity compute on a selected subset,
-and feed the verified results into the next round. [atomate2](https://materialsproject.github.io/atomate2/)
-and [jobflow](https://materialsproject.github.io/jobflow/) continue to own the
-scientific Jobs and Flows, dependencies, result schemas, JobStore, and
-execution environment. NoKV adds the durable state and evidence boundary
-between rounds and around the expensive jobs:
+An agent that wants to try an alternative, or a supervisor that gives a second
+agent the same starting point, forks a checkpoint into a new branch: a new
+Workbench that starts from exactly the revisions the checkpoint holds.
 
-1. Publish exact inputs, code, configuration, model artifacts, and candidate
-   sets as immutable, versioned artifacts.
-2. Before high-fidelity work is launched, seal the selected tasks and decision
-   inputs as one deterministic Workbench commit.
-3. Record the workflow's calculation identity and attach returned outcomes,
-   including failures, as new immutable revisions instead of overwriting prior
-   evidence.
-4. Retrain, re-analyse, or restore from a retained commit identity; populate a
-   fresh Workbench from its closure without silently mixing incompatible
-   inputs or results.
+```bash
+nokv [route options] workbench workbench_restore \
+  '{"id":"run-42","destination_id":"run-42-try-b","at_commit":"<64-hex commit identity>"}'
+```
 
-This target shape makes each expensive selection a reproducible checkpoint:
-what was chosen, from which inputs and model state, under which code and
-configuration, and what came back. NoKV does not build the workflow graph,
-submit or cancel external jobs, validate scientific correctness, or replace
-the workflow
-engine, scheduler, or JobStore. This is a target integration shape, not a
-currently bundled atomate2/jobflow adapter, partner adoption, or live-qualified
-HPC deployment. A future adapter would bind workflow job ids, output
-references, and scheduler receipts to Workbench revisions; scientific workflow
-semantics remain above NoKV.
+- The source Workbench stays unchanged, and the new branch reuses its immutable
+  payload blocks instead of copying them. Staging stays hidden until the branch
+  appears atomically, and an exact retry converges to one result.
+- Fork from a commit when the starting point must stay citable: a commit is
+  retained until it is retired. A fork from a snapshot (`at_snapshot`) works
+  only while the snapshot's lease is alive.
+- The new branch is an ordinary writable Workbench in the same root. There is
+  no in-place rollback and no fork across roots or shards.
 
-## Feature Map
+### Many agents on one root
 
-### Native Workbench CLI: the stable agent surface
+With RPC TLS:
+
+- Each agent presents its own certificate, which `nokv identity` maps to a
+  principal of the root's tenant. The CLI needs no `--agent-id`, so many
+  agents write one root concurrently, fenced by generations.
+- Every request needs a role on its root. A refused credential exits 10
+  (`unauthenticated`) and a refused role 11 (`permission_denied`); both tell
+  the agent to stop and hand over to an operator.
+- Revoking a credential or a role takes effect within about a second, on open
+  connections too.
+- `operation status` and change events name the principal that began each
+  operation; only that principal or an operator may continue, abort, or
+  complete it.
+- `nokv serve --audit-log PATH` appends one JSON line for every refused
+  connection and every denied request.
+- A Rust or Python `Session` derives clients for many roots from one transport
+  and one set of credentials, and an owner starts serving a root provisioned
+  after it started, without a restart.
+
+[SECURITY.md](SECURITY.md) and the [threat model](docs/development/threat-model.md)
+state what each mechanism covers and what it does not.
+
+### Validated with Hermes and Pi agents
+
+NoKV's acceptance runs drive [Hermes](https://github.com/NousResearch/hermes-agent)
+and Pi agents through the native CLI, each harness with its own skill:
+
+- two writer agents edit one file concurrently: no lost update, and each write
+  is attributed to the agent that made it;
+- a reader agent asked to publish is refused with `permission_denied` before
+  anything changes, then stops and reports;
+- a credential revoked mid-session is refused within about a second, and the
+  agent stops;
+- every refusal appears in the owner's audit log;
+- a control directory made group-writable mid-task is refused as
+  `operator_required` before any request; the agent stops instead of retrying,
+  and service resumes once an operator fixes the permissions;
+- 16 and 64 Pi agents, each with its own principal, share one root without
+  errors.
+
+NoKV ships no Hermes or Pi plugin: the native CLI and its
+[contract](docs/cli-contract.md) are the integration surface, and an agent
+system provides its own skill over them.
+
+### The Workbench CLI
 
 `nokv workbench <tool> '<json arguments>'` is the primary integration surface.
 The names and normalized input schemas below are fixed by the
@@ -222,358 +231,128 @@ The names and normalized input schemas below are fixed by the
 | `workbench_snapshot_renew` | Extend, but never shorten, a live snapshot lease. |
 | `workbench_snapshot_retire` | Retire a root-bound snapshot idempotently and release its hold when allowed. |
 | `workbench_snapshot_list` | Inspect aliases, deadlines, annotations, and `alive`/`expired`/`retired`/`reaped` state. |
-| `workbench_restore` | Restore a snapshot or commit into an absent destination without copying immutable payload blocks. |
+| `workbench_restore` | Fork a snapshot or commit into an absent destination without copying immutable payload blocks. |
 
-All 18 operations have complete parser-to-metadata implementation chains, with
-object-store effects for body-bearing operations, and deterministic
-adjacent-layer tests at the evidence revision below. Their native-CLI
-real-service acceptance gate is still **not qualified**.
+`put_file`, `edit`, and `append` accept an optional caller `operation_id` and
+replay under it from any process and after an owner restart.
 
-### Other CLI capabilities
+Other commands:
 
-| Command | Purpose | Boundary |
-| --- | --- | --- |
-| `nokv version --json` | Report the exact NoKV revision, lockfile identity, Holt source/version/checksum, schema, and tool count. | Identity/readback only. |
-| `nokv schema` | Emit the exact 18 normalized Workbench input schemas. | Contract inventory, not a live health check. |
-| `nokv materialize` | Copy a verified workspace artifact to a new local path. | The destination is disposable scratch, not a namespace or mount. Parents are opened without following symlinks; publication is create-only and atomic. |
-| `nokv collect` | Publish one bounded regular local file, create-only or generation-fenced replace. | Symlinks in the file or its parents and unbounded/non-regular inputs fail closed. With `--operation-id` it publishes like `workspace-path put`. |
-| `nokv workspace-path put` | Publish one whole body, create-only or pinned to `--expected-generation`, under a caller `--operation-id`. | A retry with the same id and inputs from any process returns the original receipt; other inputs are an `identity_conflict`. |
-| `nokv workspace-path stat` | Read a path's incarnation, workspace revision, generation, and artifact revision in one metadata read. | Read-only; no object-store connection. |
-| `nokv workspace-path rename` / `nokv workspace-path remove` | Apply an explicit generation- and request-id-fenced path mutation. | Custom CLI surface; not one of the 18 Workbench tools. |
-| `nokv workspace-path append` | Append bytes under a durable logical identity and recover the original receipt across process restarts. | The first admission requires an existing workspace. Retries use fenced publication attempts under the same identity; the 18-tool schema is unchanged. |
-| `nokv operation status` | Query an append, publish, commit (`--commit-identity`), or restore by its identity and report its stored receipt or next action. | Metadata only: no payload, current workspace, or object-store connection is required. |
-| `nokv operation inspect` | Inspect a bounded page of retained staged objects and save the exact operation token. | Metadata only; the cursor binds one observation and fails if state changes. |
-| `nokv operation recover` | Ask the owner to retry quarantined append cleanup. | No payload or object credentials; an explicit saved state digest replays one durable recovery request. |
-| `nokv provision` | Bind `RootId` to `AgentId`, the Workbench root its Agents present it under, object namespace, logical shard, and persisted placement through etcd. | `AgentId` prevents accidental root reuse; it is not authentication. Over RPC TLS, the owner checks roles instead and the binding is not consulted. |
-| `nokv serve` | Start one explicit metadata owner from create, same-namespace reopen, or recovery-log state. | Shared recovery publication is opt-in and not currently qualified. |
-| `nokv identity` | Create tenants and principals, bind certificate fingerprints to principals, grant or revoke tenant- and root-scoped roles, and bind roots to tenants. | Operator command that writes the control store directly. An owner that serves RPC TLS enforces these records within about a second. |
+| Command | Purpose |
+| --- | --- |
+| `nokv version --json`, `nokv schema` | Report the exact revision, lockfile, Holt build, and the 18 frozen input schemas. |
+| `nokv materialize`, `nokv collect` | Copy a verified artifact to disposable local scratch; publish one bounded regular file back, create-only or generation-fenced. |
+| `nokv workspace-path put`, `stat`, `rename`, `remove` | Publish one whole body under a caller `--operation-id`; read a path's generation in one metadata read; apply fenced path mutations. |
+| `nokv workspace-path append` | Append under one durable logical identity that survives process restarts; see [append recovery](docs/append-recovery.md). |
+| `nokv operation status`, `inspect`, `recover` | Query any append, publish, commit, or restore by identity; inspect and recover a quarantined append without object credentials. |
+| `nokv provision`, `nokv serve` | Bind a root to its Workbench root, object namespace, and shard; run one epoch-fenced shard owner. |
+| `nokv identity` | Manage tenants, principals, certificate credentials, and tenant- and root-scoped roles. |
 
-For an append that must survive a lost reply or a harness restart, save one
-operation id before sending the request, then reuse it with the same inputs:
+A failed command writes one JSON line to stderr with its failure `class` and
+`next_action` and exits with that class's code; see the
+[CLI contract](docs/cli-contract.md).
 
-```shell
-nokv [route/agent/object options] workspace-path append run-42 logs events.jsonl \
-  --operation-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  --expected-workspace-incarnation-id bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
-  --text 'step-7-done' --content-type text/plain
-```
+## B. AI for Science
 
-Replace the example ids with the caller's stable logical operation id and the
-intended workspace's incarnation. On the first call, omitting the incarnation
-observes and fences the existing workspace. On recovery, omission resolves the
-original durable operation first, even if the workspace was deleted or recreated.
-Append never creates a missing workspace.
+### Frozen evidence for adaptive campaigns
 
-Use exactly one of `--text`, `--base64`, or `--file`. Text defaults to
-`text/plain; charset=utf-8` on creation; binary and file input default to
-`application/octet-stream`. Existing content type is inherited unless
-`--content-type` overrides it. Explicitly use the same type when replaying across
-text, file, and Python inputs. The delta limit is 16 MiB; `--max-artifact-bytes`
-may lower it. The resulting body also defaults to a 16 MiB limit;
-`--max-logical-size` raises that bound and is part of the stable intent.
-`--block-size` defaults to 4 MiB and matches Python's `block_size` argument;
-retain the same value across retries and surface changes.
+An adaptive campaign screens a large candidate space with a cheap surrogate,
+spends expensive high-fidelity compute (for example DFT jobs on a batch
+scheduler) on a selected subset, and retrains on the results. Workflow engines
+such as [atomate2](https://materialsproject.github.io/atomate2/) and
+[jobflow](https://materialsproject.github.io/jobflow/) already own jobs,
+dependencies, per-calculation provenance, and execution. They do not answer
+the campaign-level question: **what evidence was available at each decision,
+and what would a different selection policy have done with it?**
 
-The receipt identifies both the logical `operation_id` and its successful
-`publication_operation_id`. Its revision, generation, workspace revision, size,
-digest, and incarnation describe the original publication, even if another
-writer has advanced or removed the path. `replayed` and nullable `commit_version`
-describe this SDK call and are not stable receipt fields.
+NoKV holds that campaign record: a create-only log of inputs, model
+predictions, reference calculations, and decisions, frozen at each decision
+point and replayable offline.
 
-Query a result without resending the delta or contacting the object store:
+### Exactly-once ingestion under scheduler retries
 
-```shell
-nokv [route/agent options] operation status aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-```
+Cluster jobs are resubmitted, restarted, and re-parsed. Ingestion stays
+idempotent:
 
-The response supplies a machine-readable recovery action:
+- Derive each publication's operation id from a stable identity of what it
+  records, for example the calculation identity and the content digest, and
+  save it before sending.
+- A resubmitted job with the same id and inputs gets the original receipt and
+  creates no second record. The same id with different inputs is refused as
+  `identity_conflict` instead of overwriting.
+- `nokv operation status <id>` tells a restarted pipeline whether an ingestion
+  committed, is still pending, or must be resubmitted, without resending the
+  payload.
+- Record a genuine rerun as a new artifact next to the calculation it repeats,
+  not as a replacement, so run-to-run variation stays part of the record.
 
-| `state` | `next_action` | Caller action |
-| --- | --- | --- |
-| `committed` | `none` | Consume the original `receipt`. |
-| `pending` | `poll` | Query the same logical identity again after waiting. |
-| `ready_to_retry` | `resubmit_same` | Resubmit the original append inputs under the same logical identity. |
-| `quarantined` | `retry_cleanup` | Inspect the failure, restore provider availability, then ask the owner to retry cleanup. |
+### Decision points and as-of reads
 
-Status also retains the current physical attempt's `cause_code`,
-`failure_message`, and structured `attempt_failure`, including when the logical
-operation is `ready_to_retry`.
+- Before launching expensive work, seal the selection: commit the Workbench
+  with a run manifest that names the decision's inputs. The commit retains the
+  exact immutable revisions present at that point until it is retired.
+- Read the campaign as it was at a point in time through a snapshot
+  (`at_snapshot`), or fork the commit to reconstruct it after the snapshot's
+  lease has expired.
+- The run manifest and its digest are supplied by the committer: NoKV binds
+  them to the commit but does not recompute them from content. A fork of a
+  commit is an ordinary writable Workbench; the frozen guarantee lives in the
+  commit and in snapshot reads, not in the copy.
 
-Inspect and recover without object credentials:
+### Counterfactual replay: fork a decision point
 
-```shell
-nokv [route/agent options] operation inspect aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --limit 32
-nokv [route/agent options] operation recover aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  --expected-state-digest <saved-operation_token.state_digest>
-```
+To ask what another acquisition policy would have chosen with the same
+evidence, fork the decision point's commit into a new branch, run the policy
+against exactly the evidence that existed then, and compare outcomes. Many
+policies can run against one frozen point, each in its own branch, without
+touching the original record. On a densely precomputed benchmark, where every
+candidate's predictions and reference calculations exist in advance, any
+policy restricted to it can be replayed exactly.
 
-Inspection returns `operation_token` and `publication_token`, each with
-`operation_id` and `state_digest`, plus the object namespace, `registered_count`,
-`cleanup_cursor`, `remaining_count`, and `entries`. Entries describe retained
-staged objects, not a historical inventory of retired keys. Each entry includes
-its sequence, identity, expected length, digest, and optional multipart token.
-The page limit defaults to 32 and may range from 1 to 192. Continue with the
-opaque base64 `next_cursor` using `--cursor`; a stale cursor returns
-`Conflict/OperationState`, requiring a fresh inspection instead of mixing pages.
+### Campaign queries, provenance, and isolation
 
-Save the logical token before requesting recovery. Reuse its state digest after
-a lost reply or process restart. The owner performs sealing; this command never
-resends the append delta. `requested=true` means a cleanup request was durably
-accepted, including a replay. Its historical `recovery_receipt` contains the
-logical id, publication id, cleanup retry count, and expected state digest.
-The top-level status is a fresh observation and may be newer than that receipt;
-acceptance is not cleanup completion. Omitting the digest targets the current
-state once and is a no-op for pending, cleaned, or committed operations. A later
-quarantine needs an intentional new request with a newly inspected token.
-`AppendCleanupUnresolved` preserves the saved digest, any known recovery receipt,
-and `next_action=retry_same_cleanup`; generic retry handlers must not choose a
-new token. After `ready_to_retry`, resubmit the original append inputs.
+- **Queries in place.** Typed indexed metadata answers campaign questions such
+  as compute spent per decision or which candidates have reference results
+  (`workbench_search`, `workbench_aggregate`, `workbench_catalog`).
+- **Provenance.** Each durable operation records the principal that began it,
+  and refusals are audited.
+- **Isolation.** Groups that share one deployment get separate tenants, roots,
+  and roles; analysis jobs can run on read-only object credentials.
+- **Your storage.** Artifact bytes stay in your own S3-compatible store.
+- **Model checkpoints.** The Python SDK's Workbench-scoped fsspec filesystem and
+  PyTorch Distributed Checkpoint reader and writer keep training checkpoints in
+  the same versioned workspace, in non-executable formats; see
+  [AI training](docs/ai-training.md).
 
-An interrupted publication must be fenced and cleaned before a successor
-attempt can start. Status queries only observe this lifecycle. Persist the delta
-or a way to reproduce the exact bytes until the operation commits. An unknown
-result or `NotFound` observation is not proof that a concurrent request cannot
-commit; errors preserve the logical id, and an unknown outcome uses
-`next_action=query_same`.
-`cause_code=RequestReplayMismatch` means the identity belongs to different
-inputs or a different lifecycle: recover the original intent before retrying.
-Never generate a replacement id merely to bypass an uncertain outcome.
+### What stays above NoKV
 
-The older `workbench_append` tool retains per-invocation identities and cannot
-recover one action across separate processes. Use `workspace-path append` for
-new retrying harness integrations. The fixed 18-tool contract remains unchanged.
-The [append product specification](docs/development/append-product-spec.md)
-defines the supported recovery, size, retention, and release boundaries.
-
-### Programmatic and non-CLI capabilities
-
-The interfaces share protocol, metadata, object, and lifecycle semantics. They
-do not expose identical method shapes.
-
-| Surface | Current public capability | Additional boundary |
-| --- | --- | --- |
-| Direct Python `Client` | Create/stat/exists/list/remove/rename, byte/file publish, stable append with status/inspect/recover, whole/range/batch reads, query/aggregate/catalog/find, commit/restore, snapshot lifecycle, materialize, and collect | Direct SDK, not a tool-for-tool copy of the 18-name CLI facade |
-| Python adapters | Workbench-scoped fsspec, checkpoint helpers, and optional torch Distributed Checkpoint reader/writer | Bounded to an explicit Workbench; not arbitrary-root POSIX or FUSE |
-| Rust `WorkspaceClient` | Lower-level typed workspace, publication, query, lifecycle, routing, and batch-range workflows; a `Session` derives the clients of several roots from one transport, resolver, and set of credentials | Recommended when the caller must own typed retry and recovery integration |
-| Rust-only extensions | Polling change feed, generic custom-index registration, raw non-append operation status, and phased publish/restore primitives | No native CLI or Python method today; change feed is polling, not push |
-| Metadata and server lifecycle | snapshot reap, commit/tag holds, reference-fenced GC, quarantine reconciliation, Holt reopen, and optional shared recovery records | Internal/operator mechanisms, not independent end-user commands |
-
-Python `append_bytes`, `operation_status`, `operation_inspect`, and
-`operation_recover` share the native stable append contract. Python inspection
-cursors are opaque bytes; recovery state digests are lowercase hex strings.
-The SDK does not expose the legacy 18-tool append facade, exact-string
-edit, or body grep methods; use the CLI for those exact behaviors.
-Custom SDK compositions are caller-owned and are not equivalent qualification
-evidence.
-
-## Choose an Interface
-
-```text
-Downstream skill or shell harness
-  -> native nokv CLI                 workspace operations and stable append recovery
-
-Embedded Python application
-  -> nokv Python Client/adapters     direct path/artifact/lifecycle API
-
-Native control plane or provider
-  -> nokv-client Rust crate          lower-level typed integration
-```
-
-Use the native CLI for agent skills because it provides one inspectable schema,
-stable JSON envelopes, and fail-closed admission. A failed command writes one
-JSON line to stderr with its failure `class` and `next_action` and exits with
-that class's code; see the [CLI Contract](docs/cli-contract.md). Use Python when the caller
-needs in-process range reads, fsspec/checkpoint integration, or direct typed
-methods. Use Rust for provider, routing, change-feed, or recovery-aware work.
-
-Every agent-facing CLI command requires self-refreshing control routing:
-`--control-dir PATH` when the owner and its clients share one host,
-`--etcd-endpoint URL` when they span hosts, with `--etcd-tls-ca`,
-`--etcd-tls-cert` and `--etcd-tls-key` when etcd authenticates its clients by
-certificate ([control plane credentials](docs/control-plane-credentials.md)
-lists the keys each role may touch). Static route pins remain an
-SDK/testing option and are rejected by the agent-facing CLI. Without RPC TLS,
-the CLI also requires the durable `RootId` to `AgentId` binding, a CLI-only
-misconfiguration check that is not authorization. Over RPC TLS, the owner
-authorizes every request by role instead; see [SECURITY.md](SECURITY.md).
-
-## Core Semantics
-
-### Namespace and publication
-
-- `RootId` is the only storage and routing identity. A presentation path such
-  as `/agents/research/wb` shapes returned paths and manifests but grants no
-  storage authority.
-- `PathCurrent(root, incarnation, normalized_path)` is canonical namespace
-  truth. Directories are implicit prefixes; an object-store listing is never
-  authoritative.
-- Every published body has a never-reused artifact revision id, immutable
-  revision-owned blocks, a whole-body digest, and a caller-visible generation.
-- Append reads the current head and publishes an immutable generation-fenced
-  revision. Stable append records a logical operation before publication; a
-  successor attempt is allowed only after its predecessor cannot publish and
-  has completed cleanup. One logical append has at most one committed result.
-
-### Commit, snapshot, and restore
-
-- A commit is the durable decision point: it binds a canonical run manifest
-  and retains the exact artifact revision closure.
-- A snapshot is a leased liveness hold, not archival retention. Use snapshot
-  plus restore while the lease is active; use commit plus restore when a
-  decision point must remain recoverable after the lease expires.
-- Restore preserves its source, reuses immutable payload blocks, stages a
-  fresh same-root incarnation invisibly, and atomically publishes the new
-  destination. It is not a cross-root or cross-shard copy transaction.
-
-### Sharding, identity, and authority
-
-- Root placement is persisted control-plane state, never derived from a path
-  prefix or the current shard count.
-- One epoch-fenced active owner executes a shard-local metadata command.
-- Transactions, snapshots, commit closure, restore, and GC barriers are
-  shard-local. NoKV does not provide cross-shard transactions.
-- Workbench jailing and `RootId` to `AgentId` binding are safety boundaries,
-  not tenant authentication, authorization, or RBAC. Over RPC TLS, the owner
-  authenticates each client and authorizes each request by role, many
-  agents can share a root, and every durable operation records which
-  principal began it, so only that principal or an operator continues it.
-
-## Why Holt Fits the Current Local Profile
-
-[Holt](https://github.com/NoKV-Lab/holt) is NoKV's purpose-built embedded Rust
-metadata engine. Its persistent adaptive radix trees provide ordered point and
-prefix access for path-shaped metadata while its WAL and atomic batches provide
-the local durability boundary. NoKV owns the workspace semantics in `nokv-meta`
-over the storage-neutral `TxnStore` contract; Holt is the currently wired and
-tested `LocalSync` implementation, while S3-compatible storage still owns
-artifact bytes.
-
-This evidence snapshot covers the exact `holt = "=0.8.7"` dependency of NoKV
-0.12.1. NoKV 0.20.0 pins `=0.8.8`, which is 0.8.7 plus a fail-closed fix: a
-write that fails after changing cached frames stops the database instead of
-letting a later checkpoint persist part of it. Later upstream Holt `main`
-features are outside this section's claims; identify an installed build with
-`nokv version --json`.
-
-Holt maps NoKV metadata families to named persistent adaptive radix trees:
-
-- adaptive Node4/16/48/256 fanout and path compression fit NoKV's
-  prefix-rich encodings for workspace paths, commit members, and indexes;
-- the same persistent ART index supports point lookup and native ordered
-  prefix/start-after/delimiter pages, which maps directly to hierarchical
-  listing without rebuilding order in the application;
-- one bounded `DB::atomic` batch checks and mutates multiple metadata families
-  through a single WAL record, matching one NoKV metadata command;
-- one scoped `DB::view` captures a consistent multi-tree read view for a NoKV
-  read batch; it is not the same object as a durable NoKV snapshot;
-- NoKV's file-backed Holt profile forces synchronous WAL acknowledgement;
-  replay, shadow checkpoint slots, and an exclusive manifest writer define the
-  tested same-namespace restart boundary;
-- compacted blobs support page-granular routed reads, while corrupt read
-  accelerators fall back to the authoritative blob.
-
-This is a workload fit, not proof that ART is universally faster or uniquely
-able to implement NoKV. The adapter contract deliberately permits another
-`TxnStore` after equivalent conformance, receipt, snapshot, scan, restart, and
-fault qualification. Current tests cover deterministic torn-frame injection
-and a real child `SIGKILL` after a durable non-empty partial manifest record;
-they do **not** constitute a physical power-cycle, remote failover, cross-host
-fencing, or metadata-HA test. No current third-party A/B number is claimed.
-NoKV's end-to-end performance evidence is the single-host agent-harness release
-check for 0.12.0: see the
-[release notes](https://github.com/NoKV-Lab/NoKV/releases/tag/v0.12.0) and the
-[raw evidence](https://gist.github.com/wchwawa/e9f86ba66c3211f1514d618e9827546a).
-
-## Evidence and Qualification
-
-The labels below mean exactly:
-
-- **Implemented:** the typed call chain and durable effect exist in current
-  source.
-- **Layer-tested:** deterministic tests exercise real adjacent implementations;
-  fake/mock tests remain identified as such.
-- **Live-qualified:** the supported entrypoint ran against the required real
-  dependencies at the pinned revision and produced accepted evidence.
-
-Evidence snapshot, rerun on 2026-10-21:
-
-- NoKV tag `v0.12.1`, commit
-  [`6be80629aa9b`](https://github.com/NoKV-Lab/NoKV/commit/6be80629aa9ba481f0e52bf57f83f7d6ae9e8542),
-  with workspace RPC `nokv.workspace.rpc.v14` and System format 14;
-- pinned Holt `=0.8.7` from crates.io, whose packaged `src/` and `tests/`
-  match Holt tag [`v0.8.7`](https://github.com/NoKV-Lab/holt/tree/v0.8.7),
-  where the Holt rows ran;
-- one Apple M3 Pro laptop, macOS 26.6, Rust 1.99.1 (the CI toolchain pin).
-
-| Surface | Current evidence | Status |
-| --- | --- | --- |
-| Rust workspace | 1,224 passed, 0 failed; 13 ignored real-etcd/S3 cases; the Linux CI run on the same commit reports the same counts | Implemented and layer-tested; ignored cases are NQ |
-| 18 Workbench operations | `all_eighteen_tools_execute_against_typed_backend_primitives` passes, as do the focused parser, facade, client/protocol, server, metadata, Holt, and object layer tests; the frozen-contract test passes 8 checks | Implemented and layer-tested |
-| Built CLI identity/schema/fail-closed admission | 15 process checks passed: help; `--version` and `version --json` report 0.12.1, the tag commit, Holt 0.8.7 from crates.io, and 18 tools; `schema` matches the frozen contract; static, missing, and mixed control routing, a malformed `--request-id` or `--expected-generation`, and an unpinned `--expected-generation` are rejected without opening a control store; there is no mount command | Local smoke passed |
-| Native CLI against real etcd + server + S3 | not rerun here; bounded real-service gates drive parts of the CLI, but no accepted full-surface Gate 0 transcript covers the complete lifecycle; the black-box runner now drives the native CLI, but its transcript is not an accepted full-surface one and it lacks terminal snapshot-reap evidence | **Not qualified** |
-| Installed Python wheel against real service | the release's macOS arm64 wheel, checked against the release `SHA256SUMS`, passed `verify-install` and 34 out-of-tree tests in a clean Python 3.12 venv; 7 tests import the installed wheel, while the 27 fsspec/checkpoint/torch tests load the source adapters over fakes and stubs; no real service ran | **Not qualified** |
-| Holt 0.8.7 | 713 listed lib, integration, and example tests: 705 passed, 0 failed, 8 ignored, 4 of them child-process bodies that their parent tests run; doctests: 1 compile-only pass, 3 ignored; the NoKV adapter adds 33 unit tests and one reopen/conformance integration test | Layer-tested for the embedded local boundary |
-| Holt third-party A/B | the v0.8.7 Holt/RocksDB/SQLite/sled comparator target (`benches/`) builds once its build scripts can load libclang (here `LIBCLANG_PATH` and `DYLD_FALLBACK_LIBRARY_PATH` set to the Command Line Tools library directory) and the stale `holt` entry in `benches/Cargo.lock` is refreshed; a partial sweep ran without errors on the shared laptop as an uncontrolled diagnostic: 34 measurements across all four engines, covering the `kv` groups and the first `objstore` groups, before it was stopped | No accepted result; no performance claim |
-| Agent-harness performance | the 0.12.0 release check on the Pi durable agent harness: W1 and W2 at 1, 4, and 16 agents, 3 rotated repetitions per cell, one owner with RustFS in Docker on one Apple M3 Pro laptop; it measured merged `main` at `bbbd435f03`, and all 36 trials of that build passed file verification ([release notes](https://github.com/NoKV-Lab/NoKV/releases/tag/v0.12.0), [raw evidence](https://gist.github.com/wchwawa/e9f86ba66c3211f1514d618e9827546a)); not rerun here, and 0.12.1, whose only product-code change is the [#555](https://github.com/NoKV-Lab/NoKV/pull/555) client fix, was not re-measured | Single-host release check; not a production, tail-latency, or HA result |
-
-The 13 ignored NoKV workspace tests are eight real-etcd control tests, three
-direct S3-compatible provider tests, and two Python S3-admission tests. They
-are gaps, not passes. See [Workspace acceptance](docs/development/workspace-acceptance.md)
-for the normative gate and [Benchmarks and evidence](docs/benchmarks.md) for
-evidence rules.
-
-The rerun rows come from these commands, run from a checkout of the tag; the
-Holt rows ran from a checkout of Holt `v0.8.7`:
-
-- Rust workspace, 18 operations, and adapter counts:
-  `cargo test --workspace --locked` and
-  `python3 scripts/workbench/workbench_contract_test.py`;
-- built CLI: `nokv --help`, `--version`, `version --json`, and `schema`
-  (compared through `scripts/workbench/workbench_contract.py`), then
-  Agent-facing commands with static, missing, or mixed routing, malformed
-  `--request-id` and `--expected-generation` values, and `nokv mount`;
-- installed wheel: `pip install` of the release wheel into a clean venv, then
-  `python3 scripts/release/python_sdk_release.py verify-install` and
-  `python -m pytest -q crates/nokv-python/tests`;
-- Holt: `cargo test --workspace --all-features --lib --tests --examples --locked`
-  (the inventory from `-- --list` and `-- --list --ignored`) and
-  `cargo test --workspace --all-features --doc --locked`;
-- Holt A/B: `cargo bench --manifest-path benches/Cargo.toml --bench main`.
-
-### Implemented, but not currently live-qualified
-
-- opt-in shared recovery publication and receipt-directed recovery-log install.
-
-### Not qualified by current evidence
-
-- remote checkpoint compaction, copied-directory failover, shared metadata
-  durability, multi-machine failover, or metadata HA;
-- accepted full-surface native-CLI and installed-Python Gate 0 live acceptance;
-- complete provider timeout and ambiguous-delete fault coverage;
-- cross-host writer fencing;
-- physical power-cycle behavior, production tail latency, write amplification,
-  RSS advantage, or universal ART performance.
-
-### Planned, not yet offered
-
-- recording the principal that starts each durable operation, access control
-  for the object store and control plane, and one client session that spans
-  many roots.
-
-### Not offered by NoKV
-
-- cross-shard transactions;
-- transparent POSIX/FUSE/CSI/NAS behavior.
+NoKV does not build the workflow graph, submit or cancel jobs, validate
+scientific results, or replace the workflow engine, scheduler, or JobStore. No
+atomate2 or jobflow adapter ships with NoKV; an adapter binds workflow job ids,
+calculation identities, and scheduler receipts to Workbench revisions and stays
+above NoKV.
 
 ## Quick Start
 
-### Inspect the contract locally
+### Install
 
-Build the CLI, identify the exact bits, and inspect the frozen schema:
+```bash
+brew install NoKV-Lab/tap/nokv          # macOS, built from the release source
+nokv version --json
+```
+
+```bash
+pip install "nokv==0.20.0" \
+  --find-links "https://github.com/NoKV-Lab/NoKV/releases/expanded_assets/v0.20.0"
+```
+
+The Python wheels are abi3 for CPython 3.9+ on Linux x86_64/aarch64 and macOS
+arm64/x86_64. The container image `ghcr.io/nokv-lab/nokv` and its quick start
+are described in [Container image](docs/container-image.md). From source
+(Rust 1.91 or later):
 
 ```bash
 cargo build --release -p nokv --bin nokv
-./target/release/nokv version --json
 ./target/release/nokv schema
 python3 scripts/workbench/workbench_contract_test.py
 ```
@@ -581,25 +360,12 @@ python3 scripts/workbench/workbench_contract_test.py
 These commands prove build identity and the offline contract. They do not
 exercise a deployed metadata owner or object provider.
 
-A source Formula is available from NoKV's public Homebrew tap:
-
-```bash
-brew install NoKV-Lab/tap/nokv
-nokv version --json
-nokv schema
-```
-
-The Formula may trail the latest GitHub release. Read back `nokv version --json`
-and verify release-specific target evidence before treating a version or
-platform as supported.
-
 ### Call a provisioned deployment
 
 A live deployment requires a persisted root placement, a leased shard owner,
-etcd routing, and admitted S3-compatible object coordinates. After following
-the [live deployment preflight](docs/workbench-preflight.md), the current
-source-level CLI shape is below. The command form is documented; full
-native-CLI real-service Gate 0 remains not qualified.
+control routing (`--etcd-endpoint` across hosts, or `--control-dir` on one
+host), and admitted S3-compatible object coordinates. After the
+[live deployment preflight](docs/workbench-preflight.md):
 
 ```bash
 nokv \
@@ -618,37 +384,48 @@ nokv \
   --object-endpoint "$NOKV_OBJECT_ENDPOINT" \
   workbench workbench_put_file \
   '{"id":"run-001","section":"scripts","path":"main.py","text":"print(42)","replace":false}'
-
-nokv \
-  --root-id "$NOKV_ROOT_ID" \
-  --agent-id "$NOKV_AGENT_ID" \
-  --etcd-endpoint "$NOKV_ETCD_ENDPOINT" \
-  --object-bucket "$NOKV_BUCKET" \
-  --object-endpoint "$NOKV_OBJECT_ENDPOINT" \
-  workbench workbench_read \
-  '{"id":"run-001","section":"scripts","path":"main.py","format":"structured"}'
 ```
 
-Credentials use the provider's normal chain or
-`--object-access-key-id`, `--object-secret-access-key`, and optional
-`--object-session-token`; never embed them in Workbench content or manifests.
-Agents need only read access under the root's prefix; see
-[Object Store Credentials](docs/object-credentials.md) for the keys each role
-touches and example policies.
+Credentials use the provider's normal chain or `--object-access-key-id`,
+`--object-secret-access-key`, and optional `--object-session-token`; never
+embed them in Workbench content or manifests. Agents need only read access
+under the root's prefix; [Object Store Credentials](docs/object-credentials.md)
+lists the keys each role touches with example policies.
 
 To carry workspace RPC over TLS 1.3, start the owner with `--rpc-tls-cert` and
 `--rpc-tls-key`, and give each client `--rpc-tls-ca`, `--rpc-tls-cert`,
-`--rpc-tls-key`, and `--rpc-tls-server-name`. The owner then admits only
-clients whose certificate is a current credential of the tenant bound to its
-roots (`nokv identity`). Every request then needs a role on its root:
-reader, writer, or operator. Over TLS the CLI needs no `--agent-id`, so many
-agents can share a root, and once a root is bound to a tenant only a TLS owner
-serves it. Agents never write objects: each block goes to the owner, which
-writes it, so an agent's object credentials can be read-only under the root's
-prefix. The control plane still needs a trusted network. The Python SDK cannot
-yet connect to an owner that requires TLS.
+`--rpc-tls-key`, and `--rpc-tls-server-name`; the Python SDK takes the same
+material through `TlsConfig`. Without RPC TLS, the CLI requires the durable
+`RootId` to `AgentId` binding shown above, a misconfiguration check that is not
+authorization. [Control plane credentials](docs/control-plane-credentials.md)
+covers etcd with mutual TLS and the single-host control directory.
 
-## Architecture and Ownership
+## Choose an Interface
+
+```text
+Downstream skill or shell harness
+  -> native nokv CLI                 workspace operations and stable append recovery
+
+Embedded Python application
+  -> nokv Python Client/Session      direct path/artifact/lifecycle API, fsspec, torch DCP
+
+Native control plane or provider
+  -> nokv-client Rust crate          lower-level typed integration
+```
+
+Use the native CLI for agent skills: it gives one inspectable schema, stable
+JSON envelopes, and fail-closed admission. Use Python when the caller needs
+in-process range reads, fsspec or checkpoint integration, or direct typed
+methods. Use Rust for provider, routing, change-feed, or recovery-aware work.
+
+| Surface | Current public capability | Boundary |
+| --- | --- | --- |
+| Direct Python `Client` and `Session` | Create/stat/exists/list/remove/rename, byte/file publish, stable append with status/inspect/recover, whole/range/batch reads, query/aggregate/catalog/find, commit/restore, snapshot lifecycle, materialize, collect; one `Session` across roots, with TLS | A direct SDK, not a tool-for-tool copy of the 18-name CLI facade |
+| Python adapters | Workbench-scoped fsspec, checkpoint helpers, and an optional torch Distributed Checkpoint reader/writer | Bounded to an explicit Workbench; not POSIX or FUSE |
+| Rust `WorkspaceClient` and `Session` | Lower-level typed workspace, publication, query, lifecycle, routing, and batch-range workflows | Recommended when the caller owns typed retry and recovery |
+| Rust-only extensions | Polling change feed, custom-index registration, raw operation status, phased publish/restore primitives | Change feed is polling, not push |
+
+## Architecture and Pluggable Components
 
 ```text
 agent skill / harness       embedded Python         native control plane
@@ -657,9 +434,9 @@ agent skill / harness       embedded Python         native control plane
   18-tool CLI facade      direct Python API       lower-level Rust SDK
         +------------------------+-------------------------+
                                  |
-                         typed NoKV protocol
+                  typed NoKV protocol (optionally TLS 1.3)
                                  |
-                   epoch-fenced logical-shard owner
+              epoch-fenced logical-shard owner, role checks
                                  |
                     nokv-meta state machine
                  path, revisions, receipts, holds,
@@ -670,28 +447,148 @@ agent skill / harness       embedded Python         native control plane
           current local: Holt          S3-compatible bytes
 ```
 
+| Component | Today | Replaceable through |
+| --- | --- | --- |
+| Artifact bytes | Any S3-compatible object store, such as AWS S3, MinIO, RustFS, or Ceph RGW | Object store options; the provider owns physical durability, replication, and access policy |
+| Metadata engine | [Holt](https://github.com/NoKV-Lab/holt), an embedded Rust engine with a write-ahead log and atomic batches | The storage-neutral `TxnStore` contract and its conformance suite |
+| Control plane | etcd across hosts, optionally with mutual TLS and RBAC, or a local control directory on one host | `--etcd-endpoint` or `--control-dir` |
+
+A write becomes visible in one bounded step: the client hands each immutable
+block to the shard owner, which verifies and writes it; then one metadata
+command compares the path generation and owner epoch, publishes the revision,
+advances the path head, and updates indexes, references, change history, and
+the operation receipt. The result is a visible revision, a typed conflict, or
+a recoverable exact replay; object listing is never namespace truth.
+
 NoKV is not a semantic-memory database or an agent orchestrator. Retrieval
-ranking, planning, scientific validation, trace/scorer semantics, and runtime
-policy remain above it. The object provider owns physical durability,
-replication, availability, and access policy for bytes. NoKV owns which
-immutable revisions are visible and retained by a workspace.
+ranking, planning, scientific validation, and runtime policy remain above it.
+
+## Core Semantics
+
+### Namespace and publication
+
+- `RootId` is the only storage and routing identity. A presentation path such
+  as `/agents/research/wb` shapes returned paths and manifests but grants no
+  storage authority.
+- `PathCurrent(root, incarnation, normalized_path)` is canonical namespace
+  truth. Directories are implicit prefixes.
+- Every published body has a never-reused artifact revision id, immutable
+  revision-owned blocks, a whole-body digest, and a caller-visible generation.
+- Stable append records a logical operation before publication; one logical
+  append has at most one committed result.
+
+### Commit, snapshot, and fork
+
+- A commit is the durable decision point: it binds a run manifest and retains
+  the exact artifact revision closure.
+- A snapshot is a leased liveness hold, not archival retention. Use a snapshot
+  while its lease is active; use a commit when a decision point must stay
+  recoverable after the lease expires.
+- Restore (fork) preserves its source, reuses immutable payload blocks, stages
+  a fresh same-root incarnation invisibly, and publishes the new Workbench
+  atomically. It is not a cross-root or cross-shard copy transaction.
+
+### Sharding, identity, and authority
+
+- Root placement is persisted control-plane state, never derived from a path
+  prefix or the current shard count.
+- One epoch-fenced active owner executes a shard-local metadata command.
+  Transactions, snapshots, commit closure, restore, and GC barriers are
+  shard-local. NoKV does not provide cross-shard transactions.
+- Over RPC TLS, the owner authenticates each client, authorizes each request
+  by role before routing, and records the initiating principal of every
+  durable operation. Without TLS, Workbench jailing and the `RootId` to
+  `AgentId` binding are safety checks, not authentication.
+
+### Why Holt fits
+
+Holt's persistent adaptive radix trees give ordered point and prefix access for
+path-shaped metadata, and one bounded atomic batch checks and mutates several
+metadata families through a single WAL record, matching one NoKV metadata
+command. NoKV's file-backed profile forces synchronous WAL acknowledgement.
+Holt 0.8.8 latches the database closed when a write fails after changing cached
+frames, so a partial batch can never reach a checkpoint. This is a workload
+fit, not a claim that ART is universally faster: the adapter contract permits
+another `TxnStore` after equivalent qualification.
+
+## Evidence and Qualification
+
+The labels below mean exactly:
+
+- **Implemented:** the typed call chain and durable effect exist in current
+  source.
+- **Layer-tested:** deterministic tests exercise real adjacent implementations;
+  fake or mock tests remain identified as such.
+- **Live-qualified:** the supported entrypoint ran against the required real
+  dependencies at the pinned revision and produced accepted evidence.
+
+Evidence for NoKV 0.20.0 (2026-10-31 to 11-01). Tag `v0.20.0` is commit
+[`6e8a84e43d`](https://github.com/NoKV-Lab/NoKV/commit/6e8a84e43d1617c8366c0424ffc8898e52573db7)
+(workspace RPC `nokv.workspace.rpc.v15`, metadata format 15, Holt `=0.8.8`); its
+release pull request ran CI on the identical tree.
+
+| Surface | Evidence | Status |
+| --- | --- | --- |
+| Rust workspace | Linux CI on the release tree: `cargo test --workspace` 1,436 passed, 0 failed, 15 ignored; the metadata read-stats feature set 449 passed; the restore crash-support set 247 passed, 1 ignored | Implemented and layer-tested; ignored cases are gaps, not passes |
+| Bounded live gates | The same CI run with real etcd and moto or digest-pinned RustFS: native CLI contract, workspace RPC over TLS (t0–t23), control plane over mutual TLS (c0–c6), direct Python SDK in plaintext and over TLS, restore composition, local-WAL successor recovery, object-namespace recovery, fork-restore recovery, and tenant identity records on etcd all pass | Pass for the scenarios each gate names |
+| Full-surface Gate 0 | The live Workbench gate's workflow passes; its full-surface Gate 0 remains not qualified, as CI expects | **Not qualified** |
+| Downstream agents | Before merge, on one Apple M3 Pro laptop: Pi scenarios m1–m5 and 16- and 64-agent contention, and contained Hermes runs for concurrent writers, reader refusal, refusal audit, mid-session revocation, and control-directory failure, all pass | Single-host acceptance; not a production result |
+| Old stores | A 0.12.1 metadata store is refused by a 0.20.0 owner with no bytes changed | Fail-closed upgrade boundary |
+| Release artifacts | The Homebrew formula installs and passes its test on macOS 15 Apple Silicon and Intel; the Python wheels build and pass the SDK tests on all four platforms; published checksums verified | Released |
+| Performance | One Apple M3 Pro laptop, release builds: authorization 61–115 ns per request; TLS 1.3 plus authorization about 0.7 ms more per CLI process; revocation p50 about 1 s; owner-mediated put of 1, 16, and 64 MiB in 0.34×, 0.83×, and 1.15× the time of the previous direct upload; 16 agents on one root at 49.6 turns/s with a turn p99 of 406 ms | Single-host measurements; no production, tail-latency, or HA claim |
+| Holt 0.8.8 | 712 tests passed, 8 ignored; Nightly Validation (fault matrix, property tests, crash and normal soaks, fuzz) passed; 0.8.7 and 0.8.8 open each other's stores; the crates.io package equals tag `v0.8.8` | Layer-tested for the embedded local boundary |
+
+The CI rows come from the release pull request's
+[Rust workflow run](https://github.com/NoKV-Lab/NoKV/actions/runs/41212564642);
+the release rows from the
+[Homebrew](https://github.com/NoKV-Lab/NoKV/actions/runs/41213468560) and
+[Python SDK](https://github.com/NoKV-Lab/NoKV/actions/runs/41213471697) release
+runs. Agent-harness throughput against SQLite was measured for 0.12.0 (see its
+[release notes](https://github.com/NoKV-Lab/NoKV/releases/tag/v0.12.0) and the
+[raw evidence](https://gist.github.com/wchwawa/e9f86ba66c3211f1514d618e9827546a))
+and was not rerun for 0.20.0. See
+[Workspace acceptance](docs/development/workspace-acceptance.md) for the
+normative gate and [Benchmarks and evidence](docs/benchmarks.md) for evidence
+rules.
+
+### Implemented, but not currently live-qualified
+
+- opt-in shared recovery publication and receipt-directed recovery-log install.
+
+### Not qualified by current evidence
+
+- remote checkpoint compaction, copied-directory failover, shared metadata
+  durability, multi-machine failover, or metadata HA;
+- accepted full-surface native-CLI and installed-Python Gate 0 live acceptance;
+- complete provider timeout and ambiguous-delete fault coverage;
+- cross-host writer fencing;
+- physical power-cycle behavior, production tail latency, write amplification,
+  RSS advantage, or universal ART performance.
+
+### Planned, not yet offered
+
+- replicated metadata and multi-machine failover.
+
+### Not offered by NoKV
+
+- cross-shard transactions;
+- in-place rollback, or a fork across roots or shards;
+- transparent POSIX/FUSE/CSI/NAS behavior.
 
 ## Documentation
 
 - [Documentation index](docs/index.md)
-- [Product design](docs/product-design.md)
-- [Architecture](docs/architecture.md)
-- [Workbench contract](docs/workbench-contract.md)
-- [CLI contract](docs/cli-contract.md)
-- [Metadata schema](docs/metadata-schema.md)
-- [Object layout](docs/object-layout.md)
-- [Path-native metadata comparison](docs/development/path-native-metadata-comparison.md)
-- [Workspace acceptance](docs/development/workspace-acceptance.md)
-- [Live deployment preflight](docs/workbench-preflight.md)
+- [Product design](docs/product-design.md) and [Architecture](docs/architecture.md)
+- [Workbench contract](docs/workbench-contract.md) and [CLI contract](docs/cli-contract.md)
+- [Append recovery](docs/append-recovery.md)
+- [Metadata schema](docs/metadata-schema.md) and [Object layout](docs/object-layout.md)
+- [Object store credentials](docs/object-credentials.md) and [Control plane credentials](docs/control-plane-credentials.md)
+- [Threat model](docs/development/threat-model.md) and [SECURITY.md](SECURITY.md)
+- [AI training](docs/ai-training.md)
+- [Live deployment preflight](docs/workbench-preflight.md) and [Workspace acceptance](docs/development/workspace-acceptance.md)
 - [Container image](docs/container-image.md) and its [Artifact Hub listing](docs/development/artifact-hub.md)
-- [Agent contributor handbook](docs/development/nokv-agent.md)
-- [Code contract](docs/development/code_contract.md)
-- [PR review checklist](docs/development/pr_review_checklist.md)
+- [Path-native metadata comparison](docs/development/path-native-metadata-comparison.md)
+- [Agent contributor handbook](docs/development/nokv-agent.md), [Code contract](docs/development/code_contract.md), and [PR review checklist](docs/development/pr_review_checklist.md)
 - [Source-only Homebrew release](scripts/release/README.md)
 
 ## Third-party Listings
@@ -736,12 +633,12 @@ git diff --check
 | [`nokv-meta-store`](crates/nokv-meta-store) | Ordered metadata transaction contract and conformance suite |
 | [`nokv-meta-holt`](crates/nokv-meta-holt) | Embedded Holt adapter, strict open/reopen, recovery, and physical diagnostics |
 | [`nokv-meta`](crates/nokv-meta) | Workspace schema, commands, history, indexes, commits, snapshots, restore, and GC |
-| [`nokv-control`](crates/nokv-control) | Persisted root placement, shard ownership, epoch fencing, and recovery coordination |
+| [`nokv-control`](crates/nokv-control) | Persisted root placement, shard ownership, epoch fencing, identity records, and recovery coordination |
 | [`nokv-object`](crates/nokv-object) | Immutable S3-compatible artifact storage and optional local hot tier |
-| [`nokv-client`](crates/nokv-client) | Root-routed Rust SDK and immutable-object data path |
+| [`nokv-client`](crates/nokv-client) | Root-routed Rust SDK, sessions, and immutable-object data path |
 | [`nokv-agent`](crates/nokv-agent) | Transport-free 18-operation Workbench facade and result shaping |
 | [`nokv-python`](crates/nokv-python) | Direct Python SDK and bounded fsspec/checkpoint adapters |
-| [`nokv-server`](crates/nokv-server) | Logical-shard owner, RPC executor, adapter composition, and lifecycle workers |
+| [`nokv-server`](crates/nokv-server) | Logical-shard owner, RPC executor and authorization, adapter composition, and lifecycle workers |
 | [`nokv`](crates/nokv) | Native CLI wiring |
 | [`nokv-bench`](bench) | Non-product contract, recovery, and performance workloads |
 
