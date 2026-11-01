@@ -107,7 +107,9 @@ pub enum ControlError {
     /// directory or a record file at `path`: group or other users can write
     /// it, another user owns it, or this process cannot create what it needs
     /// in it. Someone else may have changed the records, so an operator
-    /// checks them and fixes the permissions. Nothing ran.
+    /// checks them and fixes the permissions; `reason` ends with that fix,
+    /// addressed to the operator, since an Agent runs a bare command itself.
+    /// Nothing ran.
     ControlPathRefused {
         path: PathBuf,
         reason: String,

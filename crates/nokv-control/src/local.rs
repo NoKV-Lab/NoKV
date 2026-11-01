@@ -605,7 +605,9 @@ fn may_create_entries(path: &Path) -> io::Result<()> {
 
 /// The refusal of a control directory that this process's user lacks the
 /// permission to `action`. That lasts until an operator changes the
-/// filesystem, so it is not a transient failure.
+/// filesystem, so it is not a transient failure. The directory does not
+/// exist yet, or only this user or root can write it, so nobody else can
+/// have changed its records: the operator's fix is the permissions alone.
 fn refusal_without_permission(
     path: &Path,
     action: &str,
@@ -618,8 +620,8 @@ fn refusal_without_permission(
     .then(|| ControlError::ControlPathRefused {
         path: path.to_path_buf(),
         reason: format!(
-            "this process's user (uid {}) cannot {action} ({error}); make it a directory that \
-             user owns and can write, or choose another one",
+            "this process's user (uid {}) cannot {action} ({error}); an operator should make \
+             it a directory that user owns and can write, or choose another one",
             effective_user()
         ),
     })
@@ -643,18 +645,21 @@ fn check_control_path(path: &Path, metadata: &fs::Metadata) -> Result<(), Contro
 }
 
 /// Why a path with `mode` that belongs to `owner` cannot hold the control
-/// records of a process running as `user`.
+/// records of a process running as `user`, and the operator's fix. Someone
+/// else could have changed the records, so the operator checks them first.
 fn control_path_problem(mode: u32, owner: u32, user: u32) -> Option<String> {
     if mode & SHARED_WRITE_BITS != 0 {
         return Some(format!(
-            "group or other users can write it (mode {:o}); run `chmod go-w` on it",
+            "group or other users can write it (mode {:o}); an operator should check the \
+             control records, then run `chmod go-w` on it",
             mode & 0o7777
         ));
     }
     if owner != user && owner != 0 {
         return Some(format!(
-            "it belongs to uid {owner}, not to this process's user (uid {user}) or root; \
-             run every process that uses the control directory as its owner, or use etcd"
+            "it belongs to uid {owner}, not to this process's user (uid {user}) or root; an \
+             operator should check the control records, then run every process that uses the \
+             control directory as its owner, or use etcd"
         ));
     }
     None
@@ -1246,7 +1251,8 @@ mod tests {
     }
 
     /// `result` is the store's refusal of `path` because of `why`: a matter
-    /// for an operator, since someone else may have changed the records.
+    /// for an operator, since someone else may have changed the records, so
+    /// its fix is addressed to one.
     fn refused_because(result: Result<impl std::fmt::Debug, ControlError>, path: &Path, why: &str) {
         let error = result.expect_err("the store must refuse");
         assert_eq!(
@@ -1261,9 +1267,48 @@ mod tests {
             } => {
                 assert_eq!(refused, path, "{reason}");
                 assert!(reason.contains(why), "{reason}");
+                assert!(reason.contains("; an operator should "), "{reason}");
             }
             other => panic!("expected a refusal of {}, got {other:?}", path.display()),
         }
+    }
+
+    /// An Agent that reads a refusal's fix as a command runs it itself, so
+    /// each fix names an operator, who first checks the records wherever
+    /// someone else could have changed them.
+    #[test]
+    fn each_refusal_leaves_its_fix_to_an_operator() {
+        let user = 501;
+        let shared = control_path_problem(0o40770, user, user).unwrap();
+        assert_eq!(
+            shared,
+            "group or other users can write it (mode 770); an operator should check the \
+             control records, then run `chmod go-w` on it"
+        );
+        let foreign = control_path_problem(0o40700, 502, user).unwrap();
+        assert_eq!(
+            foreign,
+            "it belongs to uid 502, not to this process's user (uid 501) or root; an \
+             operator should check the control records, then run every process that uses \
+             the control directory as its owner, or use etcd"
+        );
+
+        // This user cannot write a directory that nobody else can write
+        // either, or that does not exist yet: there are no foreign changes
+        // to check.
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        let unusable =
+            refusal_without_permission(Path::new("/srv/ctl"), "create files in it", &denied)
+                .unwrap();
+        assert_eq!(
+            unusable.to_string(),
+            format!(
+                "local control store refuses /srv/ctl: this process's user (uid {}) cannot \
+                 create files in it ({denied}); an operator should make it a directory that \
+                 user owns and can write, or choose another one",
+                effective_user()
+            )
+        );
     }
 
     #[test]
