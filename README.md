@@ -34,6 +34,9 @@ SPDX-License-Identifier: Apache-2.0
     <a href="https://github.com/NoKV-Lab/NoKV/releases/latest">
       <img alt="Latest release" src="https://img.shields.io/github/v/release/NoKV-Lab/NoKV?sort=date&amp;display_name=tag&amp;label=release" />
     </a>
+    <a href="https://artifacthub.io/packages/container/nokv/nokv">
+      <img alt="Artifact Hub" src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/nokv" />
+    </a>
     <a href="./LICENSE">
       <img alt="Apache-2.0 license" src="https://img.shields.io/github/license/NoKV-Lab/NoKV" />
     </a>
