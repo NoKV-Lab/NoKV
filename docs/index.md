@@ -89,8 +89,9 @@ SPDX-License-Identifier: Apache-2.0
 
 - Product and interface: [Product Design](./product-design.md),
   [Architecture](./architecture.md),
-  [Workbench Contract](./workbench-contract.md), and
-  [CLI Contract](./cli-contract.md).
+  [Workbench Contract](./workbench-contract.md),
+  [CLI Contract](./cli-contract.md), and
+  [Append Recovery](./append-recovery.md).
 - Storage and distribution: [Metadata Schema](./metadata-schema.md),
   [Object Layout](./object-layout.md),
   [Object Store Credentials](./object-credentials.md), and
