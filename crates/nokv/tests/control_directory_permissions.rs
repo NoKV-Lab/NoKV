@@ -8,8 +8,9 @@
 //! refuses one that group or other users can write, before it reads or
 //! writes a record. Someone else may have changed its records, so the
 //! refusal is `operator_required` (exit 9, `operator`) and names the
-//! directory and the fix. A command that writes it also refuses one it
-//! cannot create or write, and changes nothing when it refuses.
+//! directory and the fix, addressed to an operator: an Agent that reads a
+//! fix as a command runs it itself. A command that writes it also refuses
+//! one it cannot create or write, and changes nothing when it refuses.
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
@@ -96,7 +97,9 @@ fn a_control_directory_other_users_can_write_is_refused_for_an_operator() {
         assert!(
             message.contains(&control.display().to_string())
                 && message.contains("group or other users can write it")
-                && message.contains("chmod go-w"),
+                && message.contains(
+                    "an operator should check the control records, then run `chmod go-w` on it"
+                ),
             "{envelope}"
         );
     }
@@ -132,7 +135,9 @@ fn assert_refused(exit: i32, envelope: &Value, path: &Path, why: &str) {
     assert_eq!(envelope["next_action"], "operator", "{envelope}");
     let message = envelope["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains(&format!("refuses {}:", path.display())) && message.contains(why),
+        message.contains(&format!("refuses {}:", path.display()))
+            && message.contains(why)
+            && message.contains("; an operator should "),
         "{envelope}"
     );
 }
@@ -349,18 +354,23 @@ fn a_write_refuses_a_directory_it_cannot_use_before_creating_anything_in_it() {
         control.clone(),
         0o770,
         "group or other users can write it".to_owned(),
+        "; an operator should check the control records, then run `chmod go-w` on it",
     )];
     if user != 0 {
         // Root may write any directory.
         let cannot = format!("this process's user (uid {user}) cannot create");
-        cases.push((control.clone(), 0o555, format!("{cannot} files in it")));
-        cases.push((control.join("nested"), 0o555, format!("{cannot} it")));
+        let fix = "; an operator should make it a directory that user owns and can write, \
+                   or choose another one";
+        cases.push((control.clone(), 0o555, format!("{cannot} files in it"), fix));
+        cases.push((control.join("nested"), 0o555, format!("{cannot} it"), fix));
     }
-    for (directory, unusable, why) in cases {
+    for (directory, unusable, why, fix) in cases {
         fs::set_permissions(&control, fs::Permissions::from_mode(unusable)).unwrap();
         let (exit, envelope) = nokv(&directory, &TENANT_CREATE);
         fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
         assert_refused(exit, &envelope, &directory, &why);
+        let message = envelope["message"].as_str().unwrap_or_default();
+        assert!(message.ends_with(fix), "{envelope}");
         assert_eq!(fs::read_dir(&control).unwrap().count(), 0, "{envelope}");
     }
 }
@@ -407,6 +417,13 @@ fn a_write_refuses_a_directory_another_user_owns_before_creating_anything() {
         &envelope,
         &directory,
         &format!("belongs to uid {owner}"),
+    );
+    assert!(
+        envelope["message"].as_str().unwrap_or_default().ends_with(
+            "; an operator should check the control records, then run every process that uses \
+             the control directory as its owner, or use etcd"
+        ),
+        "{envelope}"
     );
     assert!(!directory.join("sessions").exists(), "{envelope}");
 }

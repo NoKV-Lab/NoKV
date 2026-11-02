@@ -712,9 +712,9 @@ def owner_exits_when_its_control_directory_becomes_unsafe(stack: Stack) -> dict[
     """S13: an owner whose control directory becomes group-writable stops
     serving and exits within its session check, reporting the control store's
     refusal: operator_required, since someone else may have changed the
-    records, with the directory and the fix. It does not resume by itself;
-    once the mode is fixed, a restart with --metadata-reopen serves what was
-    written before."""
+    records, with the directory and the fix, addressed to an operator who
+    checks the records first. It does not resume by itself; once the mode is
+    fixed, a restart with --metadata-reopen serves what was written before."""
     workbench, body = "s13-unsafe-control", b"written before the refusal"
     stack.workbench(workbench)
     before = stack.success(stack.put("s13-before", workbench, "before.txt", new_id(), body))
@@ -733,8 +733,9 @@ def owner_exits_when_its_control_directory_becomes_unsafe(stack: Stack) -> dict[
     lines = log.read_text(errors="replace").splitlines()
     exit_call = Call("s13-owner-exit", owner.returncode, "", (lines[-1] if lines else "") + "\n")
     envelope = stack.failure(exit_call, "operator_required", "operator")
-    require(str(stack.control) in envelope["message"] and "chmod go-w" in envelope["message"],
-            "s13: the owner's exit names its control directory and the fix", envelope)
+    require(str(stack.control) in envelope["message"]
+            and "an operator should check the control records, then run `chmod go-w` on it" in envelope["message"],
+            "s13: the owner's exit names its control directory and the operator's fix", envelope)
     stack.start_owner()
     after = stack.stat("s13-after", workbench, "before.txt")
     require(after.get("exists") is True and after.get("generation") == before.get("generation"),
@@ -746,8 +747,9 @@ def owner_stop_reports_an_unwritable_control_directory(stack: Stack) -> dict[str
     """S14: an owner whose control directory it can no longer write, though
     still private, serves on until its next control-store write. Stopping it
     releases its session there: the store refuses, and the owner exits with
-    that refusal, operator_required, naming the directory and why. Once the
-    mode is fixed, a restart serves what was written meanwhile."""
+    that refusal, operator_required, naming the directory, why, and the
+    operator's fix. Once the mode is fixed, a restart serves what was written
+    meanwhile."""
     workbench, body = "s14-unwritable-control", b"written while the control directory was read-only"
     stack.workbench(workbench)
     owner, log = stack.owner, stack.evidence / f"owner-{stack.owner_starts}.log"
@@ -768,8 +770,10 @@ def owner_stop_reports_an_unwritable_control_directory(stack: Stack) -> dict[str
     lines = log.read_text(errors="replace").splitlines()
     exit_call = Call("s14-owner-exit", owner.returncode, "", (lines[-1] if lines else "") + "\n")
     envelope = stack.failure(exit_call, "operator_required", "operator")
-    require(str(stack.control) in envelope["message"] and "cannot create files in it" in envelope["message"],
-            "s14: the owner's exit names its control directory and why it is refused", envelope)
+    require(str(stack.control) in envelope["message"] and "cannot create files in it" in envelope["message"]
+            and "an operator should make it a directory that user owns and can write" in envelope["message"],
+            "s14: the owner's exit names its control directory, why it is refused, and the operator's fix",
+            envelope)
     stack.start_owner()
     after = stack.stat("s14-after", workbench, "during.txt")
     require(after.get("exists") is True and after.get("generation") == put.get("generation"),

@@ -441,7 +441,8 @@ mod control_tests {
         }
         let refused = control_error(ControlError::ControlPathRefused {
             path: "/srv/ctl".into(),
-            reason: "group or other users can write it (mode 770); run `chmod go-w` on it"
+            reason: "group or other users can write it (mode 770); an operator should check \
+                     the control records, then run `chmod go-w` on it"
                 .to_owned(),
         });
         assert!(
