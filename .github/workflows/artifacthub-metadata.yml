@@ -22,7 +22,7 @@ jobs:
       GHCR_IMAGE: ghcr.io/nokv-lab/nokv
     steps:
       - name: Set up ORAS
-        uses: oras-project/setup-oras@v1
+        uses: oras-project/setup-oras@v2
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
