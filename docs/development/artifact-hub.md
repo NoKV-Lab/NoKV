@@ -25,7 +25,12 @@ as the package page.
   `org.opencontainers.image.description`) with the values `emit` gives.
 - The **Release Images** workflow publishes `ghcr.io/nokv-lab/nokv` (and the
   Docker Hub image when its secrets are set) for a release tag with the same
-  metadata, under the tags `vX.Y.Z`, `X.Y.Z`, `X.Y`, `X` and `latest`.
+  metadata, under the tags `vX.Y.Z`, `X.Y.Z`, `X.Y`, `X` and `latest`. While
+  the repository variable `ARTIFACTHUB_REPOSITORY_ID` is set, it then runs
+  **Artifact Hub Metadata**.
+- The **Artifact Hub Metadata** workflow pushes `artifacthub-repo.yml`, which
+  holds that repository ID, as the `artifacthub.io` tag. It builds no image
+  and moves no image tag, so it can also be run by hand.
 
 ## Launch checklist
 
@@ -44,9 +49,11 @@ account.
    Track `latest` as mutable and each release tag as immutable (at most ten
    tags).
 5. Copy the repository ID Artifact Hub shows, store it as the repository
-   variable `ARTIFACTHUB_REPOSITORY_ID`, and run **Release Images** again for
-   the same tag: it pushes `artifacthub-repo.yml` as the `artifacthub.io` tag,
-   which marks the listing as a verified publisher.
+   variable `ARTIFACTHUB_REPOSITORY_ID`, and run **Artifact Hub Metadata**
+   from `main`. Artifact Hub marks the listing as a verified publisher when it
+   next processes the repository. Do not run **Release Images** again for
+   this: it rebuilds the image, so the release's tags can move to a new
+   digest.
 6. Once the package page renders, add its Artifact Hub badge to the README.
 
 A release whose tag predates `docs/container-image.md` gets a readme URL that

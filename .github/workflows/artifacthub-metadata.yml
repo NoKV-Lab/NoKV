@@ -1,0 +1,48 @@
+# Copyright 2024-2026 The NoKV Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Artifact Hub Metadata
+
+# Artifact Hub's repository metadata: its repository ID marks the listing as
+# published by this registry's owner. Pushing it builds no image and moves no
+# image tag, so it can run on its own once ARTIFACTHUB_REPOSITORY_ID is set.
+# Release Images also calls it after each release.
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  packages: write
+
+jobs:
+  metadata:
+    name: metadata
+    runs-on: ubuntu-latest
+    env:
+      GHCR_IMAGE: ghcr.io/nokv-lab/nokv
+    steps:
+      - name: Set up ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish Artifact Hub repository metadata
+        shell: bash
+        env:
+          REPOSITORY_ID: ${{ vars.ARTIFACTHUB_REPOSITORY_ID }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REPOSITORY_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "::error title=Invalid Artifact Hub repository ID::Set the repository variable ARTIFACTHUB_REPOSITORY_ID to the UUID Artifact Hub shows, got '$REPOSITORY_ID'"
+            exit 1
+          fi
+          printf 'repositoryID: %s\n' "$REPOSITORY_ID" > "$RUNNER_TEMP/artifacthub-repo.yml"
+          cd "$RUNNER_TEMP"
+          oras push "$GHCR_IMAGE:artifacthub.io" \
+            --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml \
+            artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
