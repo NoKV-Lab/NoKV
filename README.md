@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 <div align="center">
   <img src="./docs/public/img/logo.png" width="320" alt="NoKV" />
 
-  <h3>The state layer for agent workspaces and AI-for-science campaigns.</h3>
+  <h3>A file system for agent workspaces and AI-for-science campaigns.</h3>
 
   <p>
     Agents and experiment pipelines publish versioned artifacts that are never
