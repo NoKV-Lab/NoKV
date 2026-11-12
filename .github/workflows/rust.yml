@@ -51,6 +51,11 @@ jobs:
 
       - name: Cache typed qualification targets
         uses: Swatinem/rust-cache@v2
+        with:
+          # A cached target directory holds build-script results bound to
+          # the runner image, such as the libpython that pyo3 linked. Key
+          # the cache by image so a new image starts from a clean build.
+          env-vars: ImageOS
 
       - name: Check Workbench contract and live workflow
         run: |
@@ -389,6 +394,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          env-vars: ImageOS
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -808,6 +815,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          env-vars: ImageOS
 
       - name: Install pinned etcd
         shell: bash
@@ -891,6 +900,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          env-vars: ImageOS
 
       - name: Install pinned etcd
         shell: bash
