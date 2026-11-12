@@ -28,6 +28,12 @@ as the package page.
   metadata, under the tags `vX.Y.Z`, `X.Y.Z`, `X.Y`, `X` and `latest`. While
   the repository variable `ARTIFACTHUB_REPOSITORY_ID` is set, it then runs
   **Artifact Hub Metadata**.
+- **Release Images** takes one input that names the source, a canonical
+  `vX.Y.Z` tag. `scripts/ci/release_image_gate.py` refuses to publish unless
+  the workflow runs from `main`, the tag's commit is on `main`, and the `nokv`
+  crate version at that commit equals the tag. It builds from that commit
+  alone and rechecks the tag before each registry login, so a tag that moves
+  during the run stops the release.
 - The **Artifact Hub Metadata** workflow pushes `artifacthub-repo.yml`, which
   holds that repository ID, as the `artifacthub.io` tag. It builds no image
   and moves no image tag, so it can also be run by hand.

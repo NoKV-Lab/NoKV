@@ -346,6 +346,9 @@ jobs:
       - name: Check Homebrew release safety
         run: python3 scripts/release/test_homebrew_source_release.py
 
+      - name: Check image release safety
+        run: python3 scripts/ci/release_image_gate_test.py
+
       - name: Check Python SDK release safety
         run: python3 scripts/release/test_python_sdk_release.py
 
