@@ -6,61 +6,149 @@ name: Release Images
 on:
   workflow_dispatch:
     inputs:
-      ref:
-        description: "Git ref to build, for example v0.1.0"
+      tag:
+        description: "Canonical stable tag, for example v0.20.0"
         required: true
-      version:
-        description: "Release version, for example v0.1.0"
-        required: true
+        type: string
       rust_version:
-        description: "Rust toolchain image version"
+        description: "Numeric Rust toolchain image version"
         required: true
         default: "1.91"
+        type: string
       debian_version:
-        description: "Debian image version"
+        description: "Debian image version (bookworm or trixie)"
         required: true
         default: "bookworm"
+        type: string
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
-  images:
-    name: images
+  # Inputs reach the shell only as environment variables of this job. Later
+  # jobs build from the outputs the gate wrote after validating them.
+  validate:
+    name: Validate immutable release identity
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      commit: ${{ steps.resolve.outputs.commit }}
+      rust_version: ${{ steps.resolve.outputs.rust_version }}
+      debian_version: ${{ steps.resolve.outputs.debian_version }}
     env:
-      GHCR_IMAGE: ghcr.io/nokv-lab/nokv
-      DOCKERHUB_IMAGE: docker.io/feichai0017/nokv
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      RUST_VERSION: ${{ inputs.rust_version }}
+      DEBIAN_VERSION: ${{ inputs.debian_version }}
     steps:
-      - name: Checkout release ref
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.ref }}
+      - name: Require the canonical release workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REPOSITORY" != "NoKV-Lab/NoKV" || "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error title=Invalid dispatch source::Run this workflow from NoKV-Lab/NoKV main."
+            exit 1
+          fi
 
-      # The metadata script comes from this workflow's own commit, so an
-      # older release ref is labelled the same way.
-      - name: Checkout image tooling
-        uses: actions/checkout@v7
+      # The gate and the metadata script come from this workflow's own commit,
+      # so an older release tag is checked and labelled the same way. The gate
+      # compares the tag with main, which needs full history.
+      - name: Checkout trusted release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.sha }}
-          path: image-tooling
-          sparse-checkout: scripts/ci
+          path: release-tooling
+          fetch-depth: 0
           persist-credentials: false
+          sparse-checkout: |
+            scripts/ci
+            scripts/release
+
+      - name: Validate inputs and resolve the canonical tag
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 release-tooling/scripts/ci/release_image_gate.py resolve \
+            --repository release-tooling \
+            --tag "$RELEASE_TAG" \
+            --rust-version "$RUST_VERSION" \
+            --debian-version "$DEBIAN_VERSION" \
+            --output "$GITHUB_OUTPUT"
+
+      - name: Checkout resolved release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ steps.resolve.outputs.commit }}
+          path: release-source
+          persist-credentials: false
+
+      - name: Validate source version at resolved commit
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ steps.resolve.outputs.commit }}
+        run: |
+          set -euo pipefail
+          python3 release-tooling/scripts/ci/release_image_gate.py verify \
+            --repository release-tooling \
+            --source release-source \
+            --tag "$RELEASE_TAG" \
+            --expected-commit "$EXPECTED_COMMIT"
+
+  images:
+    name: images
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
+      GHCR_IMAGE: ghcr.io/nokv-lab/nokv
+      DOCKERHUB_IMAGE: docker.io/feichai0017/nokv
+      DOCKERHUB_ENABLED: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+    steps:
+      - name: Checkout trusted release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: release-tooling
+          fetch-depth: 0
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/ci
+            scripts/release
+
+      # The build context is the release commit alone; the tooling sits beside
+      # it, not inside it.
+      - name: Checkout validated release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          path: release-source
+          persist-credentials: false
+
+      - name: Recheck release tag and source before registry login
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 release-tooling/scripts/ci/release_image_gate.py verify \
+            --repository release-tooling \
+            --source release-source \
+            --tag "$RELEASE_TAG" \
+            --expected-commit "$EXPECTED_COMMIT"
 
       - name: Image metadata
         id: metadata
         shell: bash
-        env:
-          RELEASE_REF: ${{ inputs.ref }}
-          RELEASE_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          python3 image-tooling/scripts/ci/image_metadata.py emit \
-            --ref "$RELEASE_REF" --version "$RELEASE_VERSION" \
-            --revision "$(git rev-parse HEAD)" --created "$(git log -1 --format=%cI)" >> "$GITHUB_OUTPUT"
+          python3 release-tooling/scripts/ci/image_metadata.py emit \
+            --ref "$RELEASE_TAG" --version "$RELEASE_TAG" \
+            --revision "$EXPECTED_COMMIT" \
+            --created "$(git -C release-source log -1 --format=%cI)" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -73,17 +161,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
-          plain="${version#v}"
+          plain="$RELEASE_VERSION"
           IFS=. read -r major minor patch <<<"$plain"
-          if [[ -z "${major:-}" || -z "${minor:-}" || -z "${patch:-}" ]]; then
-            echo "::error title=Invalid release version::Expected vMAJOR.MINOR.PATCH, got $version"
-            exit 1
-          fi
 
           {
             echo "ghcr<<EOF"
-            printf '%s:%s\n' "$GHCR_IMAGE" "$version"
+            printf '%s:%s\n' "$GHCR_IMAGE" "$RELEASE_TAG"
             printf '%s:%s\n' "$GHCR_IMAGE" "$plain"
             printf '%s:%s.%s\n' "$GHCR_IMAGE" "$major" "$minor"
             printf '%s:%s\n' "$GHCR_IMAGE" "$major"
@@ -93,7 +176,7 @@ jobs:
 
           {
             echo "dockerhub<<EOF"
-            printf '%s:%s\n' "$DOCKERHUB_IMAGE" "$version"
+            printf '%s:%s\n' "$DOCKERHUB_IMAGE" "$RELEASE_TAG"
             printf '%s:%s\n' "$DOCKERHUB_IMAGE" "$plain"
             printf '%s:%s.%s\n' "$DOCKERHUB_IMAGE" "$major" "$minor"
             printf '%s:%s\n' "$DOCKERHUB_IMAGE" "$major"
@@ -111,12 +194,12 @@ jobs:
       - name: Publish GHCR image
         uses: docker/build-push-action@v7
         with:
-          context: .
-          file: ./Dockerfile
+          context: ./release-source
+          file: ./release-source/Dockerfile
           platforms: linux/amd64,linux/arm64
           build-args: |
-            RUST_VERSION=${{ inputs.rust_version }}
-            DEBIAN_VERSION=${{ inputs.debian_version }}
+            RUST_VERSION=${{ needs.validate.outputs.rust_version }}
+            DEBIAN_VERSION=${{ needs.validate.outputs.debian_version }}
             NOKV_PACKAGE=nokv
             NOKV_BINARY=nokv
           labels: ${{ steps.metadata.outputs.labels }}
@@ -126,24 +209,36 @@ jobs:
           outputs: type=image,push=true,oci-mediatypes=true
           tags: ${{ steps.tags.outputs.ghcr }}
 
+      # The multi-platform build above is long enough for a tag to move.
+      - name: Recheck release tag before Docker Hub login
+        if: env.DOCKERHUB_ENABLED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 release-tooling/scripts/ci/release_image_gate.py verify \
+            --repository release-tooling \
+            --source release-source \
+            --tag "$RELEASE_TAG" \
+            --expected-commit "$EXPECTED_COMMIT"
+
       - name: Log in to Docker Hub
-        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        if: env.DOCKERHUB_ENABLED == 'true'
         uses: docker/login-action@v4
         with:
           registry: docker.io
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ env.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Publish Docker Hub image
-        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        if: env.DOCKERHUB_ENABLED == 'true'
         uses: docker/build-push-action@v7
         with:
-          context: .
-          file: ./Dockerfile
+          context: ./release-source
+          file: ./release-source/Dockerfile
           platforms: linux/amd64,linux/arm64
           build-args: |
-            RUST_VERSION=${{ inputs.rust_version }}
-            DEBIAN_VERSION=${{ inputs.debian_version }}
+            RUST_VERSION=${{ needs.validate.outputs.rust_version }}
+            DEBIAN_VERSION=${{ needs.validate.outputs.debian_version }}
             NOKV_PACKAGE=nokv
             NOKV_BINARY=nokv
           labels: ${{ steps.metadata.outputs.labels }}
@@ -159,4 +254,6 @@ jobs:
     name: artifacthub-metadata
     needs: images
     if: vars.ARTIFACTHUB_REPOSITORY_ID != ''
+    permissions:
+      packages: write
     uses: ./.github/workflows/artifacthub-metadata.yml
